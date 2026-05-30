@@ -390,3 +390,25 @@ class TestFolderPredicate:
                 FolderOptions(predicate=col("pk") == "a"))
         )
         assert {lf.tabular_parent.static_values.get("pk") for lf in pruned} == {"a"}
+
+    def test_eq_and_in_predicate_probe_partition_paths_without_listing_root(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        from yggdrasil.path.local_path import LocalPath
+
+        fp = Folder(path=str(tmp_path / "part"))
+        fp.write_arrow_batches([_partitioned_batch(["a", "b", "c", "d"], [1, 2, 3, 4])])
+        root = str(tmp_path / "part")
+
+        listed: list[str] = []
+        orig = LocalPath._ls
+        monkeypatch.setattr(
+            LocalPath, "_ls",
+            lambda self, *a, **k: (listed.append(self.os_path), orig(self, *a, **k))[1],
+        )
+
+        out = Folder(path=root).read_arrow_table(options=FolderOptions(predicate=col("pk") == "a"))
+        assert sorted(out.column("val").to_pylist()) == [1]
+        # The root partition dir was never listed — pk=a was probed directly.
+        assert root not in listed
+        assert any(p.endswith("pk=a") for p in listed)

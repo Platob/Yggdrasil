@@ -695,75 +695,26 @@ class Folder(Path):
     def iter_children(
         self, options: "FolderOptions | None" = None,
     ) -> "Iterator[Tabular]":
-        """Yield every non-private direct entry of :attr:`path`.
+        """Yield every non-private **direct** entry of :attr:`path` (one level).
 
-        Sub-directories come back as a fresh :class:`Folder`. File
-        entries route through :class:`MediaType.from_` (extension
-        first, magic-byte fallback) to a registered :class:`Tabular`
-        leaf — :class:`ParquetFile` for ``.parquet``,
-        :class:`ArrowIPCFile` for ``.arrow``, etc. Files that don't
-        resolve fall back to a plain :class:`IO`, which is
-        useful for the children-surface walk but raises on the
-        Tabular hooks (so they're transparently skipped by
-        :meth:`_read_arrow_batches`).
+        Sub-directories come back as a fresh :class:`Folder`; file entries
+        resolve through :meth:`_leaf_for` to a registered :class:`Tabular`
+        leaf (non-tabular files are skipped). A missing folder yields nothing.
 
-        A missing folder yields nothing — no error. A stat failure
-        mid-listing (race with a delete) silently skips the entry
-        rather than aborting the whole walk.
-
-        When *options* has ``partition_columns`` set, the listing is
-        Hive-aware:
-
-        - the leading column is consumed at this level; sub-folders
-          matching ``<col>=<val>/`` are minted with the parsed value
-          seeded into their :attr:`Tabular.static_values` (and the
-          ``partition_columns`` tuple shrunk by one so the recursion
-          consumes the next level next time);
-        - when ``options.predicate`` constrains that column to a
-          finite value set (via :func:`extract_partition_filters`),
-          candidate sub-paths are built directly from the accepted
-          values and probed — :meth:`Path.iterdir` is **not** called,
-          so a wide partition tree stays cheap;
-        - otherwise we ``iterdir()``-walk and discard any
-          ``<col>=<val>/`` whose value is rejected by the predicate
-          via the static-values prune.
-
-        Non-partitioned folders and unset ``options`` keep the
-        legacy flat-listing behaviour.
+        Plain flat listing — the partition-aware, recursive walk lives in
+        :meth:`iter_leaves` (which the read path uses). ``options`` is accepted
+        for signature symmetry but isn't consulted here.
         """
-        # Cheap early exit on a folder that hasn't been created yet
-        # — without this :meth:`partition_columns` would call
-        # :meth:`collect_schema`, which falls back to
-        # ``super()._collect_schema`` → ``_read_arrow_batches`` →
-        # back here, cycling forever on the very first write to a
-        # fresh partition child whose sidecar doesn't exist yet.
-        # ``Path.exists`` is one stat probe and we'd pay the same on
-        # the unguarded ``iterdir`` anyway.
-        if not self.path.exists():
-            return
-        partition_columns = self.partition_columns(options)
-        if partition_columns:
-            yield from self._iter_partition_children(options, partition_columns)
-            return
-
-        for entry in self.path.iterdir():
+        for entry in self.path.ls():
             if entry.name.startswith("."):
                 continue
-
-            try:
-                is_dir = entry.is_dir()
-            except Exception:
-                continue
-
-            if is_dir:
+            if entry.is_dir():
                 yield type(self)(path=entry, tabular_parent=self)
-                continue
-
-            child = self._leaf_for(entry)
-            if child is None:
-                continue
-            child.tabular_parent = self
-            yield child
+            else:
+                child = self._leaf_for(entry)
+                if child is not None:
+                    child.tabular_parent = self
+                    yield child
 
     def partition_columns(
         self,
@@ -817,60 +768,6 @@ class Folder(Path):
         )
         self._partition_columns_cache = (cache_key, result)
         return result
-
-    def _iter_partition_children(
-        self,
-        options: "FolderOptions",
-        partition_columns: "tuple[str, ...]",
-    ) -> "Iterator[Tabular]":
-        """Hive-aware listing variant — see :meth:`iter_children`.
-
-        ``partition_columns[0]`` is the column this level resolves;
-        descendants re-resolve the layout from their own
-        :attr:`static_values` (the consumed head gets filtered out
-        of the schema-driven lookup, so the next level naturally
-        picks up the remaining partition columns). Leaf files at
-        this level (plain ``part-*.<ext>``, no ``<col>=<val>``
-        prefix) still pass through so a partially-populated tree
-        (e.g. a freshly minted folder where the writer happened to
-        land a non-partitioned leaf alongside the partition dirs)
-        reads cleanly.
-        """
-        head = partition_columns[0]
-        accepted = self._accepted_partition_values(options, head)
-
-        if accepted is not None:
-            yield from self._iter_partition_candidates(head, accepted)
-            return
-
-        for entry in self.path.iterdir():
-            if entry.name.startswith("."):
-                continue
-            try:
-                is_dir = entry.is_dir()
-            except Exception:
-                continue
-            if is_dir:
-                parsed = hive_split(entry.name)
-                if parsed is not None and parsed[0] == head:
-                    value = hive_cast_value(
-                        parsed[1], self._partition_dtype(head),
-                    )
-                    yield self._mint_partition_child(entry, head, value)
-                else:
-                    # Non-Hive sub-folder mixed in (older layout,
-                    # operator scratch dir, …): yield it as a plain
-                    # child so the walker still descends, but don't
-                    # seed any partition KV — the predicate prune
-                    # falls back to the row-level filter for it.
-                    yield type(self)(path=entry, tabular_parent=self)
-                continue
-
-            child = self._leaf_for(entry)
-            if child is None:
-                continue
-            child.tabular_parent = self
-            yield child
 
     def _iter_partition_candidates(
         self,
@@ -1092,8 +989,7 @@ class Folder(Path):
         schema = self._collect_schema(options)
         spark_schema = schema.to_spark_schema()
 
-        leaves: list = []
-        self._collect_leaves(leaves, options)
+        leaves: list = list(self.iter_leaves(options))
 
         if not leaves:
             return spark.createDataFrame([], schema=spark_schema)
@@ -1132,19 +1028,6 @@ class Folder(Path):
 
         return leaf_df.mapInArrow(_read_holders, schema=spark_schema)
 
-    def _collect_leaves(
-        self, out: list, options: "FolderOptions",
-    ) -> None:
-        """Recursively collect leaf Tabular children, applying predicate pruning."""
-        free_cols = self._free_cols_for(options.predicate) if options.predicate else None
-        if self._should_prune_by_predicate(options, free_cols=free_cols):
-            return
-        for child in self.iter_children(options=options):
-            if isinstance(child, type(self)):
-                child._collect_leaves(out, self._child_read_options(child, options))
-            else:
-                out.append(child)
-
     def iter_leaves(
         self, options: "FolderOptions | None" = None,
     ) -> "Iterator[Tabular]":
@@ -1156,10 +1039,26 @@ class Folder(Path):
         path-level Hive :attr:`static_values`. Opens **no** data file: a pure
         listing + path-prune, reusable as a file-enumeration pass. The residual
         row-level filter stays in :meth:`_read_arrow_batches`.
+
+        Fast get: when the predicate pins this level's partition column to a
+        finite value set (``col == v`` / ``col in [...]``), the matching
+        ``<col>=<val>/`` sub-paths are probed directly — a handful of ``stat``s
+        instead of listing (and pruning) every sibling partition.
         """
-        free_cols = self._free_cols_for(getattr(options, "predicate", None))
+        predicate = getattr(options, "predicate", None)
+        free_cols = self._free_cols_for(predicate)
         if self._should_prune_by_predicate(options, free_cols=free_cols):
             return
+
+        if predicate is not None:
+            cols = self.partition_columns(options)
+            if cols:
+                accepted = self._accepted_partition_values(options, cols[0])
+                if accepted is not None:
+                    for child in self._iter_partition_candidates(cols[0], accepted):
+                        yield from child.iter_leaves(options)
+                    return
+
         for entry in self.path.ls():
             if entry.name.startswith("."):
                 continue
