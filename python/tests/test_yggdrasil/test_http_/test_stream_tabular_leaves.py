@@ -57,8 +57,10 @@ def table() -> pa.Table:
 def payloads(table) -> dict[str, bytes]:
     pb = io.BytesIO()
     pq.write_table(table, pb)
+    # ArrowIPCFile reads the IPC *file* format (random-access, footer at
+    # EOF), not the streaming format — use new_file, not new_stream.
     ab = io.BytesIO()
-    with ipc.new_stream(ab, table.schema) as w:
+    with ipc.new_file(ab, table.schema) as w:
         w.write_table(table)
     cb = io.BytesIO()
     pacsv.write_csv(table, cb)
