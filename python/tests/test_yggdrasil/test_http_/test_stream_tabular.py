@@ -44,10 +44,14 @@ def _parquet_bytes(rows: int = 200_000) -> bytes:
 
 
 def _zip_bytes(members: int = 50) -> bytes:
+    # ZIP_STORED + random member bodies so the archive does NOT compress
+    # away — the payload has to exceed the in-memory window to exercise
+    # the spill path (deflated repetitive text shrank to ~8 KiB).
+    import os
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
         for i in range(members):
-            zf.writestr(f"f{i}.txt", (f"row {i} " * 5000))
+            zf.writestr(f"f{i}.bin", os.urandom(4096))
     return buf.getvalue()
 
 
@@ -96,7 +100,7 @@ def test_zip_reparses_from_spilled_stream():
     got = bytes(ms.read_mv(-1, 0))
     with zipfile.ZipFile(io.BytesIO(got)) as zf:
         assert len(zf.namelist()) == 50
-        assert zf.read("f0.txt").startswith(b"row 0 ")
+        assert len(zf.read("f0.bin")) == 4096
 
 
 def test_ndjson_reparses_from_spilled_stream():
@@ -135,6 +139,12 @@ def test_seek_behind_evicted_region_raises():
     # Window 32 KiB, total budget 64 KiB — far below the body, so the head
     # is evicted (dropped) once the tail is pulled in.
     ms = MemoryStream(io.BytesIO(data), spill_threshold=32 * 1024, byte_size=64 * 1024)
-    ms.read_mv(-1, 0)
+    # Read the *tail* (a footer-style read at EOF): this pulls the whole
+    # body through the window and evicts everything older than the 64 KiB
+    # budget — without itself touching offset 0.
+    tail = bytes(ms.read_mv(4, len(data) - 4))
+    assert tail == b"PAR1"
+    # The head is now gone — a seek back to it (what a parquet footer parse
+    # would do) raises rather than returning corrupt bytes.
     with pytest.raises(ValueError):
-        ms.read_mv(4, 0)  # head is gone — a footer-seek format can't parse here
+        ms.read_mv(4, 0)
