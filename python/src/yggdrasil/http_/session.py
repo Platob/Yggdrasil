@@ -1358,7 +1358,15 @@ class HTTPSession(Session):
             send_headers.setdefault(
                 "Host", f"{host}:{port}" if port not in (80, 443) else host,
             )
+            # Ask the server (and, on a CONNECT tunnel, end-to-end through it)
+            # to hold the socket open so :meth:`_release_connection` can pool it
+            # for the next request instead of paying a fresh TCP+TLS (or
+            # TCP+CONNECT+TLS) handshake. HTTP/1.1 keeps alive by default, but
+            # being explicit also nudges older / picky proxies into reusing the
+            # client<->proxy hop.
+            send_headers.setdefault("Connection", "keep-alive")
             if is_http_proxy:
+                send_headers.setdefault("Proxy-Connection", "keep-alive")
                 proxy = self._resolve_proxy_for(scheme, host)
                 if proxy:
                     send_headers.update(self._proxy_auth_headers(proxy))
@@ -1403,12 +1411,20 @@ class HTTPSession(Session):
                 pass
             raise
 
+        # Only hand the socket back to the pool when the server intends to
+        # keep it open. ``http.client`` sets ``will_close`` during ``begin()``
+        # (run inside ``getresponse``) from the response's ``Connection`` /
+        # HTTP-version semantics. A ``Connection: close`` socket is dead after
+        # this response, so pooling it would just get popped next call,
+        # fail mid-request, and rebuild — pass ``pool_key=None`` and let
+        # ``release_conn`` close it cleanly instead.
+        pool_key = None if getattr(raw, "will_close", False) else key
         return HTTPResponse.from_wire(
             request=request,
             raw=raw,
             session=self,
             connection=conn,
-            pool_key=key,
+            pool_key=pool_key,
             decode_content=decode_content,
             preload_content=preload_content,
             tags=tags,
