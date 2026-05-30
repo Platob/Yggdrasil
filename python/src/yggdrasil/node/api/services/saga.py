@@ -83,7 +83,8 @@ from ..schemas.saga import (
 from .saga_log import OpLog
 from ...ids import make_id
 
-_TABULAR_EXTS = {"parquet", "pq", "csv", "tsv", "ndjson", "json", "arrow", "feather", "ipc", "xlsx"}
+_TABULAR_EXTS = {"parquet", "pq", "csv", "tsv", "ndjson", "json", "arrow", "feather",
+                 "ipc", "xlsx", "zip", "gz", "orc", "delta"}
 # Formats the result-export writer can emit (every one has a tabular encoder).
 _EXPORT_FMTS = {"csv", "parquet", "json", "ndjson", "arrow", "xlsx"}
 _DIALECTS = {d.value for d in Dialect}
@@ -1103,6 +1104,10 @@ class SagaService:
         whole in memory.
         """
         node, dialect, refs = self.plan_for(req)
+        # Honor a display limit on a LIMIT-less SELECT so a preview fetch stays
+        # bounded without the caller rewriting the SQL.
+        if req.limit and req.limit > 0 and isinstance(node, SelectNode) and node.limit is None:
+            node.limit = req.limit
         tables = self._build_tables(refs, req.catalog, req.schema_)
         try:
             result = execute_plan(node, tables)

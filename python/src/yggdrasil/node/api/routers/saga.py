@@ -314,9 +314,18 @@ async def plan_edit(req: PlanEditRequest, saga: SagaService = Depends(get_saga_s
 
 
 @router.post("/sql.arrow")
-async def run_sql_arrow(req: SqlRequest, saga: SagaService = Depends(get_saga_service)):
+async def run_sql_arrow(req: SqlRequest,
+                        saga: SagaService = Depends(get_saga_service),
+                        network: NetworkService = Depends(get_network_service)):
     """Execute and stream the result as an Arrow IPC stream (zero-copy wire,
-    disk-spilled when heavy)."""
+    disk-spilled when heavy). Runs where the data lives."""
+    target = saga.compute_node(req)
+    if target:
+        body = req.model_dump(by_alias=True)
+        body["node"] = None
+        return StreamingResponse(
+            network.proxy_post_stream(target, "/api/v2/saga/sql.arrow", body),
+            media_type=transport.CONTENT_TYPE_ARROW_STREAM)
     stream, cleanup = saga.execute_sql_arrow(req)
 
     def _gen():

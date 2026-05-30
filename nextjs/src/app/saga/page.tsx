@@ -13,7 +13,6 @@ import {
   refreshTable,
   deleteCatalogEntity,
   discoverTables,
-  runSql,
   getPlan,
   editPlan,
   downloadSqlExport,
@@ -29,13 +28,12 @@ import {
   type CatalogEntry,
   type SchemaEntry,
   type TableEntry,
-  type SqlResult,
   type PlanGraph,
   type PlanEdit,
   type OpLogEntry,
 } from "@/lib/api";
 import TabularModal from "@/components/TabularModal";
-import TabularDisplay from "@/components/TabularDisplay";
+import TabularDisplay, { type QuerySpec } from "@/components/TabularDisplay";
 import PlanGraphView from "@/components/PlanGraph";
 
 const DIALECTS = ["postgres", "sqlite", "mysql", "databricks"];
@@ -83,7 +81,7 @@ export default function SagaPage() {
   const [sql, setSql] = useState("SELECT * FROM ");
   const [dialect, setDialect] = useState("postgres");
   const [ctx, setCtx] = useState<{ catalog?: string; schema?: string }>({});
-  const [result, setResult] = useState<SqlResult | null>(null);
+  const [ranQuery, setRanQuery] = useState<QuerySpec | null>(null);
   const [plan, setPlan] = useState<PlanGraph | null>(null);
   const [planBusy, setPlanBusy] = useState(false);
   const [tab, setTab] = useState<"results" | "plan">("results");
@@ -291,15 +289,17 @@ export default function SagaPage() {
 
   const planBody = () => ({ sql, dialect, catalog: ctx.catalog, schema: ctx.schema });
 
-  // -- SQL run
+  const queryFor = (sqlText: string): QuerySpec =>
+    ({ sql: sqlText, catalog: ctx.catalog, schema: ctx.schema, node, limit });
+
+  // -- SQL run: the typed Arrow grid fetches /sql.arrow itself; we just set the
+  // query + load the plan for the strip and the Plan tab.
   const onRun = async () => {
     setRunning(true); setSqlErr("");
     try {
-      const r = await runSql({ ...planBody(), node, limit });
-      setResult(r); setTab("results");
-      // Keep the (logical) plan in sync with whatever just ran.
+      setRanQuery(queryFor(sql)); setTab("results");
       getPlan(planBody()).then(setPlan).catch(() => {});
-    } catch (e) { setSqlErr(String(e)); setResult(null); }
+    } catch (e) { setSqlErr(String(e)); setRanQuery(null); }
     finally { setRunning(false); }
   };
 
@@ -333,8 +333,7 @@ export default function SagaPage() {
     try {
       const r = await editPlan({ ...planBody(), edits });
       setSql(r.sql);
-      const res = await runSql({ sql: r.sql, dialect, catalog: ctx.catalog, schema: ctx.schema, node, limit });
-      setResult(res);
+      setRanQuery(queryFor(r.sql));
       setPlan(await getPlan({ sql: r.sql, dialect, catalog: ctx.catalog, schema: ctx.schema }));
     } catch (e) { setSqlErr(String(e)); }
   };
@@ -633,22 +632,18 @@ export default function SagaPage() {
               className={tab === "results" ? "text-frost font-semibold" : "text-muted hover:text-foreground-dim"}>Results</button>
             <button onClick={() => setTab("plan")}
               className={tab === "plan" ? "text-frost font-semibold" : "text-muted hover:text-foreground-dim"}>Plan</button>
-            {result && tab === "results" && (
-              <span className="text-muted font-mono ml-auto">
-                {result.row_count} rows · {result.elapsed_ms} ms{result.truncated ? " · truncated" : ""}
-                {result.node_id ? ` · @${result.node_id}` : ""}
-              </span>
+            {ranQuery && tab === "results" && node && (
+              <span className="text-muted font-mono ml-auto">@{node}</span>
             )}
           </div>
 
           <div className="flex-1 overflow-auto border border-white/[0.06] rounded-lg min-h-0">
-            {tab === "results" && result && (
+            {tab === "results" && ranQuery && !expanded && (
               <div className="h-full p-1">
-                <TabularDisplay columns={result.columns} rows={result.rows}
-                  maxHeight="100%" onExpand={() => setExpanded(true)} />
+                <TabularDisplay query={ranQuery} plan={plan} maxHeight="100%" onExpand={() => setExpanded(true)} />
               </div>
             )}
-            {tab === "results" && !result && (
+            {tab === "results" && !ranQuery && (
               <div className="p-4 text-[12px] text-muted">Run a query to see results.</div>
             )}
             {tab === "plan" && (
@@ -712,7 +707,7 @@ export default function SagaPage() {
       )}
 
       {/* The same TabularDisplay, full-screen — proving it works in a modal too. */}
-      {expanded && result && (
+      {expanded && ranQuery && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6"
           style={{ background: "var(--modal-scrim, rgba(0,0,0,0.72))" }} onClick={() => setExpanded(false)}>
           <div className="modal-surface rounded-xl w-full max-w-6xl h-[85vh] flex flex-col p-4" onClick={(e) => e.stopPropagation()}>
@@ -721,8 +716,7 @@ export default function SagaPage() {
               <button onClick={() => setExpanded(false)} className="text-muted hover:text-foreground text-sm">close ✕</button>
             </div>
             <div className="flex-1 min-h-0">
-              <TabularDisplay columns={result.columns} rows={result.rows} maxHeight="100%"
-                caption={`${result.row_count} rows · ${result.elapsed_ms} ms${result.truncated ? " · truncated" : ""}`} />
+              <TabularDisplay query={ranQuery} plan={plan} maxHeight="100%" />
             </div>
           </div>
         </div>
