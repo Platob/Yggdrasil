@@ -69,6 +69,30 @@ class TestArrowIPCTargetCast:
         out = self._write_and_read(target=target, columns=["id", "price"])
         assert out.column_names == ["id", "price"]
 
+    def test_projection_pushdown_computes_included_fields(self):
+        # The projection is pushed into the IPC reader as field indices, in
+        # file order, for exactly the columns the target wants.
+        from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+        from yggdrasil.data.options import CastOptions
+
+        names = ["id", "price", "name"]
+        opt = CastOptions(target=schema(fields=[field("name", pa.string()),
+                                                field("id", pa.int64())]))
+        assert ArrowIPCFile._included_fields(opt, names) == [0, 2]   # id, name
+        # No target / full coverage / no file → read everything.
+        assert ArrowIPCFile._included_fields(CastOptions(), names) is None
+        full = schema(fields=[field(n, pa.int64()) for n in names])
+        assert ArrowIPCFile._included_fields(CastOptions(target=full), names) is None
+
+    def test_projection_with_column_absent_from_file_fills_null(self):
+        # A target column the file doesn't carry must survive the pushdown —
+        # it's just not in included_fields, and the cast fills it with nulls.
+        target = schema(fields=[field("id", pa.int64()), field("missing", pa.int64())])
+        out = self._write_and_read(target=target)
+        assert out.column_names == ["id", "missing"]
+        assert out.column("id").to_pylist() == [1, 2, 3]
+        assert out.column("missing").to_pylist() == [None, None, None]
+
 
 class TestParquetTargetCast:
 

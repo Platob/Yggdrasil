@@ -120,6 +120,30 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
     # Read path
     # ==================================================================
 
+    @staticmethod
+    def _included_fields(
+        options: ArrowIPCOptions, available_names: "list[str]",
+    ) -> "list[int] | None":
+        """File-field *indices* to push into ``IpcReadOptions.included_fields``.
+
+        The IPC analog of the Parquet ``columns=`` projection: when a target is
+        bound and asks for fewer columns than the file carries, return the
+        indices (in file order) of the columns the target wants, so the reader
+        only reconstructs those fields instead of every column in each batch.
+        ``None`` means read everything — no target bound, or the target already
+        covers every column on disk (no point paying the reopen). Columns the
+        target wants but the file lacks are simply absent here; the downstream
+        cast fills them with nulls.
+        """
+        target = options.target
+        if target is None or not available_names:
+            return None
+        wanted = frozenset(target.names)
+        included = [i for i, n in enumerate(available_names) if n in wanted]
+        if not included or len(included) == len(available_names):
+            return None
+        return included
+
     def _read_arrow_batches(
         self,
         options: ArrowIPCOptions,
@@ -130,6 +154,11 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         is too small`` on a zero-byte input; the "fresh write target,
         read it back" flow is common enough to deserve the
         short-circuit.
+
+        A bound target narrows the read: the footer schema is read once to
+        resolve the projection, and when it shrinks the column set the reader
+        is reopened with ``IpcReadOptions(included_fields=…)`` so only the
+        wanted fields are decoded out of each batch.
         """
         if self.size_known and self.size == 0:
             return
@@ -144,9 +173,18 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                 reader = ipc.RecordBatchFileReader(stream)
             except pa.ArrowInvalid:
                 return
+            included = self._included_fields(options, reader.schema.names)
+            if included is not None:
+                # Reopen with projection pushdown — the footer read above was
+                # metadata-only, so the only batch decode happens here.
+                stream_ctx.__exit__(None, None, None)
+                stream_ctx = self.arrow_input_stream()
+                stream = stream_ctx.__enter__()
+                reader = ipc.RecordBatchFileReader(
+                    stream, options=ipc.IpcReadOptions(included_fields=included),
+                )
             for i in range(reader.num_record_batches):
-                batch = reader.get_batch(i)
-                yield options.cast_arrow_batch(batch)
+                yield options.cast_arrow_batch(reader.get_batch(i))
         finally:
             stream_ctx.__exit__(None, None, None)
 
@@ -172,7 +210,18 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                     reader = ipc.RecordBatchFileReader(stream)
                 except pa.ArrowInvalid:
                     return super()._read_arrow_table(options)
-                table = reader.read_all()
+                included = self._included_fields(options, reader.schema.names)
+                if included is None:
+                    table = reader.read_all()
+                else:
+                    # Projection pushdown: reopen so ``read_all`` only
+                    # reconstructs the wanted fields (the first open was the
+                    # metadata-only footer read).
+                    with self.arrow_input_stream() as projected:
+                        table = ipc.RecordBatchFileReader(
+                            projected,
+                            options=ipc.IpcReadOptions(included_fields=included),
+                        ).read_all()
         except FileNotFoundError:
             return super()._read_arrow_table(options)
         table = options.cast_arrow_table(table)
