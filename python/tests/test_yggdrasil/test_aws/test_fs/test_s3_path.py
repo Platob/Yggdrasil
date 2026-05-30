@@ -726,3 +726,54 @@ class TestArrowFilesystem:
         p = real_service.path("s3://b/k")
         fs = p.arrow_filesystem()
         assert isinstance(fs, pafs.S3FileSystem)
+
+
+# ---------------------------------------------------------------------------
+# iter_mv — body streaming over a RemotePath (S3) reads via bounded Range GETs
+# ---------------------------------------------------------------------------
+
+
+class TestIterMvRangeStreaming:
+    """``Holder.iter_mv`` (used by the HTTP send path to stream a request body)
+    over an S3Path must read the object in bounded, sequential ``Range``
+    ``GetObject`` calls — never one whole-object fetch — and reassemble exactly.
+    This is the access pattern a remote file used as a request body produces on
+    the wire; it's also replayable, since reads are positional.
+    """
+
+    def _backed_client(self, client, blob: bytes):
+        client.head_object.return_value = {"ContentLength": len(blob), "LastModified": None}
+        ranges: list[str | None] = []
+
+        def _get(**kw):
+            rng = kw.get("Range")
+            ranges.append(rng)
+            if rng is None:
+                return {"Body": _Body(blob)}
+            spec = rng[len("bytes="):]
+            lo, _, hi = spec.partition("-")
+            a = int(lo)
+            b = int(hi) + 1 if hi else len(blob)
+            return {"Body": _Body(blob[a:b])}
+
+        client.get_object.side_effect = _get
+        return ranges
+
+    def test_iter_mv_reassembles_via_bounded_range_gets(self, client, service):
+        blob = bytes((i * 7) % 256 for i in range(300_000))
+        ranges = self._backed_client(client, blob)
+        # Small pages force several Range GETs across the object.
+        p = S3Path("s3://b/k", service=service, page_size=64 * 1024)
+        out = b"".join(bytes(c) for c in p.iter_mv(64 * 1024))
+        assert out == blob                          # exact reassembly
+        assert len(ranges) >= 2                      # multiple bounded reads
+        assert all(r and r.startswith("bytes=") for r in ranges)  # never a whole-object GET
+
+    def test_iter_mv_is_replayable_over_s3(self, client, service):
+        # Positional reads → a retry can stream the same body again.
+        blob = bytes((i * 11) % 256 for i in range(120_000))
+        self._backed_client(client, blob)
+        p = S3Path("s3://b/k", service=service, page_size=32 * 1024)
+        once = b"".join(bytes(c) for c in p.iter_mv(32 * 1024))
+        twice = b"".join(bytes(c) for c in p.iter_mv(32 * 1024))
+        assert once == twice == blob
