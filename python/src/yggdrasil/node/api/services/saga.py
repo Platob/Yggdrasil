@@ -502,9 +502,10 @@ class SagaService:
     def _infer(self, source: str) -> tuple[list[ColumnSpec], TableStatistics]:
         """Read schema + bounded statistics from a tabular source.
 
-        parquet/csv/ndjson scan lazily (cheap row counts from parquet
-        metadata); everything else falls back to a single bounded Arrow read.
-        Per-column null/min/max/distinct come from one streaming pass.
+        Column names / dtypes / nullability come from the canonical
+        ``Tabular.collect_schema()`` (yggdrasil.data owns the type system across
+        arrow/polars/spark). polars is just the compute engine for the bounded
+        null/distinct/min/max pass.
         """
         import polars as pl
 
@@ -515,6 +516,21 @@ class SagaService:
         except OSError:
             pass
 
+        # Canonical schema — one source of truth for field types.
+        tab = Tabular.from_(source, default=None)
+        if tab is None:
+            raise BadRequestError(f"Cannot open {source!r} as a table")
+        try:
+            ysch = tab.collect_schema()
+        except Exception as exc:
+            raise BadRequestError(f"Cannot read {source!r} as a table: {exc}")
+        columns = [
+            ColumnSpec(name=f.name, dtype=str(f.dtype), nullable=f.nullable)
+            for f in ysch.fields
+        ]
+        names = [f.name for f in ysch.fields]
+
+        # Stats pass via polars: lazy scan where possible, else read once.
         ext = source.rsplit(".", 1)[-1].lower() if "." in source else ""
         try:
             if ext in ("parquet", "pq"):
@@ -524,17 +540,11 @@ class SagaService:
             elif ext == "ndjson":
                 lf = pl.scan_ndjson(source)
             else:
-                tab = Tabular.from_(source).read_arrow_table()
-                lf = pl.from_arrow(tab).lazy()
-        except Exception as exc:
-            raise BadRequestError(f"Cannot read {source!r} as a table: {exc}")
+                lf = pl.from_arrow(tab.read_arrow_table()).lazy()
+        except Exception:
+            return columns, TableStatistics(size_bytes=size_bytes, computed_at=_now())
 
-        schema = lf.collect_schema()
-        columns = [
-            ColumnSpec(name=n, dtype=_pl_dtype_name(d), nullable=True)
-            for n, d in schema.items()
-        ]
-        names = list(schema.names())
+        pschema = lf.collect_schema()
         try:
             row_count = lf.select(pl.len()).collect(engine="streaming").item()
         except Exception:
@@ -544,10 +554,12 @@ class SagaService:
         if names:
             exprs = []
             for n in names:
+                if n not in pschema.names():
+                    continue
                 c = pl.col(n)
                 exprs.append(c.null_count().alias(f"{n}|n"))
                 exprs.append(c.n_unique().alias(f"{n}|d"))
-                if schema[n].is_numeric() or schema[n] in (pl.Date, pl.Datetime):
+                if pschema[n].is_numeric() or pschema[n] in (pl.Date, pl.Datetime):
                     exprs.append(c.min().alias(f"{n}|mn"))
                     exprs.append(c.max().alias(f"{n}|mx"))
             try:
@@ -976,23 +988,3 @@ def _as_int(v: Any) -> int | None:
         return int(v)
     except (TypeError, ValueError):
         return None
-
-
-def _pl_dtype_name(d: Any) -> str:
-    """Compact, stable name for a polars dtype."""
-    import polars as pl
-
-    if d == pl.Utf8:
-        return "string"
-    if d in (pl.Float32, pl.Float64):
-        return "double"
-    if d == pl.Boolean:
-        return "bool"
-    if d == pl.Date:
-        return "date"
-    if isinstance(d, pl.Datetime) or d == pl.Datetime:
-        return "datetime"
-    if d in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-             pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
-        return "int"
-    return str(d).lower()
