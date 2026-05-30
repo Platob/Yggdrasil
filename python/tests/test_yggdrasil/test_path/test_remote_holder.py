@@ -119,12 +119,18 @@ def _s3_round_trip_client(payload_holder: dict) -> MagicMock:
         payload_holder["buf"] = Body if isinstance(Body, (bytes, bytearray)) else bytes(Body)
         return {}
 
+    def upload_fileobj(Fileobj, Bucket, Key, Config=None):
+        # Streamed write (managed transfer): drain the file handle.
+        payload_holder["buf"] = Fileobj.read()
+        return {}
+
     def list_objects_v2(**kwargs):
         return {"KeyCount": 0}
 
     client.head_object.side_effect = head_object
     client.get_object.side_effect = get_object
     client.put_object.side_effect = put_object
+    client.upload_fileobj.side_effect = upload_fileobj
     client.list_objects_v2.side_effect = list_objects_v2
     return client
 
@@ -432,9 +438,11 @@ class TestS3WriteColdPath:
         store = {}
         s3 = self._fresh_s3(store)
         s3 = S3Path("s3://my-bucket/data.parquet", service=s3.service)
-        s3.service.boto_client.put_object.reset_mock()
+        s3.service.boto_client.upload_fileobj.reset_mock()
         ParquetFile(holder=s3, owns_holder=False).write_arrow_table(table)
-        assert s3.service.boto_client.put_object.call_count == 1
+        # Format writes spill + stream → one upload_fileobj, no put/head/get.
+        assert s3.service.boto_client.upload_fileobj.call_count == 1
+        assert s3.service.boto_client.put_object.call_count == 0
         assert s3.service.boto_client.head_object.call_count == 0
         assert store["buf"].startswith(b"PAR1")
 
@@ -442,21 +450,24 @@ class TestS3WriteColdPath:
         store = {}
         s3 = self._fresh_s3(store)
         ArrowIPCFile(holder=s3, owns_holder=False).write_arrow_table(table)
-        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.upload_fileobj.call_count == 1
+        assert s3.service.boto_client.put_object.call_count == 0
         assert s3.service.boto_client.head_object.call_count == 0
 
     def test_csv_write_one_call(self, table) -> None:
         store = {}
         s3 = self._fresh_s3(store)
         CSVFile(holder=s3, owns_holder=False).write_arrow_table(table)
-        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.upload_fileobj.call_count == 1
+        assert s3.service.boto_client.put_object.call_count == 0
         assert s3.service.boto_client.head_object.call_count == 0
 
     def test_ndjson_write_one_call(self, table) -> None:
         store = {}
         s3 = self._fresh_s3(store)
         NDJSONFile(holder=s3, owns_holder=False).write_arrow_table(table)
-        assert s3.service.boto_client.put_object.call_count == 1
+        assert s3.service.boto_client.upload_fileobj.call_count == 1
+        assert s3.service.boto_client.put_object.call_count == 0
         assert s3.service.boto_client.head_object.call_count == 0
 
     def test_stat_correct_after_write(self, table) -> None:

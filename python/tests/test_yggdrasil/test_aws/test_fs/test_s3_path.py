@@ -897,3 +897,73 @@ class TestS3StreamingRoundTrip:
         p._upload_stream(LocalPath.from_(tmp))
         assert ("b", "obj.bin") in store
         assert p.size == len(data)                 # not 0 on the same instance
+
+
+class TestS3ListCaching:
+    """``iterdir`` / ``ls`` cache the child keys (TTL'd) so a repeat doesn't
+    re-paginate, stay incremental + bounded (``limit``), and never cache a
+    listing larger than ``LS_CACHE_MAX_ENTRIES`` (no OOM on huge prefixes)."""
+
+    def _wire_pages(self, client, pages):
+        paginator = MagicMock()
+        paginator.paginate.side_effect = lambda **kw: iter(pages)  # fresh iter per call
+        client.get_paginator.return_value = paginator
+        return paginator
+
+    def test_repeated_ls_replays_cache(self, client, service):
+        pages = [{
+            "CommonPrefixes": [{"Prefix": "d/sub/"}],
+            "Contents": [{"Key": "d/a.bin", "Size": 5}, {"Key": "d/b.bin", "Size": 5}],
+        }]
+        pag = self._wire_pages(client, pages)
+        p = S3Path("s3://b/d", service=service)
+
+        first = [c.key for c in p.iterdir()]
+        second = [c.key for c in p.iterdir()]
+        assert set(first) == {"d/sub/", "d/a.bin", "d/b.bin"}
+        assert second == first
+        assert pag.paginate.call_count == 1   # second served from cache
+
+    def test_invalidate_singleton_clears_listing_cache(self, client, service):
+        pag = self._wire_pages(client, [{"Contents": [{"Key": "d/a.bin", "Size": 1}]}])
+        p = S3Path("s3://b/d", service=service)
+        list(p.iterdir())
+        list(p.iterdir())
+        assert pag.paginate.call_count == 1   # cached
+        p.invalidate_singleton()
+        list(p.iterdir())
+        assert pag.paginate.call_count == 2   # re-paginated after invalidation
+
+    def test_limit_is_bounded_and_not_cached(self, client, service):
+        pages = [{"Contents": [{"Key": f"d/{i}.bin", "Size": 1} for i in range(50)]}]
+        pag = self._wire_pages(client, pages)
+        p = S3Path("s3://b/d", service=service)
+
+        got = list(p.iterdir(limit=5))
+        assert len(got) == 5
+        # A bounded listing isn't cached as complete → next full ls re-paginates.
+        full = list(p.iterdir())
+        assert len(full) == 50
+        assert pag.paginate.call_count == 2
+
+    def test_listing_over_cap_is_streamed_not_cached(self, client, service, monkeypatch):
+        monkeypatch.setattr(S3Path, "LS_CACHE_MAX_ENTRIES", 10)
+        pages = [{"Contents": [{"Key": f"d/{i}.bin", "Size": 1} for i in range(50)]}]
+        pag = self._wire_pages(client, pages)
+        p = S3Path("s3://b/d", service=service)
+
+        assert len(list(p.iterdir())) == 50   # all yielded (streamed past the cap)
+        assert len(list(p.iterdir())) == 50   # over cap → never cached → re-paginate
+        assert pag.paginate.call_count == 2
+
+    def test_write_under_prefix_invalidates_parent_listing(self, client, service):
+        pag = self._wire_pages(client, [{"Contents": [{"Key": "d/a.bin", "Size": 1}]}])
+        parent = S3Path("s3://b/d", service=service)
+        list(parent.iterdir())
+        assert pag.paginate.call_count == 1
+
+        child = parent / "new.bin"
+        assert child.parent is parent          # shared singleton → shared cache
+        child._upload(b"x")                    # put_object + parent-listing invalidation
+        list(parent.iterdir())
+        assert pag.paginate.call_count == 2    # parent listing refreshed
