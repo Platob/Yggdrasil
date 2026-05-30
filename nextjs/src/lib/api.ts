@@ -832,6 +832,18 @@ export async function replicateTable(body: { catalog: string; schema: string; ta
   return r;
 }
 
+export interface PyFuncParam { name: string; annotation: string; dtype: string; default: string | null; has_default: boolean }
+export interface PyFuncInferResult {
+  name: string; signature: string; params: PyFuncParam[];
+  return_annotation: string; return_dtype: string;
+  dependencies: string[]; python_version: string; docstring: string;
+}
+// Scan code → typed signature + version-pinned deps. Powers live infer in the
+// function editor.
+export function inferFunc(code: string, name?: string, pin_versions = true): Promise<PyFuncInferResult> {
+  return jsonFetch<PyFuncInferResult>("/api/v2/pyfunc/infer", { method: "POST", body: JSON.stringify({ code, name, pin_versions }) });
+}
+
 export const OBJECT_TYPES = ["TABLE", "VIEW", "FUNCTION", "MODEL", "OTHER"] as const;
 
 export interface SearchHit {
