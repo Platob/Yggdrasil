@@ -123,24 +123,8 @@ LOGGER = logging.getLogger(__name__)
 # Proxy helpers — resolved once per process, shared across all sessions
 # ---------------------------------------------------------------------------
 
-# Dead proxies — process-wide set so one failure skips the proxy for
-# every session in the process, not just the one that hit the error.
-_DEAD_PROXIES: set[str] = set()
-
-
 def _proxy_key(proxy: "URL") -> str:
     return f"{proxy.host}:{proxy.port or 8080}"
-
-
-def mark_proxy_dead(proxy: "URL") -> None:
-    """Mark *proxy* as unreachable for the rest of the process."""
-    key = _proxy_key(proxy)
-    _DEAD_PROXIES.add(key)
-    LOGGER.warning("Proxy %s marked dead — falling back to direct connections", key)
-
-
-def is_proxy_dead(proxy: "URL") -> bool:
-    return _proxy_key(proxy) in _DEAD_PROXIES
 
 
 def _read_env_proxy(name: str) -> "URL | None":
@@ -837,6 +821,11 @@ class HTTPSession(Session):
         # existing TCP / TLS handshake instead of paying for a new one;
         # capped at ``pool_maxsize`` entries per host.
         self._connections: dict[tuple[str, str, int], "collections.deque[http.client.HTTPConnection]"] = {}
+        # Proxies this session has given up on. A proxy that fails to connect is
+        # skipped for the rest of *this* session's life (fall back to direct) —
+        # scoped to the session, not blacklisted process-wide, so one session's
+        # bad proxy never disables it for every other session in the process.
+        self._dead_proxies: set[str] = set()
         # Retry policy is built once at init — same policy applies to
         # every wire send and the singleton key already pins
         # ``pool_maxsize`` / ``waiting`` / ``verify`` so two sessions
@@ -867,6 +856,7 @@ class HTTPSession(Session):
             return
         super().__setstate__(state)
         self._connections = {}
+        self._dead_proxies = set()
         self._retry = self._build_retry()
 
     # ------------------------------------------------------------------
@@ -898,12 +888,21 @@ class HTTPSession(Session):
             backoff_max=_BACKOFF_429_MAX,
         )
 
+    def _mark_proxy_dead(self, proxy: "URL") -> None:
+        """Skip *proxy* for the rest of this session — fall back to direct."""
+        key = _proxy_key(proxy)
+        self._dead_proxies.add(key)
+        LOGGER.warning("Proxy %s marked dead for this session — falling back to direct connections", key)
+
+    def _is_proxy_dead(self, proxy: "URL") -> bool:
+        return _proxy_key(proxy) in self._dead_proxies
+
     def _resolve_proxy_for(self, scheme: str, host: str) -> "URL | None":
         """Return the proxy URL for this request, or ``None`` to go direct."""
         if _should_bypass_proxy(host, self.no_proxy):
             return None
         proxy = _resolve_proxy_url(self.proxy, target_scheme=scheme)
-        if proxy is not None and is_proxy_dead(proxy):
+        if proxy is not None and self._is_proxy_dead(proxy):
             return None
         return proxy
 
@@ -957,7 +956,7 @@ class HTTPSession(Session):
                             "Proxy %s:%s failed for %s:%s (%s)",
                             proxy.host, proxy.port, host, port, exc,
                         )
-                    mark_proxy_dead(proxy)
+                    self._mark_proxy_dead(proxy)
 
             return http.client.HTTPSConnection(
                 host, port=port, timeout=connect_timeout, context=ssl_ctx,
@@ -979,7 +978,7 @@ class HTTPSession(Session):
                     "Proxy %s:%s unreachable (%s) — falling back to direct",
                     proxy_host, proxy_port, exc,
                 )
-                mark_proxy_dead(proxy)
+                self._mark_proxy_dead(proxy)
 
         return http.client.HTTPConnection(host, port=port, timeout=connect_timeout)
 
