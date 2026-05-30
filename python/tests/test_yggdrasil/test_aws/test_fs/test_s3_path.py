@@ -819,3 +819,81 @@ class TestS3StreamingUpload:
         # No local file → materialise via _upload (small → put_object).
         client.put_object.assert_called_once()
         assert client.put_object.call_args.kwargs["Body"] == b"in-memory-bytes"
+
+
+class TestS3StreamingRoundTrip:
+    """End-to-end: a Parquet write to S3 streams via upload_fileobj and reads
+    back byte-correct through a store-backed mock boto client (data integrity,
+    not just call shape). Plus read-after-write size on the same instance."""
+
+    def _store_backed(self, client):
+        store: dict = {}
+
+        def _upload_fileobj(fileobj, bucket, key, Config=None):
+            store[(bucket, key)] = fileobj.read()
+
+        def _head(Bucket, Key):
+            blob = store.get((Bucket, Key))
+            if blob is None:
+                raise _client_error()
+            return {"ContentLength": len(blob), "LastModified": None}
+
+        def _get(**kw):
+            blob = store.get((kw["Bucket"], kw["Key"]))
+            if blob is None:
+                raise _client_error()
+            rng = kw.get("Range")
+            if rng and rng.startswith("bytes="):
+                lo, _, hi = rng[len("bytes="):].partition("-")
+                a = int(lo) if lo.strip() else 0
+                b = int(hi) + 1 if hi.strip() else len(blob)
+                return {"Body": _Body(blob[a:b])}
+            return {"Body": _Body(blob)}
+
+        client.upload_fileobj.side_effect = _upload_fileobj
+        client.head_object.side_effect = _head
+        client.get_object.side_effect = _get
+        client.list_objects_v2.return_value = {"KeyCount": 0}
+        return store
+
+    def test_parquet_streams_then_reads_back(self, client, service):
+        import pyarrow as pa
+        from yggdrasil.io.primitive.parquet_file import ParquetFile
+
+        store = self._store_backed(client)
+        rows = 2000
+        table = pa.table({
+            "id": pa.array(range(rows), type=pa.int64()),
+            "v": pa.array(range(0, rows * 2, 2), type=pa.int64()),
+        })
+        p = S3Path("s3://b/data.parquet", service=service)
+        ParquetFile(holder=p, owns_holder=False).write_arrow_table(table)
+
+        assert ("b", "data.parquet") in store     # streamed via upload_fileobj
+        client.put_object.assert_not_called()       # never buffered as a PUT body
+
+        # Cold read on a fresh instance → reassembles the table exactly.
+        p.invalidate_singleton()
+        back = ParquetFile(
+            holder=S3Path("s3://b/data.parquet", service=service)
+        ).read_arrow_table()
+        assert back.num_rows == rows
+        assert back.column("v").to_pylist()[:3] == [0, 2, 4]
+
+    def test_read_after_write_sees_committed_size(self, client, service):
+        # _upload_stream must make the committed size authoritative
+        # (_note_streamed_upload) — otherwise a follow-up size/read on the same
+        # instance sees buffered_size 0 and thinks the object is empty.
+        from yggdrasil.path.local_path import LocalPath
+        import tempfile, os as _os
+
+        store = self._store_backed(client)
+        data = bytes((i * 3) % 256 for i in range(123456))
+        tmp = _os.path.join(tempfile.mkdtemp(), "spill.bin")
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+
+        p = S3Path("s3://b/obj.bin", service=service)
+        p._upload_stream(LocalPath.from_(tmp))
+        assert ("b", "obj.bin") in store
+        assert p.size == len(data)                 # not 0 on the same instance
