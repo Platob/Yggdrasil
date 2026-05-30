@@ -12,7 +12,8 @@ import pyarrow.parquet as pq
 from yggdrasil.exceptions.api import BadRequestError
 from yggdrasil.node.api.schemas.analysis import (
     AggMeasure, AggregateRequest, CastSpec, ExportRequest, FilterSpec,
-    FinanceRequest, OhlcRequest, SeriesRequest, Transform,
+    FinanceRequest, IndicatorRequest, IndicatorSpec, OhlcRequest, SeriesRequest,
+    Transform,
 )
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService
