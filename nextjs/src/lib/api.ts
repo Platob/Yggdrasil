@@ -785,6 +785,20 @@ export function editPlan(body: { sql: string; dialect?: string; catalog?: string
   return jsonFetch("/api/v2/saga/plan/edit", { method: "POST", body: JSON.stringify(body) });
 }
 
+export interface SessionResult { node_id: string; path: string; columns: SqlColumn[]; row_count: number; elapsed_ms: number }
+export interface SagaFilter { column: string; op: string; value?: unknown }
+export interface WindowTransform { op: "explode" | "unnest"; column: string }
+// Stage a heavy result to an Arrow IPC file for lazy windowed scrolling.
+export function createSession(body: { sql: string; dialect?: string; catalog?: string; schema?: string; node?: string }): Promise<SessionResult> {
+  return jsonFetch<SessionResult>("/api/v2/saga/sql.session", { method: "POST", body: JSON.stringify(body) });
+}
+// Clear a staged session (best-effort; also fired via sendBeacon on unload).
+export function closeSession(path: string, node?: string): void {
+  const url = `/api/v2/saga/session/close?path=${encodeURIComponent(path)}${node ? `&node=${encodeURIComponent(node)}` : ""}`;
+  try { if (navigator.sendBeacon) { navigator.sendBeacon(url); return; } } catch { /* fall through */ }
+  fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+}
+
 export interface MaterializeResult { node_id: string; path: string; columns: SqlColumn[]; row_count: number; elapsed_ms: number }
 // Run a query once and write it to a tmp parquet, returning a node path so the
 // path-based /tabular + /analysis surfaces can analyse a SQL result.

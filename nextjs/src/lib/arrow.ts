@@ -115,3 +115,15 @@ export async function fetchArrowRichPost(url: string, body: unknown): Promise<Ri
   }
   return decodeArrowRich(new Uint8Array(await res.arrayBuffer()));
 }
+
+// A staged-session window: rich Arrow body + the has-more / rows headers.
+export async function fetchWindowRich(body: unknown): Promise<{ table: RichTable; hasMore: boolean; rows: number }> {
+  const res = await fetch("/api/v2/saga/session/window", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    let detail = ""; try { detail = (await res.json())?.detail ?? ""; } catch { /* not json */ }
+    throw new Error(`HTTP ${res.status}${detail ? `: ${detail}` : ""}`);
+  }
+  const hasMore = res.headers.get("X-Has-More") === "1";
+  const rows = Number(res.headers.get("X-Window-Rows") ?? 0);
+  return { table: decodeArrowRich(new Uint8Array(await res.arrayBuffer())), hasMore, rows };
+}

@@ -66,6 +66,7 @@ from ..schemas.saga import (
     MaterializeResult,
     RegisterRequest,
     ReplicateRequest,
+    SessionResult,
     ReplicateResult,
     SearchHit,
     SearchResponse,
@@ -1271,6 +1272,88 @@ class SagaService:
             elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
         )
 
+    # -- staged session (lazy windowed display of a heavy result) -----------
+
+    async def sql_session(self, req: SqlRequest):
+        return await run_in_threadpool(self._sql_session, req)
+
+    def _sql_session(self, req: SqlRequest):
+        """Run the query once and stage the result to an Arrow IPC file, so the
+        client can scroll a huge result by fetching small windows instead of
+        decoding the whole thing in the browser. The file is memory-mapped on
+        every window read (zero-copy) and reclaimed by the tmp janitor (or
+        /session/close) — cleared when the viewer is done or disconnects."""
+        import polars as pl
+
+        node, _, refs = self.plan_for(req)
+        tables = self._build_tables(refs, req.catalog, req.schema_)
+        t0 = time.perf_counter()
+        try:
+            table = execute_plan(node, tables).read_arrow_table()
+        except (BadRequestError, NotFoundError):
+            raise
+        except Exception as exc:
+            raise BadRequestError(f"query failed: {exc}")
+        spill = scratch.new_path(self.settings.tmp_root, "tmp",
+                                 ttl_seconds=self.settings.tmp_ttl, suffix="session.arrow")
+        pl.from_arrow(table).write_ipc(str(spill))   # Arrow IPC file (scan_ipc-able)
+        from pathlib import Path as _P
+        rel = str(_P(spill).relative_to(self.settings.node_home))
+        return SessionResult(
+            node_id=self.settings.node_id, path=rel,
+            columns=_sql_columns(table.schema), row_count=table.num_rows,
+            elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+        )
+
+    async def window(self, req):
+        return await run_in_threadpool(self._window, req)
+
+    def _window(self, req) -> tuple[bytes, int, bool]:
+        """A lazily-transformed slice of a staged session as Arrow IPC bytes.
+
+        Filters/sort/projection and nested explode/unnest are applied with
+        polars **lazy** over the mmap'd Arrow file — only the requested window is
+        ever materialised, so memory stays bounded no matter how big the result.
+        Returns (ipc_bytes, rows_in_window, has_more)."""
+        import polars as pl
+
+        src = self._resolve_path(req.path)
+        try:
+            lf = pl.scan_ipc(src)
+        except Exception as exc:
+            raise BadRequestError(f"session not found or unreadable: {exc}")
+        lf = _pl_apply_filters(lf, req.filters)
+        for t in req.transforms:
+            try:
+                lf = lf.explode(t.column) if t.op == "explode" else lf.unnest(t.column)
+            except Exception as exc:
+                raise BadRequestError(f"transform {t.op}({t.column}) failed: {exc}")
+        if req.columns:
+            lf = lf.select(req.columns)
+        if req.sort:
+            lf = lf.sort(req.sort, descending=req.descending, nulls_last=True)
+        # Pull one extra row to tell the client whether to keep scrolling.
+        out = lf.slice(max(0, req.offset), max(1, req.limit) + 1).collect(engine="streaming")
+        has_more = out.height > req.limit
+        if has_more:
+            out = out.head(req.limit)
+        return transport.write_arrow_stream_bytes(out.to_arrow()), out.height, has_more
+
+    def close_session(self, path: str) -> bool:
+        """Delete a staged session file (called on viewer close)."""
+        try:
+            target = self._resolve_path(path)
+        except BadRequestError:
+            return False
+        # Only ever unlink inside the node's tmp area.
+        if not str(target).startswith(str(self.settings.tmp_root.resolve())):
+            return False
+        try:
+            os.unlink(target)
+            return True
+        except OSError:
+            return False
+
     # -- export (download the full media type) -----------------------------
 
     async def export_sql(self, req):
@@ -1414,6 +1497,29 @@ class SagaService:
             full_name=full, mode=req.mode, bytes_copied=bytes_copied,
             target_source_url=target_source_url,
         )
+
+
+def _pl_apply_filters(lf, filters):
+    """Push session-window row filters into a polars LazyFrame."""
+    import polars as pl
+    for f in filters:
+        col = pl.col(f.column)
+        if f.op == "is_null":
+            lf = lf.filter(col.is_null())
+        elif f.op == "not_null":
+            lf = lf.filter(col.is_not_null())
+        elif f.op == "contains":
+            lf = lf.filter(col.cast(pl.Utf8).str.contains(str(f.value), literal=True))
+        elif f.op == "in":
+            vals = f.value if isinstance(f.value, list) else [f.value]
+            lf = lf.filter(col.is_in(vals))
+        elif f.op in ("==", "!=", ">", ">=", "<", "<="):
+            v = f.value
+            lf = lf.filter({"==": col == v, "!=": col != v, ">": col > v,
+                            ">=": col >= v, "<": col < v, "<=": col <= v}[f.op])
+        else:
+            raise BadRequestError(f"unknown filter op {f.op!r}")
+    return lf
 
 
 def _as_int(v: Any) -> int | None:

@@ -291,6 +291,40 @@ class MaterializeResult(StrictModel):
     elapsed_ms: float
 
 
+# -- staged result session (lazy windowed display of a heavy result) ---------
+
+class SessionResult(StrictModel):
+    node_id: str
+    # Node-home-relative Arrow IPC file the session windows read from.
+    path: str
+    columns: list[SqlColumn]
+    row_count: int
+    elapsed_ms: float
+
+
+class SagaFilter(StrictModel):
+    column: str
+    op: str  # == | != | > | >= | < | <= | contains | in | is_null | not_null
+    value: Any | None = None
+
+
+class WindowTransform(StrictModel):
+    op: str  # explode | unnest
+    column: str
+
+
+class WindowRequest(StrictModel):
+    path: str
+    node: str | None = None
+    offset: int = 0
+    limit: int = 200
+    filters: list[SagaFilter] = Field(default_factory=list)
+    sort: str | None = None
+    descending: bool = False
+    transforms: list[WindowTransform] = Field(default_factory=list)
+    columns: list[str] | None = None
+
+
 class SqlExportRequest(StrictModel):
     sql: str
     dialect: str | None = None

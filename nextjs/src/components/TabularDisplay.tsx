@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { fetchArrowRichPost, type ColKind } from "@/lib/arrow";
-import { materializeSql, type PlanGraph } from "@/lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { fetchWindowRich, type ColKind } from "@/lib/arrow";
+import { createSession, closeSession, materializeSql, type PlanGraph, type SagaFilter, type WindowTransform } from "@/lib/api";
 import TabularAnalyze from "@/components/TabularAnalyze";
 import RegisterSagaModal from "@/components/RegisterSagaModal";
 
@@ -10,34 +10,35 @@ export interface TabularColumnDef { name: string; dtype?: string; kind?: ColKind
 export type Cell = unknown;
 
 /** A LazyTabular-style source: explicit SQL, or a straight source path that
- *  becomes `SELECT * FROM '<source>'`. Either way it streams typed Arrow. */
+ *  becomes `SELECT * FROM '<source>'`. The result is staged server-side as
+ *  Arrow IPC and scrolled in lazy windows — it is never decoded whole. */
 export interface QuerySpec {
   sql?: string;
   source?: string;
   catalog?: string;
   schema?: string;
   node?: string;
-  /** Row cap pushed into the plan (default 1000). */
+  /** Optional cap on rows staged (a safety bound; the grid still windows). */
   limit?: number;
 }
 
 interface Props {
-  /** In-memory mode. */
+  /** In-memory mode (small, already-decoded rows). */
   data?: { columns: TabularColumnDef[]; rows: Cell[][] };
-  /** Arrow-fetch mode (typed, nested, windowed). */
+  /** Staged-session mode: stage → window lazily. */
   query?: QuerySpec;
-  /** Optional execution-plan strip shown above the grid. */
   plan?: PlanGraph | null;
   caption?: string;
   maxHeight?: number | string;
   filterable?: boolean;
   onExpand?: () => void;
-  /** DOM rows rendered before "load more" (default 200) — keeps it smooth. */
+  /** Rows per window / per client page (default 200). */
   pageSize?: number;
 }
 
 const NUMERIC = /int|float|double|decimal|num/i;
 const NESTED: ColKind[] = ["list", "struct", "map"];
+const FILTER_OP = (s: string) => (s.trim() !== "" && !isNaN(Number(s)) ? "==" : "contains");
 
 function kindFromDtype(d?: string): ColKind {
   const s = (d ?? "").toLowerCase();
@@ -55,7 +56,6 @@ function preview(v: unknown): string {
   if (v && typeof v === "object") return `{${Object.keys(v as object).length}}`;
   return "";
 }
-
 function fmt(v: unknown): string {
   if (v === null || v === undefined) return "";
   if (typeof v === "object") return JSON.stringify(v);
@@ -65,7 +65,7 @@ function fmt(v: unknown): string {
 interface XForm { op: "explode" | "unnest"; col: string }
 type Grid = { columns: TabularColumnDef[]; rows: Cell[][] };
 
-// Client-side nested transforms — lazy, no backend round-trip.
+// Client-side nested transforms for in-memory mode (server-side in session mode).
 function applyXforms(columns: TabularColumnDef[], rows: Cell[][], xs: XForm[]): Grid {
   let c = columns, r = rows;
   for (const x of xs) {
@@ -80,7 +80,7 @@ function applyXforms(columns: TabularColumnDef[], rows: Cell[][], xs: XForm[]): 
       }
       r = nr;
       c = c.map((col, j) => (j === i ? { ...col, dtype: "item", kind: "other" } : col));
-    } else { // unnest a struct into one column per field
+    } else {
       const fields: string[] = [];
       for (const row of r) { const v = row[i]; if (v && typeof v === "object" && !Array.isArray(v)) for (const k of Object.keys(v)) if (!fields.includes(k)) fields.push(k); }
       const cols: TabularColumnDef[] = fields.map((f) => ({ name: `${x.col}.${f}`, dtype: "", kind: "other" }));
@@ -92,115 +92,159 @@ function applyXforms(columns: TabularColumnDef[], rows: Cell[][], xs: XForm[]): 
 }
 
 /**
- * Embeddable typed tabular grid. Two modes: in-memory `data`, or `query` which
- * streams Arrow IPC from `/sql.arrow` (a straight source becomes
- * `SELECT * FROM '<source>'`). Nested list/struct/map cells render collapsibly;
- * rows are windowed ("load more") so a wide/deep result never freezes the page.
- * An optional plan strip shows the execution plan that produced the rows.
+ * Embeddable typed tabular grid. In `query` mode the result is staged server-
+ * side as Arrow IPC and scrolled in lazy windows — filter, sort and nested
+ * explode/unnest run as polars **lazy** transforms over the mmap'd file, so the
+ * browser only ever holds the visible window no matter how big the result. The
+ * session is cleared on close/unmount/disconnect. `data` mode keeps small
+ * already-decoded rows in memory.
  */
 export default function TabularDisplay({
   data, query, plan, caption, maxHeight = 460, filterable = true, onExpand, pageSize = 200,
 }: Props) {
-  const [fetched, setFetched] = useState<{ columns: TabularColumnDef[]; rows: Cell[][] } | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState("");
-  const [tookMs, setTookMs] = useState<number | null>(null);
+  const isSession = !!query;
+  const querySql = useMemo(() => {
+    if (!query) return "";
+    const cap = query.limit ? ` LIMIT ${query.limit}` : "";
+    if (query.sql) return /\blimit\b/i.test(query.sql) ? query.sql : query.sql + cap;
+    return `SELECT * FROM '${query.source}'${cap}`;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query?.sql, query?.source, query?.limit]);
 
-  const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(null);
-  const [filters, setFilters] = useState<Record<number, string>>({});
+  // -- shared view state (column-name keyed so it survives unnest reshaping)
+  const [colFilters, setColFilters] = useState<Record<string, string>>({});
+  const [colSort, setColSort] = useState<{ name: string; desc: boolean } | null>(null);
+  const [xforms, setXforms] = useState<XForm[]>([]);
   const [open, setOpen] = useState<Set<string>>(new Set());
-  const [visible, setVisible] = useState(pageSize);
   const [copied, setCopied] = useState(false);
+
+  // -- session mode state
+  const [session, setSession] = useState<{ path: string; node?: string; cols: TabularColumnDef[]; total: number; ms: number } | null>(null);
+  const [winCols, setWinCols] = useState<TabularColumnDef[]>([]);
+  const [winRows, setWinRows] = useState<Cell[][]>([]);
+  const [winMore, setWinMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const winOffset = useRef(0);
   const reqId = useRef(0);
+
+  // -- memory mode load-more
+  const [visible, setVisible] = useState(pageSize);
+
+  // -- analyze / register
   const [pane, setPane] = useState<"grid" | "analyze">("grid");
   const [aPath, setAPath] = useState<string | null>(query?.source ?? null);
   const [aBusy, setABusy] = useState(false);
   const [aErr, setAErr] = useState("");
-  const [xforms, setXforms] = useState<XForm[]>([]);
   const [regOpen, setRegOpen] = useState(false);
+  const [err, setErr] = useState("");
+
+  const serverParams = useCallback(() => {
+    const filters: SagaFilter[] = Object.entries(colFilters)
+      .filter(([, v]) => v.trim())
+      .map(([column, v]) => {
+        const op = FILTER_OP(v);
+        return { column, op, value: op === "==" ? Number(v) : v };
+      });
+    const transforms: WindowTransform[] = xforms.map((x) => ({ op: x.op, column: x.col }));
+    return { filters, transforms, sort: colSort?.name, descending: colSort?.desc ?? false };
+  }, [colFilters, xforms, colSort]);
+
+  // Stage a session whenever the query changes; clear the previous one.
+  useEffect(() => {
+    if (!isSession) return;
+    let path: string | null = null, node: string | undefined;
+    const id = ++reqId.current;
+    setLoading(true); setErr(""); setSession(null); setWinRows([]); winOffset.current = 0;
+    createSession({ sql: querySql, catalog: query?.catalog, schema: query?.schema, node: query?.node })
+      .then((s) => { if (id !== reqId.current) return; path = s.path; node = s.node_id; setSession({ path: s.path, node: s.node_id, cols: s.columns.map((c) => ({ name: c.name, dtype: c.dtype, kind: kindFromDtype(c.dtype) })), total: s.row_count, ms: s.elapsed_ms }); })
+      .catch((e) => { if (id === reqId.current) { setErr(String(e)); setLoading(false); } });
+    return () => { if (path) closeSession(path, node); };
+  }, [isSession, querySql, query?.catalog, query?.schema, query?.node]);
+
+  // Fetch the first window (reset) whenever the session or view params change.
+  const fetchWindow = useCallback(async (offset: number, append: boolean) => {
+    if (!session) return;
+    const id = reqId.current;
+    setLoading(true); setErr("");
+    try {
+      const { table, hasMore } = await fetchWindowRich({
+        path: session.path, node: session.node, offset, limit: pageSize, ...serverParams(),
+      });
+      if (id !== reqId.current) return;
+      const cols = table.columns.map((c) => ({ name: c.name, dtype: c.type, kind: c.kind }));
+      setWinCols(cols);
+      setWinRows((prev) => (append ? [...prev, ...table.rows] : table.rows));
+      setWinMore(hasMore);
+      winOffset.current = offset;
+    } catch (e) { if (id === reqId.current) setErr(String(e)); }
+    finally { if (id === reqId.current) setLoading(false); }
+  }, [session, pageSize, serverParams]);
 
   useEffect(() => {
-    if (!query) return;
-    const limit = query.limit ?? 1000;
-    const sql = query.sql ?? `SELECT * FROM '${query.source}' LIMIT ${limit}`;
-    const id = ++reqId.current;
-    setLoading(true); setErr(""); setVisible(pageSize);
-    const t0 = performance.now();
-    fetchArrowRichPost("/api/v2/saga/sql.arrow", {
-      sql, catalog: query.catalog, schema: query.schema, node: query.node, limit,
-    })
-      .then((t) => {
-        if (id !== reqId.current) return;
-        // Rich decode columns carry `type` + `kind`; the grid/analytics read
-        // `dtype`, so normalise here (this is what feeds numeric detection).
-        setFetched({ columns: t.columns.map((c) => ({ name: c.name, dtype: c.type, kind: c.kind })), rows: t.rows });
-        setTookMs(Math.round(performance.now() - t0));
-      })
-      .catch((e) => { if (id === reqId.current) setErr(String(e)); })
-      .finally(() => { if (id === reqId.current) setLoading(false); });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query?.sql, query?.source, query?.catalog, query?.schema, query?.node, query?.limit, pageSize]);
+    if (!session) return;
+    const t = setTimeout(() => fetchWindow(0, false), 250);  // debounce filter typing
+    return () => clearTimeout(t);
+  }, [session, colFilters, colSort, xforms, fetchWindow]);
 
-  const base = useMemo(() => data ?? fetched ?? { columns: [], rows: [] }, [data, fetched]);
-  // Apply client-side nested transforms (explode/unnest) to derive the grid.
-  const src = useMemo(() => (xforms.length ? applyXforms(base.columns, base.rows, xforms) : base),
-    [base, xforms]);
-  const kinds = useMemo(
-    () => src.columns.map((c) => c.kind ?? kindFromDtype(c.dtype)),
-    [src.columns],
+  // Clear the staged session if the tab/page goes away.
+  useEffect(() => {
+    if (!isSession) return;
+    const bye = () => { if (session) closeSession(session.path, session.node); };
+    window.addEventListener("beforeunload", bye);
+    return () => window.removeEventListener("beforeunload", bye);
+  }, [isSession, session]);
+
+  // -- resolve the grid's columns + rows per mode
+  const memGrid = useMemo<Grid>(() => {
+    if (isSession) return { columns: [], rows: [] };
+    const base = data ?? { columns: [], rows: [] };
+    let g = xforms.length ? applyXforms(base.columns, base.rows, xforms) : base;
+    const active = Object.entries(colFilters).filter(([, v]) => v.trim());
+    let r = g.rows;
+    if (active.length) r = r.filter((row) => active.every(([name, v]) => {
+      const ci = g.columns.findIndex((c) => c.name === name); return ci < 0 || fmt(row[ci]).toLowerCase().includes(v.toLowerCase());
+    }));
+    if (colSort) {
+      const ci = g.columns.findIndex((c) => c.name === colSort.name);
+      if (ci >= 0) r = [...r].sort((a, b) => { const x = a[ci], y = b[ci]; if (x == null) return 1; if (y == null) return -1; const c = typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y)); return colSort.desc ? -c : c; });
+    }
+    g = { columns: g.columns, rows: r };
+    return g;
+  }, [isSession, data, xforms, colFilters, colSort]);
+
+  const gcols = useMemo(
+    () => (isSession ? (winCols.length ? winCols : session?.cols ?? []) : memGrid.columns),
+    [isSession, winCols, session, memGrid.columns],
   );
+  const grows = isSession ? winRows : memGrid.rows;
+  const shown = isSession ? grows : grows.slice(0, visible);
+  const hasMore = isSession ? winMore : grows.length > visible;
+  const kinds = useMemo(() => gcols.map((c) => c.kind ?? kindFromDtype(c.dtype)), [gcols]);
 
-  const view = useMemo(() => {
-    let r = src.rows;
-    const active = Object.entries(filters).filter(([, v]) => v.trim());
-    if (active.length) {
-      r = r.filter((row) => active.every(([ci, v]) => fmt(row[Number(ci)]).toLowerCase().includes(v.toLowerCase())));
-    }
-    if (sort) {
-      const { col, dir } = sort;
-      r = [...r].sort((a, b) => {
-        const x = a[col], y = b[col];
-        if (x == null) return 1;
-        if (y == null) return -1;
-        if (typeof x === "number" && typeof y === "number") return (x - y) * dir;
-        return String(x).localeCompare(String(y)) * dir;
-      });
-    }
-    return r;
-  }, [src.rows, filters, sort]);
-
-  const shown = view.slice(0, visible);
-  const toggleSort = (c: number) =>
-    setSort((s) => (s?.col === c ? (s.dir === 1 ? { col: c, dir: -1 } : null) : { col: c, dir: 1 }));
+  const onSort = (name: string) => setColSort((s) => (s?.name === name ? (s.desc ? null : { name, desc: true }) : { name, desc: false }));
+  const onFilter = (name: string, v: string) => setColFilters((f) => ({ ...f, [name]: v }));
+  const addXform = (op: "explode" | "unnest", col: string) => setXforms((x) => [...x, { op, col }]);
   const copy = (v: unknown) => navigator.clipboard?.writeText(fmt(v)).then(() => { setCopied(true); setTimeout(() => setCopied(false), 900); }).catch(() => {});
-  const toggleCell = (key: string) => setOpen((o) => {
-    const n = new Set(o);
-    if (n.has(key)) n.delete(key); else n.add(key);
-    return n;
-  });
+  const toggleCell = (key: string) => setOpen((o) => { const n = new Set(o); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  const loadMore = () => { if (isSession) fetchWindow(winOffset.current + pageSize, true); else setVisible((v) => v + pageSize); };
 
-  // Analytics + download run against a tabular *path*. A file source is already
-  // a path; a SQL source is materialised once to a tmp parquet on demand — so
-  // Saga and Files analyse the exact same way.
+  // -- analyze (materialised path) + register
   const canAnalyze = !!(query && (query.source || query.sql));
-  // Analytics run on the materialised *original* result, so use base columns.
-  const analyzeCols = useMemo(() => base.columns.map((c) => ({ name: c.name, type: c.dtype })), [base.columns]);
+  const analyzeCols = useMemo(() => (session?.cols ?? data?.columns ?? []).map((c) => ({ name: c.name, type: c.dtype })), [session, data]);
   const openAnalyze = async () => {
     setPane("analyze");
     if (aPath) return;
     if (query?.source) { setAPath(query.source); return; }
     if (query?.sql) {
       setABusy(true); setAErr("");
-      try {
-        const r = await materializeSql({ sql: query.sql, catalog: query.catalog, schema: query.schema, node: query.node });
-        setAPath(r.path);
-      } catch (e) { setAErr(String(e)); }
-      finally { setABusy(false); }
+      try { const r = await materializeSql({ sql: query.sql, catalog: query.catalog, schema: query.schema, node: query.node }); setAPath(r.path); }
+      catch (e) { setAErr(String(e)); } finally { setABusy(false); }
     }
   };
   useEffect(() => { setAPath(query?.source ?? null); setPane("grid"); }, [query?.sql, query?.source]);
 
-  const cap = caption ?? (tookMs != null ? `${src.rows.length} rows · ${tookMs} ms` : undefined);
+  const total = isSession ? session?.total : grows.length;
+  const cap = caption ?? (isSession && session ? `${total?.toLocaleString()} rows · ${session.ms} ms · ${grows.length} loaded` : undefined);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -233,7 +277,6 @@ export default function TabularDisplay({
               <button onClick={() => setXforms((xs) => xs.filter((_, j) => j !== i))} className="text-amber/60 hover:text-rose">✕</button>
             </span>
           ))}
-          {view.length !== src.rows.length && <span className="text-amber/80">· {view.length} shown</span>}
           {copied && <span className="text-emerald/80">· copied</span>}
           {(loading || aBusy) && <span className="text-frost/80">· {aBusy ? "materialising…" : "loading…"}</span>}
           <div className="flex-1" />
@@ -258,34 +301,31 @@ export default function TabularDisplay({
           <thead className="sticky top-0 z-10 bg-[#0a0a1a]">
             <tr>
               <th className="w-10 text-right px-2 py-1.5 border-b border-white/[0.08] text-muted font-normal select-none">#</th>
-              {src.columns.map((c, ci) => (
-                <th key={ci}
-                  className="text-left px-2 py-1.5 border-b border-white/[0.08] text-frost/80 whitespace-nowrap select-none group">
-                  <span onClick={() => toggleSort(ci)} className="cursor-pointer hover:text-frost">
+              {gcols.map((c, ci) => (
+                <th key={ci} className="text-left px-2 py-1.5 border-b border-white/[0.08] text-frost/80 whitespace-nowrap select-none group">
+                  <span onClick={() => onSort(c.name)} className="cursor-pointer hover:text-frost">
                     {c.name}
                     <span className="text-muted ml-1 font-normal">{NESTED.includes(kinds[ci]) ? kinds[ci] : (c.dtype ?? "")}</span>
-                    {sort?.col === ci && <span className="ml-1 text-frost">{sort.dir === 1 ? "▲" : "▼"}</span>}
+                    {colSort?.name === c.name && <span className="ml-1 text-frost">{colSort.desc ? "▼" : "▲"}</span>}
                   </span>
                   {kinds[ci] === "list" && (
-                    <button onClick={() => setXforms((x) => [...x, { op: "explode", col: c.name }])}
-                      title="explode list → one row per element"
+                    <button onClick={() => addXform("explode", c.name)} title="explode list → one row per element"
                       className="ml-1.5 opacity-0 group-hover:opacity-100 text-amber/70 hover:text-amber">⊞</button>
                   )}
                   {kinds[ci] === "struct" && (
-                    <button onClick={() => setXforms((x) => [...x, { op: "unnest", col: c.name }])}
-                      title="unnest struct → one column per field"
+                    <button onClick={() => addXform("unnest", c.name)} title="unnest struct → one column per field"
                       className="ml-1.5 opacity-0 group-hover:opacity-100 text-frost/70 hover:text-frost">⊟</button>
                   )}
                 </th>
               ))}
             </tr>
-            {filterable && src.columns.length > 0 && (
+            {filterable && gcols.length > 0 && (
               <tr>
                 <th className="bg-[#0a0a1a] border-b border-white/[0.06]" />
-                {src.columns.map((c, ci) => (
+                {gcols.map((c, ci) => (
                   <th key={ci} className="px-1 py-1 border-b border-white/[0.06] bg-[#0a0a1a]">
-                    <input value={filters[ci] ?? ""} placeholder="filter"
-                      onChange={(e) => setFilters((f) => ({ ...f, [ci]: e.target.value }))}
+                    <input value={colFilters[c.name] ?? ""} placeholder="filter"
+                      onChange={(e) => onFilter(c.name, e.target.value)}
                       className="w-full min-w-[60px] bg-white/[0.04] border border-white/[0.06] rounded px-1.5 py-0.5 text-[10px] font-normal outline-none focus:border-frost/30" />
                   </th>
                 ))}
@@ -321,25 +361,21 @@ export default function TabularDisplay({
               </tr>
             ))}
             {shown.length === 0 && !loading && (
-              <tr><td className="px-2 py-3 text-muted text-center" colSpan={src.columns.length + 1}>no rows</td></tr>
+              <tr><td className="px-2 py-3 text-muted text-center" colSpan={gcols.length + 1}>no rows</td></tr>
             )}
           </tbody>
         </table>
-        {view.length > visible && (
-          <button onClick={() => setVisible((v) => v + pageSize)}
-            className="w-full py-2 text-[11px] text-frost/80 hover:text-frost hover:bg-white/[0.03] border-t border-white/[0.06]">
-            load {Math.min(pageSize, view.length - visible)} more ({visible} / {view.length})
+        {hasMore && (
+          <button onClick={loadMore} disabled={loading}
+            className="w-full py-2 text-[11px] text-frost/80 hover:text-frost hover:bg-white/[0.03] border-t border-white/[0.06] disabled:opacity-40">
+            {loading ? "loading…" : `load ${pageSize} more${isSession && total ? ` (${grows.length} / ${total.toLocaleString()})` : ""}`}
           </button>
         )}
       </div>
       )}
 
       {regOpen && query?.sql && (
-        <RegisterSagaModal
-          node={query.node}
-          defaults={{ objectType: "VIEW", definition: query.sql }}
-          onClose={() => setRegOpen(false)}
-        />
+        <RegisterSagaModal node={query.node} defaults={{ objectType: "VIEW", definition: query.sql }} onClose={() => setRegOpen(false)} />
       )}
     </div>
   );

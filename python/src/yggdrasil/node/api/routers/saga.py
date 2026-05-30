@@ -19,6 +19,8 @@ from ..schemas.saga import (
     ExplainResult,
     MaterializeResult,
     OpLogResponse,
+    SessionResult,
+    WindowRequest,
     PlanEditRequest,
     PlanEditResult,
     PlanGraph,
@@ -293,6 +295,52 @@ async def stage_sql(req: SqlRequest, saga: SagaService = Depends(get_saga_servic
         body["node"] = None
         return await network.proxy_json(target, "POST", "/api/v2/saga/sql.stage", json_body=body)
     return await saga.stage_result(req)
+
+
+@router.post("/sql.session", response_model=SessionResult)
+async def sql_session(req: SqlRequest,
+                      saga: SagaService = Depends(get_saga_service),
+                      network: NetworkService = Depends(get_network_service)):
+    """Stage a query result to an Arrow IPC file for lazy windowed scrolling.
+    Runs where the data lives; the result's ``node_id`` tells the client which
+    node to read windows from / close the session on."""
+    target = saga.compute_node(req)
+    if target:
+        body = req.model_dump(by_alias=True)
+        body["node"] = None
+        return await network.proxy_json(target, "POST", "/api/v2/saga/sql.session", json_body=body)
+    return await saga.sql_session(req)
+
+
+@router.post("/session/window")
+async def session_window(req: WindowRequest,
+                         saga: SagaService = Depends(get_saga_service),
+                         network: NetworkService = Depends(get_network_service)):
+    """A lazily filtered/sorted/exploded slice of a staged session as Arrow IPC.
+    ``?node=`` (or req.node) reads the window from the node that staged it."""
+    if req.node and req.node != saga.settings.node_id:
+        body = req.model_dump()
+        body["node"] = None
+        return StreamingResponse(
+            network.proxy_post_stream(req.node, "/api/v2/saga/session/window", body),
+            media_type=transport.CONTENT_TYPE_ARROW_STREAM)
+    data, rows, has_more = await saga.window(req)
+
+    return StreamingResponse(
+        iter((data,)),
+        media_type=transport.CONTENT_TYPE_ARROW_STREAM,
+        headers={"X-Window-Rows": str(rows), "X-Has-More": "1" if has_more else "0",
+                 "Access-Control-Expose-Headers": "X-Window-Rows, X-Has-More"})
+
+
+@router.post("/session/close")
+async def session_close(path: str, node: str | None = None,
+                        saga: SagaService = Depends(get_saga_service),
+                        network: NetworkService = Depends(get_network_service)):
+    """Clear a staged session file (called when the viewer closes/disconnects)."""
+    if node and node != saga.settings.node_id:
+        return await network.proxy_json(node, "POST", f"/api/v2/saga/session/close?path={path}")
+    return {"closed": saga.close_session(path)}
 
 
 @router.post("/sql.materialize", response_model=MaterializeResult)

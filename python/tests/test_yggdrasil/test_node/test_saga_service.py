@@ -295,6 +295,36 @@ class TestObjectTypes(unittest.TestCase):
                 asyncio.run(svc.execute_sql(SqlRequest(sql="SELECT * FROM main.market.loop")))
 
 
+class TestSession(unittest.TestCase):
+    def test_stage_window_transforms_and_close(self):
+        import pyarrow.ipc as _ipc
+        from yggdrasil.node.api.schemas.saga import SagaFilter, WindowRequest, WindowTransform
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); svc = _svc(home); src = _trades(svc.settings)
+            _seed(svc, src)
+            sess = asyncio.run(svc.sql_session(SqlRequest(sql="SELECT sym, qty FROM main.market.trades")))
+            self.assertEqual(sess.row_count, 5)
+            self.assertTrue((home / sess.path).exists())
+            # window: first 2, has_more
+            data, rows, more = asyncio.run(svc.window(WindowRequest(path=sess.path, offset=0, limit=2)))
+            self.assertEqual(rows, 2)
+            self.assertTrue(more)
+            # window: lazy filter + sort
+            data, rows, more = asyncio.run(svc.window(WindowRequest(
+                path=sess.path, offset=0, limit=10,
+                filters=[SagaFilter(column="sym", op="==", value="A")], sort="qty", descending=True)))
+            t = _ipc.open_stream(data).read_all()
+            self.assertEqual(t.column("qty").to_pylist(), [5, 3, 1])  # A rows desc
+            # close removes the file
+            self.assertTrue(svc.close_session(sess.path))
+            self.assertFalse((home / sess.path).exists())
+
+    def test_close_rejects_paths_outside_tmp(self):
+        with tempfile.TemporaryDirectory() as d:
+            svc = _svc(Path(d))
+            self.assertFalse(svc.close_session("data/secret.parquet"))
+
+
 class TestSearchActivity(unittest.TestCase):
     def test_search_and_limit(self):
         with tempfile.TemporaryDirectory() as d:
