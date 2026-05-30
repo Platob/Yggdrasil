@@ -943,19 +943,11 @@ class HTTPSession(Session):
                         proxy, host, port, connect_timeout, ssl_ctx,
                     )
                 except (ProxyError, OSError) as exc:
-                    exc_msg = str(exc)
-                    if "CERTIFICATE_VERIFY_FAILED" in exc_msg:
+                    if "CERTIFICATE_VERIFY_FAILED" in str(exc):
                         # The CONNECT tunnel succeeded — the proxy is fine; it's
                         # the *target's* TLS cert that failed. Keep the proxy
-                        # (don't mark it dead) and surface the error instead of
-                        # falling back to a direct connection, which would hit
-                        # the same cert failure.
-                        LOGGER.error(
-                            "SSL certificate verification failed for %s:%s "
-                            "(tunneled via proxy %s:%s). "
-                            "Use HTTPSession(verify=False) or session.insecure(): %s",
-                            host, port, proxy.host, proxy.port, exc_msg,
-                        )
+                        # (don't mark it dead) and re-raise so the request loop
+                        # logs the single warning and retries with verify=False.
                         raise
                     LOGGER.warning(
                         "Proxy %s:%s failed for %s:%s (%s)",
@@ -1230,18 +1222,17 @@ class HTTPSession(Session):
                     retries.sleep()
                     continue
                 if "CERTIFICATE_VERIFY_FAILED" in msg and self.verify is not False:
+                    # Invalid/untrusted cert: warn once, disable verification
+                    # for this session, and retry. The proxy is left untouched
+                    # — a CONNECT tunnel cert failure is the *target*'s cert,
+                    # not the proxy's. ``self.verify is not False`` gates this
+                    # to a single flip, so a second cert failure just raises.
                     LOGGER.warning(
-                        "SSL certificate verification failed for %s — "
-                        "dropping proxy + retrying with verify=False: %s",
+                        "SSL certificate verification failed for %s — disabling "
+                        "verification for this session and retrying once: %s",
                         current_request.url, msg,
                     )
                     self.verify = False
-                    self.proxy = None
-                    self.no_proxy = None
-                    for var in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
-                                "https_proxy", "http_proxy", "all_proxy"):
-                        os.environ.pop(var, None)
-                    _ProxyEnv.reset()
                     self.clear_connections()
                     continue
                 raise SSLError(msg) from exc
