@@ -494,15 +494,26 @@ class HTTPHeaders(MutableMapping[str, str]):
     # Mapping / MutableMapping protocol
     # ------------------------------------------------------------------
 
+    def _existing_key(self, sk: str) -> "str | None":
+        """The stored key equal to *sk* ignoring case, or None.
+
+        HTTP field names are case-insensitive (RFC 7230 §3.2), so a write to
+        ``Content-Length`` must land on an existing ``content-length`` slot
+        (HTTP/2 lowercases every name) rather than create a sibling. Exact hit
+        is the fast path; the scan only runs on a case mismatch.
+        """
+        if sk in self._data:
+            return sk
+        kl = sk.lower()
+        for k in self._data:
+            if k.lower() == kl:
+                return k
+        return None
+
     def __getitem__(self, key: str) -> str:
         try:
             return self._data[key]
         except KeyError:
-            # HTTP field names are case-insensitive (RFC 7230 §3.2). The store
-            # keeps the original case for serialization, but a lookup must still
-            # find e.g. ``location`` (HTTP/2 lowercases every name) under a
-            # ``"Location"`` query. Fast path is the exact hit; the scan only
-            # runs on a case mismatch.
             kl = key.lower()
             for k, v in self._data.items():
                 if k.lower() == kl:
@@ -512,20 +523,23 @@ class HTTPHeaders(MutableMapping[str, str]):
     def __setitem__(self, key: Any, value: Any) -> None:
         sk = str(key)
         sv = str(value)
-        existing = self._data.get(sk, _MISSING)
-        if existing is not _MISSING and existing == sv:
+        # Update an existing same-name slot (any case) in place rather than
+        # adding a case-variant duplicate; keep the stored name's casing.
+        target = self._existing_key(sk)
+        if target is not None:
+            if self._data[target] == sv:
+                return
+            self._data[target] = sv
+            self._version += 1
             return
         self._data[sk] = sv
         self._version += 1
 
     def __delitem__(self, key: str) -> None:
-        if key not in self._data:
-            kl = key.lower()
-            for k in self._data:
-                if k.lower() == kl:
-                    key = k
-                    break
-        del self._data[key]
+        target = self._existing_key(key)
+        if target is None:
+            raise KeyError(key)
+        del self._data[target]
         self._version += 1
 
     def __iter__(self) -> Iterator[str]:
@@ -595,11 +609,15 @@ class HTTPHeaders(MutableMapping[str, str]):
         for k, v in kwargs.items():
             merged[str(k)] = str(v)
         for k, v in merged.items():
-            existing = self._data.get(k, _MISSING)
-            if existing is not _MISSING and existing == v:
-                continue
-            self._data[k] = v
-            self._version += 1
+            target = self._existing_key(k)
+            if target is not None:
+                if self._data[target] == v:
+                    continue
+                self._data[target] = v  # update same-name slot, keep its case
+                self._version += 1
+            else:
+                self._data[k] = v
+                self._version += 1
 
     def clear(self) -> None:
         if not self._data:
