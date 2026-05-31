@@ -1,6 +1,8 @@
 """Unit tests for the ygg-job runner + wheel build/upload (no live cluster)."""
 from __future__ import annotations
 
+import subprocess
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -124,3 +126,33 @@ class TestWheel:
             dests = wheel.ensure_wheel(client, "yggdrasil", workspace_dir="/ws/job", extras=["databricks"])
         bw.assert_called_once_with("yggdrasil", extras=["databricks"], requirements=())
         assert dests == ["/ws/job/ygg-1.0-py3-none-any.whl", "/ws/job/pyarrow-1-py3-none-any.whl"]
+
+    def test_build_wheel_produces_a_real_wheel(self, tmp_path, monkeypatch):
+        """Isolated, offline end-to-end: a synthesized dep-free project is really
+        ``pip wheel``-ed into a wheel carrying the entry point."""
+        # Use the installed setuptools/wheel (no build-isolation download).
+        monkeypatch.setenv("PIP_NO_BUILD_ISOLATION", "1")
+        proj = tmp_path / "proj"
+        pkg = proj / "fakepkg"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("def hi():\n    return 'hi'\n")
+        (proj / "pyproject.toml").write_text(
+            wheel._render_pyproject(
+                "fakepkg", "0.0.1", "fakepkg",
+                deps=[],                                   # dep-free → offline build
+                scripts={"fake-job": "fakepkg:hi"},
+            )
+        )
+        try:
+            with patch("yggdrasil.databricks.job.wheel.synthesize_project", return_value=proj):
+                wheels = wheel.build_wheel("fakepkg")
+        except subprocess.CalledProcessError as exc:        # no build backend here
+            pytest.skip(f"pip wheel unavailable in this env: {exc}")
+
+        names = [w.name for w in wheels]
+        assert any(n.startswith("fakepkg-0.0.1-") and n.endswith(".whl") for n in names), names
+        # the wheel actually declares the entry point we synthesized
+        built = next(w for w in wheels if w.name.startswith("fakepkg-0.0.1-"))
+        with zipfile.ZipFile(built) as zf:
+            eps = next(n for n in zf.namelist() if n.endswith("entry_points.txt"))
+            assert "fake-job = fakepkg:hi" in zf.read(eps).decode()
