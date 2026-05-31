@@ -763,6 +763,20 @@ class AWSClient(Singleton):
         except Exception:
             return None
 
+    @property
+    def explore_url(self) -> URL:
+        """AWS Console home for this client's region — clickable from code."""
+        from yggdrasil.aws.console import account_console_url
+
+        return account_console_url(self.effective_region)
+
+    @property
+    def account(self) -> "AWSAccount":
+        """The :class:`AWSAccount` resource for this client (STS-backed)."""
+        from yggdrasil.aws.account import AWSAccount, AccountService
+
+        return AWSAccount(service=AccountService(client=self))
+
     # ==================================================================
     # Session construction internals
     # ==================================================================
@@ -1102,3 +1116,34 @@ class AWSResource(ABC):
     @property
     def boto_client(self) -> "BaseClient":
         return self.service.boto_client
+
+    @property
+    def explore_url(self) -> Optional[URL]:
+        """AWS Console deep-link for this resource, or ``None``.
+
+        Concrete resources (:class:`AWSAccount`, :class:`S3Bucket`,
+        :class:`S3Path`, …) override this to return the Console URL that opens
+        the entity in the browser — clickable straight from a repl / notebook.
+        The default :meth:`__repr__` / :meth:`_repr_html_` key off the override,
+        so any resource that returns a URL gets a clickable repr for free.
+        """
+        return None
+
+    def __repr__(self) -> str:
+        try:
+            url = self.explore_url
+        except Exception:
+            url = None
+        if url is None:
+            return super().__repr__()
+        return f"{type(self).__name__}({url!r})"
+
+    def _repr_html_(self) -> Optional[str]:
+        # Real anchor in Jupyter / IPython — one click to the Console.
+        try:
+            url = self.explore_url
+        except Exception:
+            url = None
+        if url is None:
+            return None
+        return f'<a href="{url}" target="_blank">{type(self).__name__}: {url}</a>'

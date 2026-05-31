@@ -259,6 +259,16 @@ class S3Bucket(RemotePath):
     def arrow_filesystem(self, *, region: Optional[str] = None, **overrides: Any) -> Any:
         return self.service.arrow_filesystem(region=region, **overrides)
 
+    @property
+    def explore_url(self) -> URL:
+        """AWS Console deep-link to this bucket — clickable from code."""
+        from yggdrasil.aws.console import s3_bucket_url
+
+        return s3_bucket_url(self._bucket, getattr(self.service.client, "region", None))
+
+    def _repr_html_(self) -> str:
+        return f'<a href="{self.explore_url}" target="_blank">S3Bucket: {self._bucket}</a>'
+
     def __repr__(self) -> str:
         return f"S3Bucket({self._bucket!r})"
 
@@ -370,6 +380,16 @@ class S3Path(RemotePath):
     @property
     def arrow_uri(self) -> str:
         return f"{self.bucket}/{self.key}"
+
+    @property
+    def explore_url(self) -> URL:
+        """AWS Console deep-link to this object/prefix — clickable from code."""
+        from yggdrasil.aws.console import s3_object_url
+
+        return s3_object_url(self.bucket, self.key, getattr(self.service.client, "region", None))
+
+    def _repr_html_(self) -> str:
+        return f'<a href="{self.explore_url}" target="_blank">S3Path: {self.full_path()}</a>'
 
     # ==================================================================
     # Stat
