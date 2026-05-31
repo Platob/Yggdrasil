@@ -224,7 +224,6 @@ class Singleton:
         # a callback that takes another lock.
         if cls._INSTANCES.get(key) is self:
             cls._INSTANCES.pop(key, None)
-        LOGGER.debug("Invalidated singleton for %r", self)
 
     def __hash__(self) -> int:
         return hash(getattr(self, "_singleton_key_", id(self)))

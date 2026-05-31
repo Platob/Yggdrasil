@@ -3490,20 +3490,10 @@ class Field(BaseChildrenFields):
             return table
         options = get_cast_options_class().check(options=options, **more)
         scoped = options.with_target(self)
-        if LOGGER.isEnabledFor(logging.DEBUG):
-            _log_field_cast("cast_arrow_tabular", self, table, table.num_rows)
-        # Per-column failures raise CastError from the inner
-        # ``cast_arrow_array`` wrap — that's the atomic field-level
-        # context the caller wants. Don't re-wrap here: a tabular-level
-        # rewrap would discard the failing leaf's name in favour of the
-        # outer struct's, and any non-CastError that escapes the column
-        # walk (schema-mismatch, missing column, ``pa.Table.from_arrays``
-        # type mismatch) already carries its own diagnostic.
+
         casted = self.to_struct().dtype.cast_arrow_tabular(
             table, options=scoped,
         )
-        # Tabular finalize is identity — per-column finalize already
-        # ran inside the struct walk. Kept for shape symmetry.
         return self.finalize_arrow(casted)
 
     def cast_arrow_batch_iterator(

@@ -1,18 +1,11 @@
 from __future__ import annotations
 
-import datetime as dt
 import logging
-import pathlib
-import time
-from typing import Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional, TYPE_CHECKING
+from typing import Any, Mapping, TYPE_CHECKING
 
-from yggdrasil.data.cast import any_to_datetime, any_to_timedelta
-from yggdrasil.data.cast.datetime import truncate_datetime
-from yggdrasil.enums import Mode
 from yggdrasil.dataclasses.waiting import WaitingConfig
 from yggdrasil.environ import PyEnv
-from yggdrasil.io.holder import Holder
-from yggdrasil.path import Path
+from yggdrasil.http_.schemas import RESPONSE_SCHEMA
 from yggdrasil.io.request import PreparedRequest
 
 LOGGER = logging.getLogger(__name__)
@@ -20,7 +13,6 @@ LOGGER = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from yggdrasil.io.response import Response
-    from yggdrasil.io.session import Session
     from yggdrasil.io.tabular.base import Tabular
 
 
@@ -31,10 +23,8 @@ __all__ = ["CacheConfig", "SendConfig"]
 # (``local_cache_folder`` is called per-request in the batch pipeline).
 from yggdrasil.http_.cache_config import (
     CacheConfig,
-    DEFAULT_CACHE_CONFIG,
     MATCH_COLUMN,
     MATCH_KEY,
-    _DEFAULT_CACHE_ROOT,
 )
 
 
@@ -127,7 +117,11 @@ class SendConfig:
                 hits = set(table.column(MATCH_COLUMN).to_pylist())
                 LOGGER.debug("Cache probe: %d hit(s) in %r", len(hits), holder)
                 return hits
-            except Exception:
+            except Exception as e:
+                if "not found" in str(e):
+                    holder.create(RESPONSE_SCHEMA)
+                    return _probe(cache)
+
                 LOGGER.warning("Cache probe failed for %r", holder, exc_info=True)
                 return set()
 
