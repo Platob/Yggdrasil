@@ -13,10 +13,12 @@ storage credential. Collection operations (list / create) live on
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from databricks.sdk.service.catalog import ExternalLocationInfo
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.databricks.resource import DatabricksResource
 from yggdrasil.url import URL
 
@@ -26,9 +28,25 @@ if TYPE_CHECKING:
 
 __all__ = ["ExternalLocation"]
 
+#: External locations are near-static config — cache the handle (+ fetched
+#: info) for 30 min before re-resolving.
+_RESOURCE_TTL: float = 30 * 60.0
 
-class ExternalLocation(DatabricksResource):
-    """A single Unity Catalog external location."""
+
+class ExternalLocation(DatabricksResource, Singleton):
+    """A single Unity Catalog external location.
+
+    Cached as a singleton per ``(service, name)`` for 30 min
+    (``_SINGLETON_TTL``) — repeated ``client.external_locations[name]`` share
+    one handle (and its fetched info) without re-resolving.
+    """
+
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=_RESOURCE_TTL, max_size=4096)
+    _SINGLETON_TTL: ClassVar[Any] = _RESOURCE_TTL
+
+    @classmethod
+    def _singleton_key(cls, name: Any = None, *, service: Any = None, **kwargs: Any) -> Any:
+        return (cls, service, name)
 
     def __init__(
         self,
@@ -36,7 +54,13 @@ class ExternalLocation(DatabricksResource):
         *,
         service: "Optional[ExternalLocations]" = None,
         info: Optional[ExternalLocationInfo] = None,
+        singleton_ttl: Any = ...,
     ) -> None:
+        del singleton_ttl  # consumed by Singleton.__new__
+        if getattr(self, "_initialized", False):
+            if info is not None:
+                self._info = info  # refresh cache on an eager fetch
+            return
         if service is None:
             from yggdrasil.databricks.external.location.locations import ExternalLocations
 
@@ -44,6 +68,16 @@ class ExternalLocation(DatabricksResource):
         super().__init__(service=service)
         self.name = name
         self._info = info
+        self._initialized = True
+
+    def __getstate__(self) -> dict:
+        return {"service": self.service, "name": self.name, "info": self._info}
+
+    def __setstate__(self, state: dict) -> None:
+        self.service = state["service"]
+        self.name = state["name"]
+        self._info = state.get("info")
+        self._initialized = True
 
     # -- metadata (lazy fetch + cache) ---------------------------------
     @property

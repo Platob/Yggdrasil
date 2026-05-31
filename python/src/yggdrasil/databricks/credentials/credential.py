@@ -14,10 +14,12 @@ a one-shot STS token). Collection ops live on
 from __future__ import annotations
 
 import datetime as _dt
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from databricks.sdk.service.catalog import CredentialInfo
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
+from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.databricks.resource import DatabricksResource
 from yggdrasil.url import URL
 
@@ -29,6 +31,10 @@ if TYPE_CHECKING:
 
 __all__ = ["Credential"]
 
+#: UC credentials / external locations are near-static config — cache the
+#: resource handle (and its fetched info) for 30 min before re-resolving.
+_RESOURCE_TTL: float = 30 * 60.0
+
 
 def _epoch_ms_to_iso(ms: Optional[int]) -> Optional[str]:
     if not ms:
@@ -36,8 +42,20 @@ def _epoch_ms_to_iso(ms: Optional[int]) -> Optional[str]:
     return _dt.datetime.fromtimestamp(ms / 1000, tz=_dt.timezone.utc).isoformat()
 
 
-class Credential(DatabricksResource):
-    """A single Unity Catalog credential."""
+class Credential(DatabricksResource, Singleton):
+    """A single Unity Catalog credential.
+
+    Cached as a singleton per ``(service, name)`` for 30 min (``_SINGLETON_TTL``)
+    — credentials are near-static, so repeated ``client.credentials[name]`` share
+    one handle (and its fetched info) without re-resolving.
+    """
+
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=_RESOURCE_TTL, max_size=4096)
+    _SINGLETON_TTL: ClassVar[Any] = _RESOURCE_TTL
+
+    @classmethod
+    def _singleton_key(cls, name: Any = None, *, service: Any = None, **kwargs: Any) -> Any:
+        return (cls, service, name)
 
     def __init__(
         self,
@@ -45,7 +63,15 @@ class Credential(DatabricksResource):
         *,
         service: "Optional[Credentials]" = None,
         info: Optional[CredentialInfo] = None,
+        singleton_ttl: Any = ...,
     ) -> None:
+        del singleton_ttl  # consumed by Singleton.__new__
+        if getattr(self, "_initialized", False):
+            # Re-init on the cached singleton: refresh its info when the caller
+            # eagerly fetched a fresh one (e.g. via ``get`` / ``create``).
+            if info is not None:
+                self._info = info
+            return
         if service is None:
             from yggdrasil.databricks.credentials.credentials import Credentials
 
@@ -53,6 +79,16 @@ class Credential(DatabricksResource):
         super().__init__(service=service)
         self.name = name
         self._info = info
+        self._initialized = True
+
+    def __getstate__(self) -> dict:
+        return {"service": self.service, "name": self.name, "info": self._info}
+
+    def __setstate__(self, state: dict) -> None:
+        self.service = state["service"]
+        self.name = state["name"]
+        self._info = state.get("info")
+        self._initialized = True
 
     # -- metadata (lazy fetch + cache) ---------------------------------
     @property
