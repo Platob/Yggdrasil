@@ -93,10 +93,12 @@ class TableJob(Flow):
             TriggerSettings,
         )
 
+        # Databricks requires the file-arrival URL to end with '/'.
+        url = self.logs_path(self.table).full_path()
+        if not url.endswith("/"):
+            url += "/"
         return TriggerSettings(
-            file_arrival=FileArrivalTriggerConfiguration(
-                url=self.logs_path(self.table).full_path(),
-            ),
+            file_arrival=FileArrivalTriggerConfiguration(url=url),
         )
 
     # -- get-or-create the live Job -------------------------------------

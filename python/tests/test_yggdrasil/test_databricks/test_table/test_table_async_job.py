@@ -116,7 +116,7 @@ class TestEnsure:
 
         kwargs = jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-async-insert-c.s.t"
-        assert kwargs["trigger"].file_arrival.url == "/Volumes/c/s/t/.sql/async/logs"
+        assert kwargs["trigger"].file_arrival.url == "/Volumes/c/s/t/.sql/async/logs/"
         task = kwargs["tasks"][0]
         assert task.python_wheel_task.parameters == ["c.s.t"]
         # serverless v5 + ygg[databricks] by default
