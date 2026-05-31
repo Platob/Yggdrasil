@@ -146,6 +146,10 @@ class Settings:
     # Local load score (cpu% + mem% + 0.05·runs, all /100) above which a query
     # over replicated data is offloaded to a freer peer that also holds it.
     saga_offload_load: float = 0.85
+    # Row cap applied to a live-database source read (connectorx has no lazy
+    # pushdown, so the whole referenced table would otherwise load into memory).
+    # The outer SQL's projection/predicate still apply after the bounded load.
+    saga_db_row_limit: int = 100_000
 
     @property
     def local_clients(self) -> set[str]:
@@ -255,4 +259,5 @@ def get_settings() -> Settings:
         saga_sql_preview_rows=int(os.getenv("YGG_NODE_SAGA_PREVIEW_ROWS", "10000")),
         saga_result_spill_rows=int(os.getenv("YGG_NODE_SAGA_SPILL_ROWS", "250000")),
         saga_offload_load=float(os.getenv("YGG_NODE_SAGA_OFFLOAD_LOAD", "0.85")),
+        saga_db_row_limit=int(os.getenv("YGG_NODE_SAGA_DB_LIMIT", str(100_000))),
     )

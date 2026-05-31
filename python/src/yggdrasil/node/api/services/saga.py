@@ -17,6 +17,7 @@ import math
 import os
 import tempfile
 import time
+from pathlib import Path as _PathLib
 from functools import partial
 from threading import Lock
 from typing import Any
@@ -54,6 +55,15 @@ from ..schemas.saga import (
     ForecastAssetResult,
     ForecastRegisterRequest,
     ForecastSpec,
+    MountCreate,
+    MountEntry,
+    MountListing,
+    MountListResponse,
+    MountNode,
+    MountResponse,
+    MountUpdate,
+    SagaOverview,
+    TopAsset,
     SchemaCreate,
     SchemaEntry,
     SchemaListResponse,
@@ -124,9 +134,11 @@ class SagaService:
         self._catalogs: dict[int, CatalogEntry] = {}
         self._schemas: dict[int, SchemaEntry] = {}
         self._tables: dict[int, TableEntry] = {}
+        self._mounts: dict[int, MountEntry] = {}
         self._cat_idx: dict[str, int] = {}
         self._sch_idx: dict[str, int] = {}
         self._tbl_idx: dict[str, int] = {}
+        self._mnt_idx: dict[str, int] = {}
         self._log = OpLog(settings.saga_log_root)
         self._network = None  # bound after construction; enables replication
         try:
@@ -169,6 +181,12 @@ class SagaService:
                 self._schemas[e.id] = e
             except Exception:
                 continue
+        for m in doc.get("mounts", []):
+            try:
+                e = MountEntry.model_validate(m)
+                self._mounts[e.id] = e
+            except Exception:
+                continue
         for t in doc.get("tables", []):
             try:
                 e = TableEntry.model_validate(t)
@@ -184,6 +202,7 @@ class SagaService:
         self._cat_idx = {c.name: c.id for c in self._catalogs.values()}
         self._sch_idx = {f"{s.catalog}.{s.name}": s.id for s in self._schemas.values()}
         self._tbl_idx = {t.full_name: t.id for t in self._tables.values()}
+        self._mnt_idx = {m.name: m.id for m in self._mounts.values()}
 
     def _save(self) -> None:
         """Reindex, then atomic-write: dump to a temp file, then rename."""
@@ -192,6 +211,7 @@ class SagaService:
             "catalogs": [c.model_dump() for c in self._catalogs.values()],
             "schemas": [s.model_dump() for s in self._schemas.values()],
             "tables": [t.model_dump(by_alias=True) for t in self._tables.values()],
+            "mounts": [m.model_dump() for m in self._mounts.values()],
         }
         fd, tmp = tempfile.mkstemp(dir=self._root, suffix=".tmp")
         try:
@@ -585,6 +605,75 @@ class SagaService:
             daily=[per_day[d] for d in days], recent=recent,
         )
 
+    async def overview(self) -> "SagaOverview":
+        """Catalog-wide rollup for the monitoring dashboard — counts by kind,
+        totals, recent ops across all assets, and largest/busiest leaderboards.
+        One call so the dashboard never fans out per asset."""
+        with self._lock:
+            tables = list(self._tables.values())
+            mounts = list(self._mounts.values())
+            catalog_count = len(self._catalogs)
+            schema_count = len(self._schemas)
+
+        by_type: dict[str, int] = {}
+        total_rows = total_bytes = 0
+        for t in tables:
+            by_type[t.object_type] = by_type.get(t.object_type, 0) + 1
+            total_rows += t.statistics.row_count or 0
+            total_bytes += t.statistics.size_bytes or 0
+        mount_kinds: dict[str, int] = {}
+        for m in mounts:
+            mount_kinds[m.kind] = mount_kinds.get(m.kind, 0) + 1
+
+        # Cross-asset activity feed + per-asset op tallies (one log sweep).
+        recent_rows = await run_in_threadpool(partial(self._log.recent_all, limit=40))
+        op_counts: dict[str, int] = {}
+        per_day: dict[str, int] = {}
+        ops_per_asset: dict[str, int] = {}
+        last_per_asset: dict[str, str] = {}
+        all_rows = await run_in_threadpool(partial(self._log.recent_all, limit=5000))
+        for r in all_rows:
+            op_counts[r["op"]] = op_counts.get(r["op"], 0) + 1
+            day = (r.get("ts") or "")[:10]
+            if day:
+                per_day[day] = per_day.get(day, 0) + 1
+            a = (r.get("asset") or "").replace("_", ".")  # safe-name → best-effort full
+            ops_per_asset[a] = ops_per_asset.get(a, 0) + 1
+            if a and a not in last_per_asset:
+                last_per_asset[a] = r.get("ts")
+        days = sorted(per_day)[-14:]
+
+        def _top(t: TableEntry) -> TopAsset:
+            # Match the log's safe-name folding so op tallies line up.
+            safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in t.full_name)
+            return TopAsset(
+                full_name=t.full_name, object_type=t.object_type,
+                catalog=t.catalog, schema=t.schema_name,
+                rows=t.statistics.row_count, size_bytes=t.statistics.size_bytes,
+                ops=ops_per_asset.get(t.full_name, ops_per_asset.get(safe, 0)),
+                last_op_at=last_per_asset.get(t.full_name),
+            )
+        tops = [_top(t) for t in tables]
+        largest = sorted([a for a in tops if a.size_bytes],
+                         key=lambda a: a.size_bytes or 0, reverse=True)[:5]
+        busiest = sorted([a for a in tops if a.ops],
+                         key=lambda a: a.ops, reverse=True)[:5]
+
+        return SagaOverview(
+            node_id=self.settings.node_id,
+            catalog_count=catalog_count, schema_count=schema_count,
+            table_count=by_type.get("TABLE", 0), view_count=by_type.get("VIEW", 0),
+            forecast_count=by_type.get("FORECAST", 0),
+            other_count=sum(v for k, v in by_type.items()
+                            if k not in ("TABLE", "VIEW", "FORECAST")),
+            mount_count=len(mounts), mount_kinds=mount_kinds,
+            total_rows=total_rows, total_bytes=total_bytes, total_ops=len(all_rows),
+            op_counts=op_counts, daily=[per_day[d] for d in days],
+            recent=[OpLogEntry(**{k: _json_safe(v) for k, v in r.items() if k != "asset"})
+                    for r in recent_rows],
+            largest=largest, busiest=busiest, mounts=mounts,
+        )
+
     async def list_tables(self, catalog: str, schema: str) -> TableListResponse:
         with self._lock:
             self._require_schema(catalog, schema)
@@ -634,6 +723,231 @@ class SagaService:
         self._log.purge(t.full_name)
         return TableResponse(table=t)
 
+    # -- mounts (named aliases over path objects) ---------------------------
+
+    # Connection-URI schemes that make a mount a live database source (read via
+    # connectorx) rather than a path. ``SELECT ... FROM 'alias/schema.table'``
+    # then reads that table from the database.
+    _DB_SCHEMES = ("postgres://", "postgresql://", "mysql://", "mariadb://",
+                   "sqlite://", "mssql://", "redshift://", "clickhouse://")
+
+    @classmethod
+    def _mount_kind(cls, target: str) -> str:
+        """Sniff the family of a mount target for the UI + resolution routing."""
+        low = target.lower()
+        if low.startswith(cls._DB_SCHEMES):
+            return "database"
+        if low.startswith(("/volumes/", "dbfs+volume:", "/workspace/", "dbfs+workspace:",
+                            "/dbfs/", "dbfs:", "dbfs+dbfs:")):
+            return "databricks"
+        if low.startswith(("s3://", "s3a://", "s3n://")):
+            return "s3"
+        if low.startswith("npfs://"):
+            return "node"
+        if low.startswith("http://") or low.startswith("https://"):
+            return "http"
+        return "local"
+
+    async def create_mount(self, req: MountCreate) -> MountResponse:
+        """Register (upsert by alias) a mount. Pure metadata — the target isn't
+        opened here; it's resolved lazily on browse/query, so registering a
+        mount is instant and never fails on an unreachable backend."""
+        now = _now()
+        with self._lock:
+            mid = self._mnt_idx.get(req.name)
+            existing = self._mounts.get(mid) if mid is not None else None
+            base = existing or MountEntry(
+                id=make_id(req.name), name=req.name, target=req.target,
+                node_id=self.settings.node_id, created_at=now, updated_at=now,
+            )
+            entry = base.model_copy(update={
+                "target": req.target,
+                "comment": req.comment or base.comment,
+                "read_only": req.read_only,
+                "kind": self._mount_kind(req.target),
+                "properties": {**base.properties, **req.properties},
+                "updated_at": now,
+            })
+            self._mounts[entry.id] = entry
+            self._save()
+        self._record(f"mount:{req.name}", "update" if existing else "register",
+                     detail=req.target)
+        return MountResponse(mount=entry)
+
+    async def list_mounts(self) -> MountListResponse:
+        with self._lock:
+            items = list(self._mounts.values())
+        return MountListResponse(node_id=self.settings.node_id, mounts=items)
+
+    async def get_mount(self, name: str) -> MountEntry:
+        with self._lock:
+            mid = self._mnt_idx.get(name)
+            entry = self._mounts.get(mid) if mid is not None else None
+        if entry is None:
+            raise NotFoundError(f"Mount {name!r} not found")
+        return entry
+
+    async def update_mount(self, name: str, req: MountUpdate) -> MountResponse:
+        with self._lock:
+            mid = self._mnt_idx.get(name)
+            entry = self._mounts.get(mid) if mid is not None else None
+            if entry is None:
+                raise NotFoundError(f"Mount {name!r} not found")
+            upd: dict[str, Any] = {"updated_at": _now()}
+            if req.target is not None:
+                upd["target"] = req.target
+                upd["kind"] = self._mount_kind(req.target)
+            if req.comment is not None:
+                upd["comment"] = req.comment
+            if req.read_only is not None:
+                upd["read_only"] = req.read_only
+            if req.properties is not None:
+                upd["properties"] = dict(req.properties)
+            entry = entry.model_copy(update=upd)
+            self._mounts[entry.id] = entry
+            self._save()
+        return MountResponse(mount=entry)
+
+    async def delete_mount(self, name: str) -> MountResponse:
+        with self._lock:
+            mid = self._mnt_idx.get(name)
+            entry = self._mounts.get(mid) if mid is not None else None
+            if entry is None:
+                raise NotFoundError(f"Mount {name!r} not found")
+            self._mounts.pop(entry.id, None)
+            self._save()
+        self._record(f"mount:{name}", "drop", detail=entry.target)
+        return MountResponse(mount=entry)
+
+    async def list_mount(self, name: str, subpath: str = "") -> MountListing:
+        """Lazily list a mount's children through the yggdrasil Path layer, so a
+        Databricks volume / S3 prefix / remote node all browse identically.
+        Tabular files are flagged so the UI can offer query/preview inline."""
+        return await run_in_threadpool(self._list_mount, name, subpath)
+
+    def _list_mount(self, name: str, subpath: str = "") -> MountListing:
+        with self._lock:
+            mid = self._mnt_idx.get(name)
+            mount = self._mounts.get(mid) if mid is not None else None
+        if mount is None:
+            raise NotFoundError(f"Mount {name!r} not found")
+        if mount.kind == "database":
+            # A DB mount has no directory tree to walk; list its tables from the
+            # information schema so the UI can browse + click-to-query them.
+            return self._list_db_mount(name, mount.target)
+        target = self._resolve_path(f"mount://{name}/{subpath}" if subpath else f"mount://{name}")
+        from yggdrasil.path import Path as YggPath
+        try:
+            base = YggPath.from_(target)
+            children = list(base.iterdir())
+        except FileNotFoundError:
+            raise NotFoundError(f"mount path not found: {name}/{subpath}")
+        except Exception as exc:
+            raise BadRequestError(f"cannot list mount {name!r} at {subpath!r}: {exc}")
+        entries: list[MountNode] = []
+        cap = self.settings.du_max_entries
+        truncated = False
+        for child in children:
+            if len(entries) >= cap:
+                truncated = True
+                break
+            cname = child.name
+            try:
+                is_dir = bool(child.is_dir())
+            except Exception:
+                is_dir = False
+            try:
+                size = 0 if is_dir else int(child.size)
+            except Exception:
+                size = 0
+            rel = f"{subpath.rstrip('/')}/{cname}" if subpath else cname
+            entries.append(MountNode(
+                name=cname, path=rel, is_dir=is_dir, size=size,
+                is_tabular=(not is_dir and is_tabular_source(cname)),
+            ))
+        entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
+        return MountListing(
+            mount=name, subpath=subpath, target=target,
+            entries=entries, truncated=truncated,
+        )
+
+    def _list_db_mount(self, name: str, uri: str) -> MountListing:
+        """List the tables of a database mount as queryable leaves.
+
+        sqlite exposes them in ``sqlite_master``; every other supported engine
+        in the standard ``information_schema.tables``. Each entry's path is the
+        ``alias/[schema.]table`` ref the SQL editor queries directly."""
+        import polars as pl
+
+        low = uri.lower()
+        if low.startswith("sqlite://"):
+            query = ("SELECT '' AS table_schema, name AS table_name "
+                     "FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")
+        else:
+            query = ("SELECT table_schema, table_name FROM information_schema.tables "
+                     "WHERE table_schema NOT IN "
+                     "('information_schema','pg_catalog','sys','mysql','performance_schema') "
+                     "ORDER BY table_schema, table_name")
+        try:
+            df = pl.read_database_uri(query, uri)
+        except Exception as exc:
+            raise BadRequestError(f"cannot list tables of database mount {name!r}: {exc}")
+        cap = self.settings.du_max_entries
+        entries: list[MountNode] = []
+        for row in df.iter_rows(named=True):
+            if len(entries) >= cap:
+                break
+            sch = (row.get("table_schema") or "").strip()
+            tbl = row.get("table_name")
+            qualified = f"{sch}.{tbl}" if sch else str(tbl)
+            entries.append(MountNode(name=qualified, path=qualified, is_dir=False,
+                                     size=0, is_tabular=True))
+        return MountListing(mount=name, subpath="", target=uri,
+                            entries=entries, truncated=len(entries) >= cap)
+
+    def _db_source(self, ref: str) -> tuple[str, str] | None:
+        """If ``ref`` (``alias/schema.table`` or ``mount://alias/...``) names a
+        *database* mount, return ``(connection_uri, table_name)``; else None.
+
+        The leading segment must be a registered mount whose target is a DB
+        connection URI; the remainder is the (optionally schema-qualified)
+        table to read. A plain file path is never matched.
+        """
+        raw = ref[len("mount://"):] if ref.startswith("mount://") else ref
+        head, _, sub = raw.partition("/")
+        if not head or not sub:
+            return None
+        mid = self._mnt_idx.get(head)
+        mount = self._mounts.get(mid) if mid is not None else None
+        if mount is None or mount.kind != "database":
+            return None
+        return mount.target, sub
+
+    def _read_db_tabular(self, uri: str, table: str) -> Tabular:
+        """Read a database table into a bounded in-memory Tabular via connectorx.
+
+        connectorx has no lazy pushdown, so the whole table would load — cap it
+        with ``saga_db_row_limit`` (LIMIT pushed into the source query). The
+        outer SQL's projection/predicate still apply after the load. A
+        bare table name is read as ``SELECT * FROM <table> LIMIT n``; SQL
+        identifiers aren't quoted here so a fully-qualified ``schema.table``
+        passes through unchanged.
+        """
+        import polars as pl
+        from yggdrasil.arrow.tabular import ArrowTabular
+
+        limit = self.settings.saga_db_row_limit
+        query = f"SELECT * FROM {table} LIMIT {int(limit)}"
+        try:
+            df = pl.read_database_uri(query, uri)
+        except ModuleNotFoundError as exc:
+            raise BadRequestError(
+                "database mounts need connectorx — install with "
+                f"`pip install 'ygg[database]'` ({exc})")
+        except Exception as exc:
+            raise BadRequestError(f"cannot read {table!r} from database mount: {exc}")
+        return ArrowTabular(df.to_arrow())
+
     async def read_log(self, catalog: str, schema: str, name: str, *, limit: int = 200) -> OpLogResponse:
         full = f"{catalog}.{schema}.{name}"
         table = await run_in_threadpool(partial(self._log.read, full, limit=limit))
@@ -646,11 +960,22 @@ class SagaService:
     def _resolve_path(self, source_url: str) -> str:
         """Map a stored source_url to something Tabular.from_ can open.
 
-        URLs (anything with ``://``) pass through. Relative paths are resolved
-        against the node home — the same rooting the ``/fs`` and ``/tabular``
-        APIs use — so a file's browser path, its ``source_url`` and its preview
-        path are all the same string (no translation needed by the UI).
+        Resolution order:
+
+        1. A **mount alias** — ``mount://<alias>/<sub>`` or the bare
+           ``<alias>/<sub>`` when ``<alias>`` names a registered mount —
+           expands to ``<target>/<sub>``, then re-resolves (the target may
+           itself be a URL or a node-home-relative path). This is the named
+           indirection that lets a Databricks volume / S3 prefix / remote node
+           be queried and browsed under one short name.
+        2. URLs (anything with ``://``) pass through untouched.
+        3. Relative paths resolve against the node home — the same rooting the
+           ``/fs`` and ``/tabular`` APIs use — so a file's browser path, its
+           ``source_url`` and its preview path are all the same string.
         """
+        expanded = self._expand_mount(source_url)
+        if expanded is not None:
+            return expanded
         if "://" in source_url:
             return source_url
         from pathlib import Path as _P
@@ -663,15 +988,58 @@ class SagaService:
             raise BadRequestError("source_url escapes the node home")
         return str(resolved)
 
+    def _expand_mount(self, ref: str) -> str | None:
+        """Expand ``mount://alias/sub`` or ``alias/sub`` → resolved target+sub.
+
+        Returns None when ``ref`` doesn't name a registered mount, so the
+        caller falls through to its normal URL/relative handling. The bare
+        ``alias/sub`` form only matches when the leading segment is a known
+        mount — a plain ``data/x.parquet`` is never shadowed.
+        """
+        raw = ref
+        if raw.startswith("mount://"):
+            raw = raw[len("mount://"):]
+        head, _, sub = raw.partition("/")
+        if not head:
+            return None
+        # Lock-free index read: this is called from both locked (refresh_table
+        # holds self._lock while resolving a source) and unlocked (_build_tables)
+        # contexts, and threading.Lock isn't reentrant — taking it here would
+        # deadlock the locked callers. CPython dict.get is atomic, so a lock-free
+        # read is safe; a concurrent mount edit just yields the pre/post value.
+        mid = self._mnt_idx.get(head)
+        mount = self._mounts.get(mid) if mid is not None else None
+        # A bare (non-``mount://``) ref only expands when it actually names a
+        # mount; otherwise it's an ordinary path and we leave it alone.
+        if mount is None:
+            if ref.startswith("mount://"):
+                raise NotFoundError(f"mount {head!r} not found")
+            return None
+        target = mount.target.rstrip("/")
+        joined = f"{target}/{sub}" if sub else target
+        # The target may be a URL, an absolute path, or itself node-relative —
+        # re-run resolution (mounts don't nest, so no infinite recursion).
+        if "://" in target or _PathLib(target).is_absolute():
+            return joined
+        root = self.settings.node_home
+        resolved = (root / joined).resolve()
+        if not str(resolved).startswith(str(root.resolve())):
+            raise BadRequestError("mount target escapes the node home")
+        return str(resolved)
+
     async def refresh_table(self, catalog: str, schema: str, name: str) -> TableEntry:
         with self._lock:
             t = self._table_by_name(catalog, schema, name)
             if t is None:
                 raise NotFoundError(f"Table {catalog}.{schema}.{name!r} not found")
             is_view = t.object_type == "VIEW"
-            source = None if is_view else self._resolve_path(t.source_url)
+            db = None if is_view else self._db_source(t.source_url)
+            source = None if (is_view or db) else self._resolve_path(t.source_url)
         if is_view:
             cols, stats = await run_in_threadpool(self._infer_view, t)
+        elif db is not None:
+            # A live-DB source: profile the (bounded) read directly.
+            cols, stats = await run_in_threadpool(self._infer_db, *db)
         else:
             cols, stats = await run_in_threadpool(self._infer, source)
         with self._lock:
@@ -684,6 +1052,15 @@ class SagaService:
             self._tables[entry.id] = entry
             self._save()
             return entry
+
+    def _infer_db(self, uri: str, table: str) -> tuple[list[ColumnSpec], TableStatistics]:
+        """Profile a database-mount source from its bounded read."""
+        tab = self._read_db_tabular(uri, table)
+        schema = tab.collect_schema()
+        cols = [ColumnSpec(name=f.name, dtype=str(f.dtype), nullable=f.nullable)
+                for f in schema.fields]
+        rows = tab.read_arrow_table().num_rows
+        return cols, TableStatistics(row_count=rows, computed_at=_now())
 
     def _infer_view(self, view: TableEntry) -> tuple[list[ColumnSpec], TableStatistics]:
         """Profile a view by running its definition and reading the result schema."""
@@ -985,20 +1362,37 @@ class SagaService:
                     raise BadRequestError(
                         f"{reg.object_type.lower()} {full!r} is not queryable")
                 else:
-                    src = self._resolve_path(reg.source_url)
-                    tab = Tabular.from_(src, default=None)
-                    if tab is None:
-                        raise BadRequestError(f"cannot open source for table {full!r}")
+                    db = self._db_source(reg.source_url)
+                    if db is not None:
+                        tab = self._read_db_tabular(*db)
+                    else:
+                        src = self._resolve_path(reg.source_url)
+                        tab = Tabular.from_(src, default=None)
+                        if tab is None:
+                            raise BadRequestError(f"cannot open source for table {full!r}")
                 # Register under every name shape the executor might look up.
                 tables[full] = tab
                 tables[reg.name] = tab
                 if reg.schema_name:
                     tables[f"{reg.schema_name}.{reg.name}"] = tab
                 continue
-            # Unregistered but path-shaped (a slash or a tabular extension):
-            # resolve it under the node files root so `SELECT * FROM
-            # 'data/x.parquet'` reads from the node, not the process CWD.
+            # Unregistered but path-shaped (a slash or a tabular extension) or a
+            # mount alias (``mount://vol/x.parquet`` / ``vol/x.parquet``):
+            # resolve it — mounts expand to their target, bare paths root under
+            # the node files dir — so `SELECT * FROM 'data/x.parquet'` reads from
+            # the node and `FROM 'prod_vol/2024/jan.parquet'` follows the mount.
             cand = ref.name
+            db = self._db_source(cand)
+            if db is not None:
+                tables[cand] = self._read_db_tabular(*db)
+                continue
+            resolved = self._expand_mount(cand)
+            if resolved is not None:
+                if is_tabular_source(resolved):
+                    tab = Tabular.from_(resolved, default=None)
+                    if tab is not None:
+                        tables[cand] = tab
+                continue
             ext = cand.rsplit(".", 1)[-1].lower() if "." in cand else ""
             looks_like_path = ("/" in cand or "\\" in cand or ext in _TABULAR_EXTS)
             if looks_like_path and is_tabular_source(cand):

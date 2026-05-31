@@ -228,6 +228,73 @@ class DiscoverRequest(StrictModel):
     model_config = {"populate_by_name": True}
 
 
+# -- path mounts ------------------------------------------------------------
+# A Mount is a named alias for a base path or URL — the same idea as the
+# @function feature, but for path objects. ``mount://<alias>/<sub>`` (or just
+# ``<alias>/<sub>``) expands to ``<target>/<sub>`` everywhere a source is
+# resolved: the SQL engine (``SELECT * FROM 'prod_vol/2024/jan.parquet'``), a
+# registered table's ``source_url``, and the file browser. The target is any
+# URL the yggdrasil ``Path``/``Tabular`` layer can open — a Databricks volume
+# (``/Volumes/cat/sch/vol``), an S3 prefix (``s3://bucket/key``), a remote node
+# (``npfs://node-2:8100/data``) or a node-home-relative folder.
+
+class MountCreate(StrictModel):
+    name: str                          # the alias (e.g. "prod_vol")
+    target: str                        # base path/URL the alias expands to
+    comment: str = ""
+    read_only: bool = True             # navigation/SQL never mutates unless False
+    properties: dict[str, str] = Field(default_factory=dict)
+
+
+class MountUpdate(StrictModel):
+    target: str | None = None
+    comment: str | None = None
+    read_only: bool | None = None
+    properties: dict[str, str] | None = None
+
+
+class MountEntry(StrictModel):
+    id: int
+    name: str
+    target: str
+    comment: str = ""
+    read_only: bool = True
+    # The path family of the target, sniffed from its scheme/prefix — purely
+    # informational for the UI (databricks_volume | s3 | node | local | ...).
+    kind: str = "local"
+    node_id: str = ""
+    properties: dict[str, str] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+
+
+class MountResponse(StrictModel):
+    mount: MountEntry
+
+
+class MountListResponse(StrictModel):
+    node_id: str
+    mounts: list[MountEntry]
+
+
+# -- mount navigation (lazy browse through the Path layer) ------------------
+
+class MountNode(StrictModel):
+    name: str
+    path: str                          # the mount-relative subpath of this child
+    is_dir: bool = False
+    size: int = 0
+    is_tabular: bool = False           # a tabular file → queryable / previewable
+
+
+class MountListing(StrictModel):
+    mount: str
+    subpath: str = ""
+    target: str                        # the resolved absolute target it expanded to
+    entries: list[MountNode]
+    truncated: bool = False
+
+
 # -- forecast workflow ------------------------------------------------------
 
 class ForecastSpec(StrictModel):
@@ -515,3 +582,43 @@ class ActivityResponse(StrictModel):
     # Per-day op counts (most recent last) for a sparkline.
     daily: list[int] = Field(default_factory=list)
     recent: list[OpLogEntry] = Field(default_factory=list)
+
+
+# -- overview (the catalog-wide monitoring dashboard) -----------------------
+
+class TopAsset(StrictModel):
+    """A heaviest/most-active asset row for the overview leaderboards."""
+    full_name: str
+    object_type: ObjectType = "TABLE"
+    catalog: str = ""
+    schema_: str = Field(default="", alias="schema")
+    rows: int | None = None
+    size_bytes: int | None = None
+    ops: int = 0
+    last_op_at: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class SagaOverview(StrictModel):
+    """One-call rollup of every Saga asset for the management dashboard:
+    counts by kind, totals, per-day activity, recent ops across all assets, and
+    leaderboards (largest tables, busiest assets)."""
+    node_id: str
+    catalog_count: int = 0
+    schema_count: int = 0
+    table_count: int = 0
+    view_count: int = 0
+    forecast_count: int = 0
+    other_count: int = 0
+    mount_count: int = 0
+    mount_kinds: dict[str, int] = Field(default_factory=dict)
+    total_rows: int = 0
+    total_bytes: int = 0
+    total_ops: int = 0
+    op_counts: dict[str, int] = Field(default_factory=dict)
+    daily: list[int] = Field(default_factory=list)        # last 14 days, ops/day
+    recent: list[OpLogEntry] = Field(default_factory=list)  # newest ops, any asset
+    largest: list[TopAsset] = Field(default_factory=list)   # by size_bytes
+    busiest: list[TopAsset] = Field(default_factory=list)   # by op count
+    mounts: list["MountEntry"] = Field(default_factory=list)

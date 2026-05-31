@@ -20,6 +20,11 @@ from ..schemas.saga import (
     ForecastAssetResult,
     ForecastRegisterRequest,
     MaterializeResult,
+    MountCreate,
+    MountListing,
+    MountListResponse,
+    MountResponse,
+    MountUpdate,
     OpLogResponse,
     SessionResult,
     WindowRequest,
@@ -30,6 +35,7 @@ from ..schemas.saga import (
     ActivityResponse,
     ReplicateRequest,
     ReplicateResult,
+    SagaOverview,
     SearchResponse,
     SchemaCreate,
     SchemaListResponse,
@@ -191,6 +197,71 @@ async def read_table_log(catalog: str, schema: str, name: str, limit: int = 200,
 async def register(req: RegisterRequest, saga: SagaService = Depends(get_saga_service)):
     """One-shot: ensure catalog + schema, infer the name, register + profile."""
     return await saga.register(req)
+
+
+# -- mounts (named aliases over path objects) -------------------------------
+
+@router.get("/mount", response_model=MountListResponse)
+async def list_mounts(node: str | None = None,
+                      saga: SagaService = Depends(get_saga_service),
+                      network: NetworkService = Depends(get_network_service)):
+    remote = await _remote(network, saga, node, "/mount")
+    return remote if remote is not None else await saga.list_mounts()
+
+
+@router.post("/mount", response_model=MountResponse)
+async def create_mount(req: MountCreate, node: str | None = None,
+                       saga: SagaService = Depends(get_saga_service),
+                       network: NetworkService = Depends(get_network_service)):
+    """Register (upsert by alias) a mount: a named base path/URL that the SQL
+    engine and file browser expand on demand — e.g. a Databricks volume, an S3
+    prefix, or a remote node path made queryable under one short name."""
+    remote = await _remote(network, saga, node, "/mount", method="POST", json_body=req.model_dump())
+    return remote if remote is not None else await saga.create_mount(req)
+
+
+@router.get("/mount/{name}", response_model=MountResponse)
+async def get_mount(name: str, node: str | None = None,
+                    saga: SagaService = Depends(get_saga_service),
+                    network: NetworkService = Depends(get_network_service)):
+    remote = await _remote(network, saga, node, f"/mount/{name}")
+    return remote if remote is not None else MountResponse(mount=await saga.get_mount(name))
+
+
+@router.patch("/mount/{name}", response_model=MountResponse)
+async def update_mount(name: str, req: MountUpdate, node: str | None = None,
+                       saga: SagaService = Depends(get_saga_service),
+                       network: NetworkService = Depends(get_network_service)):
+    remote = await _remote(network, saga, node, f"/mount/{name}", method="PATCH", json_body=req.model_dump())
+    return remote if remote is not None else await saga.update_mount(name, req)
+
+
+@router.delete("/mount/{name}", response_model=MountResponse)
+async def delete_mount(name: str, node: str | None = None,
+                       saga: SagaService = Depends(get_saga_service),
+                       network: NetworkService = Depends(get_network_service)):
+    remote = await _remote(network, saga, node, f"/mount/{name}", method="DELETE")
+    return remote if remote is not None else await saga.delete_mount(name)
+
+
+@router.get("/mount/{name}/ls", response_model=MountListing)
+async def list_mount_dir(name: str, subpath: str = "", node: str | None = None,
+                         saga: SagaService = Depends(get_saga_service),
+                         network: NetworkService = Depends(get_network_service)):
+    """Lazily browse a mount through the Path layer — tabular files are flagged
+    so the UI can query/preview them inline."""
+    remote = await _remote(network, saga, node, f"/mount/{name}/ls", params={"subpath": subpath})
+    return remote if remote is not None else await saga.list_mount(name, subpath)
+
+
+@router.get("/overview", response_model=SagaOverview)
+async def overview(node: str | None = None,
+                   saga: SagaService = Depends(get_saga_service),
+                   network: NetworkService = Depends(get_network_service)):
+    """Catalog-wide monitoring rollup: counts by kind, totals, activity feed,
+    and largest/busiest leaderboards — drives the Saga management dashboard."""
+    remote = await _remote(network, saga, node, "/overview")
+    return remote if remote is not None else await saga.overview()
 
 
 @router.get("/search", response_model=SearchResponse)

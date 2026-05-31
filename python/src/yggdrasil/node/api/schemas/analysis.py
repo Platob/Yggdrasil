@@ -66,6 +66,23 @@ class FinanceRequest(StrictModel):
     order_by: str | None = None
     window: int = 20
     limit: int = 2000
+    # Annualization for the scalar risk metrics: trading periods per year
+    # (252 daily, 52 weekly, 12 monthly) and the per-year risk-free rate used
+    # for Sharpe/Sortino. Defaults suit daily price bars.
+    periods_per_year: int = 252
+    risk_free: float = 0.0
+
+
+class FinanceMetrics(StrictModel):
+    """Scalar risk/return summary over the whole series (annualized)."""
+    total_return: float | None = None         # last/first - 1
+    cagr: float | None = None                 # compound annual growth rate
+    ann_return: float | None = None           # mean periodic return, annualized
+    ann_volatility: float | None = None       # std of returns, annualized
+    sharpe: float | None = None               # (ann_return - rf) / ann_vol
+    sortino: float | None = None              # ann_return / annualized downside dev
+    max_drawdown: float | None = None         # worst peak-to-trough, as a fraction
+    calmar: float | None = None               # cagr / |max_drawdown|
 
 
 class FinanceResult(StrictModel):
@@ -79,6 +96,9 @@ class FinanceResult(StrictModel):
     cum_return: list[float | None]
     roll_mean: list[float | None]
     roll_vol: list[float | None]  # rolling std of returns (volatility)
+    ema: list[float | None]       # exponential moving average (span=window)
+    drawdown: list[float | None]  # running peak-to-trough of cum_return
+    metrics: FinanceMetrics
     truncated: bool
 
 

@@ -22,6 +22,10 @@ import {
   getActivity,
   updateTable,
   replicateTable,
+  getMounts,
+  listMount,
+  type MountEntry,
+  type MountNode,
   OBJECT_TYPES,
   type SearchHit,
   type ActivityResponse,
@@ -34,6 +38,8 @@ import {
 } from "@/lib/api";
 import TabularDisplay, { type QuerySpec } from "@/components/TabularDisplay";
 import PlanGraphView from "@/components/PlanGraph";
+import SagaMonitor from "@/components/SagaMonitor";
+import FinancePanel from "@/components/FinancePanel";
 
 const DIALECTS = ["postgres", "sqlite", "mysql", "databricks"];
 
@@ -60,12 +66,16 @@ const objOf = (t: string) => OBJ[t] ?? OBJ.OTHER;
 export default function SagaPage() {
   const [nodes, setNodes] = useState<{ node_id: string; self: boolean }[]>([]);
   const [node, setNode] = useState<string | undefined>(undefined);
+  const [view, setView] = useState<"catalog" | "monitor" | "finance">("catalog");
 
   const [catalogs, setCatalogs] = useState<CatalogEntry[]>([]);
   const [openCat, setOpenCat] = useState<Set<string>>(new Set());
   const [openSch, setOpenSch] = useState<Set<string>>(new Set());
   const [schemas, setSchemas] = useState<Record<string, SchemaEntry[]>>({});
   const [tables, setTables] = useState<Record<string, TableEntry[]>>({});
+  const [treeMounts, setTreeMounts] = useState<MountEntry[]>([]);
+  const [openMounts, setOpenMounts] = useState<Set<string>>(new Set());
+  const [mountLs, setMountLs] = useState<Record<string, MountNode[]>>({});
   const [detail, setDetail] = useState<TableEntry | null>(null);
   const [log, setLog] = useState<OpLogEntry[] | null>(null);
   const [activity, setActivity] = useState<ActivityResponse | null>(null);
@@ -108,6 +118,26 @@ export default function SagaPage() {
   }, []);
 
   useEffect(() => { loadCatalogs(); }, [loadCatalogs]);
+
+  // Mounts share the catalog tree — browse + click-to-query without leaving the editor.
+  useEffect(() => {
+    getMounts(node, true).then((r) => setTreeMounts(r.mounts)).catch(() => setTreeMounts([]));
+  }, [node]);
+
+  const toggleMount = async (m: MountEntry) => {
+    const next = new Set(openMounts);
+    if (next.has(m.name)) { next.delete(m.name); setOpenMounts(next); return; }
+    next.add(m.name); setOpenMounts(next);
+    if (!mountLs[m.name]) {
+      try {
+        const r = await listMount(m.name, "", node);
+        setMountLs((s) => ({ ...s, [m.name]: r.entries }));
+      } catch { setMountLs((s) => ({ ...s, [m.name]: [] })); }
+    }
+  };
+
+  const mountKindGlyph = (k: string) =>
+    k === "database" ? "⛁" : k === "databricks" ? "◆" : k === "s3" ? "☁" : k === "node" ? "⬡" : "▢";
 
   // Debounced asset search across the catalog (bounded, truncation-flagged).
   const onSearch = (q: string) => {
@@ -355,6 +385,21 @@ export default function SagaPage() {
           <p className="text-[11px] text-muted">Distributed data catalog — register sources, query across the mesh.</p>
         </div>
         <div className="flex items-center gap-2">
+          {/* View toggle: the lazy catalog tree + SQL editor, or the monitor. */}
+          <div className="flex items-center rounded-lg border border-white/[0.08] overflow-hidden text-xs">
+            <button onClick={() => setView("catalog")}
+              className={`px-3 py-1.5 font-semibold ${view === "catalog" ? "bg-frost/20 text-frost" : "text-muted hover:text-foreground"}`}>
+              Catalog
+            </button>
+            <button onClick={() => setView("monitor")}
+              className={`px-3 py-1.5 font-semibold ${view === "monitor" ? "bg-frost/20 text-frost" : "text-muted hover:text-foreground"}`}>
+              Monitor
+            </button>
+            <button onClick={() => setView("finance")}
+              className={`px-3 py-1.5 font-semibold ${view === "finance" ? "bg-frost/20 text-frost" : "text-muted hover:text-foreground"}`}>
+              Finance
+            </button>
+          </div>
           <select
             value={node ?? "__local"}
             onChange={(e) => setNode(e.target.value === "__local" ? undefined : e.target.value)}
@@ -372,6 +417,18 @@ export default function SagaPage() {
         </div>
       </div>
 
+      {view === "monitor" ? (
+        <SagaMonitor node={node} onQuery={(ref) => {
+          // Click-to-query from the monitor: drop a ready SELECT into the editor
+          // and flip back to the catalog view so the user lands on the result.
+          const q = `SELECT * FROM '${ref}' LIMIT 100`;
+          setSql(q);
+          setRanQuery(queryFor(q));
+          setView("catalog");
+        }} />
+      ) : view === "finance" ? (
+        <FinancePanel node={node} />
+      ) : (
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-3 min-h-0">
         {/* ── Catalog tree ── */}
         <div className="glass-card p-3 overflow-auto min-h-0">
@@ -383,6 +440,41 @@ export default function SagaPage() {
             placeholder="🔍 search assets…"
             className="w-full mb-2 bg-white/[0.04] border border-white/[0.08] rounded-lg px-2.5 py-1.5 text-xs outline-none focus:border-frost/30" />
           {treeErr && <div className="text-[11px] text-rose/80 font-mono mb-2 break-words">{treeErr}</div>}
+
+          {/* Mounts — browse + click-to-query a volume / S3 / node / database. */}
+          {!query.trim() && treeMounts.length > 0 && (
+            <div className="mb-2 pb-2 border-b border-white/[0.06]">
+              <div className="text-[10px] uppercase tracking-wide text-muted mb-1">Mounts</div>
+              {treeMounts.map((m) => {
+                const open = openMounts.has(m.name);
+                return (
+                  <div key={m.id}>
+                    <div className="group flex items-center gap-1.5 py-1 px-1 rounded hover:bg-white/[0.03] cursor-pointer" onClick={() => toggleMount(m)}>
+                      <span className="text-[9px] text-muted w-2">{open ? "▾" : "▸"}</span>
+                      <span className={m.kind === "database" ? "text-violet-400" : "text-amber/80"}>{mountKindGlyph(m.kind)}</span>
+                      <span className="text-xs font-mono truncate flex-1">{m.name}</span>
+                      <span className="text-[9px] px-1.5 py-0.5 rounded bg-white/[0.04] text-muted">{m.kind}</span>
+                    </div>
+                    {open && (
+                      <div className="ml-4 border-l border-white/[0.06] pl-2 space-y-0.5">
+                        {(mountLs[m.name] ?? []).length === 0 && <div className="text-[10px] text-muted py-0.5">empty / loading…</div>}
+                        {(mountLs[m.name] ?? []).map((e) => (
+                          <div key={e.path}
+                            className="group/leaf flex items-center gap-1.5 py-0.5 px-1 rounded hover:bg-white/[0.03] cursor-pointer"
+                            title={e.is_tabular ? "insert a SELECT for this" : e.name}
+                            onClick={() => { if (e.is_tabular) { const q = `SELECT * FROM '${m.name}/${e.path}' LIMIT 100`; setSql(q); setRanQuery(queryFor(q)); } }}>
+                            <span className={e.is_dir ? "text-frost/60" : e.is_tabular ? "text-emerald/70" : "text-muted"}>{e.is_dir ? "▸" : e.is_tabular ? "▦" : "·"}</span>
+                            <span className="text-[11px] font-mono truncate flex-1">{e.name}</span>
+                            {e.is_tabular && <span className="opacity-0 group-hover/leaf:opacity-100 text-[10px] text-frost/80">query →</span>}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
           {/* Search results replace the lazy tree while a query is active. */}
           {query.trim() ? (
@@ -655,6 +747,7 @@ export default function SagaPage() {
           </div>
         </div>
       </div>
+      )}
 
       {preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6"

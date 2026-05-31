@@ -30,6 +30,7 @@ from ..schemas.analysis import (
     DescribeResult,
     ExportRequest,
     FilterSpec,
+    FinanceMetrics,
     FinanceRequest,
     FinanceResult,
     ForecastRequest,
@@ -381,15 +382,53 @@ class AnalysisService:
         window = max(2, req.window)
         roll_mean = val.rolling_mean(window_size=window)
         roll_vol = ret.rolling_std(window_size=window)
+        ema = val.ewm_mean(span=window, ignore_nulls=True)
+        # Running drawdown: equity = cumulative growth from the first bar; the
+        # drawdown at each point is how far equity sits below its running peak.
+        equity = (1.0 + cum)
+        peak = equity.cum_max()
+        drawdown = equity / peak - 1.0
         index = (
             df[req.order_by].to_list() if (req.order_by and req.order_by in cols)
             else list(range(df.height))
         )
+
+        # Scalar risk/return summary (annualized) over the realized returns.
+        ppy = max(1, req.periods_per_year)
+        r = ret.drop_nulls().to_numpy()
+        metrics = FinanceMetrics()
+        if r.size and val.drop_nulls().len() >= 2:
+            first = float(val.drop_nulls()[0])
+            last = float(val.drop_nulls()[-1])
+            total_ret = (last / first - 1.0) if first else None
+            years = r.size / ppy
+            cagr = ((last / first) ** (1.0 / years) - 1.0) if (first and years > 0 and last > 0) else None
+            mean_r = float(np.nanmean(r))
+            std_r = float(np.nanstd(r, ddof=1)) if r.size > 1 else 0.0
+            ann_return = mean_r * ppy
+            ann_vol = std_r * math.sqrt(ppy)
+            rf_per = req.risk_free / ppy
+            downside = r[r < rf_per]
+            down_dev = (float(np.sqrt(np.mean((downside - rf_per) ** 2))) * math.sqrt(ppy)
+                        if downside.size else 0.0)
+            max_dd = float(drawdown.min()) if drawdown.drop_nulls().len() else None
+            metrics = FinanceMetrics(
+                total_return=total_ret,
+                cagr=cagr,
+                ann_return=ann_return,
+                ann_volatility=ann_vol,
+                sharpe=((ann_return - req.risk_free) / ann_vol) if ann_vol else None,
+                sortino=((ann_return - req.risk_free) / down_dev) if down_dev else None,
+                max_drawdown=max_dd,
+                calmar=(cagr / abs(max_dd)) if (cagr is not None and max_dd) else None,
+            )
+
         return FinanceResult(
             node_id=self.settings.node_id, path=req.path, column=req.column, window=window,
             index=[_safe(v) for v in index],
             value=_safe_list(val), pct_change=_safe_list(ret), cum_return=_safe_list(cum),
             roll_mean=_safe_list(roll_mean), roll_vol=_safe_list(roll_vol),
+            ema=_safe_list(ema), drawdown=_safe_list(drawdown), metrics=metrics,
             truncated=truncated,
         )
 
