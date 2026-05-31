@@ -10,11 +10,13 @@ single run with the :class:`Awaitable` lifecycle (wait, cancel, repair).
 from .job import Job
 from .run import JobRun, JobTask
 from .service import Jobs, JobRuns
+from .skeleton import JobSkeleton
 
 __all__ = [
     "Job",
     "JobRun",
     "JobRuns",
     "Jobs",
+    "JobSkeleton",
     "JobTask",
 ]

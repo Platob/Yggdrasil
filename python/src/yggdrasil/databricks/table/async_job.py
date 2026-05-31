@@ -1,21 +1,23 @@
 """Async, file-arrival-triggered table loader.
 
-:class:`TableJob` turns a table's synchronous warehouse insert into a
-*drop-and-aggregate* pipeline:
+:class:`TableJob` is a :class:`~yggdrasil.databricks.job.JobSkeleton` (a
+declarative Python-job definition) that turns a table's synchronous warehouse
+insert into a *drop-and-aggregate* pipeline:
 
 - ``table.insert(..., wait=False)`` writes the staged Parquet under the table's
   staging volume at ``.sql/async/data/`` and drops a small JSON *operation log*
   next to it at ``.sql/async/logs/`` — no warehouse statement runs at call time.
-- A **file-arrival trigger** on the ``logs/`` directory wakes this job, which
-  reads every pending log, groups the operations by ``(target table, mode)``,
-  builds one aggregated ``INSERT`` per group that reads all the staged Parquet
-  at once, runs it through ygg (:meth:`Table.insert`), then clears the consumed
-  logs + data.
+- A **file-arrival trigger** on the ``logs/`` directory wakes the deployed job,
+  whose Python entry point calls :meth:`TableJob.run`: read every pending log,
+  group the operations by ``(target table, mode)``, build one aggregated
+  ``INSERT`` per group that reads all the staged Parquet at once, run it through
+  ygg (:meth:`Table.insert`), then clear the consumed logs + data.
 
 Only ``OVERWRITE`` and ``APPEND`` (no ``match_by``) are supported for now.
 
 Reach it lazily via :attr:`yggdrasil.databricks.table.table.Table.async_job`,
-which get-or-creates the job from :meth:`TableJob.definition`.
+which get-or-creates the live :class:`~yggdrasil.databricks.job.Job` from this
+skeleton's :meth:`definition`.
 """
 from __future__ import annotations
 
@@ -25,15 +27,15 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
-from yggdrasil.databricks.job.job import Job
-from yggdrasil.databricks.resource import DatabricksResource
+from yggdrasil.databricks.job.skeleton import JobSkeleton
 from yggdrasil.enums.mode import Mode
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.databricks.fs.volume_path import VolumePath
+    from yggdrasil.databricks.job.job import Job
     from yggdrasil.databricks.table.table import Table
 
-__all__ = ["TableJob", "ASYNC_ROOT", "LOGS_SUBDIR", "DATA_SUBDIR"]
+__all__ = ["TableJob", "ASYNC_ROOT", "LOGS_SUBDIR", "DATA_SUBDIR", "ASYNC_MODES"]
 
 logger = logging.getLogger(__name__)
 
@@ -48,17 +50,24 @@ DATA_SUBDIR = f"{ASYNC_ROOT}/data"
 ASYNC_MODES = (Mode.OVERWRITE, Mode.APPEND)
 
 
-class TableJob(Job):
-    """A file-arrival-triggered Databricks job that aggregates async inserts.
+class TableJob(JobSkeleton):
+    """File-arrival job skeleton that aggregates a table's async inserts.
 
-    Bound to a single :class:`Table` (its ``.sql/async`` area). Construct via
-    ``TableJob(table)`` and :meth:`ensure` it into existence, or reach the
-    cached handle through :attr:`Table.async_job`.
+    Bound to a single :class:`Table` (its ``.sql/async`` area). Build via
+    ``TableJob(table)``; :meth:`ensure` / :attr:`job` get-or-create the live
+    Databricks job from :meth:`definition`, and :meth:`run` is the loader the
+    deployed task executes. Usually reached through :attr:`Table.async_job`.
     """
 
+    entry_point: ClassVar[str] = "ygg-table-async-load"
+    task_key: ClassVar[str] = "async-load"
     _NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
 
-    # -- paths ----------------------------------------------------------
+    def __init__(self, table: "Table") -> None:
+        self._table = table
+        self._job: "Job | None" = None
+
+    # -- identity / paths -----------------------------------------------
     @staticmethod
     def job_name(table: "Table") -> str:
         return f"{TableJob._NAME_PREFIX}-{table.catalog_name}.{table.schema_name}.{table.table_name}"
@@ -73,98 +82,40 @@ class TableJob(Job):
         """``<staging_volume>/.sql/async/data`` — the staged Parquet."""
         return table.staging_volume.path(DATA_SUBDIR)
 
-    # -- singleton identity / construction ------------------------------
-    @classmethod
-    def _singleton_key(
-        cls,
-        table: "Table | None" = None,
-        *,
-        service: Any = None,
-        job_id: "int | str | None" = None,
-        name: str | None = None,
-        **_kwargs: Any,
-    ) -> Any:
-        if name is None and table is not None:
-            name = cls.job_name(table)
-        svc = service if service is not None else (table.client.jobs if table is not None else None)
-        return (cls, svc, job_id if job_id is not None else name)
+    # -- JobSkeleton definition surface ---------------------------------
+    @property
+    def name(self) -> str:
+        return self.job_name(self._table)
 
-    def __init__(
-        self,
-        table: "Table | None" = None,
-        *,
-        service: Any = None,
-        job_id: "int | str | None" = None,
-        name: str | None = None,
-        details: Any = None,
-        singleton_ttl: Any = ...,
-    ) -> None:
-        del singleton_ttl
-        if getattr(self, "_initialized", False):
-            return
-        if name is None and table is not None:
-            name = self.job_name(table)
-        if service is None and table is not None:
-            service = table.client.jobs
-        # Bypass ``Job.__init__``'s auto-lookup-by-name: the async job may not
-        # exist yet (it's get-or-created lazily in :meth:`ensure`).
-        DatabricksResource.__init__(self, service=service)
-        self.service = service
-        self.job_id = int(job_id) if isinstance(job_id, (int, str)) and str(job_id).isdigit() else None
-        self.name = name
-        self._details = details
-        self._table = table
-        self._initialized = True
+    def parameters(self) -> list[str]:
+        return [self._table.full_name()]
 
-    # -- definition + get-or-create -------------------------------------
-    def definition(self) -> dict:
-        """JobSettings kwargs for :meth:`Jobs.create_or_update`.
-
-        A single ``async-load`` task (the ygg loader, parameterised with the
-        table's full name) plus a **file-arrival trigger** on the ``logs/``
-        directory, so a dropped operation log wakes the job.
-        """
+    def trigger(self) -> Any:
         from databricks.sdk.service.jobs import (
             FileArrivalTriggerConfiguration,
-            PythonWheelTask,
-            Task,
             TriggerSettings,
         )
 
-        table = self._table
-        task = Task(
-            task_key="async-load",
-            python_wheel_task=PythonWheelTask(
-                package_name="yggdrasil",
-                entry_point="table-async-load",
-                parameters=[table.full_name()],
-            ),
-        )
-        return dict(
-            name=self.name,
-            tasks=[task],
-            trigger=TriggerSettings(
-                file_arrival=FileArrivalTriggerConfiguration(
-                    url=self.logs_path(table).full_path(),
-                ),
+        return TriggerSettings(
+            file_arrival=FileArrivalTriggerConfiguration(
+                url=self.logs_path(self._table).full_path(),
             ),
         )
 
+    # -- get-or-create the live Job -------------------------------------
     def ensure(self) -> "TableJob":
         """Get-or-create the underlying Databricks job from :meth:`definition`."""
-        if self.job_id is not None:
-            return self
-        spec = self.definition()
-        job = self.service.create_or_update(
-            name=spec.pop("name"),
-            **spec,
-        )
-        self.job_id = job.job_id
-        self._details = job._details
+        if self._job is None:
+            self._job = self.deploy(self._table.client.jobs)
         return self
 
+    @property
+    def job(self) -> "Job":
+        """The live :class:`Job` (deployed on first access)."""
+        return self.ensure()._job
+
     # -- the loader the trigger runs ------------------------------------
-    def process(self, *, wait: Any = True, limit: Optional[int] = None) -> int:
+    def run(self, *, wait: Any = True, limit: Optional[int] = None) -> int:
         """Consume pending operation logs and load them into their targets.
 
         Reads every JSON log under :meth:`logs_path`, groups by
@@ -213,6 +164,9 @@ class TableJob(Job):
                 _best_effort_unlink(data_dir / leaf)
             processed += len(items)
         return processed
+
+    #: Descriptive alias for :meth:`run` (the JobSkeleton entry point).
+    process = run
 
     def _resolve_target(self, full_name: str) -> "Table":
         table = self._table

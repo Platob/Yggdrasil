@@ -112,9 +112,9 @@ class TestEnsure:
         jobs.create_or_update.return_value = created
         t.staging_volume.path.return_value.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
 
-        tj = TableJob(t, service=jobs)
+        tj = TableJob(t)
         assert tj.ensure() is tj
-        assert tj.job_id == 42
+        assert tj.job is created
 
         kwargs = jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-async-insert-c.s.t"
@@ -122,12 +122,13 @@ class TestEnsure:
         task = kwargs["tasks"][0]
         assert task.python_wheel_task.parameters == ["c.s.t"]
 
-    def test_ensure_is_noop_when_already_resolved(self):
+    def test_ensure_is_noop_when_already_deployed(self):
         t = _table_mock()
-        jobs = MagicMock()
-        tj = TableJob(t, service=jobs, job_id=7)
+        t.client.jobs = MagicMock()
+        tj = TableJob(t)
+        tj._job = MagicMock()                # already deployed
         assert tj.ensure() is tj
-        jobs.create_or_update.assert_not_called()
+        t.client.jobs.create_or_update.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
