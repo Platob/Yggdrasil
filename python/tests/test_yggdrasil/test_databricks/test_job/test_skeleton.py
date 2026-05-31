@@ -142,18 +142,18 @@ class TestFlow:
 
         assert etl.definition()["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
 
-    def test_deploy_get_or_creates_via_service(self):
+    def test_deploy_with_client_resolves_jobs_service(self):
         @flow(name="ygg-demo", parameters=["a"])
         def demo(x):
             ...
 
-        jobs = MagicMock()
-        deployed = demo.deploy(jobs)
-        jobs.create_or_update.assert_called_once()
-        kwargs = jobs.create_or_update.call_args.kwargs
+        client = MagicMock()                         # deploy takes a client
+        deployed = demo.deploy(client)
+        client.jobs.create_or_update.assert_called_once()
+        kwargs = client.jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-demo"
         assert kwargs["tasks"][0].python_wheel_task.parameters == ["a"]
-        assert deployed is jobs.create_or_update.return_value
+        assert deployed is client.jobs.create_or_update.return_value
 
 
 def test_class_based_flow_overrides_run():

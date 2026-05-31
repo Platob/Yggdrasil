@@ -273,10 +273,13 @@ class Flow(_Runnable):
             spec["trigger"] = trigger
         return spec
 
-    def deploy(self, service: "Jobs") -> "Job":
-        """Get-or-create the live :class:`Job` from :meth:`definition`."""
+    def deploy(self, client: Any) -> "Job":
+        """Get-or-create the live :class:`Job` from :meth:`definition`.
+
+        Takes a :class:`DatabricksClient` and resolves its jobs service
+        (``client.jobs``) — no need to reach for the service yourself."""
         spec = self.definition()
-        return service.create_or_update(name=spec.pop("name"), **spec)
+        return client.jobs.create_or_update(name=spec.pop("name"), **spec)
 
 
 # ---------------------------------------------------------------------------
