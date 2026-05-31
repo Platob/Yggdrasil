@@ -28,9 +28,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
-from dataclasses import dataclass, field
-
-from yggdrasil.databricks.job.skeleton import JobSkeleton
+from yggdrasil.databricks.job.skeleton import Flow
 from yggdrasil.enums.mode import Mode
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -53,24 +51,26 @@ LOGS_SUBDIR = f"{ASYNC_ROOT}/logs"
 ASYNC_MODES = (Mode.OVERWRITE, Mode.APPEND)
 
 
-@dataclass
-class TableJob(JobSkeleton):
-    """File-arrival job skeleton that aggregates a table's async inserts.
+class TableJob(Flow):
+    """File-arrival :class:`~yggdrasil.databricks.job.Flow` that aggregates a
+    table's async inserts.
 
-    A single-task :class:`~yggdrasil.databricks.job.JobSkeleton` bound to one
-    :class:`Table` (its ``.sql/async`` area). Build via ``TableJob(table)``;
-    :meth:`ensure` / :attr:`job` get-or-create the live Databricks job from
-    :meth:`definition`, and :meth:`run` (the body) is the loader the deployed
-    task executes. Usually reached through :attr:`Table.async_job`.
+    A single-task serverless flow bound to one :class:`Table` (its ``.sql/async``
+    area). Build via ``TableJob(table)``; :meth:`ensure` / :attr:`job`
+    get-or-create the live Databricks job from :meth:`definition`, and
+    :meth:`run` (the flow body, callable via ``TableJob(table)()``) is the
+    loader the deployed task executes. Usually reached through
+    :attr:`Table.async_job`.
     """
 
     entry_point: ClassVar[str] = "ygg-table-async-load"
     task_key: ClassVar[str] = "async-load"
     _NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
 
-    #: The bound table (the single job/loader parameter).
-    table: "Table"
-    _job: "Job | None" = field(default=None, init=False, repr=False, compare=False)
+    def __init__(self, table: "Table") -> None:
+        super().__init__(name=self.job_name(table))
+        self.table = table
+        self._job: "Job | None" = None
 
     # -- identity / paths -----------------------------------------------
     @staticmethod
@@ -82,11 +82,7 @@ class TableJob(JobSkeleton):
         """``<staging_volume>/.sql/async/logs`` — the trigger's watch dir."""
         return table.staging_volume.path(LOGS_SUBDIR)
 
-    # -- JobSkeleton definition surface ---------------------------------
-    @property
-    def name(self) -> str:
-        return self.job_name(self.table)
-
+    # -- Flow deploy surface (name set in __init__) ---------------------
     def parameters(self) -> list[str]:
         # The wheel param is the table's full name, not the live handle.
         return [self.table.full_name()]

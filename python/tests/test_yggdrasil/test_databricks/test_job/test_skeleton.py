@@ -1,179 +1,169 @@
-"""Unit tests for the dataclass skeletons + @job / @task decorators."""
+"""Unit tests for the Prefect-style @task / @flow + serverless deploy."""
 from __future__ import annotations
 
-import dataclasses
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
-from yggdrasil.databricks.job import (
-    CallableSkeleton,
-    JobSkeleton,
-    TaskSkeleton,
-    job,
-    task,
-)
+from yggdrasil.databricks.job import Flow, Future, Task, flow, task
 
 
 # --------------------------------------------------------------------------- #
-# CallableSkeleton — fields are the parameters; callable
+# @task — callable, retries, submit, with_options
 # --------------------------------------------------------------------------- #
-@dataclasses.dataclass
-class _Greeter(CallableSkeleton):
-    who: str
-    times: int = 1
+class TestTask:
+    def test_decorator_yields_callable_task(self):
+        @task
+        def add(a, b=1):
+            return a + b
 
-    def run(self):
-        return "hi " * self.times + self.who
+        assert isinstance(add, Task)
+        assert add(2) == 3                      # callable like a function
+        assert add.fn.__name__ == "add"
+        assert add.name == "add"
 
+    def test_retries_until_success(self):
+        calls = {"n": 0}
 
-class TestCallableSkeleton:
-    def test_fields_are_parameters(self):
-        assert _Greeter("ada", 2).parameters() == ["ada", "2"]
+        @task(retries=2)
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ValueError("boom")
+            return "ok"
 
-    def test_is_callable(self):
-        assert _Greeter("ada")() == "hi ada"
+        assert flaky() == "ok"
+        assert calls["n"] == 3
 
+    def test_retries_exhausted_reraises(self):
+        @task(retries=1)
+        def always():
+            raise ValueError("nope")
 
-# --------------------------------------------------------------------------- #
-# @task — build a TaskSkeleton from a function signature
-# --------------------------------------------------------------------------- #
-class TestTaskDecorator:
-    def test_builds_task_skeleton_from_signature(self):
-        @task(depends_on=["extract"], timeout_seconds=600)
-        def load(table: str, mode: str = "append"):
-            return (table, mode)
+        with pytest.raises(ValueError):
+            always()
 
-        assert issubclass(load, TaskSkeleton)
-        assert [f.name for f in dataclasses.fields(load)] == ["table", "mode"]
-        inst = load(table="c.s.t")
-        assert inst.parameters() == ["c.s.t", "append"]   # from the fields
-        assert inst() == ("c.s.t", "append")              # runs the function
-        assert load.task_key == "load"
-        assert load.depends_on == ("extract",)
-        assert load.task_options == {"timeout_seconds": 600}
+    def test_submit_returns_future(self):
+        @task
+        def slow(x):
+            time.sleep(0.01)
+            return x * 2
 
-    def test_to_task_renders_python_wheel(self):
+        fut = slow.submit(21)
+        assert isinstance(fut, Future)
+        assert fut.result() == 42
+
+    def test_map_fans_out(self):
+        @task
+        def square(x):
+            return x * x
+
+        results = [f.result() for f in square.map([1, 2, 3])]
+        assert sorted(results) == [1, 4, 9]
+
+    def test_with_options_copies(self):
+        @task
+        def f():
+            return 1
+
+        g = f.with_options(retries=5, name="renamed")
+        assert g.retries == 5 and g.name == "renamed"
+        assert f.retries == 0 and f.name == "f"   # original untouched
+
+    def test_to_task_renders_serverless_wheel(self):
         @task(key="ld")
-        def load(table: str):
-            return table
+        def load():
+            ...
 
-        t = load(table="c.s.t").to_task()
+        t = load.to_task(["c.s.t"])
         assert t.task_key == "ld"
+        assert t.environment_key == "default"      # serverless
         assert t.python_wheel_task.parameters == ["c.s.t"]
 
 
 # --------------------------------------------------------------------------- #
-# @job — build a JobSkeleton from a function signature
+# @flow — callable, orchestrates tasks, deploys serverless
 # --------------------------------------------------------------------------- #
-class TestJobDecorator:
-    def test_builds_job_skeleton_from_signature(self):
-        @job(name="ygg-etl")
-        def etl(src: str, dst: str = "out"):
-            return f"{src}->{dst}"
+class TestFlow:
+    def test_flow_runs_tasks(self):
+        @task
+        def double(x):
+            return x * 2
 
-        assert issubclass(etl, JobSkeleton)
-        inst = etl(src="a")
-        assert inst.name == "ygg-etl"
-        assert inst.parameters() == ["a", "out"]
-        assert inst() == "a->out"                          # callable
+        @flow(name="etl")
+        def etl(x):
+            return double(x) + 1
 
-    def test_default_single_task_definition(self):
-        @job
-        def etl(src: str):
-            return src
+        assert isinstance(etl, Flow)
+        assert etl(10) == 21
+        assert etl.name == "etl"
 
-        spec = etl(src="a").definition()
+    def test_flow_fans_out_with_submit(self):
+        @task
+        def fetch(i):
+            return i
+
+        @flow
+        def gather(items):
+            return sorted(f.result() for f in fetch.map(items))
+
+        assert gather([3, 1, 2]) == [1, 2, 3]
+
+    def test_definition_is_serverless_v5_with_ygg_databricks(self):
+        @flow(parameters=["a", "b"])
+        def etl(x, y):
+            ...
+
+        spec = etl.definition()
         assert spec["name"] == "etl"
         assert "trigger" not in spec
         task_obj = spec["tasks"][0]
-        assert task_obj.python_wheel_task.parameters == ["a"]
-
-    def test_defaults_to_serverless_v5_with_ygg_databricks(self):
-        @job
-        def etl(src: str):
-            return src
-
-        spec = etl(src="a").definition()
+        assert task_obj.python_wheel_task.parameters == ["a", "b"]
+        assert task_obj.environment_key == "default"
         env = spec["environments"][0]
-        assert env.environment_key == "default"
         assert env.spec.environment_version == "5"
         assert env.spec.dependencies == ["ygg[databricks]"]
-        # the task runs in that serverless environment
-        assert spec["tasks"][0].environment_key == "default"
 
-    def test_serverless_false_drops_environments(self):
-        @job
-        def etl(src: str):
-            return src
+    def test_serverless_false_drops_environment(self):
+        @flow
+        def etl():
+            ...
 
         etl.serverless = False
-        spec = etl(src="a").definition()
+        spec = etl.definition()
         assert "environments" not in spec
         assert spec["tasks"][0].environment_key is None
 
     def test_trigger_included_when_set(self):
-        @job(trigger={"file_arrival": {"url": "/Volumes/x"}})
-        def etl(src: str):
-            return src
-
-        assert etl(src="a").definition()["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
-
-
-# --------------------------------------------------------------------------- #
-# JobSkeleton with composed task steps
-# --------------------------------------------------------------------------- #
-class TestComposedJob:
-    def _steps(self):
-        @task
-        def extract(src: str):
-            return f"x:{src}"
-
-        @task(depends_on=["extract"])
-        def load(src: str):
-            return f"l:{src}"
-
-        return extract, load
-
-    def test_definition_one_task_per_step_with_deps(self):
-        extract, load = self._steps()
-
-        @job(name="ygg-pipe", steps=[extract, load])
-        def pipe(src: str):
+        @flow(trigger={"file_arrival": {"url": "/Volumes/x"}})
+        def etl():
             ...
 
-        spec = pipe(src="a").definition()
-        tasks = {t.task_key: t for t in spec["tasks"]}
-        assert set(tasks) == {"extract", "load"}
-        assert tasks["extract"].depends_on is None
-        assert tasks["load"].depends_on[0].task_key == "extract"
-        # the job's field binds into each step by name
-        assert tasks["extract"].python_wheel_task.parameters == ["a"]
+        assert etl.definition()["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
 
-    def test_call_runs_steps_in_dependency_order(self):
-        extract, load = self._steps()
-
-        @job(steps=[load, extract])     # declared out of order
-        def pipe(src: str):
+    def test_deploy_get_or_creates_via_service(self):
+        @flow(name="ygg-demo", parameters=["a"])
+        def demo(x):
             ...
 
-        result = pipe(src="a")()
-        assert result == {"extract": "x:a", "load": "l:a"}
+        jobs = MagicMock()
+        deployed = demo.deploy(jobs)
+        jobs.create_or_update.assert_called_once()
+        kwargs = jobs.create_or_update.call_args.kwargs
+        assert kwargs["name"] == "ygg-demo"
+        assert kwargs["tasks"][0].python_wheel_task.parameters == ["a"]
+        assert deployed is jobs.create_or_update.return_value
 
 
-def test_deploy_get_or_creates_via_service():
-    @job(name="ygg-demo")
-    def demo(src: str):
-        return src
+def test_class_based_flow_overrides_run():
+    class MyFlow(Flow):
+        def __init__(self):
+            super().__init__(name="mine")
 
-    jobs = MagicMock()
-    deployed = demo(src="a").deploy(jobs)
-    jobs.create_or_update.assert_called_once()
-    assert jobs.create_or_update.call_args.kwargs["name"] == "ygg-demo"
-    assert deployed is jobs.create_or_update.return_value
+        def run(self, x):
+            return x + 100
 
-
-def test_jobskeleton_requires_name():
-    # abstract `name` → can't instantiate the bare base
-    with pytest.raises(TypeError):
-        JobSkeleton()
+    f = MyFlow()
+    assert f(5) == 105                              # callable
+    assert f.name == "mine"
