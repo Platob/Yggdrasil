@@ -1,27 +1,13 @@
-// Client-side port of ``yggdrasil.enums.mime_type``.
-//
-// Mirrors python/src/yggdrasil/enums/mime_type.py: the singleton MIME registry
-// (name / value / extensions / is_codec / is_tabular / is_blob + magic-byte
-// prefixes) and the resolution surface — by extension, mime value, filename
-// (codec-suffix aware, e.g. ``data.csv.gz``) and a best-effort magic sniff.
-// Keep in sync with the Python source; the two are the same contract.
+// Client-side port of ``yggdrasil.enums.mime_type`` — object-oriented, mirroring
+// the Python ``MimeType`` dataclass + registry. Keep in sync with
+// python/src/yggdrasil/enums/mime_type.py; the two are one contract.
 
 export interface Magic {
   prefix: number[]; // byte values
   offset?: number;  // default 0 (prefix); tar's ``ustar`` sits at 257
 }
 
-export interface MimeType {
-  name: string;
-  value: string;
-  extensions: string[];
-  isCodec: boolean;
-  isTabular: boolean;
-  isBlob: boolean;
-  magics: Magic[];
-}
-
-interface Opts {
+export interface MimeOpts {
   ext?: string[];
   codec?: boolean;
   tabular?: boolean;
@@ -29,30 +15,114 @@ interface Opts {
   magic?: Magic[];
 }
 
-const _BY_NAME = new Map<string, MimeType>();
-const _BY_VALUE = new Map<string, MimeType>();
-const _BY_EXT = new Map<string, MimeType>();
-const _MAGICS: MimeType[] = [];
+// ascii string -> byte values
+const bytes = (s: string): number[] => Array.from(s, (c) => c.charCodeAt(0));
 
-function def(name: string, value: string, o: Opts = {}): MimeType {
-  const mt: MimeType = {
-    name,
-    value,
-    extensions: o.ext ?? [],
-    isCodec: !!o.codec,
-    isTabular: !!o.tabular,
-    isBlob: !!o.blob,
-    magics: o.magic ?? [],
-  };
-  _BY_NAME.set(name.toLowerCase(), mt);
-  _BY_VALUE.set(value.toLowerCase(), mt);
-  for (const e of mt.extensions) _BY_EXT.set(e.toLowerCase().replace(/^\.+/, ""), mt);
-  if (mt.magics.length) _MAGICS.push(mt);
-  return mt;
+/** A MIME descriptor + the global registry (matches Python's ``MimeType``). */
+export class MimeType {
+  readonly extensions: readonly string[];
+  readonly isCodec: boolean;
+  readonly isTabular: boolean;
+  readonly isBlob: boolean;
+  readonly magics: readonly Magic[];
+
+  constructor(readonly name: string, readonly value: string, opts: MimeOpts = {}) {
+    this.extensions = opts.ext ?? [];
+    this.isCodec = !!opts.codec;
+    this.isTabular = !!opts.tabular;
+    this.isBlob = !!opts.blob;
+    this.magics = opts.magic ?? [];
+  }
+
+  /** Primary (canonical) extension, if any. */
+  get extension(): string | undefined {
+    return this.extensions[0];
+  }
+
+  get isOctet(): boolean {
+    return this.value === "application/octet-stream";
+  }
+
+  toString(): string {
+    return this.value;
+  }
+
+  // -- registry ---------------------------------------------------------------
+
+  private static _byName = new Map<string, MimeType>();
+  private static _byValue = new Map<string, MimeType>();
+  private static _byExt = new Map<string, MimeType>();
+  private static _withMagic: MimeType[] = [];
+  private static _codecExts = new Set<string>();
+
+  /** Register and return a MimeType (mirrors Python ``MimeType.define``). */
+  static define(mt: MimeType): MimeType {
+    MimeType._byName.set(mt.name.toLowerCase(), mt);
+    MimeType._byValue.set(mt.value.toLowerCase(), mt);
+    for (const e of mt.extensions) {
+      const k = e.toLowerCase().replace(/^\.+/, "");
+      MimeType._byExt.set(k, mt);
+      if (mt.isCodec) MimeType._codecExts.add(k);
+    }
+    if (mt.magics.length) MimeType._withMagic.push(mt);
+    return mt;
+  }
+
+  /** Pure lookup by mime value or registered name. ``null`` on miss. */
+  static get(s: string): MimeType | null {
+    const k = s.trim().toLowerCase();
+    return MimeType._byValue.get(k) ?? MimeType._byName.get(k) ?? null;
+  }
+
+  /** Resolve a dotless extension. */
+  static fromExtension(ext: string): MimeType | null {
+    return MimeType._byExt.get(ext.toLowerCase().replace(/^\.+/, "")) ?? null;
+  }
+
+  /**
+   * Resolve a filename/path to its *format* MimeType, honoring a trailing
+   * compression wrapper (``trades.csv.gz`` -> CSV). ``codec`` is the wrapper.
+   */
+  static fromName(name: string): { mime: MimeType | null; codec: MimeType | null } {
+    const parts = name.toLowerCase().split(".");
+    if (parts.length < 2) return { mime: null, codec: null };
+    let ext = parts[parts.length - 1];
+    let codec: MimeType | null = null;
+    if (MimeType._codecExts.has(ext) && parts.length >= 3) {
+      codec = MimeType.fromExtension(ext);
+      ext = parts[parts.length - 2];
+    }
+    return { mime: MimeType.fromExtension(ext), codec };
+  }
+
+  /** Best-effort magic-byte sniff over a head buffer. */
+  static fromMagic(head: Uint8Array): MimeType | null {
+    if (!head.length) return null;
+    for (const mt of MimeType._withMagic) {
+      for (const mg of mt.magics) {
+        const off = mg.offset ?? 0;
+        if (off + mg.prefix.length > head.length) continue;
+        let ok = true;
+        for (let i = 0; i < mg.prefix.length; i++) {
+          if (head[off + i] !== mg.prefix[i]) { ok = false; break; }
+        }
+        if (ok) return mt;
+      }
+    }
+    const c0 = head[0];
+    if (c0 === 0x7b || c0 === 0x5b) return MimeTypes.JSON; // { or [
+    if (c0 === 0x3c) return MimeTypes.XML;                  // <
+    return null;
+  }
+
+  /** All registered MimeTypes (deduped, definition order). */
+  static all(): MimeType[] {
+    return Array.from(new Set(MimeType._byName.values()));
+  }
 }
 
-// bytes() helper — ascii string or array of byte values -> number[]
-const b = (s: string): number[] => Array.from(s, (c) => c.charCodeAt(0));
+const def = (name: string, value: string, opts?: MimeOpts) =>
+  MimeType.define(new MimeType(name, value, opts));
 
 export const MimeTypes = {
   // --- Compression / codecs ---
@@ -68,28 +138,28 @@ export const MimeTypes = {
   ZZIP: def("ZZIP", "application/x-compress", { ext: ["z"], codec: true }),
 
   // --- Archives & multi-file containers (blobs) ---
-  ZIP: def("ZIP", "application/zip", { ext: ["zip"], blob: true, magic: [{ prefix: b("PK\x03\x04") }] }),
-  ZIP_ENTRY: def("ZIP_ENTRY", "application/zip-entry", { ext: ["zipentry"], blob: true, magic: [{ prefix: b("PK\x01\x02") }] }),
-  TAR: def("TAR", "application/x-tar", { ext: ["tar"], blob: true, magic: [{ prefix: b("ustar"), offset: 257 }] }),
+  ZIP: def("ZIP", "application/zip", { ext: ["zip"], blob: true, magic: [{ prefix: bytes("PK\x03\x04") }] }),
+  ZIP_ENTRY: def("ZIP_ENTRY", "application/zip-entry", { ext: ["zipentry"], blob: true, magic: [{ prefix: bytes("PK\x01\x02") }] }),
+  TAR: def("TAR", "application/x-tar", { ext: ["tar"], blob: true, magic: [{ prefix: bytes("ustar"), offset: 257 }] }),
   SEVEN_ZIP: def("SEVEN_ZIP", "application/x-7z-compressed", { ext: ["7z"], blob: true, magic: [{ prefix: [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c] }] }),
-  RAR: def("RAR", "application/vnd.rar", { ext: ["rar"], blob: true, magic: [{ prefix: b("Rar!\x1a\x07") }] }),
+  RAR: def("RAR", "application/vnd.rar", { ext: ["rar"], blob: true, magic: [{ prefix: bytes("Rar!\x1a\x07") }] }),
 
   // --- Documents / office ---
-  PDF: def("PDF", "application/pdf", { ext: ["pdf"], blob: true, magic: [{ prefix: b("%PDF-") }] }),
+  PDF: def("PDF", "application/pdf", { ext: ["pdf"], blob: true, magic: [{ prefix: bytes("%PDF-") }] }),
   XLSX: def("XLSX", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", { ext: ["xlsx", "xls"], tabular: true }),
   DOCX: def("DOCX", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", { ext: ["docx"], blob: true }),
 
   // --- Embedded stores (single-file databases) ---
-  SQLITE: def("SQLITE", "application/vnd.sqlite3", { ext: ["db", "sqlite", "sqlite3"], blob: true, magic: [{ prefix: b("SQLite format 3\x00") }] }),
+  SQLITE: def("SQLITE", "application/vnd.sqlite3", { ext: ["db", "sqlite", "sqlite3"], blob: true, magic: [{ prefix: bytes("SQLite format 3\x00") }] }),
   HDF5: def("HDF5", "application/x-hdf5", { ext: ["h5", "hdf5", "he5"], blob: true, magic: [{ prefix: [0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a] }] }),
 
   // --- Columnar / analytics (tabular) ---
-  PARQUET: def("PARQUET", "application/vnd.apache.parquet", { ext: ["parquet", "pq"], tabular: true, magic: [{ prefix: b("PAR1") }] }),
+  PARQUET: def("PARQUET", "application/vnd.apache.parquet", { ext: ["parquet", "pq"], tabular: true, magic: [{ prefix: bytes("PAR1") }] }),
   PARQUET_DELTA: def("PARQUET_DELTA", "application/vnd.apache.parquet+delta", { tabular: true }),
-  ARROW_IPC: def("ARROW_IPC", "application/vnd.apache.arrow.file", { ext: ["ipc", "feather", "arrow", "arrows"], tabular: true, magic: [{ prefix: b("ARROW1") }] }),
+  ARROW_IPC: def("ARROW_IPC", "application/vnd.apache.arrow.file", { ext: ["ipc", "feather", "arrow", "arrows"], tabular: true, magic: [{ prefix: bytes("ARROW1") }] }),
   ARROW_STREAM: def("ARROW_STREAM", "application/vnd.apache.arrow.stream", { tabular: true }),
-  ORC: def("ORC", "application/vnd.apache.orc", { ext: ["orc"], tabular: true, magic: [{ prefix: b("ORC") }] }),
-  AVRO: def("AVRO", "application/vnd.apache.avro", { ext: ["avro"], tabular: true, magic: [{ prefix: b("Obj\x01") }] }),
+  ORC: def("ORC", "application/vnd.apache.orc", { ext: ["orc"], tabular: true, magic: [{ prefix: bytes("ORC") }] }),
+  AVRO: def("AVRO", "application/vnd.apache.avro", { ext: ["avro"], tabular: true, magic: [{ prefix: bytes("Obj\x01") }] }),
   ICEBERG: def("ICEBERG", "application/vnd.apache.iceberg", { ext: ["iceberg"], tabular: true }),
   DELTA: def("DELTA", "application/vnd.delta", { ext: ["delta", "deltatable"], tabular: true }),
 
@@ -114,26 +184,26 @@ export const MimeTypes = {
   CBOR: def("CBOR", "application/cbor", { ext: ["cbor"], blob: true }),
   BSON: def("BSON", "application/bson", { ext: ["bson"], blob: true }),
   PICKLE: def("PICKLE", "application/x-python-pickle", { ext: ["pkl", "pickle"], blob: true }),
-  NUMPY: def("NUMPY", "application/x-npy", { ext: ["npy"], blob: true, magic: [{ prefix: b("\x93NUMPY") }] }),
+  NUMPY: def("NUMPY", "application/x-npy", { ext: ["npy"], blob: true, magic: [{ prefix: bytes("\x93NUMPY") }] }),
   NUMPY_ARCHIVE: def("NUMPY_ARCHIVE", "application/x-npz", { ext: ["npz"], blob: true }),
 
   // --- Images (blobs) ---
   PNG: def("PNG", "image/png", { ext: ["png"], blob: true, magic: [{ prefix: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] }] }),
   JPEG: def("JPEG", "image/jpeg", { ext: ["jpg", "jpeg"], blob: true, magic: [{ prefix: [0xff, 0xd8, 0xff] }] }),
-  GIF: def("GIF", "image/gif", { ext: ["gif"], blob: true, magic: [{ prefix: b("GIF87a") }, { prefix: b("GIF89a") }] }),
+  GIF: def("GIF", "image/gif", { ext: ["gif"], blob: true, magic: [{ prefix: bytes("GIF87a") }, { prefix: bytes("GIF89a") }] }),
   WEBP: def("WEBP", "image/webp", { ext: ["webp"], blob: true }),
   TIFF: def("TIFF", "image/tiff", { ext: ["tif", "tiff"], blob: true, magic: [{ prefix: [0x49, 0x49, 0x2a, 0x00] }, { prefix: [0x4d, 0x4d, 0x00, 0x2a] }] }),
-  BMP: def("BMP", "image/bmp", { ext: ["bmp"], blob: true, magic: [{ prefix: b("BM") }] }),
+  BMP: def("BMP", "image/bmp", { ext: ["bmp"], blob: true, magic: [{ prefix: bytes("BM") }] }),
   SVG: def("SVG", "image/svg+xml", { ext: ["svg"], blob: true }),
   ICO: def("ICO", "image/x-icon", { ext: ["ico"], blob: true, magic: [{ prefix: [0x00, 0x00, 0x01, 0x00] }] }),
   AVIF: def("AVIF", "image/avif", { ext: ["avif"], blob: true }),
   HEIC: def("HEIC", "image/heic", { ext: ["heic", "heif"], blob: true }),
 
   // --- Audio (blobs) ---
-  MP3: def("MP3", "audio/mpeg", { ext: ["mp3"], blob: true, magic: [{ prefix: b("ID3") }] }),
+  MP3: def("MP3", "audio/mpeg", { ext: ["mp3"], blob: true, magic: [{ prefix: bytes("ID3") }] }),
   WAV: def("WAV", "audio/wav", { ext: ["wav"], blob: true }),
-  FLAC: def("FLAC", "audio/flac", { ext: ["flac"], blob: true, magic: [{ prefix: b("fLaC") }] }),
-  OGG: def("OGG", "audio/ogg", { ext: ["ogg", "oga"], blob: true, magic: [{ prefix: b("OggS") }] }),
+  FLAC: def("FLAC", "audio/flac", { ext: ["flac"], blob: true, magic: [{ prefix: bytes("fLaC") }] }),
+  OGG: def("OGG", "audio/ogg", { ext: ["ogg", "oga"], blob: true, magic: [{ prefix: bytes("OggS") }] }),
   AAC: def("AAC", "audio/aac", { ext: ["aac"], blob: true }),
 
   // --- Video (blobs) ---
@@ -151,64 +221,3 @@ export const MimeTypes = {
   // --- Fallback (generic opaque bytes) ---
   OCTET_STREAM: def("OCTET_STREAM", "application/octet-stream", { blob: true }),
 } as const;
-
-// Compression-wrapper extensions (mirrors the codec mimes above), used to strip
-// a trailing codec suffix so ``data.csv.gz`` resolves to its inner ``csv``.
-const CODEC_EXTS = new Set<string>();
-for (const mt of _BY_NAME.values()) if (mt.isCodec) for (const e of mt.extensions) CODEC_EXTS.add(e);
-
-// --- Resolution ---------------------------------------------------------------
-
-/** Pure lookup by mime value or registered name. ``null`` on miss. */
-export function get(s: string): MimeType | null {
-  const k = s.trim().toLowerCase();
-  return _BY_VALUE.get(k) ?? _BY_NAME.get(k) ?? null;
-}
-
-/** Resolve a dotless extension to its MimeType. */
-export function fromExtension(ext: string): MimeType | null {
-  return _BY_EXT.get(ext.toLowerCase().replace(/^\.+/, "")) ?? null;
-}
-
-/**
- * Resolve a filename / path to its *format* MimeType, honoring a trailing
- * compression wrapper (``trades.csv.gz`` -> CSV). Returns ``{ mime, codec }``;
- * ``codec`` is the wrapper MimeType when present.
- */
-export function fromName(name: string): { mime: MimeType | null; codec: MimeType | null } {
-  const parts = name.toLowerCase().split(".");
-  if (parts.length < 2) return { mime: null, codec: null };
-  let ext = parts[parts.length - 1];
-  let codec: MimeType | null = null;
-  if (CODEC_EXTS.has(ext) && parts.length >= 3) {
-    codec = fromExtension(ext);
-    ext = parts[parts.length - 2];
-  }
-  return { mime: fromExtension(ext), codec };
-}
-
-/** Best-effort magic-byte sniff over a head buffer. */
-export function fromMagic(head: Uint8Array): MimeType | null {
-  if (!head.length) return null;
-  for (const mt of _MAGICS) {
-    for (const mg of mt.magics) {
-      const off = mg.offset ?? 0;
-      if (off + mg.prefix.length > head.length) continue;
-      let ok = true;
-      for (let i = 0; i < mg.prefix.length; i++) {
-        if (head[off + i] !== mg.prefix[i]) { ok = false; break; }
-      }
-      if (ok) return mt;
-    }
-  }
-  // Structural text sniff for the magic-less common formats.
-  const c0 = head[0];
-  if (c0 === 0x7b || c0 === 0x5b) return MimeTypes.JSON; // { or [
-  if (c0 === 0x3c) return MimeTypes.XML;                  // <
-  return null;
-}
-
-/** All registered MimeTypes (deduped). */
-export function all(): MimeType[] {
-  return Array.from(new Set(_BY_NAME.values()));
-}

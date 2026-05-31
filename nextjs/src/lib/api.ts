@@ -27,7 +27,7 @@ import type {
 } from "./types";
 import { cachedGet, cachedPost, invalidate, TTL } from "./cache";
 import { downloadBlob } from "./format";
-import { mimeType } from "./yggdrasil/enums";
+import { MimeType, MimeTypes } from "./yggdrasil/enums";
 
 // ── Low-level fetch helper ─────────────────────────────────────────────────
 
@@ -474,10 +474,11 @@ export interface TabularPreview {
   truncated: boolean;
 }
 
-// Tabularness comes from the shared yggdrasil MIME registry (mirrors the
-// backend), honoring a trailing codec wrapper so `data.csv.gz` resolves to csv.
+// File-type predicates resolve through the shared yggdrasil MIME registry
+// (mirrors the backend), honoring a trailing codec wrapper so `data.csv.gz`
+// resolves to its inner `csv`.
 export function isTabularName(name: string): boolean {
-  return mimeType.fromName(name).mime?.isTabular ?? false;
+  return MimeType.fromName(name).mime?.isTabular ?? false;
 }
 
 export function getTabularInspect(path: string, node?: string): Promise<TabularInspect> {
@@ -506,8 +507,7 @@ export function tabularPreviewArrowUrl(path: string, limit = 200, offset = 0, no
 }
 
 export function isWorkbookName(name: string): boolean {
-  const idx = name.lastIndexOf(".");
-  return idx >= 0 && ["xlsx", "xls"].includes(name.slice(idx + 1).toLowerCase());
+  return MimeType.fromName(name).mime === MimeTypes.XLSX;
 }
 
 export interface WorkbookSheet { name: string; rows: number; cols: number; visible: boolean; }
