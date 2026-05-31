@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from .table.tables import Tables
     from .column.columns import Columns
     from .catalog.catalogs import Catalogs
+    from .external.location import ExternalLocations
     from .schema.schemas import Schemas
     from .volume.volumes import Volumes
     from .warehouse.service import Warehouses
@@ -1735,6 +1736,23 @@ class DatabricksClient(Singleton, URLBased):
 
         cached = Catalogs(client=self)
         self.__dict__["_catalogs"] = cached
+        return cached
+
+    @property
+    def external_locations(self) -> "ExternalLocations":
+        """Unity Catalog external-locations service for this client::
+
+            client.external_locations["raw_zone"]          # ExternalLocation
+            client.external_locations.list()               # Iterator[ExternalLocation]
+            client.external_locations.create(name, url, credential_name)
+        """
+        cached = self.__dict__.get("_external_locations")
+        if cached is not None:
+            return cached
+        from .external.location import ExternalLocations
+
+        cached = ExternalLocations(client=self)
+        self.__dict__["_external_locations"] = cached
         return cached
 
     @property
