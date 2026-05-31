@@ -128,7 +128,10 @@ class TestEnsure:
 
         kwargs = jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "[YGG][ASYNC] c.s.t"
-        assert kwargs["trigger"].file_arrival.url == "/Volumes/c/s/t/.sql/async/logs/"
+        fa = kwargs["trigger"].file_arrival
+        assert fa.url == "/Volumes/c/s/t/.sql/async/logs/"
+        assert fa.wait_after_last_change_seconds == 120        # 2-min buffering
+        assert fa.min_time_between_triggers_seconds == 120
         task = kwargs["tasks"][0]
         # ygg-job table-async-load <full_name> on the cluster
         assert task.python_wheel_task.package_name == "ygg"

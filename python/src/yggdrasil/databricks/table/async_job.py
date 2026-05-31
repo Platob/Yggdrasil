@@ -66,6 +66,11 @@ class TableJob(Flow):
     task_key: ClassVar[str] = "async-load"
     _NAME_PREFIX: ClassVar[str] = "[YGG][ASYNC]"
 
+    #: File-arrival buffering window (seconds): wait this long after the last
+    #: dropped log before firing, and fire at most this often — so a burst of
+    #: ``async_insert`` drops batches into one aggregated load. Default 2 min.
+    BUFFER_SECONDS: ClassVar[int] = 120
+
     def __init__(self, table: "Table") -> None:
         super().__init__(name=self.job_name(table))
         self.table = table
@@ -93,7 +98,12 @@ class TableJob(Flow):
         )
 
         return TriggerSettings(
-            file_arrival=FileArrivalTriggerConfiguration(url=self._trigger_url()),
+            file_arrival=FileArrivalTriggerConfiguration(
+                url=self._trigger_url(),
+                # 2-min buffering: batch a burst of drops into one load.
+                wait_after_last_change_seconds=self.BUFFER_SECONDS,
+                min_time_between_triggers_seconds=self.BUFFER_SECONDS,
+            ),
         )
 
     def _trigger_url(self) -> str:
