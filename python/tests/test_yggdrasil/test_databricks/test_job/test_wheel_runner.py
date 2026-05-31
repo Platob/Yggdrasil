@@ -69,41 +69,25 @@ class TestWheel:
         path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
         path.write_bytes.assert_called_once_with(b"WHEELBYTES")
 
-    def test_ensure_builds_from_source_and_uploads(self):
+    def test_build_wheel_runs_pip_wheel_with_extras_and_reqs(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "x-1.0-py3-none-any.whl").write_bytes(b"")
+        (out / "dep-2.0-py3-none-any.whl").write_bytes(b"")
+        with patch("yggdrasil.databricks.job.wheel.subprocess.run") as run, \
+             patch("yggdrasil.databricks.job.wheel.tempfile.mkdtemp", return_value=str(out)):
+            wheels = wheel.build_wheel(tmp_path / "mod.py", extras=["databricks"], requirements=["databricks-sdk"])
+        cmd = run.call_args.args[0]
+        assert "wheel" in cmd and f"{tmp_path.resolve()}[databricks]" in cmd
+        assert "databricks-sdk" in cmd                  # extra requirement bundled too
+        assert sorted(w.name for w in wheels) == ["dep-2.0-py3-none-any.whl", "x-1.0-py3-none-any.whl"]
+
+    def test_ensure_builds_with_deps_and_uploads_all(self):
         client = MagicMock()
-        built = Path("/tmp/x-1.0-py3-none-any.whl")
+        built = [Path("/tmp/x-1.0-py3-none-any.whl"), Path("/tmp/dep-2.0-py3-none-any.whl")]
         with patch("yggdrasil.databricks.job.wheel.build_wheel", return_value=built) as bw, \
-             patch("yggdrasil.databricks.job.wheel.upload_wheel",
-                   return_value="/Workspace/Shared/.ygg/whl/job/x-1.0-py3-none-any.whl") as up:
-            dest = wheel.ensure_wheel(client, "/proj/src/mod.py", workspace_dir="/Workspace/Shared/.ygg/whl/job")
-        bw.assert_called_once_with("/proj/src/mod.py")     # isolated build of that project
-        up.assert_called_once_with(client, built, workspace_dir="/Workspace/Shared/.ygg/whl/job")
-        assert dest.endswith("x-1.0-py3-none-any.whl")
-
-    def test_ensure_requirement_reuses_when_version_present(self):
-        # precheck: pinned version's wheel already in the lib folder → no download
-        client = MagicMock()
-        present = MagicMock()
-        present.exists.return_value = True
-        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
-             patch("yggdrasil.databricks.job.wheel.download_wheel") as dw:
-            DP.from_.return_value = present
-            dest = wheel.ensure_requirement_wheel(client, "databricks-sdk==1.2.3")
-        assert dest == "/Workspace/Shared/.ygg/whl/databricks-sdk/databricks_sdk-1.2.3-py3-none-any.whl"
-        dw.assert_not_called()                         # precheck hit, no build/upload
-
-    def test_ensure_requirement_downloads_when_absent(self):
-        client = MagicMock()
-        downloaded = Path("/tmp/databricks_sdk-9.9-py3-none-any.whl")
-        missing = MagicMock()
-        missing.exists.return_value = False
-        with patch("yggdrasil.databricks.job.wheel.latest_version", return_value=None), \
-             patch("yggdrasil.databricks.job.wheel.download_wheel", return_value=downloaded) as dw, \
-             patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
-             patch("yggdrasil.databricks.job.wheel.upload_wheel",
-                   return_value="/Workspace/Shared/.ygg/whl/databricks-sdk/databricks_sdk-9.9-py3-none-any.whl") as up:
-            DP.from_.return_value = missing
-            dest = wheel.ensure_requirement_wheel(client, "databricks-sdk")
-        dw.assert_called_once_with("databricks-sdk")
-        up.assert_called_once_with(client, downloaded, workspace_dir="/Workspace/Shared/.ygg/whl/databricks-sdk")
-        assert dest.endswith("databricks_sdk-9.9-py3-none-any.whl")
+             patch("yggdrasil.databricks.job.wheel.upload_wheel", side_effect=lambda c, w, *, workspace_dir: f"{workspace_dir}/{w.name}"):
+            dests = wheel.ensure_wheel(client, "/proj/mod.py", workspace_dir="/ws/job", extras=["databricks"])
+        bw.assert_called_once_with("/proj/mod.py", extras=["databricks"], requirements=())
+        assert dests == ["/ws/job/x-1.0-py3-none-any.whl", "/ws/job/dep-2.0-py3-none-any.whl"]

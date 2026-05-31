@@ -167,19 +167,19 @@ class TestFlow:
 
         demo.build_wheel = True                       # opt in (air-gapped)
         client = MagicMock()
-        wheel = "/Workspace/Shared/.ygg/whl/ygg-demo/ygg-9.9-py3-none-any.whl"
-        sdk = "/Workspace/Shared/.ygg/whl/databricks-sdk/databricks_sdk-1.2.3-py3-none-any.whl"
-        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheel) as ew, \
-             patch("yggdrasil.databricks.job.wheel.ensure_requirement_wheel", return_value=sdk) as erw:
+        wheels = [
+            "/Workspace/Shared/.ygg/whl/ygg-demo/ygg-9.9-py3-none-any.whl",
+            "/Workspace/Shared/.ygg/whl/ygg-demo/databricks_sdk-1.2.3-py3-none-any.whl",
+        ]
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheels) as ew:
             demo.deploy(client)
 
-        # isolated build of the flow's own project, uploaded under the job folder
+        # isolated build of the flow's own project + deps, uploaded under the job folder
         assert ew.call_count == 1
         assert ew.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/.ygg/whl/ygg-demo"
-        assert ew.call_args.args[0] is client            # (client, source, ...)
-        erw.assert_called_once_with(client, "databricks-sdk")
+        assert ew.call_args.kwargs["requirements"] == ("databricks-sdk",)
         kwargs = client.jobs.create_or_update.call_args.kwargs
-        assert kwargs["environments"][0].spec.dependencies == [wheel, sdk]
+        assert kwargs["environments"][0].spec.dependencies == wheels   # all shipped wheels
 
 
 def test_class_based_flow_overrides_run():
