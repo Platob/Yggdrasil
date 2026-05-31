@@ -35,6 +35,7 @@ import {
 import TabularDisplay, { type QuerySpec } from "@/components/TabularDisplay";
 import PlanGraphView from "@/components/PlanGraph";
 import SagaMonitor from "@/components/SagaMonitor";
+import FinancePanel from "@/components/FinancePanel";
 
 const DIALECTS = ["postgres", "sqlite", "mysql", "databricks"];
 
@@ -61,7 +62,7 @@ const objOf = (t: string) => OBJ[t] ?? OBJ.OTHER;
 export default function SagaPage() {
   const [nodes, setNodes] = useState<{ node_id: string; self: boolean }[]>([]);
   const [node, setNode] = useState<string | undefined>(undefined);
-  const [view, setView] = useState<"catalog" | "monitor">("catalog");
+  const [view, setView] = useState<"catalog" | "monitor" | "finance">("catalog");
 
   const [catalogs, setCatalogs] = useState<CatalogEntry[]>([]);
   const [openCat, setOpenCat] = useState<Set<string>>(new Set());
@@ -367,6 +368,10 @@ export default function SagaPage() {
               className={`px-3 py-1.5 font-semibold ${view === "monitor" ? "bg-frost/20 text-frost" : "text-muted hover:text-foreground"}`}>
               Monitor
             </button>
+            <button onClick={() => setView("finance")}
+              className={`px-3 py-1.5 font-semibold ${view === "finance" ? "bg-frost/20 text-frost" : "text-muted hover:text-foreground"}`}>
+              Finance
+            </button>
           </div>
           <select
             value={node ?? "__local"}
@@ -394,6 +399,8 @@ export default function SagaPage() {
           setRanQuery(queryFor(q));
           setView("catalog");
         }} />
+      ) : view === "finance" ? (
+        <FinancePanel node={node} />
       ) : (
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-3 min-h-0">
         {/* ── Catalog tree ── */}

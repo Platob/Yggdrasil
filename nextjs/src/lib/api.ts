@@ -566,6 +566,12 @@ export function describe(path: string, node?: string): Promise<DescribeResult> {
   return jsonFetch(`/api/v2/analysis/describe?path=${encodeURIComponent(path)}${nodeParam(node)}`);
 }
 
+export interface FinanceMetrics {
+  total_return: number | null; cagr: number | null;
+  ann_return: number | null; ann_volatility: number | null;
+  sharpe: number | null; sortino: number | null;
+  max_drawdown: number | null; calmar: number | null;
+}
 export interface FinanceResult {
   column: string;
   window: number;
@@ -575,13 +581,16 @@ export interface FinanceResult {
   cum_return: (number | null)[];
   roll_mean: (number | null)[];
   roll_vol: (number | null)[];
+  ema: (number | null)[];
+  drawdown: (number | null)[];
+  metrics: FinanceMetrics;
   truncated: boolean;
 }
 
 export function finance(
   path: string,
   column: string,
-  opts: { order_by?: string; window?: number; limit?: number; node?: string } = {},
+  opts: { order_by?: string; window?: number; limit?: number; periods_per_year?: number; risk_free?: number; node?: string } = {},
 ): Promise<FinanceResult> {
   const { node, ...body } = opts;
   return jsonFetch(`/api/v2/analysis/finance${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
