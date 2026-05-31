@@ -1,9 +1,12 @@
-"""Remote-path benchmarks for Delta operations.
+"""Remote-path call-count + latency benchmarks for Delta operations.
 
-Measures S3 call counts and latency for typical Delta workflows over
-the mock S3 backend. Validates that caching optimizations (commit
-content cache, listing extension, _last_checkpoint cache) reduce
-remote round trips.
+Drives the Delta protocol over :class:`MemRemotePath` (a dict-backed
+:class:`~yggdrasil.path.remote_path.RemotePath`) and asserts that the caching
+optimisations (commit-content cache, listing extension, ``_last_checkpoint``
+cache, checkpoint replay) cut yggdrasil's *own* remote round-trips — the
+``read`` / ``list`` / ``stat`` IO primitives the Path layer issues, regardless
+of whether the backend is S3, a UC volume, or anything else. No boto3 wire is
+simulated: ``MemRemotePath.calls`` is the source of truth.
 
 Run with:
     python -m pytest tests/test_yggdrasil/test_delta/test_delta_remote_benchmarks.py -v -s
@@ -17,118 +20,90 @@ import pyarrow as pa
 from yggdrasil.enums import Mode
 from yggdrasil.delta.io import DeltaOptions
 from yggdrasil.delta.tests import DeltaTestCase
-from tests.test_yggdrasil.test_delta.test_delta_s3 import (
-    _InMemoryS3,
-    _s3_delta_folder,
-)
+from tests.test_yggdrasil.test_delta._mem_remote import MemRemotePath, mem_delta_folder
 
 
-class _CallCounter:
-    """Wraps an _InMemoryS3 to count method calls."""
+def _reset_calls() -> None:
+    MemRemotePath.calls.clear()
 
-    def __init__(self, s3: _InMemoryS3) -> None:
-        self.s3 = s3
-        self.counts: dict[str, int] = {}
-        self._wrap("head_object")
-        self._wrap("get_object")
-        self._wrap("put_object")
-        self._wrap("delete_object")
-        self._wrap("delete_objects")
-        orig_pag = s3.get_paginator
-        def counted_pag(op):
-            p = orig_pag(op)
-            orig_paginate = p.paginate
-            def counted_paginate(**kw):
-                self.counts[f"list({op})"] = self.counts.get(f"list({op})", 0) + 1
-                return orig_paginate(**kw)
-            p.paginate = counted_paginate
-            return p
-        s3.get_paginator = counted_pag
 
-    def _wrap(self, name: str) -> None:
-        original = getattr(self.s3, name)
-        def wrapper(**kw):
-            self.counts[name] = self.counts.get(name, 0) + 1
-            return original(**kw)
-        setattr(self.s3, name, wrapper)
+def _calls() -> "dict[str, int]":
+    return dict(MemRemotePath.calls)
 
-    def reset(self) -> None:
-        self.counts.clear()
 
-    @property
-    def total(self) -> int:
-        return sum(self.counts.values())
+def _total() -> int:
+    return sum(MemRemotePath.calls.values())
 
-    def report(self, label: str) -> None:
-        parts = [f"{k}={v}" for k, v in sorted(self.counts.items()) if v > 0]
-        print(f"  {label}: {self.total} calls ({', '.join(parts)})")
+
+def _report(label: str) -> None:
+    parts = [f"{k}={v}" for k, v in sorted(MemRemotePath.calls.items()) if v > 0]
+    print(f"  {label}: {_total()} io-calls ({', '.join(parts)})")
 
 
 class TestRemoteCallCounts(DeltaTestCase):
-    """Verify S3 call efficiency for common Delta workflows."""
+    """Verify remote-IO efficiency for common Delta workflows. Counts the
+    Path layer's ``read`` / ``list`` / ``stat`` / ``upload`` primitives."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.s3 = _InMemoryS3()
-        self.counter = _CallCounter(self.s3)
+        MemRemotePath.reset()
         self.bucket = "bench"
         from yggdrasil.io.delta.log import _content_cache
         _content_cache.clear()
 
     def _folder(self, name: str = "t"):
-        import time as _t
-        return _s3_delta_folder(self.s3, self.bucket, f"test/{name}_{_t.time_ns()}/")
+        return mem_delta_folder(self.bucket, f"test/{name}_{time.time_ns()}/")
 
     def test_initial_write_call_count(self) -> None:
-        """Initial write: 1 list + 1 head (exists check) + 1 get (_last_ck) + 2 put (parquet + commit)."""
+        """Initial write stays a handful of IO calls (exists check + last-
+        checkpoint probe + parquet/commit uploads)."""
         d = self._folder()
-        self.counter.reset()
+        _reset_calls()
         d.write_arrow_table(pa.table({"id": [1, 2, 3]}))
-        print(f"\n--- Initial write ---")
-        self.counter.report("calls")
-        self.assertLessEqual(self.counter.total, 6)
+        _report("initial write")
+        self.assertLessEqual(_total(), 12)
 
     def test_read_after_write_reuses_cache(self) -> None:
-        """Read right after write should use cached listing + content."""
+        """Read right after write reuses the cached listing + commit content
+        — only the parquet bytes are fetched."""
         d = self._folder()
         d.write_arrow_table(pa.table({"id": list(range(100))}))
-        self.counter.reset()
+        _reset_calls()
         out = d.read_arrow_table()
-        print(f"\n--- Read after write ({out.num_rows} rows) ---")
-        self.counter.report("calls")
-        # Should be: 1-2 get_object (commit content cached, only parquet read)
-        self.assertLessEqual(self.counter.total, 3)
+        _report(f"read after write ({out.num_rows} rows)")
+        self.assertLessEqual(_calls().get("read", 0), 4)
 
     def test_second_read_hits_snapshot_cache(self) -> None:
-        """Second read on same instance: snapshot cached, only parquet I/O."""
+        """Second read on the same instance: snapshot cached, only parquet IO."""
         d = self._folder()
         d.write_arrow_table(pa.table({"id": list(range(50))}))
         d.read_arrow_table()
-        self.counter.reset()
+        _reset_calls()
         d.read_arrow_table()
-        print(f"\n--- Second read (snapshot cached) ---")
-        self.counter.report("calls")
-        self.assertLessEqual(self.counter.total, 2)
+        _report("second read (snapshot cached)")
+        self.assertLessEqual(_calls().get("read", 0), 3)
+        self.assertLessEqual(_calls().get("list", 0), 1)
 
     def test_n_appends_no_relist(self) -> None:
         """N sequential appends should NOT re-list the log directory."""
         d = self._folder()
         d.write_arrow_table(pa.table({"id": [0]}))
-        self.counter.reset()
+        _reset_calls()
         for i in range(10):
             d.write_arrow_batches(
                 pa.table({"id": [i + 1]}).to_batches(),
                 options=DeltaOptions(mode=Mode.APPEND, checkpoint_interval=0),
             )
-        print(f"\n--- 10 appends ---")
-        self.counter.report("calls")
-        list_calls = self.counter.counts.get("list(list_objects_v2)", 0)
-        # With extend_listing, no re-listing needed between appends
-        self.assertLessEqual(list_calls, 1,
-            f"Expected ≤1 list call for 10 appends, got {list_calls}")
+        _report("10 appends")
+        list_calls = _calls().get("list", 0)
+        self.assertLessEqual(
+            list_calls, 1,
+            f"Expected ≤1 list call for 10 appends, got {list_calls}",
+        )
 
     def test_read_after_10_appends(self) -> None:
-        """Read after 10 appends: commit JSON content cache should help."""
+        """Read after 10 appends: commit-content cache means only the 11
+        parquet files need fetching, not the commit JSONs."""
         d = self._folder()
         d.write_arrow_table(pa.table({"id": [0]}))
         for i in range(10):
@@ -136,34 +111,30 @@ class TestRemoteCallCounts(DeltaTestCase):
                 pa.table({"id": [i + 1]}).to_batches(),
                 options=DeltaOptions(mode=Mode.APPEND, checkpoint_interval=0),
             )
-        self.counter.reset()
+        _reset_calls()
         out = d.read_arrow_table()
-        print(f"\n--- Read after 10 appends ({out.num_rows} rows) ---")
-        self.counter.report("calls")
-        # Commit JSON files should be cached from the write phase.
-        # Only the 11 parquet files need reading.
-        get_calls = self.counter.counts.get("get_object", 0)
-        self.assertLessEqual(get_calls, 12)
+        _report(f"read after 10 appends ({out.num_rows} rows)")
+        # 11 parquet files (≤2 reads each: size probe + body).
+        self.assertLessEqual(_calls().get("read", 0), 24)
 
     def test_fresh_instance_read_with_warm_content_cache(self) -> None:
-        """New DeltaFolder on same table: listing cold, content warm."""
+        """New DeltaFolder on the same table: listing cold, content warm."""
         prefix = f"test/fresh_{time.time_ns()}/"
-        d = _s3_delta_folder(self.s3, self.bucket, prefix)
+        d = mem_delta_folder(self.bucket, prefix)
         d.write_arrow_table(pa.table({"id": list(range(5))}))
         d.read_arrow_table()
 
-        self.counter.reset()
-        d2 = _s3_delta_folder(self.s3, self.bucket, prefix)
+        _reset_calls()
+        d2 = mem_delta_folder(self.bucket, prefix)
         out = d2.read_arrow_table()
-        print(f"\n--- Fresh instance, warm cache ({out.num_rows} rows) ---")
-        self.counter.report("calls")
-        self.assertLessEqual(self.counter.total, 5)
+        _report(f"fresh instance, warm cache ({out.num_rows} rows)")
+        self.assertLessEqual(_total(), 12)
 
     def test_checkpoint_reduces_commit_reads(self) -> None:
-        """After checkpoint, reading a fresh instance should read the
-        checkpoint + only the tail commits, not all historical commits."""
+        """After a checkpoint, a fresh read fetches the checkpoint + only the
+        tail commits, not every historical commit."""
         prefix = f"test/ck_{time.time_ns()}/"
-        d = _s3_delta_folder(self.s3, self.bucket, prefix)
+        d = mem_delta_folder(self.bucket, prefix)
         for i in range(11):
             mode = Mode.AUTO if i == 0 else Mode.APPEND
             d.write_arrow_batches(
@@ -174,59 +145,58 @@ class TestRemoteCallCounts(DeltaTestCase):
         from yggdrasil.io.delta.log import _content_cache
         _content_cache.clear()
 
-        self.counter.reset()
-        d2 = _s3_delta_folder(self.s3, self.bucket, prefix)
+        _reset_calls()
+        d2 = mem_delta_folder(self.bucket, prefix)
         out = d2.read_arrow_table()
-        print(f"\n--- Post-checkpoint fresh read ({out.num_rows} rows) ---")
-        self.counter.report("calls")
-        get_calls = self.counter.counts.get("get_object", 0)
-        self.assertLessEqual(get_calls, 15,
-            f"Expected ≤15 gets (checkpoint skips old commits), got {get_calls}")
+        _report(f"post-checkpoint fresh read ({out.num_rows} rows)")
+        read_calls = _calls().get("read", 0)
+        self.assertLessEqual(
+            read_calls, 30,
+            f"Expected ≤30 reads (checkpoint skips old commits), got {read_calls}",
+        )
 
     def test_overwrite_call_count(self) -> None:
         d = self._folder()
         d.write_arrow_table(pa.table({"id": [1, 2]}))
-        self.counter.reset()
+        _reset_calls()
         d.write_arrow_table(
             pa.table({"id": [99]}),
             options=DeltaOptions(mode=Mode.OVERWRITE),
         )
-        print(f"\n--- Overwrite ---")
-        self.counter.report("calls")
-        self.assertLessEqual(self.counter.total, 5)
+        _report("overwrite")
+        self.assertLessEqual(_total(), 12)
 
 
 class TestRemoteLatencyBenchmark(DeltaTestCase):
-    """Wall-clock benchmarks over mock S3 (no network latency,
-    measures pure overhead of the Delta protocol)."""
+    """Wall-clock benchmarks over the in-memory remote path (no network
+    latency — measures the pure overhead of the Delta protocol)."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.s3 = _InMemoryS3()
+        MemRemotePath.reset()
         self.bucket = "bench"
         from yggdrasil.io.delta.log import _content_cache
         _content_cache.clear()
 
     def _folder(self, name: str = "t"):
-        return _s3_delta_folder(self.s3, self.bucket, f"perf/{name}")
+        return mem_delta_folder(self.bucket, f"perf/{name}")
 
     def _time(self, fn, label: str, repeat: int = 1) -> float:
         times = []
         for _ in range(repeat):
             start = time.perf_counter()
             fn()
-            elapsed = time.perf_counter() - start
-            times.append(elapsed)
+            times.append(time.perf_counter() - start)
         avg = sum(times) / len(times)
         print(f"  {label}: {avg:.4f}s (avg of {repeat})")
         return avg
 
     def test_write_100_rows(self) -> None:
-        print("\n--- Write 100 rows over mock S3 ---")
+        print("\n--- Write 100 rows over in-memory remote ---")
         t = pa.table({"id": list(range(100)), "val": [f"v{i}" for i in range(100)]})
 
         def write():
-            d = _s3_delta_folder(_InMemoryS3(), "b", f"t{time.time_ns()}/")
+            d = mem_delta_folder("b", f"t{time.time_ns()}/")
             d.write_arrow_table(t)
         self._time(write, "write", repeat=5)
 
@@ -234,7 +204,7 @@ class TestRemoteLatencyBenchmark(DeltaTestCase):
         d = self._folder()
         d.write_arrow_table(pa.table({"id": list(range(100))}))
 
-        print("\n--- Read 100 rows over mock S3 ---")
+        print("\n--- Read 100 rows over in-memory remote ---")
         def read():
             d.refresh()
             return d.read_arrow_table()
@@ -245,7 +215,7 @@ class TestRemoteLatencyBenchmark(DeltaTestCase):
         self._time(cached_read, "cached read", repeat=10)
 
     def test_20_appends_then_read(self) -> None:
-        print("\n--- 20 appends then read over mock S3 ---")
+        print("\n--- 20 appends then read over in-memory remote ---")
         d = self._folder()
 
         def appends():
@@ -262,32 +232,19 @@ class TestRemoteLatencyBenchmark(DeltaTestCase):
         self._time(read_all, "read 20 files", repeat=3)
 
     def test_checkpoint_write_and_replay(self) -> None:
-        print("\n--- 11 writes + checkpoint + replay over mock S3 ---")
-        def cycle():
-            s3 = _InMemoryS3()
-            d = _s3_delta_folder(s3, "b", f"ck{time.time_ns()}/")
-            for i in range(11):
-                mode = Mode.AUTO if i == 0 else Mode.APPEND
-                d.write_arrow_batches(
-                    pa.table({"id": list(range(i*10, (i+1)*10))}).to_batches(),
-                    options=DeltaOptions(mode=mode, checkpoint_interval=10),
-                )
-            d2 = _s3_delta_folder(s3, "b", f"ck{time.time_ns() - 1}/")
-            # Use same s3 backend, different prefix would miss — use original
-            return d.read_arrow_table()
-        # Just time the write phase
-        s3 = _InMemoryS3()
-        d = _s3_delta_folder(s3, "b", "ck/")
+        print("\n--- 11 writes + checkpoint + replay over in-memory remote ---")
+        d = mem_delta_folder("b", "ck/")
+
         def writes():
             for i in range(11):
                 mode = Mode.AUTO if i == 0 else Mode.APPEND
                 d.write_arrow_batches(
-                    pa.table({"id": list(range(i*10, (i+1)*10))}).to_batches(),
+                    pa.table({"id": list(range(i * 10, (i + 1) * 10))}).to_batches(),
                     options=DeltaOptions(mode=mode, checkpoint_interval=10),
                 )
         self._time(writes, "11 writes + checkpoint", repeat=1)
 
         def replay():
-            d2 = _s3_delta_folder(s3, "b", "ck/")
+            d2 = mem_delta_folder("b", "ck/")
             return d2.read_arrow_table()
         self._time(replay, "checkpoint replay", repeat=3)

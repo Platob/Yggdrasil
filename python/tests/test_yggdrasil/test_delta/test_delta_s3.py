@@ -1,194 +1,45 @@
-"""S3-backed Delta integration tests.
+"""Remote-backed Delta integration tests.
 
 Two test suites:
 
-1. **Mock S3** — injects a mock boto3 client into S3Path, runs the
-   full DeltaFolder read/write protocol over simulated S3. No network
-   required. Validates that the Delta log, checkpoint, DV, and parquet
-   read paths all work correctly through the RemotePath abstraction.
+1. **In-memory remote** — runs the full DeltaFolder read/write protocol over
+   :class:`MemRemotePath`, a dict-backed
+   :class:`~yggdrasil.path.remote_path.RemotePath`. No network and no boto3
+   simulation: the test drives yggdrasil's *own* IO contract (the same
+   ``_read_mv`` / ``_upload`` / ``_ls`` surface S3Path implements), which is
+   enough to validate the Delta log, checkpoint, DV, and parquet read paths
+   through the RemotePath abstraction — the way ``VolumePath`` is unit-tested
+   over a staged local tree rather than the cloud SDK wire.
 
-2. **Real S3** (``@pytest.mark.integration``) — exercises the same
-   operations against an actual S3 bucket. Requires:
+2. **Real S3** (``@pytest.mark.integration``) — exercises the same operations
+   against an actual S3 bucket via the real ``S3Path``. Requires:
    - ``AWS_ACCESS_KEY_ID`` + ``AWS_SECRET_ACCESS_KEY`` env vars
    - ``YGG_TEST_S3_BUCKET`` env var (bucket name)
    - ``YGG_TEST_S3_PREFIX`` env var (optional, defaults to ``ygg-delta-test/``)
 """
 from __future__ import annotations
 
-import io
 import os
 import time
 import unittest
 from typing import Any
-from unittest.mock import MagicMock
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 from yggdrasil.enums import Mode
 from yggdrasil.delta.io import DeltaOptions
 from yggdrasil.delta.tests import DeltaTestCase
 
+from tests.test_yggdrasil.test_delta._mem_remote import (
+    MemRemotePath,
+    mem_delta_folder,
+)
+
 
 # ---------------------------------------------------------------------------
-# Mock S3 infrastructure
+# In-memory remote tests
 # ---------------------------------------------------------------------------
-
-
-class _InMemoryS3:
-    """In-memory S3 backend that tracks objects as a dict of bytes.
-
-    Provides the subset of the boto3 S3 client interface that
-    S3Path uses: head_object, get_object, put_object, delete_object,
-    delete_objects, and list_objects_v2 via a paginator.
-    """
-
-    def __init__(self) -> None:
-        self.objects: dict[str, bytes] = {}
-
-    def head_object(self, *, Bucket: str, Key: str, **kw: Any) -> dict:
-        full = f"{Bucket}/{Key}"
-        if full not in self.objects:
-            raise self._not_found(Key)
-        return {
-            "ContentLength": len(self.objects[full]),
-            "LastModified": None,
-        }
-
-    def get_object(self, *, Bucket: str, Key: str, **kw: Any) -> dict:
-        full = f"{Bucket}/{Key}"
-        if full not in self.objects:
-            raise self._not_found(Key)
-        data = self.objects[full]
-        range_header = kw.get("Range")
-        if range_header:
-            start, end = self._parse_range(range_header, len(data))
-            data = data[start : end + 1]
-            return {
-                "Body": _Body(data),
-                "ContentLength": len(data),
-                "ContentRange": f"bytes {start}-{end}/{len(self.objects[full])}",
-            }
-        return {
-            "Body": _Body(data),
-            "ContentLength": len(data),
-        }
-
-    def put_object(self, *, Bucket: str, Key: str, Body: bytes, **kw: Any) -> dict:
-        full = f"{Bucket}/{Key}"
-        self.objects[full] = bytes(Body)
-        return {}
-
-    def upload_fileobj(
-        self, Fileobj: Any, Bucket: str, Key: str, **kw: Any
-    ) -> None:
-        # boto3's managed-transfer upload: ``upload_fileobj(Fileobj,
-        # Bucket, Key, ExtraArgs=, Callback=, Config=)``. S3Path streams
-        # large writes through this instead of ``put_object``, so the mock
-        # has to honor it too — read the file object to EOF and store it.
-        self.objects[f"{Bucket}/{Key}"] = Fileobj.read()
-
-    def delete_object(self, *, Bucket: str, Key: str, **kw: Any) -> dict:
-        full = f"{Bucket}/{Key}"
-        self.objects.pop(full, None)
-        return {}
-
-    def delete_objects(self, *, Bucket: str, Delete: dict, **kw: Any) -> dict:
-        for obj in Delete.get("Objects", []):
-            full = f"{Bucket}/{obj['Key']}"
-            self.objects.pop(full, None)
-        return {}
-
-    def get_paginator(self, operation: str) -> "_Paginator":
-        return _Paginator(self, operation)
-
-    def _not_found(self, key: str) -> Exception:
-        exc = Exception(f"NoSuchKey: {key}")
-        exc.response = {  # type: ignore[attr-defined]
-            "Error": {"Code": "NoSuchKey", "Message": f"Key {key} not found"},
-            "ResponseMetadata": {"HTTPStatusCode": 404},
-        }
-        return exc
-
-    @staticmethod
-    def _parse_range(header: str, total: int) -> tuple[int, int]:
-        prefix = "bytes="
-        if header.startswith(prefix):
-            header = header[len(prefix):]
-        parts = header.split("-")
-        start = int(parts[0]) if parts[0] else 0
-        end = int(parts[1]) if parts[1] else total - 1
-        return start, min(end, total - 1)
-
-
-class _Body:
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-        self.closed = False
-
-    def read(self) -> bytes:
-        return self._data
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _Paginator:
-    def __init__(self, s3: _InMemoryS3, operation: str) -> None:
-        self.s3 = s3
-        self.operation = operation
-
-    def paginate(self, *, Bucket: str, Prefix: str = "", Delimiter: str = "", **kw: Any):
-        if self.operation != "list_objects_v2":
-            return iter([])
-
-        matching: list[dict] = []
-        common_prefixes: set[str] = set()
-
-        for full_key, data in sorted(self.s3.objects.items()):
-            if not full_key.startswith(f"{Bucket}/"):
-                continue
-            key = full_key[len(Bucket) + 1 :]
-            if not key.startswith(Prefix):
-                continue
-            suffix = key[len(Prefix) :]
-            if Delimiter and Delimiter in suffix:
-                cp = Prefix + suffix[: suffix.index(Delimiter) + len(Delimiter)]
-                common_prefixes.add(cp)
-            else:
-                matching.append({
-                    "Key": key,
-                    "Size": len(data),
-                    "LastModified": None,
-                })
-
-        page: dict[str, Any] = {}
-        if matching:
-            page["Contents"] = matching
-        if common_prefixes:
-            page["CommonPrefixes"] = [{"Prefix": p} for p in sorted(common_prefixes)]
-        return iter([page] if (matching or common_prefixes) else [])
-
-
-def _make_s3_service(mock_s3: _InMemoryS3) -> MagicMock:
-    """Build a mock S3Service wired to an in-memory S3 backend."""
-    from yggdrasil.aws.fs.service import S3Service
-
-    svc = MagicMock(spec=S3Service)
-    svc.boto_client = mock_s3
-    svc.ls_cache = {}
-    return svc
-
-
-def _s3_delta_folder(mock_s3: _InMemoryS3, bucket: str, prefix: str):
-    """Create a DeltaFolder backed by in-memory S3."""
-    from yggdrasil.aws.fs.path import S3Path
-    from yggdrasil.io.delta.delta_folder import DeltaFolder
-
-    svc = _make_s3_service(mock_s3)
-    root = S3Path(f"s3://{bucket}/{prefix}", service=svc)
-    return DeltaFolder(path=root)
 
 
 # ---------------------------------------------------------------------------
@@ -201,12 +52,13 @@ class TestDeltaOnMockS3(DeltaTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.s3 = _InMemoryS3()
+        MemRemotePath.reset()
+        self.store = MemRemotePath.objects
         self.bucket = "test-bucket"
         self.prefix = f"delta-test-{int(time.time_ns())}/"
 
     def delta_s3(self, name: str = "table") -> Any:
-        return _s3_delta_folder(self.s3, self.bucket, f"{self.prefix}{name}")
+        return mem_delta_folder(self.bucket, f"{self.prefix}{name}")
 
     def test_write_and_read_unpartitioned(self) -> None:
         d = self.delta_s3()
@@ -268,8 +120,7 @@ class TestDeltaOnMockS3(DeltaTestCase):
                 ),
             )
 
-        from yggdrasil.io.delta.delta_folder import DeltaFolder
-        d2 = _s3_delta_folder(self.s3, self.bucket, f"{self.prefix}table")
+        d2 = mem_delta_folder(self.bucket, f"{self.prefix}table")
         out = d2.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), list(range(6)))
 
@@ -285,7 +136,7 @@ class TestDeltaOnMockS3(DeltaTestCase):
                     checkpoint_kind="v2",
                 ),
             )
-        d2 = _s3_delta_folder(self.s3, self.bucket, f"{self.prefix}table")
+        d2 = mem_delta_folder(self.bucket, f"{self.prefix}table")
         out = d2.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), list(range(6)))
 
@@ -343,7 +194,7 @@ class TestDeltaOnMockS3(DeltaTestCase):
         # Manually write version 1 commit to simulate concurrent writer
         log_prefix = f"{self.prefix}table/_delta_log/"
         key = f"{self.bucket}/{log_prefix}00000000000000000001.json"
-        self.s3.objects[key] = b'{"commitInfo":{"timestamp":0}}\n'
+        self.store[key] = b'{"commitInfo":{"timestamp":0}}\n'
 
         from yggdrasil.io.delta.delta_folder import ConcurrentDeltaCommitError
         d.write_arrow_batches(
@@ -370,7 +221,7 @@ class TestDeltaOnMockS3(DeltaTestCase):
         prefix = f"{self.prefix}layout_test/"
         s3_keys = [
             k[len(self.bucket) + 1 :]
-            for k in self.s3.objects
+            for k in self.store
             if k.startswith(f"{self.bucket}/{prefix}")
         ]
         log_keys = [k for k in s3_keys if "/_delta_log/" in k]
