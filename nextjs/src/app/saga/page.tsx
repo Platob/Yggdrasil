@@ -34,6 +34,7 @@ import {
 } from "@/lib/api";
 import TabularDisplay, { type QuerySpec } from "@/components/TabularDisplay";
 import PlanGraphView from "@/components/PlanGraph";
+import SagaMonitor from "@/components/SagaMonitor";
 
 const DIALECTS = ["postgres", "sqlite", "mysql", "databricks"];
 
@@ -60,6 +61,7 @@ const objOf = (t: string) => OBJ[t] ?? OBJ.OTHER;
 export default function SagaPage() {
   const [nodes, setNodes] = useState<{ node_id: string; self: boolean }[]>([]);
   const [node, setNode] = useState<string | undefined>(undefined);
+  const [view, setView] = useState<"catalog" | "monitor">("catalog");
 
   const [catalogs, setCatalogs] = useState<CatalogEntry[]>([]);
   const [openCat, setOpenCat] = useState<Set<string>>(new Set());
@@ -355,6 +357,17 @@ export default function SagaPage() {
           <p className="text-[11px] text-muted">Distributed data catalog — register sources, query across the mesh.</p>
         </div>
         <div className="flex items-center gap-2">
+          {/* View toggle: the lazy catalog tree + SQL editor, or the monitor. */}
+          <div className="flex items-center rounded-lg border border-white/[0.08] overflow-hidden text-xs">
+            <button onClick={() => setView("catalog")}
+              className={`px-3 py-1.5 font-semibold ${view === "catalog" ? "bg-frost/20 text-frost" : "text-muted hover:text-foreground"}`}>
+              Catalog
+            </button>
+            <button onClick={() => setView("monitor")}
+              className={`px-3 py-1.5 font-semibold ${view === "monitor" ? "bg-frost/20 text-frost" : "text-muted hover:text-foreground"}`}>
+              Monitor
+            </button>
+          </div>
           <select
             value={node ?? "__local"}
             onChange={(e) => setNode(e.target.value === "__local" ? undefined : e.target.value)}
@@ -372,6 +385,16 @@ export default function SagaPage() {
         </div>
       </div>
 
+      {view === "monitor" ? (
+        <SagaMonitor node={node} onQuery={(ref) => {
+          // Click-to-query from the monitor: drop a ready SELECT into the editor
+          // and flip back to the catalog view so the user lands on the result.
+          const q = `SELECT * FROM '${ref}' LIMIT 100`;
+          setSql(q);
+          setRanQuery(queryFor(q));
+          setView("catalog");
+        }} />
+      ) : (
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-3 min-h-0">
         {/* ── Catalog tree ── */}
         <div className="glass-card p-3 overflow-auto min-h-0">
@@ -655,6 +678,7 @@ export default function SagaPage() {
           </div>
         </div>
       </div>
+      )}
 
       {preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6"

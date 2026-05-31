@@ -35,6 +35,7 @@ from ..schemas.saga import (
     ActivityResponse,
     ReplicateRequest,
     ReplicateResult,
+    SagaOverview,
     SearchResponse,
     SchemaCreate,
     SchemaListResponse,
@@ -251,6 +252,16 @@ async def list_mount_dir(name: str, subpath: str = "", node: str | None = None,
     so the UI can query/preview them inline."""
     remote = await _remote(network, saga, node, f"/mount/{name}/ls", params={"subpath": subpath})
     return remote if remote is not None else await saga.list_mount(name, subpath)
+
+
+@router.get("/overview", response_model=SagaOverview)
+async def overview(node: str | None = None,
+                   saga: SagaService = Depends(get_saga_service),
+                   network: NetworkService = Depends(get_network_service)):
+    """Catalog-wide monitoring rollup: counts by kind, totals, activity feed,
+    and largest/busiest leaderboards — drives the Saga management dashboard."""
+    remote = await _remote(network, saga, node, "/overview")
+    return remote if remote is not None else await saga.overview()
 
 
 @router.get("/search", response_model=SearchResponse)

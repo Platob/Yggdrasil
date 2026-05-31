@@ -49,7 +49,7 @@ import urllib.request
 from typing import Any, Iterator
 
 __all__ = [
-    "sql", "mount", "register", "table", "catalog", "forecast", "finance",
+    "sql", "mount", "register", "table", "catalog", "forecast", "finance", "overview",
     "mounts", "SqlResult", "Mount", "Catalog",
 ]
 
@@ -218,6 +218,13 @@ def mounts(node_url: str | None = None) -> list[Mount]:
     resp = _request("GET", f"{_base_url(node_url)}/api/v2/saga/mount")
     return [Mount(m["name"], m["target"], m.get("kind", "local"), node_url)
             for m in resp.get("mounts", [])]
+
+
+def overview(node_url: str | None = None) -> dict:
+    """Catalog-wide monitoring rollup: asset counts by kind, totals (rows,
+    bytes, ops), a recent-activity feed across all assets, and largest/busiest
+    leaderboards. The one call behind the Saga management dashboard."""
+    return _request("GET", f"{_base_url(node_url)}/api/v2/saga/overview")
 
 
 # ---------------------------------------------------------------------------

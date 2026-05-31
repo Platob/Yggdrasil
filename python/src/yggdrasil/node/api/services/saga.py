@@ -62,6 +62,8 @@ from ..schemas.saga import (
     MountNode,
     MountResponse,
     MountUpdate,
+    SagaOverview,
+    TopAsset,
     SchemaCreate,
     SchemaEntry,
     SchemaListResponse,
@@ -601,6 +603,75 @@ class SagaService:
             node_id=self.settings.node_id, asset=full, op_counts=counts,
             total_ops=len(rows), last_op_at=(rows[0]["ts"] if rows else None),
             daily=[per_day[d] for d in days], recent=recent,
+        )
+
+    async def overview(self) -> "SagaOverview":
+        """Catalog-wide rollup for the monitoring dashboard — counts by kind,
+        totals, recent ops across all assets, and largest/busiest leaderboards.
+        One call so the dashboard never fans out per asset."""
+        with self._lock:
+            tables = list(self._tables.values())
+            mounts = list(self._mounts.values())
+            catalog_count = len(self._catalogs)
+            schema_count = len(self._schemas)
+
+        by_type: dict[str, int] = {}
+        total_rows = total_bytes = 0
+        for t in tables:
+            by_type[t.object_type] = by_type.get(t.object_type, 0) + 1
+            total_rows += t.statistics.row_count or 0
+            total_bytes += t.statistics.size_bytes or 0
+        mount_kinds: dict[str, int] = {}
+        for m in mounts:
+            mount_kinds[m.kind] = mount_kinds.get(m.kind, 0) + 1
+
+        # Cross-asset activity feed + per-asset op tallies (one log sweep).
+        recent_rows = await run_in_threadpool(partial(self._log.recent_all, limit=40))
+        op_counts: dict[str, int] = {}
+        per_day: dict[str, int] = {}
+        ops_per_asset: dict[str, int] = {}
+        last_per_asset: dict[str, str] = {}
+        all_rows = await run_in_threadpool(partial(self._log.recent_all, limit=5000))
+        for r in all_rows:
+            op_counts[r["op"]] = op_counts.get(r["op"], 0) + 1
+            day = (r.get("ts") or "")[:10]
+            if day:
+                per_day[day] = per_day.get(day, 0) + 1
+            a = (r.get("asset") or "").replace("_", ".")  # safe-name → best-effort full
+            ops_per_asset[a] = ops_per_asset.get(a, 0) + 1
+            if a and a not in last_per_asset:
+                last_per_asset[a] = r.get("ts")
+        days = sorted(per_day)[-14:]
+
+        def _top(t: TableEntry) -> TopAsset:
+            # Match the log's safe-name folding so op tallies line up.
+            safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in t.full_name)
+            return TopAsset(
+                full_name=t.full_name, object_type=t.object_type,
+                catalog=t.catalog, schema=t.schema_name,
+                rows=t.statistics.row_count, size_bytes=t.statistics.size_bytes,
+                ops=ops_per_asset.get(t.full_name, ops_per_asset.get(safe, 0)),
+                last_op_at=last_per_asset.get(t.full_name),
+            )
+        tops = [_top(t) for t in tables]
+        largest = sorted([a for a in tops if a.size_bytes],
+                         key=lambda a: a.size_bytes or 0, reverse=True)[:5]
+        busiest = sorted([a for a in tops if a.ops],
+                         key=lambda a: a.ops, reverse=True)[:5]
+
+        return SagaOverview(
+            node_id=self.settings.node_id,
+            catalog_count=catalog_count, schema_count=schema_count,
+            table_count=by_type.get("TABLE", 0), view_count=by_type.get("VIEW", 0),
+            forecast_count=by_type.get("FORECAST", 0),
+            other_count=sum(v for k, v in by_type.items()
+                            if k not in ("TABLE", "VIEW", "FORECAST")),
+            mount_count=len(mounts), mount_kinds=mount_kinds,
+            total_rows=total_rows, total_bytes=total_bytes, total_ops=len(all_rows),
+            op_counts=op_counts, daily=[per_day[d] for d in days],
+            recent=[OpLogEntry(**{k: _json_safe(v) for k, v in r.items() if k != "asset"})
+                    for r in recent_rows],
+            largest=largest, busiest=busiest, mounts=mounts,
         )
 
     async def list_tables(self, catalog: str, schema: str) -> TableListResponse:

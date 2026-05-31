@@ -116,6 +116,36 @@ class OpLog:
         out = out.take(pc.sort_indices(out, sort_keys=[("ts", "descending")]))
         return out.slice(0, limit)
 
+    def recent_all(self, *, limit: int = 50) -> list[dict]:
+        """Most-recent ops across *every* asset — the monitoring feed.
+
+        Each returned row carries an extra ``asset`` key recovered from its log
+        subtree, so the dashboard can show "what changed across the catalog"
+        without asking per asset. Newest-first, capped at ``limit``.
+        """
+        if not self._root.exists():
+            return []
+        parts = sorted(self._root.rglob("*.arrows"), reverse=True)
+        rows: list[dict] = []
+        for p in parts:
+            # Layout is <root>/<safe_asset>/<day>/<hour>/<file>.arrows — the asset
+            # dir is three levels up from the file.
+            try:
+                asset = p.relative_to(self._root).parts[0]
+            except ValueError:
+                asset = ""
+            try:
+                t = ipc.open_stream(pa.memory_map(str(p), "r")).read_all()
+            except Exception:
+                continue
+            for r in t.to_pylist():
+                r["asset"] = asset
+                rows.append(r)
+            if len(rows) >= limit * 3:  # over-read a little, then sort + slice
+                break
+        rows.sort(key=lambda r: r.get("ts") or "", reverse=True)
+        return rows[:limit]
+
     def purge(self, asset: str) -> None:
         base = self._root / _safe(asset)
         if base.exists():

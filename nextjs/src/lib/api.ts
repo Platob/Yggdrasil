@@ -944,6 +944,53 @@ export function getActivity(catalog: string, schema: string, name: string, node?
   return jsonFetch(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}/activity${q}`);
 }
 
+// ── Mounts (named aliases over a path/URL or a live database) ───────────────
+
+export interface MountEntry {
+  id: number; name: string; target: string; comment: string;
+  read_only: boolean; kind: string; node_id: string;
+  properties: Record<string, string>; created_at: string; updated_at: string;
+}
+export interface MountNode { name: string; path: string; is_dir: boolean; size: number; is_tabular: boolean; }
+export interface MountListing { mount: string; subpath: string; target: string; entries: MountNode[]; truncated: boolean; }
+
+export function getMounts(node?: string, fresh = false): Promise<{ node_id: string; mounts: MountEntry[] }> {
+  return cachedGet<{ node_id: string; mounts: MountEntry[] }>(`/api/v2/saga/mount${sagaNode(node)}`, TTL.DEFINITION, jsonFetch, fresh);
+}
+export function listMount(name: string, subpath = "", node?: string): Promise<MountListing> {
+  const q = `subpath=${encodeURIComponent(subpath)}${node ? `&node=${encodeURIComponent(node)}` : ""}`;
+  return jsonFetch(`/api/v2/saga/mount/${encodeURIComponent(name)}/ls?${q}`);
+}
+export async function createMount(body: { name: string; target: string; comment?: string; read_only?: boolean }): Promise<{ mount: MountEntry }> {
+  const r = await jsonFetch<{ mount: MountEntry }>("/api/v2/saga/mount", { method: "POST", body: JSON.stringify(body) });
+  invalidate("saga/mount");
+  return r;
+}
+export async function deleteMount(name: string): Promise<{ mount: MountEntry }> {
+  const r = await jsonFetch<{ mount: MountEntry }>(`/api/v2/saga/mount/${encodeURIComponent(name)}`, { method: "DELETE" });
+  invalidate("saga/mount");
+  return r;
+}
+
+// ── Overview (catalog-wide monitoring rollup) ───────────────────────────────
+
+export interface TopAsset {
+  full_name: string; object_type: string; catalog: string; schema: string;
+  rows: number | null; size_bytes: number | null; ops: number; last_op_at: string | null;
+}
+export interface SagaOverview {
+  node_id: string;
+  catalog_count: number; schema_count: number; table_count: number;
+  view_count: number; forecast_count: number; other_count: number;
+  mount_count: number; mount_kinds: Record<string, number>;
+  total_rows: number; total_bytes: number; total_ops: number;
+  op_counts: Record<string, number>; daily: number[]; recent: OpLogEntry[];
+  largest: TopAsset[]; busiest: TopAsset[]; mounts: MountEntry[];
+}
+export function getSagaOverview(node?: string, fresh = false): Promise<SagaOverview> {
+  return cachedGet<SagaOverview>(`/api/v2/saga/overview${sagaNode(node)}`, TTL.VITAL, jsonFetch, fresh);
+}
+
 export async function updateTable(catalog: string, schema: string, name: string, body: Partial<{ source_url: string; object_type: string; definition: string; comment: string; table_type: string; node: string | null; properties: Record<string, string> }>): Promise<{ table: TableEntry }> {
   const r = await jsonFetch<{ table: TableEntry }>(`/api/v2/saga/catalog/${encodeURIComponent(catalog)}/schema/${encodeURIComponent(schema)}/table/${encodeURIComponent(name)}`, { method: "PATCH", body: JSON.stringify(body) });
   invalidate("saga/catalog");

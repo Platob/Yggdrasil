@@ -582,3 +582,43 @@ class ActivityResponse(StrictModel):
     # Per-day op counts (most recent last) for a sparkline.
     daily: list[int] = Field(default_factory=list)
     recent: list[OpLogEntry] = Field(default_factory=list)
+
+
+# -- overview (the catalog-wide monitoring dashboard) -----------------------
+
+class TopAsset(StrictModel):
+    """A heaviest/most-active asset row for the overview leaderboards."""
+    full_name: str
+    object_type: ObjectType = "TABLE"
+    catalog: str = ""
+    schema_: str = Field(default="", alias="schema")
+    rows: int | None = None
+    size_bytes: int | None = None
+    ops: int = 0
+    last_op_at: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class SagaOverview(StrictModel):
+    """One-call rollup of every Saga asset for the management dashboard:
+    counts by kind, totals, per-day activity, recent ops across all assets, and
+    leaderboards (largest tables, busiest assets)."""
+    node_id: str
+    catalog_count: int = 0
+    schema_count: int = 0
+    table_count: int = 0
+    view_count: int = 0
+    forecast_count: int = 0
+    other_count: int = 0
+    mount_count: int = 0
+    mount_kinds: dict[str, int] = Field(default_factory=dict)
+    total_rows: int = 0
+    total_bytes: int = 0
+    total_ops: int = 0
+    op_counts: dict[str, int] = Field(default_factory=dict)
+    daily: list[int] = Field(default_factory=list)        # last 14 days, ops/day
+    recent: list[OpLogEntry] = Field(default_factory=list)  # newest ops, any asset
+    largest: list[TopAsset] = Field(default_factory=list)   # by size_bytes
+    busiest: list[TopAsset] = Field(default_factory=list)   # by op count
+    mounts: list["MountEntry"] = Field(default_factory=list)
