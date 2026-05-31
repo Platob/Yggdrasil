@@ -110,23 +110,29 @@ class TestEnsure:
         jobs.create_or_update.return_value = created
         t.staging_volume.path.return_value.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
 
-        tj = TableJob(t)
-        assert tj.ensure() is tj
+        wheel = "/Workspace/Shared/.ygg/jobs/ygg-1.2.3-py3-none-any.whl"
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheel) as ew:
+            tj = TableJob(t)
+            assert tj.ensure() is tj
         assert tj.job is created
+        ew.assert_called_once_with(t.client)               # built + uploaded the wheel
         # the watched logs dir is created so the trigger URL is valid
         t.staging_volume.path.return_value.mkdir.assert_called_with(
             parents=True, exist_ok=True
         )
 
         kwargs = jobs.create_or_update.call_args.kwargs
-        assert kwargs["name"] == "ygg-async-insert-c.s.t"
+        assert kwargs["name"] == "[YGG][ASYNC] c.s.t"
         assert kwargs["trigger"].file_arrival.url == "/Volumes/c/s/t/.sql/async/logs/"
         task = kwargs["tasks"][0]
-        assert task.python_wheel_task.parameters == ["c.s.t"]
-        # serverless v5 + ygg[databricks] by default
+        # ygg-job table-async-load <full_name> on the cluster
+        assert task.python_wheel_task.package_name == "ygg"
+        assert task.python_wheel_task.entry_point == "ygg-job"
+        assert task.python_wheel_task.parameters == ["table-async-load", "c.s.t"]
+        # serverless v5, dependency = the uploaded wheel (not a direct package)
         env = kwargs["environments"][0]
         assert env.spec.environment_version == "5"
-        assert env.spec.dependencies == ["ygg[databricks]"]
+        assert env.spec.dependencies == [wheel]
         assert task.environment_key == env.environment_key
 
     def test_ensure_is_noop_when_already_deployed(self):

@@ -63,9 +63,8 @@ class TableJob(Flow):
     :attr:`Table.async_job`.
     """
 
-    entry_point: ClassVar[str] = "ygg-table-async-load"
     task_key: ClassVar[str] = "async-load"
-    _NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
+    _NAME_PREFIX: ClassVar[str] = "[YGG][ASYNC]"
 
     def __init__(self, table: "Table") -> None:
         super().__init__(name=self.job_name(table))
@@ -75,7 +74,7 @@ class TableJob(Flow):
     # -- identity / paths -----------------------------------------------
     @staticmethod
     def job_name(table: "Table") -> str:
-        return f"{TableJob._NAME_PREFIX}-{table.catalog_name}.{table.schema_name}.{table.table_name}"
+        return f"{TableJob._NAME_PREFIX} {table.catalog_name}.{table.schema_name}.{table.table_name}"
 
     @staticmethod
     def logs_path(table: "Table") -> "VolumePath":
@@ -84,8 +83,8 @@ class TableJob(Flow):
 
     # -- Flow deploy surface (name set in __init__) ---------------------
     def parameters(self) -> list[str]:
-        # The wheel param is the table's full name, not the live handle.
-        return [self.table.full_name()]
+        # ``ygg-job table-async-load <full_name>`` on the cluster.
+        return ["table-async-load", self.table.full_name()]
 
     def trigger(self) -> Any:
         from databricks.sdk.service.jobs import (

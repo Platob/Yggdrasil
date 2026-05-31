@@ -183,16 +183,23 @@ class Task(_Runnable, Generic[T]):
 class Flow(_Runnable):
     """A callable flow; deploys as a Databricks **serverless** job."""
 
-    package_name: str = "yggdrasil"
+    package_name: str = "ygg"
     entry_point: str = "ygg-job"
     task_key: str = "run"
 
-    #: Serverless environment (default: **v5** + ``ygg[databricks]``). Set
-    #: :attr:`serverless` ``False`` to deploy without one.
+    #: Serverless environment version (default **v5**).
     serverless: bool = True
     environment_key: str = "default"
     environment_version: str = "5"
+
+    #: Fallback dependency when not shipping a built wheel (see
+    #: :attr:`build_wheel`) — e.g. ``ygg`` from an index.
     dependencies: "tuple[str, ...]" = ("ygg[databricks]",)
+
+    #: Build the ygg wheel from source on :meth:`deploy` and ship *that* (not a
+    #: ``ygg[databricks]`` index install) as the serverless dependency. Uploaded
+    #: to ``/Workspace/Shared/.ygg/jobs/`` and referenced by path.
+    build_wheel: bool = True
 
     def __init__(
         self,
@@ -212,6 +219,7 @@ class Flow(_Runnable):
         self.retries = retries
         self.retry_delay_seconds = retry_delay_seconds
         self._parameters = tuple(parameters)
+        self._wheel_path: Optional[str] = None
         if entry_point is not None:
             self.entry_point = entry_point
         if package_name is not None:
@@ -229,8 +237,16 @@ class Flow(_Runnable):
         ``None``. Function-built flows carry the ``@flow(trigger=...)`` value."""
         return self._trigger
 
+    def effective_dependencies(self) -> list[str]:
+        """The serverless dependencies — the uploaded wheel once
+        :meth:`deploy` has shipped it, else :attr:`dependencies`."""
+        if getattr(self, "_wheel_path", None):
+            return [self._wheel_path]
+        return list(self.dependencies)
+
     def environments(self) -> Optional[list]:
-        """Serverless environment list (v5 + :attr:`dependencies`), or ``None``."""
+        """Serverless environment list (v5 + :meth:`effective_dependencies`),
+        or ``None``."""
         if not self.serverless:
             return None
         from databricks.sdk.service.compute import Environment
@@ -241,7 +257,7 @@ class Flow(_Runnable):
                 environment_key=self.environment_key,
                 spec=Environment(
                     environment_version=self.environment_version,
-                    dependencies=list(self.dependencies),
+                    dependencies=self.effective_dependencies(),
                 ),
             )
         ]
@@ -277,7 +293,14 @@ class Flow(_Runnable):
         """Get-or-create the live :class:`Job` from :meth:`definition`.
 
         Takes a :class:`DatabricksClient` and resolves its jobs service
-        (``client.jobs``) — no need to reach for the service yourself."""
+        (``client.jobs``). When :attr:`build_wheel` is set (default), builds the
+        ygg wheel from source and uploads it to ``/Workspace/Shared/.ygg/jobs/``
+        first, shipping that wheel as the serverless dependency instead of an
+        index ``ygg[databricks]`` install."""
+        if self.build_wheel and self.serverless:
+            from yggdrasil.databricks.job.wheel import ensure_wheel
+
+            self._wheel_path = ensure_wheel(client)
         spec = self.definition()
         return client.jobs.create_or_update(name=spec.pop("name"), **spec)
 

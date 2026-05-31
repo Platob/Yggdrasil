@@ -142,17 +142,25 @@ class TestFlow:
 
         assert etl.definition()["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
 
-    def test_deploy_with_client_resolves_jobs_service(self):
+    def test_deploy_builds_wheel_and_ships_it(self):
+        from unittest.mock import patch
+
         @flow(name="ygg-demo", parameters=["a"])
         def demo(x):
             ...
 
         client = MagicMock()                         # deploy takes a client
-        deployed = demo.deploy(client)
+        wheel = "/Workspace/Shared/.ygg/jobs/ygg-9.9-py3-none-any.whl"
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheel) as ew:
+            deployed = demo.deploy(client)
+
+        ew.assert_called_once_with(client)            # built + uploaded the wheel
         client.jobs.create_or_update.assert_called_once()
         kwargs = client.jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-demo"
         assert kwargs["tasks"][0].python_wheel_task.parameters == ["a"]
+        # the shipped wheel is the serverless dependency (not ygg[databricks])
+        assert kwargs["environments"][0].spec.dependencies == [wheel]
         assert deployed is client.jobs.create_or_update.return_value
 
 
