@@ -113,3 +113,42 @@ def test_databrickspath_posix_prefix_dispatches_to_location(service):
     el = DatabricksPath.from_("/ExternalLocations/raw_zone", service=service)
     assert isinstance(el, ExternalLocation)
     assert el.name == "raw_zone"
+
+
+def test_s3_url_at_location_root_resolves_to_location(service):
+    from yggdrasil.databricks.path import DatabricksPath
+
+    el = DatabricksPath.from_("s3://my-bucket/raw/", service=service)
+    assert isinstance(el, ExternalLocation)
+    assert el.name == "raw_zone"
+
+
+def test_s3_url_child_resolves_to_inner_storage_path(service):
+    from yggdrasil.aws.fs.path import S3Path
+    from yggdrasil.databricks.path import DatabricksPath
+
+    child = DatabricksPath.from_("s3://my-bucket/raw/sub/f.parquet", service=service)
+    assert isinstance(child, S3Path)            # left the wrapper
+    assert child.bucket == "my-bucket" and child.key == "raw/sub/f.parquet"
+
+
+def test_s3_url_without_matching_location_falls_back_to_plain_s3(service):
+    from yggdrasil.aws.fs.path import S3Path
+    from yggdrasil.databricks.path import DatabricksPath
+
+    p = DatabricksPath.from_("s3://unregistered-bucket/x.csv", service=service)
+    assert type(p) is S3Path                    # not a Databricks surface
+
+
+def test_find_url_longest_prefix_wins(service, store):
+    from databricks.sdk.service.catalog import ExternalLocationInfo
+
+    store["deep"] = ExternalLocationInfo(
+        name="deep", url="s3://my-bucket/raw/deep/", credential_name="prod-cred",
+    )
+    # A child under the nested location resolves to that (more specific) one.
+    assert service.find_url("s3://my-bucket/raw/deep/x.csv").name == "deep"
+    # A child only under the outer one resolves to it.
+    assert service.find_url("s3://my-bucket/raw/other.csv").name == "raw_zone"
+    # Nothing covers a different bucket.
+    assert service.find_url("s3://elsewhere/x") is None

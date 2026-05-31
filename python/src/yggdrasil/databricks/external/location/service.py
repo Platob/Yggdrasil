@@ -57,6 +57,25 @@ class ExternalLocations(SecurableMapping):
 
     location = resolve  # ergonomic alias
 
+    def find_url(self, url: Any) -> "Optional[ExternalLocation]":
+        """Find the external location whose storage URL *contains* *url*.
+
+        Longest-prefix match across every location (so nested locations
+        resolve to the most specific one): a location at ``s3://b/raw/``
+        matches both ``s3://b/raw/`` (its root) and any child below it
+        (``s3://b/raw/sub/f.parquet``). Returns ``None`` when no location
+        contains *url*."""
+        target = str(url).rstrip("/")
+        best: Optional[ExternalLocationInfo] = None
+        best_len = -1
+        for info in self._infos():
+            base = (info.url or "").rstrip("/")
+            if base and (target == base or target.startswith(base + "/")) and len(base) > best_len:
+                best, best_len = info, len(base)
+        if best is None:
+            return None
+        return ExternalLocation(best.name, service=self, info=best)
+
     # -- SecurableMapping hooks ----------------------------------------
     def _infos(self) -> Iterator[ExternalLocationInfo]:
         return self._api.list()

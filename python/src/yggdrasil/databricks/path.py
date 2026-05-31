@@ -577,6 +577,13 @@ class DatabricksPath(RemotePath, DatabricksResource):
             return instance
 
         target, normalized = _resolve_databricks_subclass(data=data, url=url)
+        # ``s3://`` URLs aren't a Databricks namespace — they resolve
+        # through Unity Catalog external locations (credential lookup),
+        # which needs the client. Route to ``from_url`` (it returns an
+        # ExternalLocation / inner storage path, neither a DatabricksPath,
+        # so Python skips the auto-``__init__`` pass).
+        if normalized is not None and (normalized.scheme or "").lower() in cls._S3_SCHEMES:
+            return cls.from_url(normalized, **kwargs)
         # Byte-shaped Path subclasses (DBFSPath / VolumePath /
         # WorkspacePath) accept ``url=`` straight through ``__init__``,
         # so we can hand control back to Python — their auto-fired
@@ -740,6 +747,22 @@ class DatabricksPath(RemotePath, DatabricksResource):
         explore = _coerce_explore_url(u)
         if explore is not None:
             u = explore
+        # ``s3://`` URLs resolve against Unity Catalog external locations:
+        # the location whose storage URL contains ``u`` lends its
+        # credentials. The location root returns the ExternalLocation; a
+        # child returns the credential-backed inner storage path.
+        if (u.scheme or "").lower() in cls._S3_SCHEMES:
+            resolved = cls._resolve_external_location(
+                u, service=kwargs.get("service"), client=kwargs.get("client"),
+            )
+            if resolved is not None:
+                return resolved
+            # No external location covers it — an ``s3://`` URL is not a
+            # Databricks namespace, so fall back to a plain (ambient-creds)
+            # S3 path rather than mis-dispatching to a DBFS surface.
+            from yggdrasil.aws.fs.path import S3Path
+
+            return S3Path.from_(u)
         if cls is not DatabricksPath:
             return cls(url=u, **kwargs)
 
@@ -747,6 +770,54 @@ class DatabricksPath(RemotePath, DatabricksResource):
         if normalized is None:
             normalized = u
         return target.from_url(normalized, **kwargs)
+
+    #: Cloud-storage schemes resolved through external locations.
+    _S3_SCHEMES: ClassVar[Tuple[str, ...]] = ("s3", "s3a", "s3n")
+
+    @classmethod
+    def _resolve_external_location(
+        cls,
+        u: "URL",
+        *,
+        service: Any = None,
+        client: Any = None,
+    ) -> "Any | None":
+        """Resolve an ``s3://`` URL against the workspace's external locations.
+
+        Builds the :class:`ExternalLocations` service from whatever binding
+        is available (an :class:`ExternalLocations` passed as *service*, a
+        *client*, the *service*'s client, else the process-current client)
+        and asks :meth:`ExternalLocations.find_url` for the location whose
+        storage URL contains *u*. When *u* is the location root the
+        :class:`ExternalLocation` itself is returned; for a child the
+        credential-backed inner storage path is built from it. Returns
+        ``None`` when nothing (no binding, or no matching location) resolves
+        — the caller then falls back to a plain path."""
+        from yggdrasil.databricks.external.location.service import ExternalLocations
+
+        if isinstance(service, ExternalLocations):
+            locations = service
+        elif client is not None:
+            locations = ExternalLocations(client=client)
+        elif service is not None and getattr(service, "client", None) is not None:
+            locations = ExternalLocations(client=service.client)
+        else:
+            from . import client as _client_mod
+
+            current = _client_mod.CURRENT_BASE_CLIENT
+            if current is None:
+                return None
+            locations = ExternalLocations(client=current)
+
+        el = locations.find_url(u)
+        if el is None:
+            return None
+        base = (el.url or "").rstrip("/")
+        target = str(u).rstrip("/")
+        if target == base:
+            return el  # location root → the ExternalLocation itself
+        # Child → the credential-backed inner storage path (an S3Path).
+        return el.joinpath(target[len(base):].lstrip("/"))
 
     @classmethod
     def from_(cls, obj: Any, **kwargs: Any) -> "DatabricksPath":
