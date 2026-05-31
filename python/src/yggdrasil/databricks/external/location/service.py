@@ -1,62 +1,85 @@
 """Collection-level service for Unity Catalog **external locations**.
 
 Wraps the Databricks ``external_locations`` workspace API
-(https://docs.databricks.com/api/workspace/externallocations) — list / get /
-create / update / delete — and hands back :class:`ExternalLocation` resources.
-Reach it as ``client.external_locations``.
+(https://docs.databricks.com/api/workspace/externallocations) as a dict-like
+:class:`~yggdrasil.databricks.securable.SecurableMapping`::
+
+    client.external_locations["raw"]                          # fetch (KeyError if absent)
+    client.external_locations["raw"] = {"url": u, "credential_name": c}  # create / update
+    del client.external_locations["raw"]                      # delete
+    "raw" in client.external_locations                        # exists
+    list(client.external_locations)                           # names
+
+External locations are identified by name (no id), so :meth:`location` /
+:meth:`resolve` take a handle or a name.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any, Iterator, Optional
 
-from databricks.sdk.errors import NotFound
 from databricks.sdk.service.catalog import ExternalLocationInfo
 
-from yggdrasil.databricks.client import DatabricksService
 from yggdrasil.databricks.external.location.resource import ExternalLocation
+from yggdrasil.databricks.securable import SecurableMapping
 
 __all__ = ["ExternalLocations"]
 
 logger = logging.getLogger(__name__)
 
 
-class ExternalLocations(DatabricksService):
-    """Service over a workspace's Unity Catalog external locations."""
+class ExternalLocations(SecurableMapping):
+    """Dict-like service over a workspace's Unity Catalog external locations."""
 
     @property
     def _api(self):
         return self.client.workspace_client().external_locations
 
-    # -- reads ----------------------------------------------------------
+    # -- flexible finder ------------------------------------------------
+    def resolve(
+        self,
+        obj: "ExternalLocation | str | None" = None,
+        *,
+        name: Optional[str] = None,
+    ) -> ExternalLocation:
+        """Coerce to a lazy :class:`ExternalLocation` handle (a handle is
+        returned as-is; a string is the name)."""
+        if obj is not None:
+            if isinstance(obj, ExternalLocation):
+                return obj
+            if isinstance(obj, str):
+                name = obj
+            else:
+                raise TypeError(f"expected ExternalLocation | str | None, got {type(obj).__name__}")
+        if name is None:
+            raise ValueError("provide an ExternalLocation or a name")
+        return ExternalLocation(name, service=self)
+
+    location = resolve  # ergonomic alias
+
+    # -- SecurableMapping hooks ----------------------------------------
+    def _infos(self) -> Iterator[ExternalLocationInfo]:
+        return self._api.list()
+
     def get_info(self, name: str, *, include_browse: Optional[bool] = None) -> ExternalLocationInfo:
         """Raw :class:`ExternalLocationInfo` for *name* (one GET)."""
         return self._api.get(name, include_browse=include_browse)
 
-    def location(self, name: str) -> ExternalLocation:
-        """A lazy :class:`ExternalLocation` handle (no API call until used)."""
-        return ExternalLocation(name, service=self)
+    def _resource(self, name: str, info: Any = None) -> ExternalLocation:
+        return ExternalLocation(name, service=self, info=info)
 
-    __getitem__ = location
+    def delete(self, name: str, *, force: bool = False) -> None:
+        self._api.delete(name, force=force)
 
-    def get(self, name: str) -> ExternalLocation:
-        """Fetch *name* eagerly (raises :class:`NotFound` if absent)."""
-        return ExternalLocation(name, service=self, info=self.get_info(name))
-
-    def list(self, **kwargs: Any) -> Iterator[ExternalLocation]:
-        """Iterate every external location in the metastore."""
-        for info in self._api.list(**kwargs):
-            yield ExternalLocation(info.name, service=self, info=info)
-
-    def names(self, **kwargs: Any) -> "list[str]":
-        return [info.name for info in self._api.list(**kwargs)]
-
-    def exists(self, name: str) -> bool:
-        try:
-            self.get_info(name)
-            return True
-        except NotFound:
-            return False
+    def _apply(self, name: str, spec: Any, *, exists: bool) -> ExternalLocation:
+        spec = self._as_spec(spec)
+        if exists:
+            return self.update(name, **spec)
+        if "url" not in spec or "credential_name" not in spec:
+            raise ValueError(
+                f"creating external location {name!r} needs 'url' and 'credential_name'"
+            )
+        return self.create(name, spec.pop("url"), spec.pop("credential_name"), **spec)
 
     # -- writes ---------------------------------------------------------
     def create(self, name: str, url: str, credential_name: str, **kwargs: Any) -> ExternalLocation:
@@ -72,6 +95,3 @@ class ExternalLocations(DatabricksService):
         ``comment`` / ``read_only`` / ``owner`` / …)."""
         info = self._api.update(name, **changes)
         return ExternalLocation(info.name or name, service=self, info=info)
-
-    def delete(self, name: str, *, force: bool = False) -> None:
-        self._api.delete(name, force=force)

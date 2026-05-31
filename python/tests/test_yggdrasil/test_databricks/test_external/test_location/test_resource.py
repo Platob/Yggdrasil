@@ -12,7 +12,7 @@ def test_metadata(service):
 
 
 def test_lazy_info_single_fetch(service):
-    el = service["raw_zone"]  # lazy, no fetch
+    el = service.location("raw_zone")  # lazy handle, no fetch
     api = service.client.workspace_client.return_value.external_locations
     api.get.assert_not_called()
     _ = el.url  # triggers exactly one GET

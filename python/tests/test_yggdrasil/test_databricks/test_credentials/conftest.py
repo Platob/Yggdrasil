@@ -57,8 +57,15 @@ def service():
             expiration_time=1893456000000,  # 2030-01-01Z
         )
 
+    def _update(name, **changes):
+        cur = store[name].as_dict()
+        cur.update({k: (v.as_dict() if hasattr(v, "as_dict") else v) for k, v in changes.items()})
+        store[name] = CredentialInfo.from_dict(cur)
+        return store[name]
+
     api.create_credential.side_effect = _create
     api.get_credential.side_effect = _get
+    api.update_credential.side_effect = _update
     api.list_credentials.side_effect = lambda **k: list(store.values())
     api.delete_credential.side_effect = lambda name, **k: store.pop(name, None)
     api.generate_temporary_service_credential.side_effect = _temp
