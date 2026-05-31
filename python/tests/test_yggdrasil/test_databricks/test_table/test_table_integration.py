@@ -76,6 +76,7 @@ __all__ = [
     "TestTableCloneIntegration",
     "TestTableViewIntegration",
     "TestTableStoragePathIntegration",
+    "TestTableAsyncInsertIntegration",
 ]
 
 
@@ -832,3 +833,100 @@ class TestTableStoragePathIntegration(_TableFixture):
         # Managed tables on AWS resolve to an ``s3://...`` URL — the
         # full_path must at minimum be a non-empty string.
         self.assertTrue(str(path.full_path()))
+
+
+@pytest.mark.integration
+class TestTableAsyncInsertIntegration(_TableFixture):
+    """``insert(wait=False)`` drop → ``TableJob`` aggregate-load round-trip.
+
+    Exercises the real volume I/O: ``async_insert`` stages the Parquet to the
+    table's tmp path and drops a JSON operation log (no warehouse statement),
+    then the loader reads the log, builds one aggregated ``INSERT`` per
+    ``(target, mode)`` group and loads it through ygg, clearing the consumed
+    log + data. The loader is driven directly (``TableJob.process``) — the live
+    file-arrival job is best-effort and may need compute wired into the
+    definition before it can auto-trigger.
+    """
+
+    table_prefix = "yg_async"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        # Drop the file-arrival job the async path may have created.
+        try:
+            from yggdrasil.databricks.table.async_job import TableJob
+
+            cls.client.jobs.delete(name=TableJob.job_name(cls.table))
+        except Exception:
+            pass
+        super().tearDownClass()
+
+    def _count(self) -> int:
+        result = self.client.sql(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        ).execute(
+            f"SELECT COUNT(*) AS n FROM {self.table.full_name(safe=True)}"
+        ).to_arrow_table()
+        return int(result.column("n").to_pylist()[0])
+
+    def test_async_drop_then_loader_appends(self) -> None:
+        import json
+
+        from yggdrasil.databricks.table.async_job import TableJob
+
+        # 1. async insert → stage Parquet + drop a JSON operation log, no DML.
+        try:
+            log_path = self.table.async_insert(_sample_data(), mode=Mode.APPEND)
+        except (DatabricksError, PermissionDenied) as exc:
+            raise unittest.SkipTest(
+                f"async insert needs volume write access: {exc}."
+            )
+
+        self.assertTrue(log_path.exists())
+        record = json.loads(bytes(log_path.read_bytes()))
+        self.assertEqual(record["target"], self.table.full_name())
+        self.assertEqual(record["mode"], "append")
+
+        # the staged Parquet lives exactly where the log says it does
+        data_path = TableJob(self.table)._data_file(record["data"])
+        self.assertTrue(data_path.exists())
+
+        # 2. loader: aggregate + load through ygg, then clean up.
+        processed = TableJob(self.table).process(wait=True)
+        self.assertGreaterEqual(processed, 1)
+        self.assertEqual(self._count(), 3)
+
+        # consumed log + data are gone
+        self.assertFalse(log_path.exists())
+        self.assertFalse(data_path.exists())
+
+    def test_async_overwrite_replaces_rows(self) -> None:
+        from yggdrasil.databricks.table.async_job import TableJob
+
+        # seed some rows synchronously
+        try:
+            self.table.insert(_sample_data(), mode=Mode.APPEND)
+        except (DatabricksError, PermissionDenied) as exc:
+            raise unittest.SkipTest(f"seed insert failed: {exc}.")
+        self.assertEqual(self._count(), 3)
+
+        # async OVERWRITE drop + load should reset to just the new rows
+        overwrite_rows = pa.table(
+            {
+                "id": pa.array([9], type=pa.int64()),
+                "label": pa.array(["z"], type=pa.string()),
+                "amount": pa.array([9.5], type=pa.float64()),
+            }
+        )
+        try:
+            self.table.async_insert(overwrite_rows, mode=Mode.OVERWRITE)
+        except (DatabricksError, PermissionDenied) as exc:
+            raise unittest.SkipTest(f"async insert failed: {exc}.")
+
+        TableJob(self.table).process(wait=True)
+        self.assertEqual(self._count(), 1)
+
+    def test_async_rejects_merge_mode(self) -> None:
+        with self.assertRaises(ValueError):
+            self.table.async_insert(_sample_data(), mode=Mode.MERGE)

@@ -3426,8 +3426,17 @@ class Table(DatabricksPath):
                 }
             ).encode()
         )
-        # Make sure the file-arrival job exists so the drop gets picked up.
-        self.async_job
+        # Best-effort: make sure the file-arrival job exists so the drop gets
+        # picked up automatically. The staged data + log are already durable,
+        # so don't fail the insert if the job can't be (re)created right now
+        # (e.g. compute not yet wired into the definition, or no job-create
+        # grant) — an explicit ``table.async_job`` access still surfaces it.
+        try:
+            self.async_job
+        except Exception:
+            logger.warning(
+                "async_insert: could not ensure async_job for %s", self, exc_info=True
+            )
         return log_file
 
     def arrow_insert(
