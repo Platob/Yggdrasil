@@ -2055,6 +2055,18 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             "to write Arrow record batches into this byte buffer."
         )
 
+    def _delete(
+        self,
+        predicate: "Any" = None,
+        *,
+        wait: "Any" = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: "Any",
+    ) -> int:
+        """Row-level delete for a byte-backed leaf — generic rewrite."""
+        return self._delete_rewrite(predicate, **kwargs)
+
     def flush(self) -> None:
         """Push buffered writes to the durable backing.
 

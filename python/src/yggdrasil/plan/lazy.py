@@ -47,6 +47,11 @@ class LazyTabular(Tabular[O], Generic[O]):
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: O) -> None:
         raise TypeError("LazyTabular is read-only.")
 
+    def _delete(self, predicate: Any = None, *, wait: Any = True,
+                missing_ok: bool = False, delete_staging: bool = True,
+                **kwargs: Any) -> int:
+        raise NotImplementedError("LazyTabular is read-only; delete on the source instead.")
+
     def _collect_schema(self, options: O) -> "Schema":
         # Fast path: filter/limit/offset/order-by can't reshape the column
         # set or types, so read the schema straight off the source and skip

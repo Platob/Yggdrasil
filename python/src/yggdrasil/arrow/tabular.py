@@ -503,6 +503,18 @@ class ArrowTabular(Tabular[CastOptions]):
         self._table_cache = table
         return table
 
+    def _delete(
+        self,
+        predicate: Any = None,
+        *,
+        wait: Any = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: Any,
+    ) -> int:
+        """In-memory delete — filter the held batches and rewrite."""
+        return self._delete_rewrite(predicate, **kwargs)
+
     def _write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],

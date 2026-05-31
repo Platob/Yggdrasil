@@ -892,6 +892,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         )
         return self
 
+    @abstractmethod
     def _delete(
         self,
         predicate: "Predicate" = None,
@@ -899,6 +900,31 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         wait: "WaitingConfigArg" = True,
         missing_ok: bool = False,
         delete_staging: bool = True,
+        **kwargs: Any,
+    ) -> int:
+        """Remove rows matching *predicate* (``None`` = all); return rows deleted.
+
+        Every concrete tabular declares its own delete strategy:
+
+        * writable leaves (:class:`~yggdrasil.io.holder.IO`,
+          :class:`~yggdrasil.arrow.tabular.ArrowTabular`,
+          :class:`~yggdrasil.spark.tabular.SparkDataset`) delegate to the
+          generic :meth:`_delete_rewrite` — filter every batch, rewrite
+          the survivors;
+        * aggregators (:class:`~yggdrasil.path.folder.Folder`,
+          :class:`~yggdrasil.io.delta.delta_folder.DeltaFolder`) prune /
+          rewrite per leaf;
+        * read-only tabulars (:class:`LazyTabular`, :class:`ExecutionPlan`,
+          :class:`StatementResult`, :class:`HTTPResponseBatch`) raise.
+
+        ``options`` and other read/write overrides ride in via ``**kwargs``;
+        ``wait`` / ``missing_ok`` / ``delete_staging`` exist for signature
+        parity with resource-backed deletes and are ignored by row paths.
+        """
+
+    def _delete_rewrite(
+        self,
+        predicate: "Predicate" = None,
         **kwargs: Any,
     ) -> int:
         """Generic single-leaf delete: filter all batches, rewrite.
@@ -911,9 +937,9 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         one batch resides in memory at a time. A ``None`` *predicate*
         removes every row. Returns the number of rows deleted.
 
-        ``options`` (and any other read/write override) ride in via
-        ``**kwargs``; ``wait`` / ``missing_ok`` / ``delete_staging`` are
-        accepted for signature parity and ignored by this row path.
+        Reusable building block for the writable ``_delete``
+        implementations. ``options`` (and any other read/write override)
+        ride in via ``**kwargs``.
         """
         options = self.check_options(kwargs.pop("options", None), **kwargs)
         survivors: "list[pa.RecordBatch]" = []

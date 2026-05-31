@@ -480,6 +480,18 @@ class SparkDataset(Tabular[CastOptions]):
             return
         yield from Record.from_spark_frame(self._frame)
 
+    def _delete(
+        self,
+        predicate: Any = None,
+        *,
+        wait: Any = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: Any,
+    ) -> int:
+        """Spark delete — filter the dataset's batches and rewrite."""
+        return self._delete_rewrite(predicate, **kwargs)
+
     def _write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],

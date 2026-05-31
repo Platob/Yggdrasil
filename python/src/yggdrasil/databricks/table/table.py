@@ -1426,6 +1426,39 @@ class Table(DatabricksPath):
             safe_merge=options.safe_merge,
         )
 
+    def _delete(
+        self,
+        predicate: "Any" = None,
+        *,
+        wait: "Any" = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: "Any",
+    ) -> int:
+        """Row-level delete that avoids rewriting the (potentially huge) table.
+
+        * **No predicate** → drop the table through the Unity Catalog tables
+          API (:meth:`delete`). Emptying the whole table needs no row
+          filtering, so there's no reason to spin up a SQL warehouse.
+        * **With a predicate** → issue a server-side ``DELETE FROM <t> WHERE …``
+          so the warehouse does the work in place, instead of streaming every
+          batch back to the client to filter and rewrite (the generic
+          :meth:`~yggdrasil.io.tabular.base.Tabular._delete_rewrite` path).
+
+        Returns ``0`` — the affected-row count isn't surfaced by the
+        execution result; the public :meth:`delete` returns the table itself.
+        """
+        if predicate is None:
+            # Whole-table removal — UC API, no SQL warehouse.
+            self.delete(wait=wait, missing_ok=missing_ok, delete_staging=delete_staging)
+            return 0
+        where = predicate if isinstance(predicate, str) else expr_to_sql(
+            predicate, dialect=Dialect.DATABRICKS,
+        )
+        self.sql.execute(f"DELETE FROM {self.full_name(safe=True)} WHERE {where}", wait=wait)
+        self.invalidate_singleton(remove_global=True)
+        return 0
+
     def _read_spark_frame(self, options: O) -> "SparkDataFrame":
         options = options.with_source(source=self.collect_schema(options))
         query = self._options_to_sql(options)
