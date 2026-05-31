@@ -50,6 +50,34 @@ class AggregateResult(StrictModel):
     truncated: bool           # source exceeded the analysis cap
 
 
+class PivotRequest(StrictModel):
+    """Excel-style pivot: ``rows`` (down the side) × ``columns`` (cross-tab,
+    across the top) × ``measures`` (aggregated at each cell). Either field list
+    may be empty (rows-only = group-by; columns-only = a single total row;
+    both empty = a grand total). Filters push into the scan."""
+    path: str
+    rows: list[str] = []
+    columns: list[str] = []
+    measures: list[AggMeasure]
+    filters: list[FilterSpec] = []
+    row_limit: int = 1000     # max distinct row groups returned
+    col_limit: int = 50       # max distinct column groups (top-N by 1st measure)
+
+
+class PivotResult(StrictModel):
+    node_id: str
+    path: str
+    row_fields: list[str]     # echoed input (the leading columns of each row)
+    column_fields: list[str]
+    measures: list[str]       # flattened measure names ("col_agg")
+    columns: list[str]        # full output header (row_fields + pivoted cells)
+    rows: list[list[Any]]
+    row_count: int            # distinct row groups before row_limit
+    col_count: int            # distinct column groups before col_limit
+    source_rows: int
+    truncated: bool           # column groups exceeded col_limit (top-N kept)
+
+
 class DescribeResult(StrictModel):
     node_id: str
     path: str

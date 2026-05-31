@@ -21,7 +21,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.node.api.schemas.analysis import (
-    AggMeasure, AggregateRequest, ForecastRequest, OhlcRequest, SeriesRequest,
+    AggMeasure, AggregateRequest, ForecastRequest, OhlcRequest, PivotRequest,
+    SeriesRequest,
 )
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService
@@ -33,8 +34,9 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as d:
         home = Path(d)
         cols = {"sector": [["Tech", "Energy", "Finance", "Health", "Ind"][i % 5] for i in range(n)],
+                "region": [["NA", "EU", "APAC", "LATAM"][i % 4] for i in range(n)],
                 "price": [100.0 + (i % 1000) * 0.1 for i in range(n)]}
-        for j in range(ncols - 2):
+        for j in range(ncols - 3):
             cols[f"pad{j}"] = [float(i % 97) for i in range(n)]   # noise columns
         pq.write_table(pa.table(cols), str(home / "wide.parquet"))
         mb = (home / "wide.parquet").stat().st_size // 1024 // 1024
@@ -69,6 +71,25 @@ def main() -> None:
         ohlc_ms = (time.perf_counter() - t0) * 1000
         print(f"  downsample {n:,} -> {len(s.x)} pts:  {ds_ms:8.1f} ms")
         print(f"  ohlc {n:,} -> {o.bars} bars:      {ohlc_ms:8.1f} ms\n")
+
+        # cross-tab pivot: sector(5) x region(4), sum(price) — pushdown reads
+        # only 3 cols, streams the group-by, shapes the bounded 20-cell grid.
+        preq = PivotRequest(path="wide.parquet", rows=["sector"], columns=["region"],
+                            measures=[AggMeasure(column="price", agg="sum")])
+        t0 = time.perf_counter()
+        for _ in range(5):
+            p = asyncio.run(svc.pivot(preq))
+        pivot_ms = (time.perf_counter() - t0) / 5 * 1000
+
+        t0 = time.perf_counter()
+        for _ in range(5):
+            df = pl.from_arrow(pq.read_table(str(home / "wide.parquet")))
+            _ = df.group_by(["sector", "region"]).agg(pl.col("price").sum())
+        eager_pivot_ms = (time.perf_counter() - t0) / 5 * 1000
+        print(f"  pivot sector x region (3 cols): {pivot_ms:8.1f} ms   "
+              f"({p.row_count} rows x {p.col_count} cols)")
+        print(f"  eager full read (30) + pivot:   {eager_pivot_ms:8.1f} ms")
+        print(f"  ==> {eager_pivot_ms / pivot_ms:5.1f}x\n")
 
     # -- forecasting (xgboost→gbr→ridge over engineered features) -----------
     import math

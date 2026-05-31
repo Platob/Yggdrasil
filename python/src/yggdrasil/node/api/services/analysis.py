@@ -38,6 +38,8 @@ from ..schemas.analysis import (
     ForecastSeries,
     OhlcRequest,
     OhlcResult,
+    PivotRequest,
+    PivotResult,
     SeriesRequest,
     SeriesResult,
     Transform,
@@ -70,6 +72,9 @@ class AnalysisService:
 
     async def aggregate(self, req: AggregateRequest) -> AggregateResult:
         return await run_in_threadpool(partial(self._aggregate, req))
+
+    async def pivot(self, req: PivotRequest) -> PivotResult:
+        return await run_in_threadpool(partial(self._pivot, req))
 
     async def describe(self, path: str) -> DescribeResult:
         return await run_in_threadpool(partial(self._describe, path))
@@ -327,6 +332,103 @@ class AnalysisService:
         )
 
     # -- describe -----------------------------------------------------------
+
+    def _pivot(self, req: PivotRequest) -> PivotResult:
+        """Excel-style cross-tab. Streams a group-by over ``rows + columns``
+        (memory bounded, correct totals), then shapes the bounded grouped
+        frame into a wide table in-process — full control over the flattened
+        column headers and top-N column capping (avoids polars' version-y
+        pivot column naming)."""
+        if not req.measures:
+            raise BadRequestError("pivot needs at least one measure")
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        cols = set(lf.collect_schema().names())
+        keys = list(dict.fromkeys(req.rows + req.columns))
+        for k in keys:
+            if k not in cols:
+                raise BadRequestError(f"pivot field {k!r} not found")
+        exprs, measure_names = [], []
+        for m in req.measures:
+            if m.agg not in _AGGS:
+                raise BadRequestError(f"unknown agg {m.agg!r}; one of {sorted(_AGGS)}")
+            if m.column not in cols:
+                raise BadRequestError(f"measure column {m.column!r} not found")
+            name = f"{m.column}_{m.agg}"
+            exprs.append(getattr(pl.col(m.column), m.agg)().alias(name))
+            measure_names.append(name)
+
+        keep = list(dict.fromkeys(keys + [m.column for m in req.measures]))
+        plan = lf.select(keep)
+        grouped = (plan.group_by(keys).agg(exprs) if keys else plan.select(exprs))
+        grouped = grouped.collect(engine="streaming")
+        source_rows = lf.select(pl.len()).collect(engine="streaming").item()
+        if grouped.height > self.settings.pivot_max_groups:
+            raise BadRequestError(
+                f"pivot would materialise {grouped.height:,} groups (cap "
+                f"{self.settings.pivot_max_groups:,}); add filters or drop a field"
+            )
+
+        # Rows-only (or no fields): the grouped frame is already the result —
+        # row fields followed by one column per measure.
+        if not req.columns:
+            out = grouped.sort(req.rows) if req.rows else grouped
+            row_count = out.height
+            out = out.head(req.row_limit)
+            return PivotResult(
+                node_id=self.settings.node_id, path=req.path,
+                row_fields=req.rows, column_fields=[], measures=measure_names,
+                columns=out.columns,
+                rows=[[_safe(v) for v in r] for r in out.iter_rows()],
+                row_count=row_count, col_count=0,
+                source_rows=source_rows, truncated=False,
+            )
+
+        # Cross-tab: shape the (bounded) grouped frame into a wide table.
+        multi_measure = len(measure_names) > 1
+        cell: dict[tuple, dict[tuple, list]] = {}
+        col_labels: dict[tuple, str] = {}
+        weights: dict[tuple, float] = {}
+        for r in grouped.iter_rows(named=True):
+            rt = tuple(r[k] for k in req.rows)
+            ct = tuple(r[k] for k in req.columns)
+            cell.setdefault(rt, {})[ct] = [r[mn] for mn in measure_names]
+            col_labels.setdefault(ct, " / ".join("∅" if v is None else str(v) for v in ct))
+            w = r[measure_names[0]]
+            weights[ct] = weights.get(ct, 0.0) + (float(w) if isinstance(w, (int, float)) and w == w else 0.0)
+
+        col_count = len(col_labels)
+        combos = list(col_labels)
+        truncated = col_count > req.col_limit
+        if truncated:  # keep the top-N column groups by the first measure
+            combos = sorted(combos, key=lambda c: weights.get(c, 0.0), reverse=True)[:req.col_limit]
+        combos.sort(key=lambda c: tuple("" if v is None else str(v) for v in c))
+
+        header = list(req.rows)
+        plan_cols: list[tuple[tuple, int]] = []
+        for ct in combos:
+            for mi, mn in enumerate(measure_names):
+                header.append(f"{col_labels[ct]} · {mn}" if multi_measure else col_labels[ct])
+                plan_cols.append((ct, mi))
+
+        row_tuples = sorted(cell, key=lambda rt: tuple("" if v is None else str(v) for v in rt))
+        row_count = len(row_tuples)
+        row_tuples = row_tuples[:req.row_limit]
+        result_rows = []
+        for rt in row_tuples:
+            row = [_safe(v) for v in rt]
+            bycol = cell[rt]
+            for ct, mi in plan_cols:
+                vals = bycol.get(ct)
+                row.append(_safe(vals[mi]) if vals is not None else None)
+            result_rows.append(row)
+
+        return PivotResult(
+            node_id=self.settings.node_id, path=req.path,
+            row_fields=req.rows, column_fields=req.columns, measures=measure_names,
+            columns=header, rows=result_rows,
+            row_count=row_count, col_count=col_count,
+            source_rows=source_rows, truncated=truncated,
+        )
 
     def _describe(self, path: str) -> DescribeResult:
         lf = self._frame(path)
