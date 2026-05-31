@@ -32,6 +32,22 @@ class TestRegistryConstants:
     def test_octet_stream_is_any_bytes(self) -> None:
         assert MimeTypes.OCTET_STREAM.is_any_bytes
 
+    def test_columnar_and_json_formats_are_tabular(self) -> None:
+        # The frame-producing file formats must all carry is_tabular so the
+        # registry agrees with how the IO/inspect layer treats them.
+        for fmt in (
+            MimeTypes.PARQUET, MimeTypes.PARQUET_DELTA, MimeTypes.ARROW_IPC,
+            MimeTypes.ARROW_STREAM, MimeTypes.ORC, MimeTypes.AVRO,
+            MimeTypes.ICEBERG, MimeTypes.DELTA,
+            MimeTypes.JSON, MimeTypes.NDJSON, MimeTypes.CSV, MimeTypes.TSV,
+        ):
+            assert fmt.is_tabular, f"{fmt.name} should be tabular"
+
+    def test_ndjson_identity(self) -> None:
+        # NDJSON is newline-delimited JSON, not JSON-LD.
+        assert MimeTypes.NDJSON.value == "application/x-ndjson"
+        assert "ndjson" in MimeTypes.NDJSON.extensions
+
 
 class TestPureGet:
     """`get` is a side-effect-free dict lookup."""

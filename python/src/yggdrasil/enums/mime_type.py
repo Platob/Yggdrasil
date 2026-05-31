@@ -730,10 +730,11 @@ class MimeTypes:
             "application/vnd.apache.parquet",
             extensions=("parquet", "pq"),
             magics=(magic_parquet,),
+            is_tabular=True,
         )
     )
     PARQUET_DELTA = MimeType.define(
-        MimeType("PARQUET_DELTA", "application/vnd.apache.parquet+delta")
+        MimeType("PARQUET_DELTA", "application/vnd.apache.parquet+delta", is_tabular=True)
     )
     ARROW_IPC = MimeType.define(
         MimeType(
@@ -741,6 +742,7 @@ class MimeTypes:
             "application/vnd.apache.arrow.file",
             extensions=("ipc", "feather", "arrow", "arrows"),
             magics=(magic_prefix(b"ARROW1"),),
+            is_tabular=True,
         )
     )
     # Arrow IPC *stream* framing — distinct from the file format above
@@ -759,6 +761,7 @@ class MimeTypes:
             "application/vnd.apache.orc",
             extensions=("orc",),
             magics=(magic_prefix(b"ORC"),),
+            is_tabular=True,
         )
     )
     AVRO = MimeType.define(
@@ -767,22 +770,25 @@ class MimeTypes:
             "application/avro",
             extensions=("avro",),
             magics=(magic_prefix(b"Obj\x01"),),
+            is_tabular=True,
         )
     )
     ICEBERG = MimeType.define(
-        MimeType("ICEBERG", "application/vnd.apache.iceberg", extensions=("iceberg",))
+        MimeType("ICEBERG", "application/vnd.apache.iceberg", extensions=("iceberg",), is_tabular=True)
     )
     DELTA = MimeType.define(
-        MimeType("DELTA", "application/vnd.delta", extensions=("delta", "deltatable"))
+        MimeType("DELTA", "application/vnd.delta", extensions=("delta", "deltatable"), is_tabular=True)
     )
 
     # --- Text / semi-structured ---
-    JSON = MimeType.define(MimeType("JSON", "application/json", extensions=("json",)))
+    # JSON is tabular in this stack: the readers coerce it (and an array of
+    # objects) into a frame, same as NDJSON below.
+    JSON = MimeType.define(MimeType("JSON", "application/json", extensions=("json",), is_tabular=True))
     NDJSON = MimeType.define(
         MimeType(
             "NDJSON",
-            "application/ld+json",
-            extensions=("jsonld", "ldjson"),
+            "application/x-ndjson",
+            extensions=("ndjson",),
             is_tabular=True,
         )
     )
