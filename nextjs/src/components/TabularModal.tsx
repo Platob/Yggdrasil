@@ -392,23 +392,22 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
     }
   };
 
-  // Download-as image: in analyze mode rasterize the rendered chart SVG (png/
-  // jpeg/svg), otherwise paint the current grid view (filters + sort + hidden
-  // applied) to a png/jpeg/webp — all client-side, no round-trip.
+  // Download-as image (png/jpg): in analyze mode rasterize the rendered chart
+  // SVG, otherwise paint the current grid view (filters + sort + hidden
+  // applied) to a canvas — all client-side, no round-trip.
   const exportImage = async (fmt: string) => {
     setDlOpen(false); setExporting(true); setAnalyzeErr(null);
     try {
       const base = path.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "table";
-      const ext = fmt === "jpeg" ? "jpg" : fmt;
       if (mode === "analyze") {
         const svg = analyzeRef.current?.querySelector("svg");
         if (!svg) throw new Error("run an analysis to render a chart first");
-        downloadBlob(await svgToImage(svg as SVGSVGElement, fmt), `${base}.${ext}`);
+        downloadBlob(await svgToImage(svg as SVGSVGElement, fmt), `${base}.${fmt}`);
       } else {
         const vis = columns.map((_, i) => i).filter((i) => !hidden.has(i));
         const head = vis.map((i) => columns[i].name);
         const rows = viewOrder.map((ri) => vis.map((i) => grid[ri][i] ?? ""));
-        downloadBlob(await tableToImage(head, rows, fmt), `${base}.${ext}`);
+        downloadBlob(await tableToImage(head, rows, fmt), `${base}.${fmt}`);
       }
     } catch (e) {
       setAnalyzeErr(e instanceof Error ? e.message : "image export failed");
@@ -897,10 +896,9 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                   </button>
                 ))}
                 <div className="h-px bg-white/10 my-1" />
-                <div className="px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted/50">{mode === "analyze" ? "chart image" : "table image"}</div>
-                {(mode === "analyze" ? ["png", "jpeg", "svg"] : ["png", "jpeg", "webp"]).map((fmt) => (
+                {["png", "jpg"].map((fmt) => (
                   <button key={fmt} onClick={() => exportImage(fmt)} className="block w-full text-left px-2 py-1.5 rounded hover:bg-frost/10 text-foreground/80 hover:text-frost">
-                    {fmt}
+                    {mode === "analyze" ? "chart" : "table"} · {fmt}
                   </button>
                 ))}
               </div>

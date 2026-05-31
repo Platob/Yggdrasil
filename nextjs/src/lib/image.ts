@@ -1,11 +1,11 @@
-// Client-side rendering of tabular data and SVG charts to downloadable images.
-// Dependency-free: a grid is painted onto a <canvas>; charts (already SVG) are
-// serialized — with the theme's CSS custom properties (var(--emerald)…)
-// resolved to concrete colors so a detached SVG keeps its Nordic palette — and,
-// for raster formats, rasterized through an <img> onto a canvas. Drives the
+// Client-side rendering of tabular data and SVG charts to downloadable images
+// (png/jpg). Dependency-free: a grid is painted onto a <canvas>; charts
+// (already SVG) are serialized — with the theme's CSS custom properties
+// (var(--emerald)…) resolved to concrete colors so a detached SVG keeps its
+// Nordic palette — then rasterized through an <img> onto a canvas. Drives the
 // TabularModal "Download as → image" options.
 
-const RASTER: Record<string, string> = { png: "image/png", jpeg: "image/jpeg", webp: "image/webp" };
+const MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg" };
 
 // Resolve var(--x) references against the document root's computed theme.
 function themeColor(name: string, fallback: string): string {
@@ -21,9 +21,9 @@ export function downloadBlob(blob: Blob, filename: string) {
   URL.revokeObjectURL(a.href);
 }
 
-// Serialize an on-screen SVG and return it as an image blob (svg | png | jpeg |
-// webp). Raster output is painted at `scale`× over a themed background and
-// reproduces exactly what's rendered (same viewBox + rendered px box).
+// Rasterize an on-screen SVG to a png/jpg blob, painted at `scale`× over a
+// themed background. Reproduces exactly what's rendered (same viewBox +
+// rendered px box).
 export async function svgToImage(svg: SVGSVGElement, fmt: string, scale = 2): Promise<Blob> {
   const rect = svg.getBoundingClientRect();
   const w = Math.ceil(rect.width) || svg.viewBox.baseVal.width || 720;
@@ -36,8 +36,6 @@ export async function svgToImage(svg: SVGSVGElement, fmt: string, scale = 2): Pr
   const str = new XMLSerializer()
     .serializeToString(clone)
     .replace(/var\((--[\w-]+)\)/g, (_, n) => cs.getPropertyValue(n).trim() || "#888");
-
-  if (fmt === "svg") return new Blob([str], { type: "image/svg+xml;charset=utf-8" });
 
   const img = new Image();
   await new Promise<void>((res, rej) => {
@@ -54,12 +52,12 @@ export async function svgToImage(svg: SVGSVGElement, fmt: string, scale = 2): Pr
   ctx.fillRect(0, 0, w, h);
   ctx.drawImage(img, 0, 0, w, h);
   return await new Promise<Blob>((res, rej) =>
-    canvas.toBlob((b) => (b ? res(b) : rej(new Error("encode failed"))), RASTER[fmt] ?? "image/png"),
+    canvas.toBlob((b) => (b ? res(b) : rej(new Error("encode failed"))), MIME[fmt] ?? "image/png"),
   );
 }
 
 // Paint a bounded grid (header + rows + row index) onto a canvas in the Nordic
-// palette and return it as png | jpeg | webp.
+// palette and return it as png | jpg.
 export async function tableToImage(columns: string[], rows: string[][], fmt: string, scale = 2): Promise<Blob> {
   const bg = themeColor("--background", "#050510");
   const fg = themeColor("--foreground", "#e4e2df");
@@ -133,6 +131,6 @@ export async function tableToImage(columns: string[], rows: string[][], fmt: str
   });
 
   return await new Promise<Blob>((res, rej) =>
-    canvas.toBlob((b) => (b ? res(b) : rej(new Error("encode failed"))), RASTER[fmt] ?? "image/png"),
+    canvas.toBlob((b) => (b ? res(b) : rej(new Error("encode failed"))), MIME[fmt] ?? "image/png"),
   );
 }
