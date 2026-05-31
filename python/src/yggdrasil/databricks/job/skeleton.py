@@ -27,7 +27,9 @@ body), :attr:`~Flow.name`, :meth:`~Flow.parameters`, :meth:`~Flow.trigger`.
 from __future__ import annotations
 
 import functools
+import logging
 import re
+import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar
 
@@ -35,6 +37,22 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.concurrent.threading import ThreadJob
     from yggdrasil.databricks.job.job import Job
     from yggdrasil.databricks.job.service import Jobs
+
+logger = logging.getLogger(__name__)
+
+
+def ensure_console_logging(name: str = "yggdrasil", level: int = logging.INFO) -> None:
+    """Attach an INFO stdout handler to the *name* logger if it has none, so
+    interactive deploys / job runs surface ygg logs (the default root config is
+    WARNING-only). Idempotent and scoped — never touches the root logger."""
+    lg = logging.getLogger(name)
+    lg.setLevel(min(lg.level or level, level) if lg.level else level)
+    if not any(isinstance(h, logging.StreamHandler) for h in lg.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        lg.addHandler(handler)
 
 __all__ = [
     "Task",
@@ -312,9 +330,11 @@ class Flow(_Runnable):
 
         Takes a :class:`DatabricksClient` and resolves its jobs service
         (``client.jobs``). When :attr:`build_wheel` is set (default), builds the
-        ygg wheel from source and uploads it to ``/Workspace/Shared/.ygg/jobs/``
+        ygg wheel from source and uploads it to ``/Workspace/Shared/.ygg/whl/``
         first, shipping that wheel as the serverless dependency instead of an
         index ``ygg[databricks]`` install."""
+        ensure_console_logging()  # so the deploy CRUD is visible interactively
+        logger.info("deploying flow %r", self.name)
         if self.build_wheel and self.serverless:
             from yggdrasil.databricks.job.wheel import (
                 ensure_requirement_wheel,
@@ -331,7 +351,10 @@ class Flow(_Runnable):
                 ensure_requirement_wheel(client, req) for req in self.extra_dependencies
             ]
         spec = self.definition()
-        return client.jobs.create_or_update(name=spec.pop("name"), **spec)
+        logger.info("create-or-update job %r", self.name)
+        job = client.jobs.create_or_update(name=spec.pop("name"), **spec)
+        logger.info("deployed job %r (id=%s)", self.name, getattr(job, "job_id", None))
+        return job
 
 
 # ---------------------------------------------------------------------------

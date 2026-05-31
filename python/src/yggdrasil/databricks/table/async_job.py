@@ -105,7 +105,9 @@ class TableJob(Flow):
     def deploy(self, client: Any) -> "Job":
         # The file-arrival trigger watches the logs dir — create it first so
         # Databricks accepts the trigger URL (and the first drop lands cleanly).
-        self.logs_path(self.table).mkdir(parents=True, exist_ok=True)
+        logs = self.logs_path(self.table)
+        logger.info("async job: ensuring logs dir %s", logs.full_path())
+        logs.mkdir(parents=True, exist_ok=True)
         job = super().deploy(client)
         self._prune_duplicates(client, keep=job.job_id)
         return job

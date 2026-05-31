@@ -32,21 +32,10 @@ def run(kind: str, args: Sequence[str]) -> int:
     raise SystemExit(f"ygg-job: unknown job kind {kind!r}")
 
 
-def _setup_logging() -> None:
-    """Surface ygg INFO logs in the Databricks job output (stdout). Scoped to
-    the ``yggdrasil`` logger so it doesn't clobber an existing root config."""
-    ygg = logging.getLogger("yggdrasil")
-    ygg.setLevel(logging.INFO)
-    if not any(isinstance(h, logging.StreamHandler) for h in ygg.handlers):
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
-        ygg.addHandler(handler)
-
-
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    _setup_logging()
+    from yggdrasil.databricks.job.skeleton import ensure_console_logging
+
+    ensure_console_logging()
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
         raise SystemExit("ygg-job: expected <kind> <args...>")
