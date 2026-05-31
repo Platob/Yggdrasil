@@ -18,6 +18,7 @@ import pytest
 from yggdrasil.databricks.table import async_job as aj
 from yggdrasil.databricks.table.async_job import LOGS_SUBDIR, TableJob
 from yggdrasil.databricks.table.table import Table
+from yggdrasil.version import __version__
 
 
 def _table_mock(full_name="c.s.t"):
@@ -130,7 +131,7 @@ class TestEnsure:
         # serverless v5; published ygg from the index + latest databricks-sdk
         env = kwargs["environments"][0]
         assert env.spec.environment_version == "5"
-        assert env.spec.dependencies == ["ygg[databricks]", "databricks-sdk"]
+        assert env.spec.dependencies == [f"ygg[databricks]=={__version__}", "databricks-sdk"]
         assert task.environment_key == env.environment_key
 
     def test_ensure_is_noop_when_already_deployed(self):

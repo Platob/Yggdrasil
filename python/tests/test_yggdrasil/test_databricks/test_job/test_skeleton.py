@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from yggdrasil.databricks.job import Flow, Future, Task, flow, task
+from yggdrasil.version import __version__
 
 
 # --------------------------------------------------------------------------- #
@@ -123,7 +124,7 @@ class TestFlow:
         assert task_obj.environment_key == "default"
         env = spec["environments"][0]
         assert env.spec.environment_version == "5"
-        assert env.spec.dependencies == ["ygg[databricks]", "databricks-sdk"]
+        assert env.spec.dependencies == [f"ygg[databricks]=={__version__}", "databricks-sdk"]
 
     def test_serverless_false_drops_environment(self):
         @flow
@@ -154,7 +155,7 @@ class TestFlow:
         assert kwargs["name"] == "ygg-demo"
         assert kwargs["tasks"][0].python_wheel_task.parameters == ["a"]
         # published ygg from the index + latest databricks-sdk — no built wheel
-        assert kwargs["environments"][0].spec.dependencies == ["ygg[databricks]", "databricks-sdk"]
+        assert kwargs["environments"][0].spec.dependencies == [f"ygg[databricks]=={__version__}", "databricks-sdk"]
         assert deployed is client.jobs.create_or_update.return_value
 
     def test_deploy_can_build_and_ship_wheel(self):

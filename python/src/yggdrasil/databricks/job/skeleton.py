@@ -274,12 +274,23 @@ class Flow(_Runnable):
     def effective_dependencies(self) -> list[str]:
         """The serverless dependencies. Once :meth:`deploy` has shipped wheels,
         it's the uploaded ygg wheel + each :attr:`extra_dependencies` shipped as
-        its own uploaded wheel (the latest ``databricks-sdk`` embedded by path,
-        no index install); otherwise the plain :attr:`dependencies` +
+        its own uploaded wheel (no index install); otherwise the published
+        :attr:`dependencies` (``ygg`` **pinned to the running version** so the
+        cluster gets exactly this code, not a stale cached one) +
         :attr:`extra_dependencies` names."""
         if getattr(self, "_wheel_path", None):
             return [self._wheel_path, *getattr(self, "_extra_wheel_paths", ())]
-        return [*self.dependencies, *self.extra_dependencies]
+        return [self._pin(d) for d in self.dependencies] + list(self.extra_dependencies)
+
+    @staticmethod
+    def _pin(dependency: str) -> str:
+        """Pin a bare ``ygg`` / ``ygg[...]`` requirement to the running version
+        so the deployed job installs the same code (avoids a stale cached one)."""
+        if dependency == "ygg" or dependency.startswith("ygg["):
+            from yggdrasil.version import __version__
+
+            return f"{dependency}=={__version__}"
+        return dependency
 
     def environments(self) -> Optional[list]:
         """Serverless environment list (v5 + :meth:`effective_dependencies`),
