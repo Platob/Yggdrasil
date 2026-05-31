@@ -26,83 +26,59 @@ Object-oriented, mirroring the Python classes:
 | `url/url.ts` | `url/url.py` |
 | `path/path.ts` | `path/path.py` (value identity) |
 | `http_/request.ts` | `http_/request.py` + session |
-| `io/tabular.ts` | `io/tabular/` (Arrow IPC) |
+| `data/types.ts` · `field.ts` · `schema.ts` · `options.ts` | `data/types/` · `data_field.py` · `schema.py` · `options.py` |
+| `arrow/cast.ts` | `arrow/cast.py` (any-source → Arrow Table) |
+| `io/tabular/base.ts` · `io/primitive/` · `io/nested/` | `io/tabular/` · `io/primitive/` · `io/nested/` |
 | `index.ts` | `__init__.py` |
 
 Implemented: **`enums`** (MIME/media-type, State, ByteUnit), **`url`** (URL
 value type — parity-tested against the Python reference), **`path`** (URL-backed
-pathlib identity), **`http_`** (HTTPRequest/HTTPSession over `fetch`), **`io`**
-(Arrow IPC `Tabular`; `apache-arrow` is a peer dependency). Tested with
-**vitest** (`npm test`) + benchmarks (`npm run bench`). Follow-on: full `path`
-IO holders (Local/S3/Node), `io` parquet/csv readers + a polars adapter, and the
-`http_` cache / identity-hash layer.
+pathlib identity), **`http_`** (HTTPRequest/HTTPSession over `fetch`), **`data`**
+(the `DataType`/`Field`/`Schema` type system + `CastOptions`, with `toDict`
+round-tripping the *exact* Python `to_dict` wire form and `DataTypeId` integer
+codes shared across languages), **`arrow`** (any-source → Arrow Table coercion),
+**`io`** (the Arrow-IPC `Tabular` core + the `primitive`/`nested` format leaves;
+`apache-arrow` is a peer dependency). Tested with **vitest** (`npm test`) +
+benchmarks (`npm run bench`).
+
+> **Note — structural vs. value casting.** Apache Arrow's JS build ships no
+> compute/cast kernels (unlike pyarrow), so `CastOptions` does the *structural*
+> cast (project/reorder to the target schema + row limit). Value-level type
+> coercion (int→float, string→date, timezone normalisation) routes through
+> **polars** — the documented compute follow-on, alongside `path` IO holders
+> (Local/S3/Node), `io` parquet/csv/ndjson readers, and the `http_` cache layer.
 
 ## Usage
 
 ```ts
-import { MimeType, MimeTypes, MediaType } from "@/lib/yggdrasil/enums";
+import { MimeType, MimeTypes, MediaType, Tabular, Schema, field, Int64Type } from "@platob/yggdrasil";
 
 MimeType.fromName("trades.csv.gz");   // { mime: CSV, codec: GZIP }
 MimeTypes.PARQUET.isTabular;          // true
 MediaType.from("a.csv.gz").value;     // "text/csv+application/gzip"
+
+// One typing contract with Python: the canonical dict is byte-for-byte identical.
+const s = new Schema([field("id", Int64Type()), field("name", "string")]);
+s.toDict();                           // { name: "", nullable: false, dtype: { id: 102, name: "STRUCT", fields: [...] } }
+
+// Arrow IPC stream is the cross-language wire format.
+const ipc = Tabular.from([{ id: 1, name: "a" }]).toArrowIPC();
+Tabular.fromArrowIPC(ipc).numRows;    // 1
 ```
 
-## Publishing to npm (making it public)
+## Publishing to npm
 
-Today this module is imported in-repo by the Next.js app via the `@/lib/...`
-path alias — it is **not** an npm package yet. npm is the public registry for
-JS/TS; "publishing" means uploading a built, versioned package so anyone can
-`npm install` it.
+The package is published publicly as **`@platob/yggdrasil`**, so any JS consumer
+(including the in-repo Next.js app) installs it with `npm install
+@platob/yggdrasil`. The build is run by **tsup** (`npm run build` → ESM bundle +
+`.d.ts` in `dist/`, with `apache-arrow` left external as a peer dependency);
+`prepublishOnly` runs the tests then the build, and only `dist/` is shipped
+(`files` in `package.json`).
 
-To ship it publicly, extract it into its own package directory (e.g.
-`packages/yggdrasil/` at the repo root so it doesn't sit inside the Next app)
-with this shape:
+Releases are automated by `.github/workflows/publish-yggdrasil-npm.yml` (an
+`NPM_TOKEN` repo secret): push a `yggdrasil-js-v*` tag, or run the workflow
+manually, and CI runs `npm publish --access public` (`--access public` is
+required for the scoped name).
 
-```
-packages/yggdrasil/
-  src/            # the .ts sources (this folder's contents)
-  package.json
-  tsconfig.json   # compiles src -> dist with .d.ts type declarations
-  README.md
-```
-
-`package.json`:
-
-```jsonc
-{
-  "name": "@platob/yggdrasil",        // scoped to your npm org/user; pick a free name
-  "version": "0.1.0",                  // semver; bump on every publish
-  "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": { ".": "./dist/index.js", "./enums": "./dist/enums/index.js" },
-  "files": ["dist"],                   // only ship the build, not the sources
-  "sideEffects": false,
-  "scripts": { "build": "tsc -p tsconfig.json", "prepublishOnly": "npm run build" },
-  "license": "MIT",
-  "repository": "github:platob/yggdrasil"
-}
-```
-
-`tsconfig.json`: `{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"bundler","declaration":true,"outDir":"dist","strict":true},"include":["src"]}`
-
-Then, one-time:
-
-```bash
-npm login                       # create a free account at npmjs.com first
-cd packages/yggdrasil
-npm publish --access public     # --access public is required for scoped names
-```
-
-Each release after that: bump `version` (`npm version patch|minor|major`), then
-`npm publish`. Consumers install with `npm install @platob/yggdrasil`.
-
-Notes:
-- The package name must be globally unique on npm; a **scoped** name
-  (`@your-org/yggdrasil`) avoids collisions and is free for public packages.
-- Ship `dist/` (compiled JS + `.d.ts`), not the `.ts` sources — `files` and
-  `.npmignore` control what's included.
-- For automated releases, run `npm publish` from CI (GitHub Actions) with an
-  `NPM_TOKEN` secret instead of publishing from a laptop.
-- After extraction, point the Next app at it (workspace dep or
-  `npm install @platob/yggdrasil`) and keep the **parity rule** above.
+To cut a release: bump `version` here (`npm version patch|minor|major`), commit,
+then push the matching tag.

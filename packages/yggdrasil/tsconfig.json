@@ -10,6 +10,6 @@
     "noEmit": false,
     "lib": ["ES2020", "DOM"]
   },
-  "include": ["index.ts", "enums", "url", "path", "io", "http_"],
+  "include": ["index.ts", "enums", "url", "path", "io", "http_", "data", "arrow"],
   "exclude": ["dist", "node_modules", "**/*.test.ts", "**/*.bench.ts"]
 }

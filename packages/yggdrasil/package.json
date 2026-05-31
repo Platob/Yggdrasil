@@ -1,7 +1,7 @@
 {
   "name": "@platob/yggdrasil",
-  "version": "0.2.0",
-  "description": "Client-side replication of the Python yggdrasil package — MIME/media-type registry, URL value type, and more. Kept in parity with python/src/yggdrasil.",
+  "version": "0.3.0",
+  "description": "Yggdrasil for JS/TS — the cross-compatible twin of the Python yggdrasil package, optimized for JS. Mirrors the Python module surface (enums, url, path, data typing, io) so backend (Python) and frontend (JS) speak one contract for high-performance communication, leveraging Apache Arrow and polars (and later Spark).",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
