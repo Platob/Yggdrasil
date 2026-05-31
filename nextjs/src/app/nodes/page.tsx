@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { NodeCard } from "@/components/NodeCard";
+import { State } from "@platob/yggdrasil";
 import {
   getBackend,
   getPeers,
@@ -180,7 +181,7 @@ export default function NodesPage() {
       if (envsRes.status === "fulfilled") setEnvs(envsRes.value.envs);
       if (funcsRes.status === "fulfilled") setFuncs(funcsRes.value.funcs);
       if (dagsRes.status === "fulfilled") setDagList(dagsRes.value.dags);
-      if (runsRes.status === "fulfilled") setActiveRuns(runsRes.value.runs.filter((r) => r.status === "running"));
+      if (runsRes.status === "fulfilled") setActiveRuns(runsRes.value.runs.filter((r) => State.from(r.status).isActive));
       if (usersRes.status === "fulfilled") setUsers(usersRes.value.users);
       if (auditRes.status === "fulfilled") setAuditEntries(auditRes.value.entries);
     } finally {

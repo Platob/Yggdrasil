@@ -27,7 +27,7 @@ import type {
 } from "./types";
 import { cachedGet, cachedPost, invalidate, TTL } from "./cache";
 import { downloadBlob } from "./format";
-import { MimeType, MimeTypes } from "@platob/yggdrasil";
+import { MimeType, MimeTypes, State } from "@platob/yggdrasil";
 
 // ── Low-level fetch helper ─────────────────────────────────────────────────
 
@@ -212,7 +212,7 @@ export async function runFuncByName(
     `/api/v2/pyfuncrun/${triggered.run.id}/wait?timeout=60`,
   );
   invalidate("pyfuncrun", "pyfunc", "stats", "metrics");
-  if (final.run.status === "failed" || final.run.error) {
+  if (State.from(final.run.status).isFailed || final.run.error) {
     throw new Error(final.run.error || `Run #${final.run.id} failed`);
   }
   // Prefer the structured result; fall back to stdout for fire-and-forget funcs.
