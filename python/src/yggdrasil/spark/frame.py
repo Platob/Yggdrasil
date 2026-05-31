@@ -1,25 +1,16 @@
 import logging
 from typing import Any, Iterator
 
+import cloudpickle
 import pyarrow as pa
-from pyspark.sql import SparkSession
 from yggdrasil.arrow.cast import any_to_arrow_batch_iterator, any_to_arrow_table
 from yggdrasil.data import schema as schema_builder, field as field_builder, Schema
 from yggdrasil.data.options import CastOptions
-# Use yggdrasil's serde wire format (orjson-backed with broad type
-# coverage — datetime / UUID / Path / dataclass / namedtuple / Decimal —
-# beyond what cloudpickle alone provides) for the row payloads. The
-# cluster needs ygg installed for the unpickle side; that's exactly
-# what ``DatabricksClient.spark`` auto-declares via
-# ``DatabricksEnv.withDependencies("ygg")``.
-from yggdrasil.pickle.ser import dumps, loads
 
-# Function dependency scanning helpers — exposed via the pyspark-free
-# ``yggdrasil.spark.dependencies`` module so the scan logic can be
-# tested / imported in environments where ``pyspark`` is not installed
-# (which is the common path for the Spark Connect client). Re-exported here
-# for the back-compat call sites that import them from ``...spark.frame``.
-from yggdrasil.spark.dependencies import _function_top_modules  # noqa: F401
+# Dynamic-frame row payloads and the user function are serialized with
+# cloudpickle — the serializer pyspark itself ships — so executors need
+# nothing ygg-specific (no install step, no custom envelope) to read a
+# dynamic batch back.
 
 LOGGER = logging.getLogger(__name__)
 
@@ -27,13 +18,6 @@ __all__ = [
     "Dataset",  # noqa: F822  -- lazy module attribute via ``__getattr__``
     "is_dynamic_schema",
 ]
-
-# Per-session install cache. Spark Connect sessions don't always accept
-# attribute writes (``session.X = ...`` may be rejected by the proxy), so we
-# can't reliably stash this on the session itself. Keying by ``id(session)``
-# leaks at most one entry per session over the process lifetime — acceptable
-# for the long-lived client pattern these sessions are designed for.
-_PER_SESSION_INSTALLED_MODULES: "dict[int, set[str]]" = {}
 
 PICKLE_COLUMN_NAME = "_pickle"
 DYNAMIC_SCHEMA = schema_builder(
@@ -71,7 +55,7 @@ def _emit_pickled(
     out: list[dict[str, bytes]] = []
     out_bytes = 0
     for obj in objects:
-        ser = dumps(obj)
+        ser = cloudpickle.dumps(obj)
         if out and out_bytes + len(ser) > byte_size:
             yield pa.RecordBatch.from_pylist(out, schema=_ARROW_DYNAMIC_SCHEMA)
             out = []
@@ -103,7 +87,7 @@ def _dynamic_rows(batches: Iterator[pa.RecordBatch]) -> Iterator[Any]:
     for batch in batches:
         col = batch.column(0)
         for i in range(batch.num_rows):
-            yield loads(col[i].as_py())
+            yield cloudpickle.loads(col[i].as_py())
 
 
 def _typed_rows(batches: Iterator[pa.RecordBatch]) -> Iterator[dict[str, Any]]:
@@ -111,169 +95,6 @@ def _typed_rows(batches: Iterator[pa.RecordBatch]) -> Iterator[dict[str, Any]]:
     for batch in batches:
         for row in batch.to_pylist():
             yield row
-
-
-# ---------------------------------------------------------------------------
-# Executor module shipping
-# ---------------------------------------------------------------------------
-
-# File extensions that mean "compiled native module" — the zip-import path
-# Python uses for ``addPyFile`` archives only handles pure-Python source.
-# A package shipping these has to land on disk somewhere on ``sys.path``,
-# not inside a zip, so we never auto-ship them.
-_NATIVE_EXTENSION_SUFFIXES = (".so", ".pyd", ".dylib")
-
-
-def _module_has_native_extensions(root: "Any") -> bool:
-    """``True`` iff *root* is a package directory containing ``.so`` / ``.pyd``.
-
-    A single-file ``.whl`` or ``.zip`` is taken at face value (we trust the
-    archive name); the check only rejects raw package directories whose
-    on-disk contents include compiled extensions.
-    """
-    try:
-        if not root.is_dir():
-            return False
-        for path in root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in _NATIVE_EXTENSION_SUFFIXES:
-                return True
-    except Exception:
-        return False
-    return False
-
-
-def _install_modules_on_executors(
-    session: SparkSession,
-    modules: "set[str]",
-) -> set[str]:
-    """Ship each module to Spark executors via ``addArtifacts``.
-
-    Two backends, picked by feature detection:
-
-    - **Spark Connect / Databricks Connect** — ``session.addArtifacts(
-      path, pyfile=True)`` injects the archive into the
-      session's artifact directory for every executor. When a
-      :class:`DatabricksClient` is stashed on the session
-      (``session.ygg_client`` — set by
-      :meth:`DatabricksClient.spark`), the archive is *also*
-      published to the shared workspace registry at
-      ``/Workspace/.../.ygg/pypi/simple/`` so teammates on the
-      same workspace can reuse it without rebuilding.
-    - **Plain Spark** — falls back to
-      :meth:`SparkContext.addPyFile`.
-
-    Every module is materialized through
-    :func:`build_module_archive` so the artifact is a
-    deflated ``.zip`` whose top-level entry IS the package
-    directory — ``addArtifacts(pyfile=True)`` then loads it
-    straight onto the executor's ``sys.path``. Failures are
-    logged at INFO / WARNING and swallowed: best-effort
-    installs shouldn't crash an otherwise valid transform.
-    """
-    from yggdrasil.path._module_pack import (
-        build_module_archive,
-        resolve_module_root,
-    )
-
-    client = getattr(session, "ygg_client", None)
-    registry = None
-    if client is not None:
-        try:
-            from yggdrasil.databricks.registry import WorkspacePyPIRegistry
-            registry = WorkspacePyPIRegistry(client=client)
-        except Exception as exc:
-            LOGGER.info(
-                "Could not build WorkspacePyPIRegistry: %s", exc,
-            )
-            registry = None
-
-    add_art = getattr(session, "addArtifacts", None) or getattr(
-        session, "addArtifact", None,
-    )
-    # ``session.sparkContext`` raises ``JVM_ATTRIBUTE_NOT_SUPPORTED`` on
-    # Spark Connect — never just returns ``None`` — so guard the probe.
-    try:
-        sc = getattr(session, "sparkContext", None)
-    except Exception:
-        sc = None
-    add_py = getattr(sc, "addPyFile", None) if sc is not None else None
-
-    if not callable(add_art) and not callable(add_py):
-        LOGGER.info(
-            "SparkSession exposes neither addArtifacts nor "
-            "addPyFile — cannot install %s on executors.",
-            sorted(modules),
-        )
-        return set()
-
-    installed: set[str] = set()
-    for module_name in sorted(modules):
-        try:
-            root = resolve_module_root(module_name)
-        except Exception as exc:
-            LOGGER.info(
-                "Skipping %s — cannot resolve module root: %s",
-                module_name, exc,
-            )
-            continue
-
-        # Compiled extensions (``.so`` / ``.pyd``) inside a wheel-installed
-        # package can't be loaded from a zip — Python's zipimporter handles
-        # pure-Python source but not native ``.so`` modules. Trying to ship
-        # pyarrow / numpy / polars / pandas via ``addPyFile`` puts a broken
-        # copy ahead of the executor's real install in ``sys.path``. These
-        # are the packages the cluster always already has; skip them.
-        if _module_has_native_extensions(root):
-            LOGGER.info(
-                "Skipping %s — package contains compiled extensions that "
-                "won't load from a zip; assuming cluster has it pre-installed.",
-                module_name,
-            )
-            continue
-
-        archive_path = None
-        if registry is not None:
-            # Workspace-cache path: publish through the registry
-            # so the wheel / zip ends up at
-            # ``.ygg/pypi/simple/<pkg>/...`` for sharing. The
-            # registry returns a ``local:<path>`` spec and the
-            # remote :class:`WorkspacePath`; we use the local
-            # path for ``addArtifacts``.
-            try:
-                spec, _remote = registry.publish(module_name)
-                if spec.startswith("local:"):
-                    archive_path = spec[len("local:"):]
-            except Exception as exc:
-                LOGGER.info(
-                    "Registry publish failed for %s; falling back "
-                    "to in-place archive: %s", module_name, exc,
-                )
-
-        if archive_path is None:
-            try:
-                archive_path = str(
-                    build_module_archive(root, dest=None),
-                )
-            except Exception as exc:
-                LOGGER.info(
-                    "Skipping %s — cannot build archive: %s",
-                    module_name, exc,
-                )
-                continue
-
-        try:
-            if callable(add_art):
-                add_art(archive_path, pyfile=True)
-            else:
-                add_py(archive_path)
-        except Exception as exc:
-            LOGGER.warning(
-                "Failed to ship %s via Spark: %s", module_name, exc,
-            )
-            continue
-        installed.add(module_name)
-    return installed
-
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +117,7 @@ def _install_modules_on_executors(
 # ``yggdrasil.io.tabular`` keep working unchanged — both names resolve
 # to the same class. The module-level helpers above
 # (``is_dynamic_schema``, ``_emit_pickled``, ``_typed_cast``,
-# ``_dynamic_rows``, ``_typed_rows``, ``_install_modules_on_executors``,
+# ``_dynamic_rows``, ``_typed_rows``,
 # ``DYNAMIC_SCHEMA``, ``PICKLE_COLUMN_NAME``) stay here —
 # :class:`Dataset` imports them where needed.
 

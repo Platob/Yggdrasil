@@ -115,11 +115,10 @@ class TestSparkTabularDatasetAlias(unittest.TestCase):
 
         df = _fake_frame()
         ds = Dataset(df)
-        # The old ``Dataset`` exposed ``.df`` and ``.schema`` and
-        # ``.installed_modules`` — all still present on the merged class.
+        # The old ``Dataset`` exposed ``.df`` and ``.schema`` — both still
+        # present on the merged class.
         self.assertIs(ds.df, df)
         self.assertIsNone(ds.schema)
-        self.assertEqual(ds.installed_modules, set())
 
 
 class TestSparkTabularIsCached(unittest.TestCase):
