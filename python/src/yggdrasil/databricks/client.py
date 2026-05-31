@@ -1580,7 +1580,11 @@ class DatabricksClient(Singleton, URLBased):
             return cached
         from .sql.engine import SQLEngine
 
-        cached = SQLEngine(client=self)
+        cached = SQLEngine(
+            client=self,
+            catalog_name=self.unity_catalog_name,
+            schema_name=self.unity_schema_name,
+        )
         self.__dict__["_sql"] = cached
         return cached
 
@@ -1871,7 +1875,11 @@ class DatabricksClient(Singleton, URLBased):
             return cached
         from .schema.schemas import Schemas
 
-        cached = Schemas(client=self)
+        cached = Schemas(
+            client=self,
+            catalog_name=self.unity_catalog_name,
+            schema_name=self.unity_schema_name,
+        )
         self.__dict__["_schemas"] = cached
         return cached
 
@@ -1890,7 +1898,11 @@ class DatabricksClient(Singleton, URLBased):
             return cached
         from .volume.volumes import Volumes
 
-        cached = Volumes(client=self)
+        cached = Volumes(
+            client=self,
+            catalog_name=self.unity_catalog_name,
+            schema_name=self.unity_schema_name,
+        )
         self.__dict__["_volumes"] = cached
         return cached
 

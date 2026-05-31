@@ -79,6 +79,28 @@ class TestBroadcast:
         bare = DatabricksClient(host="g.example.com", token="t")
         assert bare.external.unity_catalog_name == "globalcat"
 
+    def test_vended_sql_engine_inherits_client_context(self):
+        c = DatabricksClient(
+            host="h.example.com", token="t",
+            unity_catalog_name="main", unity_schema_name="sales",
+        )
+        assert c.sql.catalog_name == "main"
+        assert c.sql.schema_name == "sales"
+
+    def test_vended_schemas_and_volumes_inherit_client_context(self):
+        c = DatabricksClient(
+            host="i.example.com", token="t",
+            unity_catalog_name="main", unity_schema_name="sales",
+        )
+        assert c.schemas.catalog_name == "main"
+        assert c.volumes.catalog_name == "main"
+        assert c.volumes.schema_name == "sales"
+
+    def test_vended_service_defaults_stay_none_without_context(self):
+        c = DatabricksClient(host="j.example.com", token="t")
+        assert c.sql.catalog_name is None
+        assert c.volumes.catalog_name is None
+
 
 class TestSerializationDropsDefaults:
     def test_getstate_omits_fields_at_default(self):
