@@ -48,6 +48,24 @@ class DatabricksService(ABC):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(client={self.client!r})"
 
+    # -- Unity Catalog default context (broadcast from the client) --------
+    @property
+    def unity_catalog_name(self) -> Optional[str]:
+        """Default Unity Catalog name: this client's, else the active global
+        context (:func:`yggdrasil.databricks.client.current_unity_catalog`)."""
+        from .client import current_unity_catalog
+
+        return self.client.unity_catalog_name or current_unity_catalog()
+
+    @property
+    def unity_schema_name(self) -> Optional[str]:
+        """Default Unity Catalog schema: this client's, else the active
+        global context
+        (:func:`yggdrasil.databricks.client.current_unity_schema`)."""
+        from .client import current_unity_schema
+
+        return self.client.unity_schema_name or current_unity_schema()
+
     def __getstate__(self):
         return {"client": self.client}
 

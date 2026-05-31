@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+from contextvars import ContextVar
 from pathlib import Path
 from threading import RLock
 from typing import (
@@ -153,8 +154,41 @@ _STATIC_DEFAULTS: dict[str, Any] = {
     "max_connections_per_pool": _DEFAULT_MAX_CONNECTIONS_PER_POOL,
     "product": "yggdrasil",
     "product_version": ygg_version,
-    "skip_verify": False
+    "skip_verify": False,
+    # Default Unity Catalog context — the catalog / schema sub-services and
+    # the SQL engine fall back to when a call doesn't name one. Broadcast
+    # process-/async-wide via the ``UNITY_CATALOG_NAME`` /
+    # ``UNITY_SCHEMA_NAME`` context vars (see below) so code without a
+    # client reference can still read the active default.
+    "unity_catalog_name": None,
+    "unity_schema_name": None,
 }
+
+
+# Global Unity Catalog context. A client *broadcasts* its
+# ``unity_catalog_name`` / ``unity_schema_name`` into these on construction
+# and when it becomes current, so every sub-service (and any standalone
+# helper) reads one process-/async-local default through
+# :func:`current_unity_catalog` / :func:`current_unity_schema` without
+# threading a client through every call. :class:`contextvars.ContextVar`
+# (not a plain global) so concurrent async tasks / threads can scope their
+# own default without clobbering each other.
+UNITY_CATALOG_NAME: "ContextVar[Optional[str]]" = ContextVar(
+    "ygg_unity_catalog_name", default=None
+)
+UNITY_SCHEMA_NAME: "ContextVar[Optional[str]]" = ContextVar(
+    "ygg_unity_schema_name", default=None
+)
+
+
+def current_unity_catalog() -> Optional[str]:
+    """The process-/async-local default Unity Catalog name, or ``None``."""
+    return UNITY_CATALOG_NAME.get()
+
+
+def current_unity_schema() -> Optional[str]:
+    """The process-/async-local default Unity Catalog schema, or ``None``."""
+    return UNITY_SCHEMA_NAME.get()
 
 
 # Lazy snapshot of resolved env-default values. The env values get baked
@@ -275,6 +309,8 @@ class DatabricksClient(Singleton, URLBased):
     max_connections_per_pool: Optional[int]
     product: Optional[str]
     product_version: Optional[str]
+    unity_catalog_name: Optional[str]
+    unity_schema_name: Optional[str]
 
     # ---- private singleton cache -----------------------------------------
 
@@ -419,6 +455,8 @@ class DatabricksClient(Singleton, URLBased):
         product: Any = ...,
         product_version: Any = ...,
         skip_verify: Any = ...,
+        unity_catalog_name: Any = ...,
+        unity_schema_name: Any = ...,
         singleton_ttl: "int | None" = ...,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor
@@ -460,10 +498,16 @@ class DatabricksClient(Singleton, URLBased):
             max_connections_per_pool=max_connections_per_pool,
             product=product,
             product_version=product_version,
-            skip_verify=skip_verify
+            skip_verify=skip_verify,
+            unity_catalog_name=unity_catalog_name,
+            unity_schema_name=unity_schema_name,
         )
         for name, value in resolved.items():
             self.__dict__[name] = value
+
+        # Broadcast the Unity Catalog defaults so sub-services (and
+        # standalone helpers) can read them as the active global context.
+        self._broadcast_unity_context()
 
         self._was_connected = False
         self._workspace_config: Optional[Config] = None
@@ -513,6 +557,15 @@ class DatabricksClient(Singleton, URLBased):
         # pickle.
         state.pop("_singleton_key_", None)
 
+        # Drop init fields still at their resolved default — the receiver
+        # re-seeds them from the same defaults in ``__setstate__`` (the
+        # singleton identity already travels via ``__getnewargs_ex__``).
+        # Keeps the payload to just the fields that actually differ.
+        defaults = self._resolve_init_kwargs()
+        for name, default in defaults.items():
+            if name in state and state[name] == default:
+                state.pop(name)
+
         # Best-effort. We don't *construct* a Config here — pickling must
         # never trigger a browser flow or network round-trip.
         state["_session_token"] = self._snapshot_session_token()
@@ -545,7 +598,12 @@ class DatabricksClient(Singleton, URLBased):
             self.__dict__[key] = None
         self.__dict__["_session_token"] = None
 
+        # Re-seed init fields from their resolved defaults first, so any the
+        # sender dropped (because they equalled the default) are restored;
+        # the carried ``state`` then overrides only the fields that differ.
+        self.__dict__.update(self._resolve_init_kwargs())
         self.__dict__.update(state)
+        self._broadcast_unity_context()
 
         if self.is_in_databricks_environment():
             self.auth_type = "runtime"
@@ -758,6 +816,21 @@ class DatabricksClient(Singleton, URLBased):
         global CURRENT_BASE_CLIENT
         with CURRENT_BASE_CLIENT_LOCK:
             CURRENT_BASE_CLIENT = workspace
+        if workspace is not None:
+            workspace._broadcast_unity_context()
+
+    def _broadcast_unity_context(self) -> None:
+        """Publish this client's Unity Catalog defaults to the global
+        context vars, so sub-services / helpers read them via
+        :func:`current_unity_catalog` / :func:`current_unity_schema`.
+
+        Only non-``None`` values are published — a credential-only client
+        (no catalog / schema configured) leaves an existing active default
+        in place rather than wiping it."""
+        if self.unity_catalog_name is not None:
+            UNITY_CATALOG_NAME.set(self.unity_catalog_name)
+        if self.unity_schema_name is not None:
+            UNITY_SCHEMA_NAME.set(self.unity_schema_name)
 
     # -------------------------------------------------------------------------
     # Repr / context manager
