@@ -8,7 +8,6 @@ import pytest
 
 from yggdrasil.arrow.tabular import ArrowTabular
 from yggdrasil.plan import parse_sql, BUILTIN_REGISTRY
-from yggdrasil.plan.func_registry import FunctionRegistry
 
 
 @pytest.fixture
@@ -152,16 +151,9 @@ class TestRegistryAPI:
 class TestSparkUDFRegistration:
     @pytest.fixture(scope="class")
     def spark(self):
-        try:
-            from pyspark.sql import SparkSession
-            session = (SparkSession.builder.master("local[1]").appName("udf_test")
-                       .config("spark.ui.enabled", "false")
-                       .config("spark.driver.memory", "512m")
-                       .getOrCreate())
-            yield session
-            session.stop()
-        except ImportError:
-            pytest.skip("pyspark not available")
+        # Shared SparkTestCase session — never stopped (other modules share it).
+        from yggdrasil.spark.tests import _get_test_spark
+        return _get_test_spark()
 
     def test_spark_builtin_upper(self, spark):
         df = spark.createDataFrame([("hello",), ("world",)], ["name"])

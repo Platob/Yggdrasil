@@ -19,9 +19,8 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.arrow.tabular import ArrowTabular
-from yggdrasil.plan import parse_sql, SelectPlan, ExecutionPlan
+from yggdrasil.plan import parse_sql, ExecutionPlan
 from yggdrasil.plan.nodes import PlanNode, SelectNode
-from yggdrasil.plan.ops import TableRef
 
 
 # ---------------------------------------------------------------------------
@@ -242,19 +241,9 @@ class TestDefaultParamExec:
 
 @pytest.fixture(scope="module")
 def spark():
-    try:
-        from pyspark.sql import SparkSession
-        session = (SparkSession.builder
-                   .master("local[1]")
-                   .appName("ygg_plan_test")
-                   .config("spark.ui.enabled", "false")
-                   .config("spark.driver.memory", "512m")
-                   .config("spark.sql.shuffle.partitions", "2")
-                   .getOrCreate())
-        yield session
-        session.stop()
-    except ImportError:
-        pytest.skip("pyspark not available")
+    # Shared SparkTestCase session — never stopped (other modules share it).
+    from yggdrasil.spark.tests import _get_test_spark
+    return _get_test_spark()
 
 
 @pytest.fixture
