@@ -27,6 +27,7 @@ body), :attr:`~Flow.name`, :meth:`~Flow.parameters`, :meth:`~Flow.trigger`.
 from __future__ import annotations
 
 import functools
+import re
 import time
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar
 
@@ -242,6 +243,15 @@ class Flow(_Runnable):
         ``None``. Function-built flows carry the ``@flow(trigger=...)`` value."""
         return self._trigger
 
+    def wheel_dir(self) -> str:
+        """Workspace folder the built wheel is uploaded to — named by the job
+        (``/Workspace/Shared/.ygg/whl/pkg/<job-name>``) so each job owns its
+        wheel."""
+        from yggdrasil.databricks.job.wheel import WORKSPACE_WHL_DIR
+
+        slug = re.sub(r"[^0-9A-Za-z._-]+", "_", self.name).strip("_") or "flow"
+        return f"{WORKSPACE_WHL_DIR}/{slug}"
+
     def effective_dependencies(self) -> list[str]:
         """The serverless dependencies. Once :meth:`deploy` has shipped wheels,
         it's the uploaded ygg wheel + each :attr:`extra_dependencies` shipped as
@@ -311,9 +321,12 @@ class Flow(_Runnable):
                 ensure_wheel,
             )
 
-            self._wheel_path = ensure_wheel(client)
-            # Embed each extra (latest databricks-sdk) as its own uploaded wheel
-            # so the cluster needs no index access.
+            # Built wheel lives under the job-named folder; rebuilt each deploy
+            # so the job always ships current code.
+            self._wheel_path = ensure_wheel(client, workspace_dir=self.wheel_dir(), rebuild=True)
+            # Each extra (latest databricks-sdk) ships as a wheel centralized by
+            # lib name (precheck → reuse, else download + upload), so the cluster
+            # needs no index access and versions are shared across jobs.
             self._extra_wheel_paths = [
                 ensure_requirement_wheel(client, req) for req in self.extra_dependencies
             ]

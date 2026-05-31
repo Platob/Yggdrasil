@@ -156,8 +156,9 @@ class TestFlow:
              patch("yggdrasil.databricks.job.wheel.ensure_requirement_wheel", return_value=sdk) as erw:
             deployed = demo.deploy(client)
 
-        ew.assert_called_once_with(client)            # built + uploaded the ygg wheel
-        erw.assert_called_once_with(client, "databricks-sdk")  # downloaded + uploaded the sdk wheel
+        wheel_dir = "/Workspace/Shared/.ygg/whl/ygg-demo"   # built wheel named by the job
+        ew.assert_called_once_with(client, workspace_dir=wheel_dir, rebuild=True)
+        erw.assert_called_once_with(client, "databricks-sdk")   # external lib centralized by name
         client.jobs.create_or_update.assert_called_once()
         kwargs = client.jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-demo"

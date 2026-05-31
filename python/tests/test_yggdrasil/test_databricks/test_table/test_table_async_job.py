@@ -117,7 +117,12 @@ class TestEnsure:
             tj = TableJob(t)
             assert tj.ensure() is tj
         assert tj.job is created
-        ew.assert_called_once_with(t.client)               # built + uploaded the wheel
+        # built wheel lives under the job-named folder, rebuilt each deploy
+        ew.assert_called_once_with(
+            t.client,
+            workspace_dir="/Workspace/Shared/.ygg/whl/YGG_ASYNC_c.s.t",
+            rebuild=True,
+        )
         # the watched logs dir is created so the trigger URL is valid
         t.staging_volume.path.return_value.mkdir.assert_called_with(
             parents=True, exist_ok=True
