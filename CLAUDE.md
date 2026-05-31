@@ -7,7 +7,7 @@ Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 Yggdrasil is replicated across languages so the same concepts run on the
 backend and client-side. The reference implementation is **Python**
 (`python/src/yggdrasil/`); the **JS/TS** port lives in
-`nextjs/src/lib/yggdrasil/` (mirrors the Python package layout — `enums/`,
+`packages/yggdrasil/` (mirrors the Python package layout — `enums/`,
 …). More languages may follow.
 
 **These ports are ONE contract, not independent code.** When you touch a
@@ -20,7 +20,7 @@ synchronized — same names, same structure, same behavior:
 - Keep the **structure** parallel: file-for-file, class-for-class,
   method-for-method (Python `MimeType.from_` ↔ TS `MimeType.fromName`/`from`).
 - Each port's module header points at its counterpart; update both when the
-  mapping changes. See `nextjs/src/lib/yggdrasil/README.md` for the file map.
+  mapping changes. See `packages/yggdrasil/README.md` for the file map.
 - If you can only do one side now, leave an explicit `// PARITY:` /
   `# PARITY:` note at both sites describing the gap — never let the two
   drift silently.

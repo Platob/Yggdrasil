@@ -1,6 +1,6 @@
 """MIME / media-type registry.
 
-PARITY: ported to JS/TS at ``nextjs/src/lib/yggdrasil/enums/mimeType.ts``.
+PARITY: ported to JS/TS at ``packages/yggdrasil/enums/mimeType.ts``.
 This module is the reference; keep the two in sync (see the "Cross-language
 parity" rule in the repo CLAUDE.md).
 """

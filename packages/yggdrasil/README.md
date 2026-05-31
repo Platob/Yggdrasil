@@ -20,7 +20,7 @@ Object-oriented, mirroring the Python classes:
 
 ## File map (TS ↔ Python)
 
-| JS/TS (`nextjs/src/lib/yggdrasil/`) | Python (`python/src/yggdrasil/`) |
+| JS/TS (`packages/yggdrasil/`) | Python (`python/src/yggdrasil/`) |
 |---|---|
 | `enums/mimeType.ts` | `enums/mime_type.py` |
 | `enums/mediaType.ts` | `enums/media_type.py` |

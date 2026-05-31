@@ -1,6 +1,6 @@
 """Backend-agnostic execution + order state enum.
 
-PARITY: ported to JS/TS at nextjs/src/lib/yggdrasil/enums/state.ts — keep in sync.
+PARITY: ported to JS/TS at packages/yggdrasil/enums/state.ts — keep in sync.
 
 
 Every async-execution surface in yggdrasil — Databricks SQL warehouse

@@ -27,7 +27,7 @@ import type {
 } from "./types";
 import { cachedGet, cachedPost, invalidate, TTL } from "./cache";
 import { downloadBlob } from "./format";
-import { MimeType, MimeTypes } from "./yggdrasil/enums";
+import { MimeType, MimeTypes } from "@platob/yggdrasil";
 
 // ── Low-level fetch helper ─────────────────────────────────────────────────
 

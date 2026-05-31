@@ -1,6 +1,6 @@
 name: 📦 Publish @platob/yggdrasil (npm)
 
-# Publishes the JS/TS yggdrasil library (nextjs/src/lib/yggdrasil) to npm.
+# Publishes the JS/TS yggdrasil library (packages/yggdrasil) to npm.
 #
 # Triggers:
 #   - push a tag like ``yggdrasil-js-v0.1.0`` (the version must match package.json)
@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: nextjs/src/lib/yggdrasil
+        working-directory: packages/yggdrasil
 
     steps:
       - name: Checkout

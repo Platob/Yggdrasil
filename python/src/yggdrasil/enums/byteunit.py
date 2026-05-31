@@ -1,6 +1,6 @@
 """Centralized byte-unit enum for memory / capacity / spill thresholds.
 
-PARITY: ported to JS/TS at nextjs/src/lib/yggdrasil/enums/byteUnit.ts — keep in sync.
+PARITY: ported to JS/TS at packages/yggdrasil/enums/byteUnit.ts — keep in sync.
 
 
 Across Yggdrasil, a "size in bytes" appears in many places: ``Memory``'s
