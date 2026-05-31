@@ -6,12 +6,12 @@ import {
   type TableEntry, type FinanceResult,
 } from "@/lib/api";
 import Chart from "@/components/Chart";
+import { NUMERIC } from "@/lib/format";
 
 // A flat, finance-ready view of a registered table: its file/mount path plus the
 // numeric columns worth treating as a price/return series.
 interface Series { full_name: string; source_url: string; numeric: string[]; }
 
-const NUMERIC = /int|float|double|decimal|number|real/i;
 const PRICEY = /close|price|adj|nav|value|amount|mrr|rate|last/i;
 
 function pct(v: number | null | undefined): string {

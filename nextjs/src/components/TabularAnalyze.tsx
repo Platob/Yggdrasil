@@ -18,10 +18,10 @@ import {
   type CastSpec,
 } from "@/lib/api";
 import Chart, { type ChartType } from "@/components/Chart";
+import { NUMERIC, fmtCell } from "@/lib/format";
 
 const AGGS: AggFunc[] = ["sum", "mean", "min", "max", "count", "median", "std", "var"];
 const EXPORT_FORMATS = ["csv", "parquet", "json", "ndjson", "arrow", "xlsx"];
-const NUMERIC = /int|float|double|decimal|num/i;
 
 export interface AnalyzeColumn { name: string; type?: string }
 
@@ -419,7 +419,7 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
                             const isTotalCol = j >= pivotView.firstTotalCol;
                             return (
                               <td key={j} className={`px-2 py-1 border-b border-white/[0.03] ${isRowField ? `whitespace-nowrap sticky left-0 ${isTotalRow ? "text-emerald font-semibold bg-[#0b1410]" : "text-frost/70 font-semibold bg-[#0b0e14]"}` : `text-right tabular-nums ${isTotalRow || isTotalCol ? "text-emerald font-semibold" : "text-foreground/80"}`}`}>
-                                {v == null ? "·" : typeof v === "number" ? Number(v).toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(v)}
+                                {fmtCell(v)}
                               </td>
                             );
                           })}

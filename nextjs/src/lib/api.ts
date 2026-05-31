@@ -26,6 +26,7 @@ import type {
   UserCard,
 } from "./types";
 import { cachedGet, cachedPost, invalidate, TTL } from "./cache";
+import { downloadBlob } from "./format";
 
 // ── Low-level fetch helper ─────────────────────────────────────────────────
 
@@ -543,27 +544,6 @@ export async function editWorkbook(
 // ── Analysis (pivot / describe / finance) ───────────────────────────────────
 export type AggFunc = "sum" | "mean" | "min" | "max" | "count" | "median" | "std" | "var";
 
-export interface AggregateResult {
-  columns: string[];
-  rows: TabularCell[][];
-  group_count: number;
-  source_rows: number;
-  truncated: boolean;
-}
-
-export function aggregate(
-  path: string,
-  group_by: string[],
-  measures: { column: string; agg: AggFunc }[],
-  node?: string,
-  limit = 500,
-  filters: { column: string; op: string; value?: unknown }[] = [],
-): Promise<AggregateResult> {
-  const url = `/api/v2/analysis/aggregate${node ? `?node=${encodeURIComponent(node)}` : ""}`;
-  const payload = { path, group_by, measures, limit, filters };
-  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
-}
-
 export interface PivotMeasure { column: string; agg: AggFunc }
 
 export interface PivotResult {
@@ -596,17 +576,6 @@ export function pivot(
     filters: opts.filters ?? [],
   };
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
-}
-
-export interface DescribeResult {
-  statistics: string[];
-  columns: string[];
-  rows: TabularCell[][];
-  truncated: boolean;
-}
-
-export function describe(path: string, node?: string): Promise<DescribeResult> {
-  return jsonFetch(`/api/v2/analysis/describe?path=${encodeURIComponent(path)}${nodeParam(node)}`);
 }
 
 export interface FinanceMetrics {
@@ -677,11 +646,7 @@ export async function downloadExport(path: string, fmt: string, transform: Trans
   if (!res.ok) throw new Error(`export failed: HTTP ${res.status}`);
   const blob = await res.blob();
   const base = path.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "export";
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `${base}.${fmt}`;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  downloadBlob(blob, `${base}.${fmt}`);
 }
 
 export interface OhlcResult {
@@ -936,11 +901,7 @@ export async function downloadSqlExport(body: { sql: string; fmt: string; dialec
   }
   const blob = await res.blob();
   const name = res.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1] ?? `result.${body.fmt}`;
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  downloadBlob(blob, name);
 }
 
 export interface OpLogEntry {
