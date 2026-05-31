@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
     from yggdrasil.databricks.sql.engine import SQLEngine
     from yggdrasil.databricks.table.tables import Tables
+    from yggdrasil.databricks.table.async_job import TableJob
     from yggdrasil.databricks.catalog.catalog import UCCatalog
     from yggdrasil.databricks.column.columns import Columns
     from yggdrasil.databricks.schema.schema import UCSchema
@@ -1214,6 +1215,7 @@ class Table(DatabricksPath):
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
         self._staging_volume: Volume | None = None
+        self._async_job = None
         self._initialized = True
 
     # ------------------------------------
@@ -3176,7 +3178,26 @@ class Table(DatabricksPath):
         return_data: bool = False,
         **kwargs
     ) -> "Tabular | None":
-        """Insert *data* into this table — thin wrapper over :meth:`insert_into`."""
+        """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
+
+        ``wait=False`` switches to the **async drop** path
+        (:meth:`_async_insert`): the staged Parquet + a JSON operation log are
+        written under the table's ``.sql/async`` area and a file-arrival job
+        (:attr:`async_job`) aggregates and loads them later — no warehouse
+        statement runs here. Only ``OVERWRITE`` / ``APPEND`` with no
+        ``match_by`` qualify; anything else (or a query / Spark source) falls
+        through to the normal synchronous path.
+        """
+        from yggdrasil.databricks.table.async_job import ASYNC_MODES
+
+        if (
+            wait is False
+            and not match_by
+            and Mode.from_(mode, default=Mode.APPEND) in ASYNC_MODES
+            and not isinstance(data, (PreparedStatement, StatementResult))
+            and not PreparedStatement.looks_like_query(data)
+        ):
+            return self._async_insert(data, mode=mode, **kwargs)
         return self.insert_into(
             data,
             mode=mode,
@@ -3333,6 +3354,76 @@ class Table(DatabricksPath):
             f".sql/tmp/{leaf}",
             temporary=temporary,
         )
+
+    # =========================================================================
+    # async insert — drop Parquet + an operation log; a file-arrival job loads
+    # =========================================================================
+
+    @property
+    def async_job(self) -> "TableJob":
+        """The file-arrival :class:`TableJob` for this table (lazy get-or-create).
+
+        Watches ``<staging_volume>/.sql/async/logs`` and aggregates the
+        operation logs that :meth:`_async_insert` drops into one ``INSERT``
+        per ``(target, mode)`` group. Created on first access from
+        :meth:`TableJob.definition`."""
+        if self._async_job is None:
+            from yggdrasil.databricks.table.async_job import TableJob
+
+            self._async_job = TableJob(self).ensure()
+        return self._async_job
+
+    def _async_insert(
+        self,
+        data: Any,
+        *,
+        mode: Mode | str | None = None,
+        match_by: Optional[list[str]] = None,
+        cast_options: Optional[CastOptions] = None,
+        **_kwargs: Any,
+    ) -> "VolumePath":
+        """Stage *data* as Parquet + drop a JSON operation log — no warehouse.
+
+        Writes the rows to ``<staging_volume>/.sql/async/data/<op>.parquet`` and
+        an operation log to ``<staging_volume>/.sql/async/logs/<op>.json`` that
+        records the target, mode, and data leaf, then ensures :attr:`async_job`
+        exists so the file-arrival trigger picks it up. Returns the log path.
+
+        Only ``OVERWRITE`` / ``APPEND`` with no ``match_by``; the data is staged
+        with its own schema (the aggregating ``INSERT`` casts at load time).
+        """
+        import json as _json
+
+        from yggdrasil.databricks.table.async_job import ASYNC_MODES, TableJob
+
+        mode_enum = Mode.from_(mode, default=Mode.APPEND)
+        if mode_enum not in ASYNC_MODES:
+            raise ValueError(
+                f"async insert (wait=False) supports only OVERWRITE / APPEND, "
+                f"got {mode_enum.name}"
+            )
+        if match_by:
+            raise ValueError("async insert (wait=False) does not support match_by")
+
+        op_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        data_file = TableJob.data_path(self) / f"{op_id}.parquet"
+        data_file.write_table(data, cast_options, mode=Mode.OVERWRITE)
+
+        log_file = TableJob.logs_path(self) / f"{op_id}.json"
+        log_file.write_bytes(
+            _json.dumps(
+                {
+                    "op_id": op_id,
+                    "target": self.full_name(),
+                    "mode": mode_enum.name.lower(),
+                    "data": f"{op_id}.parquet",
+                    "ts": time.time(),
+                }
+            ).encode()
+        )
+        # Make sure the file-arrival job exists so the drop gets picked up.
+        self.async_job
+        return log_file
 
     def arrow_insert(
         self,
