@@ -10,35 +10,39 @@ from yggdrasil.databricks.job import runner, wheel
 
 
 # --------------------------------------------------------------------------- #
-# runner — ygg-job <kind> <args>
+# runner — ygg-job CLI
 # --------------------------------------------------------------------------- #
 class TestRunner:
-    def test_dispatches_table_async_load(self):
+    def test_table_async_load_runs_loader(self):
         client = MagicMock()
         table = MagicMock()
         client.tables.__getitem__.return_value = table
-        table.async_job  # noqa: B018
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.databricks.table.async_job.TableJob") as TJ:
             TJ.return_value.run.return_value = 3
-            n = runner.run("table-async-load", ["c.s.t"])
+            n = runner.table_async_load("c.s.t")
         client.tables.__getitem__.assert_called_once_with("c.s.t")
         TJ.assert_called_once_with(table)
         TJ.return_value.run.assert_called_once_with(wait=True)
         assert n == 3
 
-    def test_unknown_kind_raises(self):
+    def test_main_dispatches_subcommand(self):
+        with patch.object(runner, "table_async_load", return_value=2) as f:
+            rc = runner.main(["table-async-load", "c.s.t"])
+        f.assert_called_once_with("c.s.t")
+        assert rc == 0
+
+    def test_unknown_command_exits(self):
         with pytest.raises(SystemExit):
-            runner.run("nope", [])
+            runner.main(["nope"])
 
-    def test_main_parses_argv(self):
-        with patch.object(runner, "run", return_value=0) as r:
-            runner.main(["table-async-load", "c.s.t"])
-        r.assert_called_once_with("table-async-load", ["c.s.t"])
-
-    def test_main_requires_kind(self):
+    def test_missing_command_exits(self):
         with pytest.raises(SystemExit):
             runner.main([])
+
+    def test_missing_table_arg_exits(self):
+        with pytest.raises(SystemExit):
+            runner.main(["table-async-load"])
 
 
 # --------------------------------------------------------------------------- #
