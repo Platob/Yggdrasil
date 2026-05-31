@@ -3380,7 +3380,7 @@ class Table(DatabricksPath):
         mode: Mode | str | None = None,
         match_by: Optional[list[str]] = None,
         cast_options: Optional[CastOptions] = None,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> "VolumePath":
         """Stage *data* as Parquet + drop a JSON operation log — no warehouse.
 
