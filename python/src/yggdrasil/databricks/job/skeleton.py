@@ -196,6 +196,10 @@ class Flow(_Runnable):
     #: :attr:`build_wheel`) — e.g. ``ygg`` from an index.
     dependencies: "tuple[str, ...]" = ("ygg[databricks]",)
 
+    #: Always-installed extras, on top of the wheel / :attr:`dependencies` —
+    #: ``databricks-sdk`` (latest) so the runtime SDK is current.
+    extra_dependencies: "tuple[str, ...]" = ("databricks-sdk",)
+
     #: Build the ygg wheel from source on :meth:`deploy` and ship *that* (not a
     #: ``ygg[databricks]`` index install) as the serverless dependency. Uploaded
     #: to ``/Workspace/Shared/.ygg/jobs/`` and referenced by path.
@@ -238,11 +242,11 @@ class Flow(_Runnable):
         return self._trigger
 
     def effective_dependencies(self) -> list[str]:
-        """The serverless dependencies — the uploaded wheel once
-        :meth:`deploy` has shipped it, else :attr:`dependencies`."""
-        if getattr(self, "_wheel_path", None):
-            return [self._wheel_path]
-        return list(self.dependencies)
+        """The serverless dependencies — the uploaded wheel once :meth:`deploy`
+        has shipped it (else :attr:`dependencies`), plus
+        :attr:`extra_dependencies` (``databricks-sdk``)."""
+        base = [self._wheel_path] if getattr(self, "_wheel_path", None) else list(self.dependencies)
+        return base + list(self.extra_dependencies)
 
     def environments(self) -> Optional[list]:
         """Serverless environment list (v5 + :meth:`effective_dependencies`),

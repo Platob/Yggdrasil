@@ -129,10 +129,11 @@ class TestEnsure:
         assert task.python_wheel_task.package_name == "ygg"
         assert task.python_wheel_task.entry_point == "ygg-job"
         assert task.python_wheel_task.parameters == ["table-async-load", "c.s.t"]
-        # serverless v5, dependency = the uploaded wheel (not a direct package)
+        # serverless v5; deps = the uploaded wheel (not a direct package) +
+        # databricks-sdk (latest)
         env = kwargs["environments"][0]
         assert env.spec.environment_version == "5"
-        assert env.spec.dependencies == [wheel]
+        assert env.spec.dependencies == [wheel, "databricks-sdk"]
         assert task.environment_key == env.environment_key
 
     def test_ensure_is_noop_when_already_deployed(self):

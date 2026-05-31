@@ -123,7 +123,7 @@ class TestFlow:
         assert task_obj.environment_key == "default"
         env = spec["environments"][0]
         assert env.spec.environment_version == "5"
-        assert env.spec.dependencies == ["ygg[databricks]"]
+        assert env.spec.dependencies == ["ygg[databricks]", "databricks-sdk"]
 
     def test_serverless_false_drops_environment(self):
         @flow
@@ -160,7 +160,7 @@ class TestFlow:
         assert kwargs["name"] == "ygg-demo"
         assert kwargs["tasks"][0].python_wheel_task.parameters == ["a"]
         # the shipped wheel is the serverless dependency (not ygg[databricks])
-        assert kwargs["environments"][0].spec.dependencies == [wheel]
+        assert kwargs["environments"][0].spec.dependencies == [wheel, "databricks-sdk"]
         assert deployed is client.jobs.create_or_update.return_value
 
 
