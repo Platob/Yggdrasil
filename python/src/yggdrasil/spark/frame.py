@@ -17,7 +17,9 @@ from yggdrasil.pickle.ser import dumps, loads
 # Function dependency scanning helpers — exposed via the pyspark-free
 # ``yggdrasil.spark.dependencies`` module so the scan logic can be
 # tested / imported in environments where ``pyspark`` is not installed
-# (which is the common path for the Spark Connect client).
+# (which is the common path for the Spark Connect client). Re-exported here
+# for the back-compat call sites that import them from ``...spark.frame``.
+from yggdrasil.spark.dependencies import _function_top_modules  # noqa: F401
 
 LOGGER = logging.getLogger(__name__)
 
