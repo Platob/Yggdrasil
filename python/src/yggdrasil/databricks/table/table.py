@@ -3181,7 +3181,7 @@ class Table(DatabricksPath):
         """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
 
         ``wait=False`` switches to the **async drop** path
-        (:meth:`_async_insert`): the staged Parquet + a JSON operation log are
+        (:meth:`async_insert`): the staged Parquet + a JSON operation log are
         written under the table's ``.sql/async`` area and a file-arrival job
         (:attr:`async_job`) aggregates and loads them later — no warehouse
         statement runs here. Only ``OVERWRITE`` / ``APPEND`` with no
@@ -3197,7 +3197,7 @@ class Table(DatabricksPath):
             and not isinstance(data, (PreparedStatement, StatementResult))
             and not PreparedStatement.looks_like_query(data)
         ):
-            return self._async_insert(data, mode=mode, **kwargs)
+            return self.async_insert(data, mode=mode, **kwargs)
         return self.insert_into(
             data,
             mode=mode,
@@ -3364,7 +3364,7 @@ class Table(DatabricksPath):
         """The file-arrival :class:`TableJob` for this table (lazy get-or-create).
 
         Watches ``<staging_volume>/.sql/async/logs`` and aggregates the
-        operation logs that :meth:`_async_insert` drops into one ``INSERT``
+        operation logs that :meth:`async_insert` drops into one ``INSERT``
         per ``(target, mode)`` group. Created on first access from
         :meth:`TableJob.definition`."""
         if self._async_job is None:
@@ -3373,7 +3373,7 @@ class Table(DatabricksPath):
             self._async_job = TableJob(self).ensure()
         return self._async_job
 
-    def _async_insert(
+    def async_insert(
         self,
         data: Any,
         *,

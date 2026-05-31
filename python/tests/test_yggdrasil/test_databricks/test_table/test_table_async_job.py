@@ -1,9 +1,9 @@
 """Unit tests for the async, file-arrival table loader (no live Databricks).
 
 Covers:
-* ``Table.insert(wait=False)`` routing → ``_async_insert`` (OVERWRITE/APPEND,
+* ``Table.insert(wait=False)`` routing → ``async_insert`` (OVERWRITE/APPEND,
   no match_by), and the sync path otherwise;
-* ``_async_insert`` staging a Parquet + dropping a JSON operation log;
+* ``async_insert`` staging a Parquet + dropping a JSON operation log;
 * ``TableJob.ensure`` get-or-create with a file-arrival trigger;
 * ``TableJob.process`` aggregating logs into one INSERT per (target, mode),
   then cleaning up consumed logs + data.
@@ -34,43 +34,43 @@ class TestInsertRouting:
     def test_wait_false_routes_to_async(self):
         t = MagicMock()
         out = Table.insert(t, {"a": [1]}, mode="append", wait=False)
-        t._async_insert.assert_called_once()
-        assert t._async_insert.call_args.kwargs["mode"] == "append"
-        assert out is t._async_insert.return_value
+        t.async_insert.assert_called_once()
+        assert t.async_insert.call_args.kwargs["mode"] == "append"
+        assert out is t.async_insert.return_value
         t.insert_into.assert_not_called()
 
     def test_wait_true_uses_sync_path(self):
         t = MagicMock()
         Table.insert(t, {"a": [1]}, mode="append")  # wait defaults True
         t.insert_into.assert_called_once()
-        t._async_insert.assert_not_called()
+        t.async_insert.assert_not_called()
 
     def test_match_by_stays_sync(self):
         t = MagicMock()
         Table.insert(t, {"a": [1]}, mode="append", wait=False, match_by=["id"])
         t.insert_into.assert_called_once()
-        t._async_insert.assert_not_called()
+        t.async_insert.assert_not_called()
 
     def test_merge_mode_stays_sync(self):
         t = MagicMock()
         Table.insert(t, {"a": [1]}, mode="merge", wait=False)
         t.insert_into.assert_called_once()
-        t._async_insert.assert_not_called()
+        t.async_insert.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
-# Table._async_insert
+# Table.async_insert
 # --------------------------------------------------------------------------- #
 class TestAsyncInsert:
     def test_rejects_non_overwrite_append(self):
         t = _table_mock()
         with pytest.raises(ValueError, match="OVERWRITE / APPEND"):
-            Table._async_insert(t, object(), mode="merge")
+            Table.async_insert(t, object(), mode="merge")
 
     def test_rejects_match_by(self):
         t = _table_mock()
         with pytest.raises(ValueError, match="match_by"):
-            Table._async_insert(t, object(), mode="append", match_by=["id"])
+            Table.async_insert(t, object(), mode="append", match_by=["id"])
 
     def test_writes_parquet_to_staging_and_logs_its_path(self):
         t = _table_mock()
@@ -83,7 +83,7 @@ class TestAsyncInsert:
         logs_dir.__truediv__.return_value = log_file
 
         with patch.object(TableJob, "logs_path", staticmethod(lambda tbl: logs_dir)):
-            result = Table._async_insert(t, {"a": [1]}, mode="append")
+            result = Table.async_insert(t, {"a": [1]}, mode="append")
 
         assert result is log_file
         data_file.write_table.assert_called_once()           # staged Parquet
