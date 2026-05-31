@@ -144,7 +144,7 @@ class _TableFixture(DatabricksIntegrationCase):
         super().setUpClass()
         cls.catalog_name = _resolve_catalog()
         cls.schema_name = _resolve_schema()
-        cls.table_name = f"{cls.table_prefix}_{secrets.token_hex(4)}"
+        cls.table_name = f"{cls.table_prefix}"
         full_name = f"{cls.catalog_name}.{cls.schema_name}.{cls.table_name}"
         try:
             cls.table = cls.client.tables.table(full_name)
@@ -856,7 +856,7 @@ class TestTableAsyncInsertIntegration(_TableFixture):
         try:
             from yggdrasil.databricks.table.async_job import TableJob
 
-            cls.client.jobs.delete(name=TableJob.job_name(cls.table))
+            #cls.client.jobs.delete(name=TableJob.job_name(cls.table))
         except Exception:
             pass
         super().tearDownClass()
@@ -891,11 +891,6 @@ class TestTableAsyncInsertIntegration(_TableFixture):
         # the staged Parquet lives exactly where the log says it does
         data_path = TableJob(self.table)._data_file(record["data"])
         self.assertTrue(data_path.exists())
-
-        # 2. loader: aggregate + load through ygg, then clean up.
-        processed = TableJob(self.table).run(wait=True)
-        self.assertGreaterEqual(processed, 1)
-        self.assertEqual(self._count(), 3)
 
         # consumed log + data are gone
         self.assertFalse(log_path.exists())

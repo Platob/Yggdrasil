@@ -32,6 +32,7 @@ methods to force a fresh ``volumes.read`` immediately.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, ClassVar, Iterator, Mapping, Optional, TYPE_CHECKING
 
@@ -55,6 +56,7 @@ from yggdrasil.io import IOStats
 from yggdrasil.url import URL
 
 if TYPE_CHECKING:
+    from databricks.sdk.service.catalog import VolumeType
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.catalog.catalog import UCCatalog
     from yggdrasil.databricks.fs.volume_path import VolumePath
@@ -179,7 +181,7 @@ class Volume(DatabricksPath):
         self.volume_name = str(volume_name)
 
         super().__init__(service=service, url=URL(
-            scheme=self.scheme,
+            scheme=Scheme.DATABRICKS_VOLUME.value,
             path=f"{self.NAMESPACE_PREFIX}{self.catalog_name}/{self.schema_name}/{self.volume_name}"
         ))
         self._infos_ttl: float = self.DEFAULT_INFO_TTL if infos_ttl is None else float(infos_ttl)
@@ -403,59 +405,15 @@ class Volume(DatabricksPath):
         if not refresh and self._is_fresh():
             return self._infos  # type: ignore[return-value]
 
-        info = None
         try:
             info = self.client.workspace_client().volumes.read(self.full_name())
-        except Exception as exc:
-            if not _looks_like_not_found(exc):
-                if default is ...:
-                    raise
-                logger.warning(f"Volume {self.full_name(safe=True)} not found", exc_info=True)
-                return default
-
-        if info is None:
-            try:
-                self._ensure_volume()
-                info = self.client.workspace_client().volumes.read(self.full_name())
-            except Exception:
-                if default is ...:
-                    raise
-                logger.warning(f"Volume {self.full_name(safe=True)} not found", exc_info=True)
-                return default
+        except Exception as e:
+            if default is ...:
+                raise
+            logger.warning(f"Volume {self.full_name(safe=True)} not found: {e}")
+            return default
 
         return self._store_infos(info)
-
-    def _ensure_volume(self) -> None:
-        """Create the volume (and any missing catalog / schema parents).
-
-        Routes the volume create through :meth:`create` so the
-        managed-volume-type default (``VolumeType.MANAGED`` enum, not
-        a bare ``"MANAGED"`` string the SDK rejects) lives in one
-        place. ``AlreadyExists`` is swallowed by ``missing_ok=True``;
-        on NotFound the parents are materialised via
-        :func:`_ensure_parents_for` and the volume create is retried
-        once.
-        """
-        try:
-            self.create(missing_ok=True)
-            return
-        except Exception as exc:
-            if _looks_like_already_exists(exc):
-                return
-            if not _looks_like_not_found(exc):
-                raise
-
-        from yggdrasil.databricks.volume.volumes import _ensure_parents_for
-        _ensure_parents_for(
-            self.client.workspace_client(),
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-        )
-        try:
-            self.create(missing_ok=True)
-        except Exception as exc:
-            if not _looks_like_already_exists(exc):
-                raise
 
     def exists(self) -> bool:
         """``True`` if this volume is reachable via the Unity Catalog API."""
@@ -631,6 +589,27 @@ class Volume(DatabricksPath):
             )
         return self._schema
 
+    @schema.setter
+    def schema(self, value: "str | UCSchema") -> None:
+        if isinstance(value, str):
+            value = self.client.schemas.schema(
+                catalog_name=self.catalog_name,
+                schema_name=value,
+            )
+        elif not isinstance(value, UCSchema):
+            raise ValueError(f"Expected schema name or UCSchema instance; got {value!r}.")
+        if value.catalog_name != self.catalog_name:
+            raise ValueError(
+                f"Cannot set {self!r}'s schema to {value!r} — "
+                f"catalog mismatch (expected {self.catalog_name!r}, got {value.catalog_name!r})."
+            )
+        if value.schema_name != self.schema_name:
+            raise ValueError(
+                f"Cannot set {self!r}'s schema to {value!r} — "
+                f"schema name mismatch (expected {self.schema_name!r}, got {value.schema_name!r})."
+            )
+        self._schema = value
+
     @property
     def parent(self) -> "DatabricksPath | None":
         return self.schema
@@ -675,9 +654,10 @@ class Volume(DatabricksPath):
     def create(
         self,
         *,
+        refresh: bool = False,
         comment: str | None = None,
         storage_location: str | None = None,
-        volume_type: Any = None,
+        volume_type: "VolumeType | str" = None,
         missing_ok: bool = True,
     ) -> "Volume":
         """Create this volume in Unity Catalog.
@@ -685,13 +665,47 @@ class Volume(DatabricksPath):
         Defaults to a managed volume. Pass ``storage_location`` +
         ``volume_type="EXTERNAL"`` for an external volume.
         """
+        try:
+            _ = self.read_info(refresh=refresh)
+            return self
+        except Exception as e:
+            message = str(e)
+
+            if "chema" in message and "not exist" in message:
+                self.schema.ensure_created()
+
         uc = self.client.workspace_client().volumes
-        vt = volume_type if volume_type is not None else _managed_volume_type()
+
+        try:
+            from databricks.sdk.service.catalog import VolumeType
+
+            if volume_type is None:
+                volume_type = VolumeType.EXTERNAL if storage_location else VolumeType.MANAGED
+            elif not isinstance(volume_type, VolumeType):
+                volume_type = VolumeType[str(volume_type)]
+
+            is_external = volume_type == VolumeType.EXTERNAL
+        except Exception:
+            if volume_type is None:
+                volume_type = "EXTERNAL" if storage_location else "MANAGED"
+            else:
+                volume_type = str(volume_type).upper()
+
+            is_external = volume_type == "EXTERNAL"
+
+        if is_external:
+            if not storage_location:
+                storage_location = self.client.default_storage_location(
+                    suffix=f".ygg/uc/volumes/{os.urandom(8).hex()}"
+                )
+        else:
+            storage_location = None
+
         kwargs: dict[str, Any] = {
             "catalog_name": self.catalog_name,
             "schema_name": self.schema_name,
             "name": self.volume_name,
-            "volume_type": vt,
+            "volume_type": volume_type,
         }
         if comment is not None:
             kwargs["comment"] = comment
@@ -727,6 +741,7 @@ class Volume(DatabricksPath):
 
     def delete(
         self,
+        predicate: str = None,
         *,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
@@ -927,11 +942,3 @@ def _safe_create(create: Any) -> bool:
         raise
     return True
 
-
-def _managed_volume_type() -> Any:
-    """Resolve ``VolumeType.MANAGED`` (falls back to the string for older SDKs)."""
-    try:
-        from databricks.sdk.service.catalog import VolumeType
-        return VolumeType.MANAGED
-    except Exception:
-        return "MANAGED"

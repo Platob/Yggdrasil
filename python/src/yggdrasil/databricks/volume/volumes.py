@@ -28,53 +28,18 @@ share the same TTL-bounded :class:`VolumeInfo` snapshot.
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterator, Optional
+from typing import Iterator, Optional
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import VolumeInfo
-
 from yggdrasil.databricks.client import DatabricksService
+from yggdrasil.url import URL
 
-from .volume import Volume, _looks_like_already_exists, _looks_like_not_found
+from .volume import Volume
 
 __all__ = ["Volumes"]
 
 logger = logging.getLogger(__name__)
-
-
-def _ensure_parents_for(
-    workspace: Any,
-    *,
-    catalog_name: str,
-    schema_name: str,
-) -> None:
-    """Create the schema (and catalog if needed) for *workspace*.
-
-    Used by :meth:`Volumes.create` to materialise missing parents
-    after a volume-create NotFound. Idempotent: ``AlreadyExists`` on
-    either level is treated as success. If schema creation itself
-    NotFounds the catalog, the catalog is created first then the
-    schema retried.
-    """
-    try:
-        workspace.schemas.create(name=schema_name, catalog_name=catalog_name)
-        return
-    except Exception as exc:
-        if _looks_like_already_exists(exc):
-            return
-        if not _looks_like_not_found(exc):
-            raise
-
-    try:
-        workspace.catalogs.create(name=catalog_name)
-    except Exception as exc:
-        if not _looks_like_already_exists(exc):
-            raise
-    try:
-        workspace.schemas.create(name=schema_name, catalog_name=catalog_name)
-    except Exception as exc:
-        if not _looks_like_already_exists(exc):
-            raise
 
 
 class Volumes(DatabricksService):
@@ -195,7 +160,7 @@ class Volumes(DatabricksService):
 
     def volume(
         self,
-        location: str | None = None,
+        location: "Volume | str | None" = None,
         *,
         catalog_name: str | None = None,
         schema_name: str | None = None,
@@ -206,6 +171,10 @@ class Volumes(DatabricksService):
         Routes through the singleton cache so repeated calls collapse
         to the same instance.
         """
+        if location is not None:
+            if isinstance(location, Volume):
+                return location
+
         c, s, v = self._resolve_parts(
             location=location,
             catalog_name=catalog_name,
@@ -253,24 +222,13 @@ class Volumes(DatabricksService):
             schema_name=schema_name,
             volume_name=volume_name,
         )
-        create_kwargs = dict(
+
+        return volume.create(
             comment=comment,
             storage_location=storage_location,
             volume_type=volume_type,
+            missing_ok=missing_ok
         )
-
-        try:
-            return volume.create(**create_kwargs, missing_ok=missing_ok)
-        except Exception as exc:
-            if not _looks_like_not_found(exc):
-                raise
-            _ensure_parents_for(
-                self.client.workspace_client(),
-                catalog_name=volume.catalog_name,
-                schema_name=volume.schema_name,
-            )
-
-        return volume.create(**create_kwargs, missing_ok=True)
 
     # ── remote fetch ──────────────────────────────────────────────────────────
 
@@ -403,7 +361,15 @@ class Volumes(DatabricksService):
         *location*. Service defaults fill any remaining blanks.
         """
         if location:
-            parts = [p.strip().strip("`") for p in location.split(".")]
+            if isinstance(location, Volume):
+                return location.catalog_name, location.schema_name, location.volume_name
+
+            location = str(location)
+            if "/" in location:
+                parts = URL.from_(location).parts
+            else:
+                parts = [p.strip().strip("`") for p in location.split(".")]
+
             if len(parts) >= 3:
                 catalog_name = catalog_name or parts[-3]
                 schema_name = schema_name or parts[-2]

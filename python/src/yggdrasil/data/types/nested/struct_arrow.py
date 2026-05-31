@@ -430,35 +430,16 @@ def cast_arrow_tabular(
     target_sources: list["Field | None"] = []
     num_rows = data.num_rows
 
-    debug = LOGGER.isEnabledFor(logging.DEBUG)
-    if debug:
-        LOGGER.debug(
-            "cast_arrow_tabular rebuild target=%r cols=%d rows=%d",
-            tgt.name, len(tgt_children), num_rows,
-        )
-
     for i, target_field in enumerate(target_schema.children):
         source_field = source_schema.field(name=target_field.name, index=i, raise_error=False)
 
         if source_field is None:
-            if debug:
-                LOGGER.debug(
-                    "cast_arrow_tabular col=%r default (missing source) -> %s",
-                    target_field.name, target_field.type_id.name.lower(),
-                )
             casted = target_field.default_arrow_array(
                 size=num_rows,
                 memory_pool=options.arrow_memory_pool,
             )
         else:
             source_array = data.column(source_field.name)
-            if debug:
-                LOGGER.debug(
-                    "cast_arrow_tabular col=%r %s -> %s",
-                    target_field.name,
-                    str(source_array.type).split("<", 1)[0],
-                    target_field.type_id.name.lower(),
-                )
             # CastError wrapping lives on ``Field.cast_arrow_array``
             # now — it fires here too (per leaf), and recursively on
             # any nested rebuild beneath it. No need to wrap again.

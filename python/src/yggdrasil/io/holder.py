@@ -62,14 +62,13 @@ from typing import (
 )
 
 import pyarrow as pa
-
+from yggdrasil.disposable import Disposable
 from yggdrasil.enums import MediaType, MimeType
 from yggdrasil.enums.mode import Mode, ModeLike
-from yggdrasil.dataclasses.singleton import Singleton
-from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular
-from .io_stats import IOStats
 from yggdrasil.url import URL, URLBased
+
+from .io_stats import IOStats
 
 if TYPE_CHECKING:
     pass
@@ -2155,7 +2154,9 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         if isinstance(value, URL) and value.scheme == self.scheme:
             self._url = value
             return
-        self._url = URL.from_(value).with_scheme(self.scheme)
+        self._url = URL.from_(value)
+        if not self._url.scheme:
+            self._url.with_scheme(self.scheme, inplace=True)
 
     # ------------------------------------------------------------------
     # Backing-shape predicates

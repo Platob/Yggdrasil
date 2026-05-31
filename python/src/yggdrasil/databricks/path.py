@@ -684,7 +684,7 @@ class DatabricksPath(RemotePath, DatabricksResource):
                 if explore is not None:
                     url = explore
                 url = _strip_dbfs_family_prefix(url)
-                target_scheme = self.scheme
+                target_scheme = (url.scheme if url else None) or self.scheme
                 if target_scheme is not None:
                     target_token = (
                         target_scheme.value
@@ -712,6 +712,12 @@ class DatabricksPath(RemotePath, DatabricksResource):
 
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
         self._initialized = True
+
+    def __repr__(self):
+        exp = getattr(self, "explore_url", None)
+        if exp is not None:
+            return f"{self.__class__.__name__}({exp!r})"
+        return super().__repr__()
 
     # ==================================================================
     # URLBased dispatch — ``dbfs://`` resolves here and forwards

@@ -59,7 +59,7 @@ __all__ = [
 
 def _resolve_catalog() -> str:
     name = os.environ.get(
-        "DATABRICKS_INTEGRATION_CATALOG", "trading",
+        "DATABRICKS_INTEGRATION_CATALOG", "trading_tgp_dev",
     ).strip()
     if not name:
         raise unittest.SkipTest(
@@ -82,8 +82,8 @@ class _VolumeIOFixture(DatabricksIntegrationCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         cls.catalog_name = _resolve_catalog()
-        cls.schema_name = f"yg_volio_{secrets.token_hex(4)}"
-        cls.volume_name = f"yg_vol_{secrets.token_hex(3)}"
+        cls.schema_name = f"yg_volio"
+        cls.volume_name = f"yg_vol"
         try:
             cls.schema = cls.client.schemas(
                 catalog_name=cls.catalog_name,
@@ -274,3 +274,21 @@ class TestVolumeNavigation(_VolumeIOFixture):
                 directory.remove(recursive=True, missing_ok=True)
             except DatabricksError:
                 pass
+
+
+class TestExternalVolume(_VolumeIOFixture):
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.external_volume_name = f"yg_external"
+        cls.external_volume = cls.client.volumes(
+            catalog_name=cls.catalog_name,
+            schema_name=cls.schema_name,
+        ).create(
+            volume_name=cls.external_volume_name,
+            volume_type="EXTERNAL"
+        )
+
+    def test_details(self):
+        v = self.external_volume

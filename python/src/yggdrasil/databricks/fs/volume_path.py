@@ -68,16 +68,16 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 from urllib.parse import quote
 
 from databricks.sdk.errors import PermissionDenied
-
 from yggdrasil.concurrent import Job
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
+from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Mode, ModeLike, Scheme
 from yggdrasil.enums.media_type import MediaType
-from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.http_.exceptions import HTTPError
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
+
 from ..path import DatabricksPath
 
 if TYPE_CHECKING:
@@ -241,10 +241,12 @@ class VolumePath(DatabricksPath):
 
     @property
     def explore_url(self) -> URL:
-        return self.volume.explore_url.add_param(
-            key="volumePath",
-            value=self.full_path(),
-        )
+        full = self.full_path().rstrip("/")
+        parent, _, leaf = full.rpartition("/")
+        params = {"volumePath": full}
+        if "." in leaf:  # extension heuristic: open the file preview panel
+            params = {"volumePath": parent, "filePreviewPath": leaf}
+        return self.volume.explore_url.add_params(params)
 
     # ==================================================================
     # Path rendering
@@ -996,13 +998,8 @@ class VolumePath(DatabricksPath):
             if not _looks_like_not_found(exc):
                 raise
 
-        from yggdrasil.databricks.volume.volumes import _ensure_parents_for
+        self.schema.ensure_created()
 
-        _ensure_parents_for(
-            self.client.workspace_client(),
-            catalog_name=volume.catalog_name,
-            schema_name=volume.schema_name,
-        )
         try:
             volume.create(missing_ok=True)
         except Exception as exc:

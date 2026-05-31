@@ -29,7 +29,7 @@ import logging
 import time
 from typing import Any, ClassVar, Iterable, Iterator, Mapping, Optional, TYPE_CHECKING
 
-from databricks.sdk.errors import DatabricksError, NotFound
+from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.catalog import (
     PermissionsChange,
     Privilege,
@@ -38,21 +38,20 @@ from databricks.sdk.service.catalog import (
     SecurableType,
 )
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
-from yggdrasil.dataclasses import Singleton
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.databricks.path import (
     DatabricksPath,
     TABLE_PATH_PREFIX,
     resolve_path_prefix,
 )
-from yggdrasil.url import URL
+from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
+from yggdrasil.dataclasses import Singleton
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
+from yggdrasil.enums.mode import Mode, ModeLike
 from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.path import Path
-from yggdrasil.enums.mode import Mode, ModeLike
-
-from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
+from yggdrasil.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schemas import Schemas
@@ -530,24 +529,7 @@ class UCSchema(DatabricksPath):
 
     @property
     def infos(self) -> SchemaInfo:
-        """SchemaInfo — local cache first (TTL-guarded), then remote on miss."""
-        now = time.time()
-
-        if self._infos is not None:
-            age = now - (self._infos_fetched_at or 0.0)
-            if self._infos_ttl is None or age < self._infos_ttl:
-                return self._infos
-            logger.debug(
-                "Cache expired for schema %r (age=%.0fs, ttl=%.0fs) — refreshing",
-                self, age, self._infos_ttl,
-            )
-
-        logger.debug("Fetching schema info for %r from remote", self)
-        infos = self.client.workspace_client().schemas.get(full_name=self.full_name())
-        logger.info("Fetched schema info for %r from remote", self)
-        object.__setattr__(self, "_infos", infos)
-        object.__setattr__(self, "_infos_fetched_at", now)
-        return self._infos
+        return self.read_infos()
 
     def read_infos(self, default: Any = ...):
         now = time.time()
@@ -566,7 +548,7 @@ class UCSchema(DatabricksPath):
             infos = self.client.workspace_client().schemas.get(full_name=self.full_name())
         except Exception:
             if default is ...:
-                return default
+                raise
 
             logger.warning(f"Schema {self.full_name(safe=True)} not found", exc_info=True)
             return default
@@ -576,12 +558,17 @@ class UCSchema(DatabricksPath):
         object.__setattr__(self, "_infos_fetched_at", now)
         return infos
 
+    @property
+    def schema_id(self):
+        infos = self.read_infos(default=None)
+        return infos.schema_id if infos is not None else None
+
     def exists(self) -> bool:
         """``True`` if this schema is reachable via the Unity Catalog API."""
         try:
             _ = self.infos
             return True
-        except NotFound:
+        except Exception:
             return False
 
     @property
@@ -595,6 +582,15 @@ class UCSchema(DatabricksPath):
     @property
     def storage_location(self) -> Optional[str]:
         return self.infos.storage_location
+
+    @property
+    def storage_path(self):
+        l = self.storage_location
+
+        if not l:
+            return None
+
+        return Path.from_(l)
 
     @property
     def storage_root(self) -> Optional[str]:

@@ -22,16 +22,12 @@ Run:
 """
 from __future__ import annotations
 
-import itertools
 import os
 import secrets
-import unittest
 
 from databricks.sdk.errors import PermissionDenied
 from databricks.sdk.service.catalog import CredentialPurpose
-
 from tests.test_yggdrasil.test_databricks import DatabricksIntegrationCase
-
 from yggdrasil.aws.fs.path import S3Path
 
 _AWS_ROLE = os.environ.get("YGG_TEST_AWS_ROLE_ARN", "").strip()
@@ -89,7 +85,7 @@ class TestExternalLocationIntegration(DatabricksIntegrationCase):
             return self.locations.get(_EL_NAME)
         try:
             for el in self.locations.list():
-                if (el.url or "").startswith(("s3://", "s3a://")):
+                if (el.url or "").startswith(("s3://", "s3a://")) and not el.name.startswith("__"):
                     return el
         except PermissionDenied:
             return None

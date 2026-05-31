@@ -859,8 +859,6 @@ class WarehouseStatementResult(StatementResult):
                 "Polled statement %r (state=%s, prev=%s)",
                 self, new_state, cached_state,
             )
-        else:
-            logger.debug("Polled statement %r (state=%s)", self, new_state)
         self.set_api_response(response)
         return self
 

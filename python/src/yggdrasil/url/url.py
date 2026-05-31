@@ -38,7 +38,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar, Iterable, Literal, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 from urllib.parse import (
     parse_qsl,
     quote,
@@ -50,13 +50,12 @@ from urllib.parse import (
 )
 
 import pyarrow as pa
-
-from yggdrasil.url.hive import hive_split
 from yggdrasil.lazy_imports import (
     io_class,
     media_type_class,
     mime_type_class,
 )
+from yggdrasil.url.hive import hive_split
 
 __all__ = [
     "URL",

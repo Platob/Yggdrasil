@@ -33,6 +33,7 @@ from typing import Any, ClassVar, Iterable, Iterator, Mapping, Optional, TYPE_CH
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import CatalogInfo, SecurableType
 from yggdrasil.concurrent.threading import Job
+from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
@@ -248,11 +249,18 @@ class UCCatalog(DatabricksPath, Singleton):
 
     def _stat_uncached(self) -> IOStats:
         infos = self.read_infos(default=None)
-        kind = IOKind.MISSING if infos is None else IOKind.DIRECTORY
+
+        if infos is None:
+            kind = IOKind.MISSING
+            mtime = 0.0
+        else:
+            kind = IOKind.DIRECTORY
+            mtime = float(infos.updated_at / 1000.0) if infos.updated_at else 0.0
 
         return IOStats(
             kind=kind,
             media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_CATALOG,
+            mtime=mtime
         )
 
     def _from_url(self, url: URL) -> "DatabricksPath":
@@ -494,6 +502,10 @@ class UCCatalog(DatabricksPath, Singleton):
     @property
     def storage_root(self) -> Optional[str]:
         return self.infos.storage_root
+
+    @property
+    def storage_location(self):
+        return self.infos.storage_location
 
     # ── navigation ────────────────────────────────────────────────────────────
 

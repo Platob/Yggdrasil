@@ -156,7 +156,7 @@ class Schemas(DatabricksService):
 
     def schema(
         self,
-        location: str | None = None,
+        location: "UCSchema | str | None" = None,
         *,
         catalog_name: str | None = None,
         schema_name: str | None = None,
@@ -171,6 +171,12 @@ class Schemas(DatabricksService):
             catalog_name: Override catalog (falls back to ``self.catalog_name``).
             schema_name:  Override schema (falls back to ``self.schema_name``).
         """
+        from .schema import UCSchema
+
+        if location is not None:
+            if isinstance(location, UCSchema):
+                return location
+
         c, s = self._resolve_parts(
             location=location,
             catalog_name=catalog_name,

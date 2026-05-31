@@ -2784,16 +2784,7 @@ class Table(DatabricksPath):
             self.sql.execute(statement, wait=wait)
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
-                logger.debug(
-                    "Parent schema missing for view %r — auto-creating %s.%s",
-                    self, self.catalog_name, self.schema_name,
-                )
-                self.sql.execute(
-                    f"CREATE SCHEMA IF NOT EXISTS "
-                    f"{quote_ident(self.catalog_name)}.{quote_ident(self.schema_name)}",
-                    wait=True,
-                )
-                self.sql.execute(statement, wait=wait)
+                self.schema.ensure_created()
             else:
                 raise
 
@@ -2891,40 +2882,6 @@ class Table(DatabricksPath):
             )
 
         return "\nUNION ALL\n".join(select_blocks)
-
-    def delete(
-        self,
-        *,
-        wait: WaitingConfigArg = True,
-        missing_ok: bool = False,
-        delete_staging: bool = True,
-    ) -> "Table":
-        # ``delete_staging=False`` keeps the staging volume around for
-        # internal drop-and-recreate flows (OVERWRITE) where the very
-        # next step uploads a fresh parquet to the same volume — the
-        # background ``VolumesAPI.delete`` would otherwise race the
-        # upload and surface as PATH_NOT_FOUND on the warehouse INSERT.
-        uc = self.client.workspace_client().tables
-        logger.debug(
-            "Deleting table %r (wait=%s, delete_staging=%s)",
-            self, bool(wait), delete_staging,
-        )
-
-        if wait:
-            try:
-                uc.delete(full_name=self.full_name())
-
-                if delete_staging and self._staging_volume:
-                    self._staging_volume.delete(wait=False)
-            except DatabricksError:
-                if not missing_ok:
-                    raise
-        else:
-            Job.make(self.delete, delete_staging=delete_staging).fire_and_forget()
-
-        self.invalidate_singleton(remove_global=True)
-        logger.info("Deleted table %r", self)
-        return self
 
     # =========================================================================
     # Rename
@@ -3322,6 +3279,13 @@ class Table(DatabricksPath):
             )
         return self._staging_volume
 
+    @staging_volume.setter
+    def staging_volume(self, value):
+        self._staging_volume = self.client.volumes(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        ).volume(value)
+
     def staging_folder(
         self,
         temporary: bool = False,
@@ -3333,6 +3297,7 @@ class Table(DatabricksPath):
         self,
         target: "Table | None" = None,
         *,
+        staging_volume: "Volume | None" = None,
         temporary: bool = True,
     ) -> VolumePath:
         """Mint a fresh Parquet staging path under the target table's
@@ -3349,7 +3314,9 @@ class Table(DatabricksPath):
         target = target if target is not None else self
         seed = uuid.uuid4().hex[:8]
         leaf = f"tmp-{int(time.time() * 1000)}-{seed}.parquet"
-        return target.staging_volume.path(
+        staging_volume = target.staging_volume if staging_volume is None else staging_volume
+
+        return staging_volume.path(
             f".sql/tmp/{leaf}",
             temporary=temporary,
         )
@@ -3449,6 +3416,7 @@ class Table(DatabricksPath):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
+        staging_volume: "Volume | None" = None
     ) -> "StatementBatch | Tabular | None":
         """Insert through the warehouse SQL path with staged Parquet.
 
@@ -3501,7 +3469,7 @@ class Table(DatabricksPath):
             match_by = [f.name for f in existing_schema.primary_fields] or None
 
         wait = WaitingConfig.from_(wait)
-        staging = self.insert_volume_path(target, temporary=bool(wait))
+        staging = self.insert_volume_path(target, temporary=bool(wait), staging_volume=staging_volume)
         output_data: "Tabular | None" = None
         staging.write_table(data, cast_options, mode=Mode.OVERWRITE)
         if return_data:
