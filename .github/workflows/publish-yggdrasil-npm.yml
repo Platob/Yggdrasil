@@ -1,0 +1,61 @@
+name: 📦 Publish @platob/yggdrasil (npm)
+
+# Publishes the JS/TS yggdrasil library (nextjs/src/lib/yggdrasil) to npm.
+#
+# Triggers:
+#   - push a tag like ``yggdrasil-js-v0.1.0`` (the version must match package.json)
+#   - or run manually from the Actions tab (workflow_dispatch)
+#
+# Requires an ``NPM_TOKEN`` repo secret: an npm "Automation" access token for an
+# account/org that owns the ``@platob`` scope (npmjs.com → Access Tokens).
+
+on:
+  push:
+    tags:
+      - "yggdrasil-js-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + pack only (no publish)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-yggdrasil-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & publish to npm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nextjs/src/lib/yggdrasil
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install build deps
+        run: npm install --no-audit --no-fund
+
+      - name: Build (ESM + type declarations)
+        run: npm run build
+
+      - name: Pack (sanity — lists the published files)
+        run: npm pack --dry-run
+
+      - name: Publish to npm
+        if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

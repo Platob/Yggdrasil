@@ -1,0 +1,35 @@
+{
+  "name": "@platob/yggdrasil",
+  "version": "0.1.0",
+  "description": "Client-side replication of the Python yggdrasil package — MIME/media-type registry and more. Kept in parity with python/src/yggdrasil.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup index.ts --format esm --dts --clean --out-dir dist",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["yggdrasil", "mime", "media-type", "arrow"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/platob/yggdrasil.git",
+    "directory": "nextjs/src/lib/yggdrasil"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0"
+  }
+}
