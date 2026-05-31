@@ -103,31 +103,42 @@ function QuickAction({
   );
 }
 
-// ── Live metric card with optional progress bar ─────────────
+// ── Live metric card with optional progress bar + trend ──────
 function MetricCard({
   label,
   value,
   sub,
   percent,
   color,
+  trend,
 }: {
   label: string;
   value: string;
   sub?: string;
   percent?: number;
   color?: string;
+  trend?: number;  // positive = up (good), negative = down, 0 = flat
 }) {
+  const trendIcon = trend == null ? null
+    : trend > 0 ? "↑" : trend < 0 ? "↓" : "→";
+  const trendColor = trend == null ? undefined
+    : trend > 0 ? "var(--emerald)" : trend < 0 ? "var(--rose)" : "var(--muted)";
   return (
     <div className="glass-card p-4 flex-1 min-w-[140px]">
       <p className="text-[10px] text-muted uppercase tracking-widest font-medium">
         {label}
       </p>
-      <p
-        className="text-2xl font-bold font-mono mt-2"
-        style={{ color: color || "var(--foreground)" }}
-      >
-        {value}
-      </p>
+      <div className="flex items-baseline gap-2 mt-2">
+        <p
+          className="text-2xl font-bold font-mono"
+          style={{ color: color || "var(--foreground)" }}
+        >
+          {value}
+        </p>
+        {trendIcon && (
+          <span className="text-sm font-mono font-bold" style={{ color: trendColor }}>{trendIcon}</span>
+        )}
+      </div>
       {sub && (
         <p className="text-[10px] text-foreground-dim font-mono mt-0.5">{sub}</p>
       )}
@@ -188,6 +199,7 @@ function PulseSparkline({ values, color }: { values: number[]; color: string }) 
 
 export default function DashboardPage() {
   const [stats, setStats] = useState<ClusterStats | null>(null);
+  const [prevStats, setPrevStats] = useState<ClusterStats | null>(null);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [pulseHistory, setPulseHistory] = useState<number[]>([]);
@@ -204,7 +216,7 @@ export default function DashboardPage() {
   const fetchStats = useCallback(async () => {
     try {
       const s = await getStats();
-      setStats(s);
+      setStats((prev) => { setPrevStats(prev); return s; });
       // Keep a rolling 30-sample history of active_runs for the pulse widget.
       setPulseHistory((prev) => [...prev.slice(-29), s.active_runs]);
       setError(false);
@@ -447,12 +459,14 @@ export default function DashboardPage() {
           value={`${stats.cpu_percent.toFixed(1)}%`}
           percent={stats.cpu_percent}
           color={cpuColor}
+          trend={prevStats ? Math.sign(stats.cpu_percent - prevStats.cpu_percent) * -1 : undefined}
         />
         <MetricCard
           label="Memory"
           value={`${stats.memory_percent.toFixed(1)}%`}
           percent={stats.memory_percent}
           color={memColor}
+          trend={prevStats ? Math.sign(stats.memory_percent - prevStats.memory_percent) * -1 : undefined}
         />
         <MetricCard
           label="Uptime"
@@ -464,6 +478,7 @@ export default function DashboardPage() {
           value={String(stats.peer_count)}
           sub={stats.peer_count === 1 ? "node" : "nodes"}
           color={stats.peer_count > 0 ? "var(--frost)" : "var(--muted)"}
+          trend={prevStats ? Math.sign(stats.peer_count - prevStats.peer_count) : undefined}
         />
         <MetricCard
           label="GPUs"

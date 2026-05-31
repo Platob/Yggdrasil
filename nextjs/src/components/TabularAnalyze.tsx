@@ -6,6 +6,7 @@ import {
   analysisSeries,
   analysisOhlc,
   analysisForecast,
+  analysisRisk,
   registerForecastWorkflow,
   downloadExport,
   type AggFunc,
@@ -13,6 +14,7 @@ import {
   type SeriesResult,
   type OhlcResult,
   type ForecastResult,
+  type RiskResult,
   type FilterSpec,
   type CastSpec,
 } from "@/lib/api";
@@ -42,7 +44,7 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
   const allCols = useMemo(() => columns.map((c) => c.name), [columns]);
   const numericCols = useMemo(() => columns.filter((c) => NUMERIC.test(c.type ?? "")).map((c) => c.name), [columns]);
 
-  const [kind, setKind] = useState<"pivot" | "series" | "candles" | "forecast">("pivot");
+  const [kind, setKind] = useState<"pivot" | "series" | "candles" | "forecast" | "risk">("pivot");
   const [groupBy, setGroupBy] = useState("");
   const [measureCol, setMeasureCol] = useState(numericCols[0] ?? allCols[0] ?? "");
   const [aggFn, setAggFn] = useState<AggFunc>("sum");
@@ -74,6 +76,11 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
   const [registering, setRegistering] = useState(false);
   const [regMsg, setRegMsg] = useState<string | null>(null);
 
+  // risk panel
+  const [riskData, setRiskData] = useState<RiskResult | null>(null);
+  const [riskOrderBy, setRiskOrderBy] = useState("");
+  const [riskPpy, setRiskPpy] = useState(252);
+
   const [transformOpen, setTransformOpen] = useState(false);
   const [filters, setFilters] = useState<FilterSpec[]>([]);
   const [casts, setCasts] = useState<CastSpec[]>([]);
@@ -99,6 +106,16 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
     setAnalyzing(true); setErr(null);
     try { setCandles(await analysisOhlc(path, seriesCol, { x: xCol || undefined, volume: volCol || undefined, buckets: 120, filters, node })); }
     catch (e) { setErr(e instanceof Error ? e.message : "ohlc failed"); }
+    finally { setAnalyzing(false); }
+  };
+  const runRisk = async () => {
+    if (!seriesCol) return;
+    setAnalyzing(true); setErr(null);
+    try {
+      setRiskData(await analysisRisk(path, seriesCol, {
+        order_by: riskOrderBy || undefined, periods_per_year: riskPpy, node,
+      }));
+    } catch (e) { setErr(e instanceof Error ? e.message : "risk failed"); }
     finally { setAnalyzing(false); }
   };
   const runForecast = async () => {
@@ -158,7 +175,7 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
   return (
     <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30 p-3 space-y-3">
       <div className="flex items-center gap-2 text-[11px] font-mono flex-wrap">
-        {(["pivot", "series", "candles", "forecast"] as const).map((k) => (
+        {(["pivot", "series", "candles", "forecast", "risk"] as const).map((k) => (
           <button key={k} onClick={() => setKind(k)}
             className={`px-2.5 py-1 rounded ${kind === k ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{k}</button>
         ))}
@@ -242,6 +259,26 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
             </select>
             <button onClick={runForecast} disabled={analyzing || !seriesCol} className="px-2.5 py-1 rounded bg-emerald/15 text-emerald border border-emerald/30 disabled:opacity-40">run</button>
             <button onClick={() => { setRegName(`${seriesCol}_forecast`); setRegOpen((v) => !v); }} className="px-2.5 py-1 rounded bg-frost/10 text-frost border border-frost/25">register ▾</button>
+          </>
+        )}
+        {kind === "risk" && (
+          <>
+            <label className="text-muted">price</label>
+            <select value={seriesCol} onChange={(e) => setSeriesCol(e.target.value)} className={sel}>
+              {(numericCols.length ? numericCols : allCols).map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <label className="text-muted">order by</label>
+            <select value={riskOrderBy} onChange={(e) => setRiskOrderBy(e.target.value)} className={sel}>
+              <option value="">(none)</option>
+              {allCols.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <label className="text-muted">periods/yr</label>
+            <select value={riskPpy} onChange={(e) => setRiskPpy(Number(e.target.value))} className={sel}>
+              <option value={252}>252 daily</option>
+              <option value={52}>52 weekly</option>
+              <option value={12}>12 monthly</option>
+            </select>
+            <button onClick={runRisk} disabled={analyzing || !seriesCol} className="px-2.5 py-1 rounded bg-emerald/15 text-emerald border border-emerald/30 disabled:opacity-40">run</button>
           </>
         )}
         {/* Download-as (applies filters + casts) */}
@@ -404,10 +441,52 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
         </div>
       )}
 
-      {((kind === "pivot" && !pivot) || (kind === "series" && !seriesData) || (kind === "candles" && !candles) || (kind === "forecast" && !fcData)) && !analyzing && !err && (
+      {kind === "risk" && riskData && !analyzing && (
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">
+            {[
+              { label: "Ann. Return", val: riskData.ann_return, fmt: "pct", good: true },
+              { label: "Ann. Volatility", val: riskData.ann_volatility, fmt: "pct", amber: true },
+              { label: "Sharpe", val: riskData.sharpe_ratio, fmt: "num", good: true },
+              { label: "Sortino", val: riskData.sortino_ratio, fmt: "num", good: true },
+              { label: "Max Drawdown", val: riskData.max_drawdown, fmt: "pct", good: false },
+              { label: "Calmar", val: riskData.calmar_ratio, fmt: "num", good: true },
+              { label: "VaR 95%", val: riskData.var_95, fmt: "pct4", rose: true },
+              { label: "CVaR 95%", val: riskData.cvar_95, fmt: "pct4", rose: true },
+              { label: "Win Rate", val: riskData.win_rate, fmt: "pct", good: true },
+              { label: "Profit Factor", val: riskData.profit_factor, fmt: "num", good: true },
+              { label: "Skewness", val: riskData.skewness, fmt: "num" },
+              { label: "Kurtosis", val: riskData.kurtosis, fmt: "num" },
+            ].map(({ label, val, fmt, good, amber, rose }) => {
+              const text = val == null ? "—"
+                : fmt === "pct" ? (val * 100).toFixed(2) + "%"
+                : fmt === "pct4" ? (val * 100).toFixed(4) + "%"
+                : val.toLocaleString(undefined, { maximumFractionDigits: 3 });
+              const color = rose ? "text-rose" : amber ? "text-amber"
+                : good == null || val == null ? "text-foreground"
+                : good ? (val > 0 ? "text-emerald" : "text-rose")
+                : (val < 0 ? "text-emerald" : "text-rose");
+              return (
+                <div key={label} className="rounded border border-white/[0.06] bg-white/[0.02] p-2">
+                  <div className="text-[9px] text-muted uppercase tracking-wider">{label}</div>
+                  <div className={`text-base font-mono font-bold mt-0.5 ${color}`}>{text}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="text-[10px] text-muted font-mono">
+            {riskData.n.toLocaleString()} return obs · {riskData.periods_per_year} periods/yr
+            {riskData.max_drawdown_peak_i != null && ` · drawdown peak @${riskData.max_drawdown_peak_i} → trough @${riskData.max_drawdown_trough_i}`}
+          </div>
+        </div>
+      )}
+
+      {((kind === "pivot" && !pivot) || (kind === "series" && !seriesData) || (kind === "candles" && !candles) || (kind === "forecast" && !fcData) || (kind === "risk" && !riskData)) && !analyzing && !err && (
         <div className="text-[11px] text-muted font-mono py-8 text-center">
           {kind === "forecast"
             ? "Pick a value (+ time / by) and hit run to forecast — then register it as a live Saga workflow."
+            : kind === "risk"
+            ? "Pick a price column (+ optional order-by) and hit run for Sharpe, drawdown, VaR, and more."
             : `Pick a ${kind === "pivot" ? "group + measure" : kind === "candles" ? "price (+ x / volume)" : "series (+ x)"} and hit run.`}
         </div>
       )}
