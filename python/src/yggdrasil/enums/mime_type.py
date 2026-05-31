@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, ClassVar, IO, Mapping, Union, Iterable, Iterator
@@ -411,16 +412,12 @@ class MimeType:
                 finally:
                     fh.seek(saved)
             else:
-                # Anything else the buffer class can wrap (Path/PathLike).
-                # A wrap that can't yield bytes (unreadable / size-0 / not a
-                # real byte source) is a soft miss, not a crash.
+                # Path / PathLike — peek the head with a plain open (the
+                # IO-holder wrap is legacy and over-heavy for a magic sniff).
+                # Anything unreadable is a soft miss, not a crash.
                 try:
-                    bio = IO(magic)
-                    bio.acquire()
-                    try:
-                        magic = bytes(bio.pread(_MAGIC_PEEK, 0))
-                    finally:
-                        bio.close()
+                    with open(os.fspath(magic), "rb") as fh:
+                        magic = fh.read(_MAGIC_PEEK)
                 except Exception:
                     return _miss(default, "could not read magic bytes")
 
