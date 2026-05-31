@@ -47,6 +47,29 @@ class TestRegistryConstants:
         assert MimeTypes.NDJSON.value == "application/ld+json"
         assert "ndjson" in MimeTypes.NDJSON.extensions
 
+    def test_bin_is_generic_not_flatbuffers(self) -> None:
+        # ``.bin`` is generic binary — it must not be claimed by FlatBuffers.
+        assert MimeType._EXT_MAP.get("bin") is None
+        assert "bin" not in MimeTypes.FLATBUFFERS.extensions
+        assert "fbs" in MimeTypes.FLATBUFFERS.extensions
+
+    def test_no_duplicate_or_colliding_extensions(self) -> None:
+        # Every registered extension maps to exactly one MimeType, and no
+        # MimeType lists the same extension twice (case-insensitively).
+        from collections import Counter
+        owners: dict[str, set[str]] = {}
+        for mt in set(MimeType._BY_NAME.values()):
+            seen = Counter(e.lower().lstrip(".") for e in mt.extensions)
+            assert all(c == 1 for c in seen.values()), f"{mt.name} has dup exts"
+            for e in seen:
+                owners.setdefault(e, set()).add(mt.name)
+        collisions = {e: o for e, o in owners.items() if len(o) > 1}
+        assert not collisions, f"extension collisions: {collisions}"
+
+    def test_from_magic_soft_misses_on_unreadable(self) -> None:
+        # A magic sniff that can't yield bytes is a soft miss, not a crash.
+        assert MimeType.from_magic(b"", default=None) is None
+
 
 class TestPureGet:
     """`get` is a side-effect-free dict lookup."""

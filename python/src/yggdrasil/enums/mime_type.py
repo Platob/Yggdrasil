@@ -377,12 +377,22 @@ class MimeType:
                 finally:
                     fh.seek(saved)
             else:
-                bio = IO(magic)
-                bio.acquire()
+                # Anything else the buffer class can wrap (Path/PathLike).
+                # A wrap that can't yield bytes (unreadable / size-0 / not a
+                # real byte source) is a soft miss, not a crash.
                 try:
-                    magic = bytes(bio.pread(64, 0))
-                finally:
-                    bio.close()
+                    bio = IO(magic)
+                    bio.acquire()
+                    try:
+                        magic = bytes(bio.pread(64, 0))
+                    finally:
+                        bio.close()
+                except Exception:
+                    return _miss(default, "could not read magic bytes")
+
+        # An empty head (e.g. a zero-byte file) has no magic to match.
+        if not magic:
+            return _miss(default, "empty magic buffer")
 
         # Fast path: probe the first-byte → prefix index. Almost every
         # registered magic is a fixed byte prefix (PNG / GZIP / PARQUET /
@@ -653,7 +663,7 @@ class MimeTypes:
         MimeType("LZMA", "application/x-lzma", extensions=("lzma",), is_codec=True)
     )
     ZZIP = MimeType.define(
-        MimeType("ZZIP", "application/x-compress", extensions=("z", "Z"), is_codec=True)
+        MimeType("ZZIP", "application/x-compress", extensions=("z",), is_codec=True)
     )
 
     # --- Containers / docs ---
@@ -809,7 +819,9 @@ class MimeTypes:
         MimeType("PROTOBUF", "application/x-protobuf", extensions=("pb", "proto", "protobuf"))
     )
     FLATBUFFERS = MimeType.define(
-        MimeType("FLATBUFFERS", "application/x-flatbuffers", extensions=("bin", "fbs"))
+        # No ``bin`` extension: ``.bin`` is generic binary and must fall
+        # through to OCTET_STREAM, not get claimed as a FlatBuffer.
+        MimeType("FLATBUFFERS", "application/x-flatbuffers", extensions=("fbs",))
     )
     CBOR = MimeType.define(MimeType("CBOR", "application/cbor", extensions=("cbor",)))
     BSON = MimeType.define(MimeType("BSON", "application/bson", extensions=("bson",)))
