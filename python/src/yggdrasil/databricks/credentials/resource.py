@@ -5,7 +5,7 @@ cloud identity — for AWS, an IAM role). Its headline feature is turning that
 into **refreshable AWS credentials**: ``credential.aws_client()`` hands back a
 self-refreshing :class:`~yggdrasil.aws.client.AWSClient` (and ``.aws_credentials()``
 a one-shot STS token). Collection ops live on
-:class:`~yggdrasil.databricks.credentials.credentials.Credentials`.
+:class:`~yggdrasil.databricks.credentials.service.Credentials`.
 
     cred = client.credentials["prod_s3"]
     s3 = cred.aws_client(region="us-east-1").s3      # auto-refreshing
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from databricks.sdk.service.catalog import AwsIamRole, TemporaryCredentials
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.aws.config import AwsCredentials
-    from yggdrasil.databricks.credentials.credentials import Credentials
+    from yggdrasil.databricks.credentials.service import Credentials
 
 __all__ = ["Credential"]
 
@@ -73,7 +73,7 @@ class Credential(DatabricksResource, Singleton):
                 self._info = info
             return
         if service is None:
-            from yggdrasil.databricks.credentials.credentials import Credentials
+            from yggdrasil.databricks.credentials.service import Credentials
 
             service = Credentials.current()
         super().__init__(service=service)

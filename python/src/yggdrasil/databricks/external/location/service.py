@@ -14,7 +14,7 @@ from databricks.sdk.errors import NotFound
 from databricks.sdk.service.catalog import ExternalLocationInfo
 
 from yggdrasil.databricks.client import DatabricksService
-from yggdrasil.databricks.external.location.location import ExternalLocation
+from yggdrasil.databricks.external.location.resource import ExternalLocation
 
 __all__ = ["ExternalLocations"]
 

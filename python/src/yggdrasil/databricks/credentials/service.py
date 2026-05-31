@@ -21,7 +21,7 @@ from databricks.sdk.service.catalog import (
 )
 
 from yggdrasil.databricks.client import DatabricksService
-from yggdrasil.databricks.credentials.credential import Credential
+from yggdrasil.databricks.credentials.resource import Credential
 
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient

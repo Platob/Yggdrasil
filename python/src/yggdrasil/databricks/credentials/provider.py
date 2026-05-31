@@ -34,7 +34,7 @@ class DatabricksCredentialAwsProvider(AwsCredentialsProvider):
 
     def bind(self, credential: Any) -> "DatabricksCredentialAwsProvider":
         """Point this provider at *credential* (a
-        :class:`~yggdrasil.databricks.credentials.credential.Credential`)."""
+        :class:`~yggdrasil.databricks.credentials.resource.Credential`)."""
         self._credential = credential
         return self
 

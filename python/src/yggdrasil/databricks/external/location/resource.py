@@ -3,7 +3,7 @@
 An :class:`ExternalLocation` wraps one Unity Catalog external location — a
 named binding of a cloud storage URL (``s3://`` / ``abfss://`` / ``gs://``) to a
 storage credential. Collection operations (list / create) live on
-:class:`~yggdrasil.databricks.external.location.locations.ExternalLocations`.
+:class:`~yggdrasil.databricks.external.location.service.ExternalLocations`.
 
     el = client.external_locations["raw_zone"]
     el.url                 # 's3://my-bucket/raw/'
@@ -23,7 +23,7 @@ from yggdrasil.databricks.resource import DatabricksResource
 from yggdrasil.url import URL
 
 if TYPE_CHECKING:
-    from yggdrasil.databricks.external.location.locations import ExternalLocations
+    from yggdrasil.databricks.external.location.service import ExternalLocations
     from yggdrasil.path import Path
 
 __all__ = ["ExternalLocation"]
@@ -62,7 +62,7 @@ class ExternalLocation(DatabricksResource, Singleton):
                 self._info = info  # refresh cache on an eager fetch
             return
         if service is None:
-            from yggdrasil.databricks.external.location.locations import ExternalLocations
+            from yggdrasil.databricks.external.location.service import ExternalLocations
 
             service = ExternalLocations.current()
         super().__init__(service=service)

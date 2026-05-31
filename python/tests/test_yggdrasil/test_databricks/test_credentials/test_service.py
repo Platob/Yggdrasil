@@ -1,4 +1,4 @@
-"""Service: yggdrasil.databricks.credentials.credentials.Credentials."""
+"""Service: yggdrasil.databricks.credentials.service.Credentials."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock

@@ -1,4 +1,4 @@
-"""Resource: yggdrasil.databricks.credentials.credential.Credential —
+"""Resource: yggdrasil.databricks.credentials.resource.Credential —
 metadata + refreshable AWS credentials."""
 from __future__ import annotations
 

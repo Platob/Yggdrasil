@@ -1,4 +1,4 @@
-"""Service: yggdrasil.databricks.external.location.locations.ExternalLocations."""
+"""Service: yggdrasil.databricks.external.location.service.ExternalLocations."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock

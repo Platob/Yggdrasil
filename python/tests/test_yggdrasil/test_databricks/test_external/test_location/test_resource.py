@@ -1,4 +1,4 @@
-"""Resource: yggdrasil.databricks.external.location.location.ExternalLocation."""
+"""Resource: yggdrasil.databricks.external.location.resource.ExternalLocation."""
 from __future__ import annotations
 
 from databricks.sdk.service.catalog import ExternalLocationInfo
