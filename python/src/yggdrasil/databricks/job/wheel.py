@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "WORKSPACE_WHL_DIR",
-    "wheel_name",
+    "find_project_root",
     "build_wheel",
     "upload_wheel",
     "ensure_wheel",
@@ -34,31 +34,31 @@ __all__ = [
 #: built wheel, the lib name for external deps) to centralize versions.
 WORKSPACE_WHL_DIR = "/Workspace/Shared/.ygg/whl"
 
+#: Files that mark a buildable Python project root.
+_PROJECT_MARKERS = ("pyproject.toml", "setup.py", "setup.cfg")
 
-def project_root() -> Path:
-    """The directory holding ``pyproject.toml`` (the ygg source tree)."""
-    here = Path(__file__).resolve()
-    for parent in (here, *here.parents):
-        if (parent / "pyproject.toml").exists():
+
+def find_project_root(start: "str | Path") -> Path:
+    """Walk up from *start* (a file or dir) to the nearest project root — a dir
+    holding a ``pyproject.toml`` / ``setup.py`` / ``setup.cfg``. Generic, so it
+    locates whatever project a flow is defined in, not just ygg."""
+    p = Path(start).resolve()
+    candidates = (p, *p.parents) if p.is_dir() else p.parents
+    for parent in candidates:
+        if any((parent / marker).exists() for marker in _PROJECT_MARKERS):
             return parent
     raise FileNotFoundError(
-        "could not locate pyproject.toml — building the ygg wheel needs the "
-        "source tree (deploy from a checkout, not an installed package)"
+        f"no Python project ({' / '.join(_PROJECT_MARKERS)}) found from {start!r}"
     )
 
 
-def wheel_name() -> str:
-    """The wheel filename for the current ygg version (``ygg-<v>-…whl``)."""
-    from yggdrasil.version import __version__
-
-    return f"ygg-{__version__}-py3-none-any.whl"
-
-
-def build_wheel(dest_dir: "str | Path | None" = None) -> Path:
-    """Build the ygg wheel via ``python -m build`` — returns the ``.whl`` path."""
-    root = project_root()
+def build_wheel(source: "str | Path", dest_dir: "str | Path | None" = None) -> Path:
+    """Build a wheel for the project at (or above) *source* via an **isolated**
+    ``python -m build`` (PEP 517 build env — independent of the current
+    install). Works for any project. Returns the produced ``.whl`` path."""
+    root = find_project_root(source)
     out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-wheel-"))
-    logger.info("building ygg wheel from %s", root)
+    logger.info("building wheel from %s (isolated build)", root)
     subprocess.run(
         [sys.executable, "-m", "build", "--wheel", "--outdir", str(out), str(root)],
         check=True,
@@ -78,27 +78,14 @@ def upload_wheel(client: Any, wheel: "str | Path", *, workspace_dir: str = WORKS
     path = DatabricksPath.from_(dest, client=client)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(wheel.read_bytes())
-    logger.info("uploaded ygg wheel to %s", dest)
+    logger.info("uploaded wheel to %s", dest)
     return dest
 
 
-def ensure_wheel(
-    client: Any,
-    *,
-    workspace_dir: str = WORKSPACE_WHL_DIR,
-    rebuild: bool = False,
-) -> str:
-    """Build + upload the ygg wheel; return its workspace path.
-
-    Idempotent by version: when the matching wheel already exists in
-    *workspace_dir* it's reused (skipping the build) unless ``rebuild=True``.
-    """
-    from yggdrasil.databricks.path import DatabricksPath
-
-    dest = f"{workspace_dir.rstrip('/')}/{wheel_name()}"
-    if not rebuild and DatabricksPath.from_(dest, client=client).exists():
-        return dest
-    wheel = build_wheel()
+def ensure_wheel(client: Any, source: "str | Path", *, workspace_dir: str = WORKSPACE_WHL_DIR) -> str:
+    """Build the project at *source* (isolated) + upload the wheel; return its
+    workspace path. Built fresh each call so the deployed job ships current code."""
+    wheel = build_wheel(source)
     return upload_wheel(client, wheel, workspace_dir=workspace_dir)
 
 

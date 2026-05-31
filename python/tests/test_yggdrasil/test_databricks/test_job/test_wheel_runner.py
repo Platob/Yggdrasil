@@ -45,9 +45,16 @@ class TestRunner:
 # wheel — build + upload + ensure
 # --------------------------------------------------------------------------- #
 class TestWheel:
-    def test_wheel_name_uses_version(self):
-        with patch("yggdrasil.version.__version__", "1.2.3"):
-            assert wheel.wheel_name() == "ygg-1.2.3-py3-none-any.whl"
+    def test_find_project_root_walks_up(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        nested = tmp_path / "pkg" / "sub"
+        nested.mkdir(parents=True)
+        assert wheel.find_project_root(nested / "mod.py") == tmp_path.resolve()
+        assert wheel.find_project_root(nested) == tmp_path.resolve()
+
+    def test_find_project_root_raises_when_absent(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            wheel.find_project_root(tmp_path / "nope" / "mod.py")
 
     def test_upload_writes_to_workspace_dir(self, tmp_path):
         client = MagicMock()
@@ -62,17 +69,16 @@ class TestWheel:
         path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
         path.write_bytes.assert_called_once_with(b"WHEELBYTES")
 
-    def test_ensure_reuses_existing_wheel(self):
+    def test_ensure_builds_from_source_and_uploads(self):
         client = MagicMock()
-        existing = MagicMock()
-        existing.exists.return_value = True
-        with patch("yggdrasil.databricks.job.wheel.wheel_name", return_value="ygg-1.0-py3-none-any.whl"), \
-             patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
-             patch("yggdrasil.databricks.job.wheel.build_wheel") as bw:
-            DP.from_.return_value = existing
-            dest = wheel.ensure_wheel(client)
-        assert dest == "/Workspace/Shared/.ygg/whl/ygg-1.0-py3-none-any.whl"
-        bw.assert_not_called()                         # reused, no rebuild
+        built = Path("/tmp/x-1.0-py3-none-any.whl")
+        with patch("yggdrasil.databricks.job.wheel.build_wheel", return_value=built) as bw, \
+             patch("yggdrasil.databricks.job.wheel.upload_wheel",
+                   return_value="/Workspace/Shared/.ygg/whl/job/x-1.0-py3-none-any.whl") as up:
+            dest = wheel.ensure_wheel(client, "/proj/src/mod.py", workspace_dir="/Workspace/Shared/.ygg/whl/job")
+        bw.assert_called_once_with("/proj/src/mod.py")     # isolated build of that project
+        up.assert_called_once_with(client, built, workspace_dir="/Workspace/Shared/.ygg/whl/job")
+        assert dest.endswith("x-1.0-py3-none-any.whl")
 
     def test_ensure_requirement_reuses_when_version_present(self):
         # precheck: pinned version's wheel already in the lib folder → no download
@@ -101,18 +107,3 @@ class TestWheel:
         dw.assert_called_once_with("databricks-sdk")
         up.assert_called_once_with(client, downloaded, workspace_dir="/Workspace/Shared/.ygg/whl/databricks-sdk")
         assert dest.endswith("databricks_sdk-9.9-py3-none-any.whl")
-
-    def test_ensure_builds_and_uploads_when_absent(self):
-        client = MagicMock()
-        missing = MagicMock()
-        missing.exists.return_value = False
-        built = Path("/tmp/ygg-1.0-py3-none-any.whl")
-        with patch("yggdrasil.databricks.job.wheel.wheel_name", return_value="ygg-1.0-py3-none-any.whl"), \
-             patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
-             patch("yggdrasil.databricks.job.wheel.build_wheel", return_value=built) as bw, \
-             patch("yggdrasil.databricks.job.wheel.upload_wheel", return_value="/Workspace/Shared/.ygg/whl/ygg-1.0-py3-none-any.whl") as up:
-            DP.from_.return_value = missing
-            dest = wheel.ensure_wheel(client)
-        bw.assert_called_once()
-        up.assert_called_once()
-        assert dest.endswith("ygg-1.0-py3-none-any.whl")

@@ -173,7 +173,10 @@ class TestFlow:
              patch("yggdrasil.databricks.job.wheel.ensure_requirement_wheel", return_value=sdk) as erw:
             demo.deploy(client)
 
-        ew.assert_called_once_with(client, workspace_dir="/Workspace/Shared/.ygg/whl/ygg-demo", rebuild=True)
+        # isolated build of the flow's own project, uploaded under the job folder
+        assert ew.call_count == 1
+        assert ew.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/.ygg/whl/ygg-demo"
+        assert ew.call_args.args[0] is client            # (client, source, ...)
         erw.assert_called_once_with(client, "databricks-sdk")
         kwargs = client.jobs.create_or_update.call_args.kwargs
         assert kwargs["environments"][0].spec.dependencies == [wheel, sdk]

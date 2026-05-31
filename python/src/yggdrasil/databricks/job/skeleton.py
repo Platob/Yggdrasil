@@ -264,12 +264,21 @@ class Flow(_Runnable):
 
     def wheel_dir(self) -> str:
         """Workspace folder the built wheel is uploaded to — named by the job
-        (``/Workspace/Shared/.ygg/whl/pkg/<job-name>``) so each job owns its
+        (``/Workspace/Shared/.ygg/whl/<job-name>``) so each job owns its
         wheel."""
         from yggdrasil.databricks.job.wheel import WORKSPACE_WHL_DIR
 
         slug = re.sub(r"[^0-9A-Za-z._-]+", "_", self.name).strip("_") or "flow"
         return f"{WORKSPACE_WHL_DIR}/{slug}"
+
+    def wheel_source(self) -> str:
+        """The project to build when :attr:`build_wheel` is set — derived from
+        where this flow is defined, so it adapts to any project (not just ygg).
+        Override to point at a different source tree."""
+        import inspect
+
+        target = self.fn if self.fn is not None else type(self)
+        return inspect.getfile(target)
 
     def effective_dependencies(self) -> list[str]:
         """The serverless dependencies. Once :meth:`deploy` has shipped wheels,
@@ -353,9 +362,11 @@ class Flow(_Runnable):
                 ensure_wheel,
             )
 
-            # Built wheel lives under the job-named folder; rebuilt each deploy
-            # so the job always ships current code.
-            self._wheel_path = ensure_wheel(client, workspace_dir=self.wheel_dir(), rebuild=True)
+            # Isolated build of this flow's own project (adapts to any project),
+            # uploaded under the job-named folder, rebuilt each deploy.
+            self._wheel_path = ensure_wheel(
+                client, self.wheel_source(), workspace_dir=self.wheel_dir()
+            )
             # Each extra (latest databricks-sdk) ships as a wheel centralized by
             # lib name (precheck → reuse, else download + upload), so the cluster
             # needs no index access and versions are shared across jobs.
