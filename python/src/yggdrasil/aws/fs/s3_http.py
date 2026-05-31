@@ -100,11 +100,18 @@ class S3HttpClient:
         signer: SigV4Signer,
         transport: Optional[Callable[..., S3Response]] = None,
         path_style: bool = False,
+        region: Optional[str] = None,
+        managed: bool = True,
     ) -> None:
         self.bucket = bucket
         self.endpoint = endpoint
         self.signer = signer
         self.path_style = path_style
+        # ``managed`` AWS endpoints can self-correct their region on a redirect
+        # (boto3 does the same); a custom ``endpoint_url`` (MinIO/localstack) is
+        # left alone.
+        self.region = region or signer.region
+        self._managed = managed
         self._transport = transport or self._default_transport
         self._session = None
 
@@ -132,13 +139,32 @@ class S3HttpClient:
         payload_sha256: Optional[str] = None,
         stream_body: Any = None,
     ) -> S3Response:
-        url = self._url(key, query=query)
         if payload_sha256 is None:
             payload_sha256 = sha256_hex(body) if body is not None else EMPTY_PAYLOAD_SHA256
-        sign_headers = self.signer.sign(method, url, headers=headers, payload_sha256=payload_sha256)
-        merged = dict(headers or {})
-        merged.update(sign_headers)
-        return self._transport(method=method, url=url, headers=merged, body=stream_body if stream_body is not None else body)
+        wire = stream_body if stream_body is not None else body
+        for attempt in range(2):
+            url = self._url(key, query=query)
+            sign_headers = self.signer.sign(method, url, headers=headers, payload_sha256=payload_sha256)
+            merged = dict(headers or {})
+            merged.update(sign_headers)
+            resp = self._transport(method=method, url=url, headers=merged, body=wire)
+            # Wrong-region buckets answer 301/400 with the real region in a
+            # header; re-point once and retry (matches boto3's auto-discovery).
+            if attempt == 0 and resp.status in (301, 400) and self._managed:
+                region = resp.headers.get("x-amz-bucket-region") or resp.headers.get("X-Amz-Bucket-Region")
+                if region and region != self.region:
+                    self._reregion(region)
+                    continue
+            return resp
+        return resp
+
+    def _reregion(self, region: str) -> None:
+        self.region = region
+        self.signer.region = region
+        if not self.path_style:
+            self.endpoint = URL.from_(f"https://{self.bucket}.s3.{region}.amazonaws.com")
+        else:
+            self.endpoint = URL.from_(f"https://s3.{region}.amazonaws.com")
 
     def _default_transport(self, *, method: str, url: URL, headers: Mapping[str, str], body: Any) -> S3Response:
         if self._session is None:

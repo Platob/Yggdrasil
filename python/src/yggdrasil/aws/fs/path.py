@@ -77,6 +77,13 @@ def _normalize_scheme(url: URL) -> URL:
     return url
 
 
+def _can_virtual_host(bucket: str) -> bool:
+    """True when *bucket* is a DNS-safe label that can ride a virtual-host TLS
+    cert (``<bucket>.s3...``). Dotted names break the wildcard cert, so boto3 —
+    and we — drop those to path-style."""
+    return "." not in bucket and 3 <= len(bucket) <= 63
+
+
 # ---------------------------------------------------------------------------
 # S3Bucket — long-lived bucket singleton owning the HTTP data plane
 # ---------------------------------------------------------------------------
@@ -144,14 +151,19 @@ class S3Bucket(RemotePath):
             client = self.service.client
             region = getattr(client, "region", None) or "us-east-1"
             endpoint_url = getattr(client, "endpoint_url", None)
+            managed = not endpoint_url
             if endpoint_url:  # S3-compatible store (MinIO / localstack) → path-style
                 endpoint, path_style = URL.from_(endpoint_url), True
+            elif _can_virtual_host(self._bucket):
+                endpoint, path_style = URL.from_(f"https://{self._bucket}.s3.{region}.amazonaws.com"), False
             else:
-                endpoint = URL.from_(f"https://{self._bucket}.s3.{region}.amazonaws.com")
-                path_style = False
+                # Dotted / non-DNS-safe bucket names can't ride a virtual-host
+                # TLS cert — fall back to path-style, exactly as boto3 does.
+                endpoint, path_style = URL.from_(f"https://s3.{region}.amazonaws.com"), True
             signer = SigV4Signer(region=region, credentials_provider=self._credentials)
             self._http = S3HttpClient(
-                bucket=self._bucket, endpoint=endpoint, signer=signer, path_style=path_style,
+                bucket=self._bucket, endpoint=endpoint, signer=signer,
+                path_style=path_style, region=region, managed=managed,
             )
         return self._http
 
