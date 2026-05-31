@@ -129,6 +129,25 @@ class TestDelete:
         assert not any(k.startswith("d/") for k in fake.objects)
 
 
+# --- not folder-oriented ---------------------------------------------------
+class TestNotFolderOriented:
+    """S3 is an object store, not a directory tree — there are no folders to
+    create, so mkdir is inert and writing a deep key never materializes
+    intermediate prefixes or probes for them."""
+
+    def test_mkdir_issues_no_requests(self, fake):
+        d = wire_s3_path(fake, "s3://bkt/a/b/c/")
+        d.mkdir(parents=True, exist_ok=True)
+        assert fake.calls == {}  # nothing created, nothing probed
+
+    def test_deep_write_creates_no_intermediate_prefixes(self, fake):
+        p = _path(fake, "a/b/c/d.txt")
+        p.write_bytes(b"hello", overwrite=True)
+        # Exactly one PUT for the object — no list/head/mkdir for the "folders".
+        assert fake.calls == {"put": 1}
+        assert set(fake.objects) == {"a/b/c/d.txt"}
+
+
 # --- listing ---------------------------------------------------------------
 class TestListing:
     def test_shallow_lists_children_and_prefixes(self, fake):

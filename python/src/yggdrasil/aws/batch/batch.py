@@ -22,11 +22,12 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping, Optional
 
+from yggdrasil.aws.batch.service import BatchService
 from yggdrasil.aws.client import AWSResource, AWSService
 from yggdrasil.aws.console import batch_job_url
 from yggdrasil.url import URL
 
-__all__ = ["AWSBatch", "BatchService", "in_aws_environment"]
+__all__ = ["AWSBatch", "in_aws_environment"]
 
 # Env vars any AWS-managed compute sets — used as a network-free "in AWS" probe.
 _AWS_ENV_SIGNALS = (
@@ -55,15 +56,6 @@ def _int(env: Mapping[str, str], name: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
-
-
-class BatchService(AWSService):
-    """AWS Batch service binding (the boto ``batch`` client lives on
-    :attr:`boto_client` for future control-plane calls)."""
-
-    @classmethod
-    def service_name(cls) -> str:
-        return "batch"
 
 
 class AWSBatch(AWSResource):

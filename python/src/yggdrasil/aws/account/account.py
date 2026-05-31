@@ -1,32 +1,21 @@
-"""AWS account resource + service.
+"""AWS account resource — the account a client authenticates as.
 
 :class:`AWSAccount` is the :class:`~yggdrasil.aws.client.AWSResource` for the
-account a client authenticates as — account id, region, STS caller identity,
-and a clickable :attr:`explore_url` to the AWS Console home. Its
-:class:`AccountService` is the thin :class:`~yggdrasil.aws.client.AWSService`
-binding (STS-flavored, since account identity is resolved via
-``sts:GetCallerIdentity``). Reach it as ``AWSClient.current().account``.
+account: account id, region, STS caller identity, and a clickable
+:attr:`explore_url` to the AWS Console home. Its :class:`AccountService` (in
+``service.py``) is the thin STS-flavored binding. Reach it as
+``AWSClient.current().account``.
 """
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from yggdrasil.aws.client import AWSClient, AWSResource, AWSService
+from yggdrasil.aws.account.service import AccountService
+from yggdrasil.aws.client import AWSResource, AWSService
 from yggdrasil.aws.console import account_console_url
 from yggdrasil.url import URL
 
-__all__ = ["AWSAccount", "AccountService"]
-
-
-class AccountService(AWSService):
-    """AWS account/identity service — STS-backed (``GetCallerIdentity``)."""
-
-    @classmethod
-    def service_name(cls) -> str:
-        return "sts"
-
-    def caller_identity(self) -> dict:
-        return self.client.caller_identity()
+__all__ = ["AWSAccount"]
 
 
 class AWSAccount(AWSResource):
