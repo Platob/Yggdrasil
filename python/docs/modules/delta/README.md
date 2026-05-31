@@ -2,7 +2,7 @@
 
 Pure-Python Delta Lake read/write — no Spark, no JVM. Works on local, S3, DBFS, or any yggdrasil `Path`.
 
-> **Import:** `from yggdrasil.delta import DeltaFolder` or `from yggdrasil.io.nested.delta import DeltaFolder`
+> **Import:** `from yggdrasil.delta import DeltaFolder` or `from yggdrasil.io.delta import DeltaFolder`
 
 ---
 

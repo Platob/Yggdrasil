@@ -13,8 +13,8 @@ from yggdrasil.data import field, schema
 from yggdrasil.enums.media_type import MediaTypes
 from yggdrasil.path.memory import Memory
 from yggdrasil.path.folder import Folder, FolderOptions
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 
 def _source_table() -> pa.Table:
@@ -72,7 +72,7 @@ class TestArrowIPCTargetCast:
     def test_projection_columns_resolves_target_subset(self):
         # The projection is the target's columns (target order) intersected
         # with the file, applied as a zero-copy select.
-        from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+        from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
         from yggdrasil.data.options import CastOptions
 
         names = ["id", "price", "name"]
@@ -417,7 +417,7 @@ class TestProjectionWithPredicate:
 
     def test_direct_parquet_columns_plus_predicate_on_dropped_column(self, tmp_path):
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
         from yggdrasil.path.local_path import LocalPath
         from yggdrasil.execution.expr import col
 

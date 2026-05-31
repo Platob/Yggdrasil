@@ -1,7 +1,7 @@
 // yggdrasil.io — PARITY: python/src/yggdrasil/io/
-// Arrow-IPC tabular core + format leaves (primitive / nested). apache-arrow is
-// a peer dep; a polars adapter (compute/casting) is a documented follow-on.
+// Arrow-IPC tabular core (``tabular/``) + the format leaves, which live
+// directly under ``io`` (the ``primitive``/``nested`` grouping layer was
+// flattened away on both sides). apache-arrow is a peer dep; a polars adapter
+// (compute/casting) and the parquet/csv/ndjson leaves are documented follow-ons.
 export { Tabular, type TabularSource } from "./tabular/base";
-export * as primitive from "./primitive";
-export * as nested from "./nested";
-export { ArrowIPCFile } from "./primitive";
+export { ArrowIPCFile } from "./arrowIpc";

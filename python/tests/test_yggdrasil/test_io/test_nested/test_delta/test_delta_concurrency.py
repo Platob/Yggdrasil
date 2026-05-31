@@ -27,12 +27,12 @@ from typing import Any
 from yggdrasil.data.data_field import Field
 from yggdrasil.enums import Mode
 from yggdrasil.data.types.primitive import Int64Type
-from yggdrasil.io.nested.delta import (
+from yggdrasil.io.delta import (
     ConcurrentDeltaCommitError,
     DeltaFolder,
     DeltaOptions,
 )
-from yggdrasil.io.nested.delta.tests import DeltaTestCase
+from yggdrasil.io.delta.tests import DeltaTestCase
 
 
 def _key_field(name: str = "id") -> Field:
@@ -218,7 +218,7 @@ class TestConcurrentRetry(DeltaTestCase):
         d._commit_atomic = _flaky  # type: ignore[assignment]
 
         sleeps: list[float] = []
-        import yggdrasil.io.nested.delta.delta_folder as _dio
+        import yggdrasil.io.delta.delta_folder as _dio
         orig_sleep = _dio.time.sleep
         _dio.time.sleep = lambda s: sleeps.append(s)  # type: ignore[attr-defined]
         try:
@@ -261,7 +261,7 @@ class TestConcurrentRetry(DeltaTestCase):
         d._commit_atomic = _flaky_twice  # type: ignore[assignment]
 
         sleeps: list[float] = []
-        import yggdrasil.io.nested.delta.delta_folder as _dio
+        import yggdrasil.io.delta.delta_folder as _dio
         orig_sleep = _dio.time.sleep
         _dio.time.sleep = lambda s: sleeps.append(s)  # type: ignore[attr-defined]
         try:
@@ -303,7 +303,7 @@ class TestConcurrentRetry(DeltaTestCase):
         d._commit_atomic = _flaky  # type: ignore[assignment]
 
         sleeps: list[float] = []
-        import yggdrasil.io.nested.delta.delta_folder as _dio
+        import yggdrasil.io.delta.delta_folder as _dio
         orig_sleep = _dio.time.sleep
         _dio.time.sleep = lambda s: sleeps.append(s)  # type: ignore[attr-defined]
         try:

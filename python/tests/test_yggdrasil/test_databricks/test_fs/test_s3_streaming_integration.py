@@ -62,7 +62,7 @@ class TestS3StreamingViaDatabricks(DatabricksIntegrationCase):
     def _exercise_s3_streaming(self, s3root) -> None:
         import pyarrow as pa
 
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         base = s3root / f"ygg-s3-stream-{secrets.token_hex(4)}"
         blob = base / "blob.bin"

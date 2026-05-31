@@ -1,4 +1,4 @@
-"""Back-compat shim — DV codec lives at :mod:`yggdrasil.io.nested.delta.deletion_vector`.
+"""Back-compat shim — DV codec lives at :mod:`yggdrasil.io.delta.deletion_vector`.
 
 Re-exports the public API plus a few underscore-prefixed helpers
 the old test suite reaches for (``_decode_payload``, ``_MAGIC_SIMPLE``,
@@ -8,7 +8,7 @@ module directly.
 
 from __future__ import annotations
 
-from yggdrasil.io.nested.delta.deletion_vector import (  # noqa: F401
+from yggdrasil.io.delta.deletion_vector import (  # noqa: F401
     DeletionVector,
     DeletionVectorDescriptor,
     _decode_payload,

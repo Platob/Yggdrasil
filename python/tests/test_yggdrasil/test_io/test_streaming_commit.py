@@ -14,7 +14,7 @@ import io
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.parquet_file import ParquetFile
 from yggdrasil.path.memory import Memory
 
 

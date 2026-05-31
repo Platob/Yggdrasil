@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.primitive.xlsx_file.XLSXFile`."""
+"""Tests for :class:`yggdrasil.io.xlsx_file.XLSXFile`."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ pytest.importorskip("fastexcel")
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
 from yggdrasil.path.local_path import LocalPath
-from yggdrasil.io.primitive.xlsx_file import XLSXFile
+from yggdrasil.io.xlsx_file import XLSXFile
 
 
 class TestRegistration:

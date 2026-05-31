@@ -1,4 +1,4 @@
-"""Tests for the rewritten :mod:`yggdrasil.io.nested.delta` package.
+"""Tests for the rewritten :mod:`yggdrasil.io.delta` package.
 
 Focuses on the features that distinguish this implementation from a
 plain folder-of-parquets:
@@ -6,7 +6,7 @@ plain folder-of-parquets:
 - DV write (inline + sidecar) and read round-trip
 - ``DeltaFolder.delete`` with the rewrite strategy and the DV strategy
 - :class:`yggdrasil.data.Schema` ↔ Spark JSON schema bridges
-- The canonical import path (``yggdrasil.io.nested.delta``) lights up
+- The canonical import path (``yggdrasil.io.delta``) lights up
   the same class registered against ``MimeTypes.DELTA_FOLDER`` as the
   back-compat shim at ``yggdrasil.delta``.
 
@@ -20,14 +20,14 @@ from __future__ import annotations
 
 import struct
 
-from yggdrasil.io.nested.delta.deletion_vector import (
+from yggdrasil.io.delta.deletion_vector import (
     _MAGIC_SIMPLE,
     DeletionVectorDescriptor,
     decode_deletion_vector,
     encode_inline_deletion_vector,
     write_uuid_deletion_vector,
 )
-from yggdrasil.io.nested.delta.tests import DeltaTestCase
+from yggdrasil.io.delta.tests import DeltaTestCase
 
 # ---------------------------------------------------------------------------
 # Canonical import path
@@ -37,14 +37,14 @@ from yggdrasil.io.nested.delta.tests import DeltaTestCase
 class TestImportSurface(DeltaTestCase):
     def test_canonical_path_resolves_same_class_as_shim(self) -> None:
         from yggdrasil.delta import DeltaFolder as Shim
-        from yggdrasil.io.nested.delta import DeltaFolder as Canonical
+        from yggdrasil.io.delta import DeltaFolder as Canonical
 
         self.assertIs(Shim, Canonical)
 
     def test_io_nested_reexports_deltaio(self) -> None:
-        from yggdrasil.io.nested import DeltaFolder, DeltaOptions
-        from yggdrasil.io.nested.delta import DeltaFolder as Canonical
-        from yggdrasil.io.nested.delta import DeltaOptions as CanonicalOpts
+        from yggdrasil.io.delta import DeltaFolder, DeltaOptions
+        from yggdrasil.io.delta import DeltaFolder as Canonical
+        from yggdrasil.io.delta import DeltaOptions as CanonicalOpts
 
         self.assertIs(DeltaFolder, Canonical)
         self.assertIs(DeltaOptions, CanonicalOpts)
@@ -145,7 +145,7 @@ class TestDeleteByRewrite(DeltaTestCase):
 
 class TestDeleteByDV(DeltaTestCase):
     def _opts(self):
-        from yggdrasil.io.nested.delta import DeltaOptions
+        from yggdrasil.io.delta import DeltaOptions
 
         return DeltaOptions(delete_via_dv=True)
 
@@ -183,7 +183,7 @@ class TestDeleteByDV(DeltaTestCase):
         self.assertEqual(sorted(out.column("id").to_pylist()), [10, 30, 50])
 
     def test_dv_delete_protocol_bumped(self) -> None:
-        from yggdrasil.io.nested.delta import DeltaOptions
+        from yggdrasil.io.delta import DeltaOptions
 
         d = self.delta_io()
         d.write_arrow_table(self.pa.table({"id": [1, 2, 3]}))
@@ -206,7 +206,7 @@ class TestSchemaCodec(DeltaTestCase):
         from yggdrasil.data.data_field import Field
         from yggdrasil.data.schema import Schema
         from yggdrasil.data.types.primitive import Int64Type, StringType
-        from yggdrasil.io.nested.delta import (
+        from yggdrasil.io.delta import (
             schema_to_spark_json,
             spark_json_to_schema,
         )
@@ -224,7 +224,7 @@ class TestSchemaCodec(DeltaTestCase):
         self.assertEqual(names, ["id", "name"])
 
     def test_arrow_schema_passes_metadata(self) -> None:
-        from yggdrasil.io.nested.delta import (
+        from yggdrasil.io.delta import (
             arrow_schema_to_spark_json,
             spark_json_to_arrow_schema,
         )
@@ -286,7 +286,7 @@ class TestEncodeDecodeBytes(DeltaTestCase):
         # of cardinality. Verifying the magic byte locks in that
         # contract — readers from other engines (delta-rs, Spark) only
         # need to support the simple-list shape to consume our DVs.
-        from yggdrasil.io.nested.delta.deletion_vector import (
+        from yggdrasil.io.delta.deletion_vector import (
             _encode_simple_payload,
         )
 

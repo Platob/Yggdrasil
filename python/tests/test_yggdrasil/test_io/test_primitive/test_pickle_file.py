@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.primitive.pickle_file.PickleFile`."""
+"""Tests for :class:`yggdrasil.io.pickle_file.PickleFile`."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import pytest
 
 from yggdrasil.enums import Mode, MimeTypes
 from yggdrasil.io.holder import IO
-from yggdrasil.io.primitive.pickle_file import PickleFile
+from yggdrasil.io.pickle_file import PickleFile
 from yggdrasil.path.local_path import LocalPath
 from yggdrasil.path.memory import Memory
 

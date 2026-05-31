@@ -72,7 +72,7 @@ class TestRemoteCallCounts(DeltaTestCase):
         self.s3 = _InMemoryS3()
         self.counter = _CallCounter(self.s3)
         self.bucket = "bench"
-        from yggdrasil.io.nested.delta.log import _content_cache
+        from yggdrasil.io.delta.log import _content_cache
         _content_cache.clear()
 
     def _folder(self, name: str = "t"):
@@ -171,7 +171,7 @@ class TestRemoteCallCounts(DeltaTestCase):
                 options=DeltaOptions(mode=mode, checkpoint_interval=10),
             )
 
-        from yggdrasil.io.nested.delta.log import _content_cache
+        from yggdrasil.io.delta.log import _content_cache
         _content_cache.clear()
 
         self.counter.reset()
@@ -204,7 +204,7 @@ class TestRemoteLatencyBenchmark(DeltaTestCase):
         super().setUp()
         self.s3 = _InMemoryS3()
         self.bucket = "bench"
-        from yggdrasil.io.nested.delta.log import _content_cache
+        from yggdrasil.io.delta.log import _content_cache
         _content_cache.clear()
 
     def _folder(self, name: str = "t"):

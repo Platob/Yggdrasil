@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.nested.zip_file.ZipFile`."""
+"""Tests for :class:`yggdrasil.io.zip_file.ZipFile`."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
 from yggdrasil.path.local_path import LocalPath
-from yggdrasil.io.nested.zip_file import ZipFile, ZipEntryFile
+from yggdrasil.io.zip_file import ZipFile, ZipEntryFile
 
 
 class TestRegistration:
@@ -86,11 +86,11 @@ class TestReadArrowBatchesSingleOpen:
 
     def test_single_zipfile_open_per_read(self, monkeypatch) -> None:
         # Build a 3-entry parquet archive in-memory.
-        from yggdrasil.io.nested.zip_file import (
+        from yggdrasil.io.zip_file import (
             ZipFile as _Zip, ZipOptions,
         )
-        import yggdrasil.io.nested.zip_file as zip_module
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        import yggdrasil.io.zip_file as zip_module
+        from yggdrasil.io.parquet_file import ParquetFile
 
         tables = [
             pa.table({"x": [i, i + 1, i + 2]}) for i in range(3)
@@ -137,14 +137,14 @@ class TestAppendStreaming:
     moment."""
 
     def test_append_preserves_existing_entries(self) -> None:
-        from yggdrasil.io.nested.zip_file import (
+        from yggdrasil.io.zip_file import (
             ZipFile as _Zip, ZipOptions,
         )
         from yggdrasil.enums import Mode
 
         # Start with one parquet entry; append another with a
         # different name; verify both survive.
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         # Pre-existing entry.
         existing_table = pa.table({"x": [10, 20]})
@@ -171,11 +171,11 @@ class TestAppendStreaming:
             assert names == {"old.parquet", "new.parquet"}
 
     def test_append_replaces_same_named_entry(self) -> None:
-        from yggdrasil.io.nested.zip_file import (
+        from yggdrasil.io.zip_file import (
             ZipFile as _Zip, ZipOptions,
         )
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         # First write (becomes the survivor that gets replaced).
         first = pa.table({"x": [1, 2, 3]})
@@ -214,7 +214,7 @@ class TestEntryReadWrite:
     surface."""
 
     def test_entry_open_writes_raw_bytes(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
 
         zf = _Zip(holder=Memory(), owns_holder=False)
         with zf.entry("notes.txt").open("wb") as f:
@@ -228,7 +228,7 @@ class TestEntryReadWrite:
             assert zfile.read("notes.txt") == b"hello entry"
 
     def test_entry_open_committed_payload_replaces_prior_entry(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
 
         # Pre-populate with one entry under the same name.
         raw = _build_archive({"x.bin": b"old"})
@@ -243,7 +243,7 @@ class TestEntryReadWrite:
             assert zfile.read("x.bin") == b"new"
 
     def test_entry_open_preserves_other_entries(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
 
         raw = _build_archive({"a.bin": b"alpha", "b.bin": b"beta"})
         zf = _Zip(holder=Memory(raw), owns_holder=False)
@@ -260,7 +260,7 @@ class TestEntryReadWrite:
             assert zfile.read("c.bin") == b"gamma"
 
     def test_entry_open_exception_drops_staged_bytes(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
 
         zf = _Zip(holder=Memory(), owns_holder=False)
         try:
@@ -275,7 +275,7 @@ class TestEntryReadWrite:
         assert zf.size == 0
 
     def test_entry_write_arrow_batches_packs_parquet(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
 
         table = pa.table({"x": [1, 2, 3]})
         zf = _Zip(holder=Memory(), owns_holder=False)
@@ -287,14 +287,14 @@ class TestEntryReadWrite:
             assert zfile.namelist() == ["data.parquet"]
 
     def test_entry_returns_zip_entry_file(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
 
         zf = _Zip(holder=Memory(), owns_holder=False)
         entry = zf.entry("x.bin")
         assert isinstance(entry, ZipEntryFile)
 
     def test_entry_read_existing(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
 
         raw = _build_archive({"x.bin": b"alpha"})
         zf = _Zip(holder=Memory(raw), owns_holder=False)
@@ -302,7 +302,7 @@ class TestEntryReadWrite:
         assert entry.to_bytes() == b"alpha"
 
     def test_entry_mode_error_if_exists(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
         from yggdrasil.enums import Mode
 
         raw = _build_archive({"x.bin": b"old"})
@@ -312,7 +312,7 @@ class TestEntryReadWrite:
                 f.write(b"new")
 
     def test_entry_mode_ignore_skips_existing(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
         from yggdrasil.enums import Mode
 
         raw = _build_archive({"x.bin": b"keep-me"})
@@ -326,7 +326,7 @@ class TestEntryReadWrite:
             assert zfile.read("x.bin") == b"keep-me"
 
     def test_entry_mode_append_concatenates(self) -> None:
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
         from yggdrasil.enums import Mode
 
         raw = _build_archive({"log.txt": b"first\n"})
@@ -348,7 +348,7 @@ class TestParallelEntryWrites:
 
     def test_concurrent_distinct_entries_all_persist(self) -> None:
         import concurrent.futures as cf
-        from yggdrasil.io.nested.zip_file import ZipFile as _Zip
+        from yggdrasil.io.zip_file import ZipFile as _Zip
 
         zf = _Zip(holder=Memory(), owns_holder=False)
         n = 16

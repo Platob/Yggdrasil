@@ -66,6 +66,7 @@ from yggdrasil.enums.media_type import MediaType
 from yggdrasil.enums.mime_type import MimeType
 from yggdrasil.io.holder import IO
 from yggdrasil.io.holder import Holder
+from yggdrasil.io.holder import _bootstrap_holder_format_registry
 from yggdrasil.path.memory import Memory
 from yggdrasil.io.tabular.base import Tabular
 
@@ -265,10 +266,11 @@ class ZipEntryFile(IO):
     # ==================================================================
 
     def _resolve_leaf(self) -> "Tabular | None":
-        # Triggers the side-effecting registrations on every primitive
-        # leaf — without this a caller that starts at zip_file directly
-        # would see an empty Tabular registry and fail to dispatch.
-        import yggdrasil.io.primitive  # noqa: F401
+        # Force every format leaf to register (a caller that starts at
+
+        # zip_file directly would otherwise see an empty Tabular registry).
+
+        _bootstrap_holder_format_registry()
 
         try:
             mt = MediaType.from_(self.entry_name, default=None)
@@ -399,8 +401,8 @@ class ZipEntryFile(IO):
         :class:`Memory` buffer; those bytes become the entry's payload
         and commit through the same path the raw-bytes write uses.
         """
-        # Side-effect import: ensures the primitive leaves are registered.
-        import yggdrasil.io.primitive  # noqa: F401
+        # Force every format leaf to register before we dispatch.
+        _bootstrap_holder_format_registry()
 
         try:
             mt = MediaType.from_(self.entry_name, default=None)
@@ -628,9 +630,9 @@ class ZipFile(IO):
         if self.size_known and self.size == 0:
             return
 
-        # Side-effect import: ensures the primitive leaves registered
-        # before we probe the media-type → Holder class table.
-        import yggdrasil.io.primitive  # noqa: F401
+        # Force every format leaf to register before we probe the
+        # media-type -> Holder class table.
+        _bootstrap_holder_format_registry()
 
         with self.view(pos=0) as v:
             with zipfile.ZipFile(v, "r") as zf:
@@ -717,8 +719,8 @@ class ZipFile(IO):
             action = Mode.OVERWRITE
 
         # Pack the batches into the inner format implied by entry name.
-        # Side-effect import: ensures the primitive leaves registered.
-        import yggdrasil.io.primitive  # noqa: F401
+        # Force every format leaf to register before we dispatch.
+        _bootstrap_holder_format_registry()
         try:
             inner_mt = MediaType.from_(options.entry_name, default=None)
         except Exception:

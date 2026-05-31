@@ -6,7 +6,7 @@ import pytest
 openpyxl = pytest.importorskip("openpyxl")
 pytest.importorskip("fastexcel")
 
-from yggdrasil.io.primitive.xlsx_file import ExcelFile, XLSXFile
+from yggdrasil.io.xlsx_file import ExcelFile, XLSXFile
 from yggdrasil.path.local_path import LocalPath
 
 

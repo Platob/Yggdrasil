@@ -34,7 +34,7 @@ name. Cleanup is one :func:`shutil.rmtree` — no per-file unlink
 loops, no half-deleted state on partial failure.
 
 Writes go through
-:class:`yggdrasil.io.primitive.arrow_ipc_file.ArrowIPCFile` over a
+:class:`yggdrasil.io.arrow_ipc_file.ArrowIPCFile` over a
 :class:`yggdrasil.io.path.local_path.LocalPath`, so the spill picks
 up the same OSFile streaming, codec knob, and legacy-format toggle
 the format leaf already manages. Spill compression defaults to
@@ -135,7 +135,7 @@ def _write_spill_part(
     same :func:`pa.ipc.new_file` sequence inline.
     """
     from yggdrasil.path.local_path import LocalPath
-    from yggdrasil.io.primitive.arrow_ipc_file import (
+    from yggdrasil.io.arrow_ipc_file import (
         ArrowIPCFile,
         ArrowIPCOptions,
     )
@@ -590,7 +590,7 @@ class ArrowTabular(Tabular[CastOptions]):
         before re-raising; previously-spilled state stays intact.
 
         The write side routes through
-        :class:`yggdrasil.io.primitive.arrow_ipc_file.ArrowIPCFile`
+        :class:`yggdrasil.io.arrow_ipc_file.ArrowIPCFile`
         over a :class:`LocalPath`, so each part picks up the same
         OSFile streaming, codec knob, and legacy-format toggle the
         format leaf already manages. The read side opens a fresh

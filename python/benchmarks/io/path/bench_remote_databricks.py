@@ -34,10 +34,10 @@ from yggdrasil.databricks.fs.dbfs_path import DBFSPath
 from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.fs.workspace_path import WorkspacePath
 from yggdrasil.io.path.remote_path import RemotePath
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
-from yggdrasil.io.primitive.csv_file import CSVFile
-from yggdrasil.io.primitive.ndjson_file import NDJSONFile
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.csv_file import CSVFile
+from yggdrasil.io.ndjson_file import NDJSONFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 
 # ---------------------------------------------------------------------------

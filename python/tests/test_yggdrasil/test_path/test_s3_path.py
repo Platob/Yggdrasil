@@ -393,7 +393,7 @@ class TestRangedProjection:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         class _RangedStub(_StubS3Path):
             SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = True

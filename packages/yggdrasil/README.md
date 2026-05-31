@@ -28,7 +28,7 @@ Object-oriented, mirroring the Python classes:
 | `http_/request.ts` | `http_/request.py` + session |
 | `data/types.ts` · `field.ts` · `schema.ts` · `options.ts` | `data/types/` · `data_field.py` · `schema.py` · `options.py` |
 | `arrow/cast.ts` | `arrow/cast.py` (any-source → Arrow Table) |
-| `io/tabular/base.ts` · `io/primitive/` · `io/nested/` | `io/tabular/` · `io/primitive/` · `io/nested/` |
+| `io/tabular/base.ts` · `io/arrowIpc.ts` | `io/tabular/` · `io/arrow_ipc_file.py` (leaves live directly under `io/`) |
 | `index.ts` | `__init__.py` |
 
 Implemented: **`enums`** (MIME/media-type, State, ByteUnit), **`url`** (URL
@@ -37,7 +37,8 @@ pathlib identity), **`http_`** (HTTPRequest/HTTPSession over `fetch`), **`data`*
 (the `DataType`/`Field`/`Schema` type system + `CastOptions`, with `toDict`
 round-tripping the *exact* Python `to_dict` wire form and `DataTypeId` integer
 codes shared across languages), **`arrow`** (any-source → Arrow Table coercion),
-**`io`** (the Arrow-IPC `Tabular` core + the `primitive`/`nested` format leaves;
+**`io`** (the Arrow-IPC `Tabular` core under `io/tabular/` + the format leaves
+directly under `io/`, e.g. `io/arrowIpc.ts`;
 `apache-arrow` is a peer dependency). Tested with **vitest** (`npm test`) +
 benchmarks (`npm run bench`).
 

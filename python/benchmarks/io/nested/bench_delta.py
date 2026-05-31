@@ -1,6 +1,6 @@
 """Benchmark :class:`DeltaFolder` — streamed reads/writes over the full feature set.
 
-The Delta read/write path in :class:`yggdrasil.io.nested.delta.DeltaFolder`
+The Delta read/write path in :class:`yggdrasil.io.delta.DeltaFolder`
 runs end-to-end on Arrow record batches: never materialise the full
 table into RAM unless the caller explicitly asks for it. This bench
 pins the wall-clock + peak-memory cost of every step in the pipeline
@@ -58,7 +58,7 @@ from yggdrasil.data.data_field import Field
 from yggdrasil.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
-from yggdrasil.io.nested.delta import DeltaFolder, DeltaOptions
+from yggdrasil.io.delta import DeltaFolder, DeltaOptions
 from yggdrasil.execution.expr import col as expr_col
 
 
@@ -736,7 +736,7 @@ def _deletion_vector_scenarios(repeat: int) -> list[dict]:
     rewritten to vectorise through numpy + pyarrow.compute — this
     pins the per-batch cost so the row-loop regression surfaces.
     """
-    from yggdrasil.io.nested.delta.deletion_vector import (
+    from yggdrasil.io.delta.deletion_vector import (
         DeletionVector, DeletionVectorDescriptor, mask_batch_with_dv,
     )
 

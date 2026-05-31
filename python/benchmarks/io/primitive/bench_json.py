@@ -17,7 +17,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from yggdrasil.io.primitive.json_file import JSONFile
+from yggdrasil.io.json_file import JSONFile
 
 from _common import (  # type: ignore[import-not-found]
     bench_roundtrip,

@@ -424,7 +424,7 @@ class TestResponseRoundTrip:
         ``ParquetFile``, …) on the deserialized side.
         """
         from yggdrasil.io.holder import Holder
-        from yggdrasil.io.primitive import JSONFile
+        from yggdrasil.io.json_file import JSONFile
         from yggdrasil.enums.media_type import MediaType
         from yggdrasil.enums.mime_type import MimeTypes
 

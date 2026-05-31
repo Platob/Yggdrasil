@@ -30,9 +30,9 @@ import pyarrow as pa
 from yggdrasil.enums import Mode
 from yggdrasil.data.options import CastOptions
 from yggdrasil.io.path.local_path import LocalPath
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
-from yggdrasil.io.primitive.csv_file import CSVFile
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.csv_file import CSVFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 
 # Writes share the same target path across iterations, so use OVERWRITE

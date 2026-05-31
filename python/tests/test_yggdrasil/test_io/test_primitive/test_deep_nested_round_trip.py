@@ -34,10 +34,10 @@ import pytest
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
-from yggdrasil.io.primitive.json_file import JSONFile
-from yggdrasil.io.primitive.ndjson_file import NDJSONFile
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.json_file import JSONFile
+from yggdrasil.io.ndjson_file import NDJSONFile
+from yggdrasil.io.parquet_file import ParquetFile
 from yggdrasil.io.tabular import Tabular
 
 

@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.primitive.csv_file.CSVFile`."""
+"""Tests for :class:`yggdrasil.io.csv_file.CSVFile`."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
 from yggdrasil.path.local_path import LocalPath
-from yggdrasil.io.primitive.csv_file import CSVFile
+from yggdrasil.io.csv_file import CSVFile
 
 
 class TestRegistration:

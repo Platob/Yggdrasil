@@ -29,7 +29,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 
 from yggdrasil.arrow.tests import ArrowTestCase
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile, ArrowIPCOptions
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile, ArrowIPCOptions
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from yggdrasil.io.primitive.ndjson_file import NDJSONFile
+from yggdrasil.io.ndjson_file import NDJSONFile
 
 from _common import (  # type: ignore[import-not-found]
     bench_roundtrip,

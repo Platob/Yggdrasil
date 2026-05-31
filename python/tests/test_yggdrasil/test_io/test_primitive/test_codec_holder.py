@@ -23,12 +23,12 @@ from yggdrasil.enums.media_type import MediaType
 from yggdrasil.io.base import IO
 from yggdrasil.path.memory import Memory
 from yggdrasil.path.local_path import LocalPath
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
-from yggdrasil.io.primitive.csv_file import CSVFile
-from yggdrasil.io.primitive.json_file import JSONFile
-from yggdrasil.io.primitive.ndjson_file import NDJSONFile
-from yggdrasil.io.primitive.parquet_file import ParquetFile
-from yggdrasil.io.primitive.xlsx_file import XLSXFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.csv_file import CSVFile
+from yggdrasil.io.json_file import JSONFile
+from yggdrasil.io.ndjson_file import NDJSONFile
+from yggdrasil.io.parquet_file import ParquetFile
+from yggdrasil.io.xlsx_file import XLSXFile
 
 
 @pytest.fixture
@@ -164,7 +164,7 @@ class TestCsvGzipLocalPath:
         self, tmp_path, table,
     ) -> None:
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.csv_file import CsvOptions
+        from yggdrasil.io.csv_file import CsvOptions
 
         target = LocalPath(str(tmp_path / "trades.csv.gz"))
         CSVFile(holder=target, owns_holder=False).write_arrow_table(table)

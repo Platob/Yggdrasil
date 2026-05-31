@@ -254,20 +254,43 @@ _HOLDER_FORMAT_REGISTRY: "dict[str, type[IO]]" = {}
 _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED: bool = False
 
 
-def _bootstrap_holder_format_registry() -> None:
-    """Force-load every concrete format-leaf package once.
+def _bootstrap_primitive_format_leaves() -> None:
+    """Force-load the single-buffer format leaves (parquet / csv / …).
 
-    Each leaf module registers its ``mime_type`` via
-    :meth:`IO.__init_subclass__` on import, so importing the leaf
-    packages is enough to populate :data:`_HOLDER_FORMAT_REGISTRY`.
+    These have no dependency on :class:`yggdrasil.path.folder.Folder`, so
+    they are safe to import eagerly — even from inside ``folder``'s own
+    module body, which does exactly that so per-child dispatch never pays
+    a cold-miss. Each leaf registers its ``mime_type`` via
+    :meth:`IO.__init_subclass__` on import.
+    """
+    import yggdrasil.io.arrow_ipc_file  # noqa: F401
+    import yggdrasil.io.parquet_file  # noqa: F401
+    import yggdrasil.io.csv_file  # noqa: F401
+    import yggdrasil.io.json_file  # noqa: F401
+    import yggdrasil.io.ndjson_file  # noqa: F401
+    import yggdrasil.io.xlsx_file  # noqa: F401
+    import yggdrasil.io.pickle_file  # noqa: F401
+
+
+def _bootstrap_holder_format_registry() -> None:
+    """Force-load every concrete format leaf once.
+
+    The leaves live directly under :mod:`yggdrasil.io` (the ``primitive``
+    / ``nested`` grouping packages were flattened away), so they are
+    imported explicitly here rather than as two umbrella packages. The
+    nested leaves (``zip_file`` / ``delta``) depend on
+    :class:`yggdrasil.path.folder.Folder`, so they load *after* the
+    primitives and only through this full bootstrap — never from
+    ``folder``'s module body, which would close an import cycle.
     Idempotent — the module-level flag short-circuits repeat calls.
     """
     global _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED
     if _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
         return
     _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED = True
-    import yggdrasil.io.primitive  # noqa: F401
-    import yggdrasil.io.nested  # noqa: F401
+    _bootstrap_primitive_format_leaves()
+    import yggdrasil.io.zip_file  # noqa: F401
+    import yggdrasil.io.delta  # noqa: F401
 
 
 def _resolve_format_target(
@@ -1315,7 +1338,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         # Miss may just mean the leaf package hasn't been imported
         # yet — force the side-effect bootstrap once and retry. This
         # is what catches nested leaves (ZipFile / Folder / DeltaFolder)
-        # for callers that never touched ``yggdrasil.io.nested``.
+        # for callers that never touched ``yggdrasil.io.delta``.
         if not _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
             _bootstrap_holder_format_registry()
             hit = _HOLDER_FORMAT_REGISTRY.get(mt.mime_type.name)

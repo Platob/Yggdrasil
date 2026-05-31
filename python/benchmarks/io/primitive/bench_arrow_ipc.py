@@ -20,7 +20,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from yggdrasil.data.options import CastOptions
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
 
 from _common import (  # type: ignore[import-not-found]
     bench_roundtrip,

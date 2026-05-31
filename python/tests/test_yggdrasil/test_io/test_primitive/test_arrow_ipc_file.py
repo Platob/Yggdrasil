@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.primitive.arrow_ipc_file.ArrowIPCFile`."""
+"""Tests for :class:`yggdrasil.io.arrow_ipc_file.ArrowIPCFile`."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
 from yggdrasil.path.local_path import LocalPath
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
 
 
 class TestRegistration:
@@ -450,7 +450,7 @@ class TestReadArrowTableBypassesBatchHook:
         assert out.equals(table)
 
     def test_row_limit_applied_on_fast_path(self) -> None:
-        from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCOptions
+        from yggdrasil.io.arrow_ipc_file import ArrowIPCOptions
 
         table = pa.table({"id": list(range(1000))})
         mem = Memory()
@@ -517,7 +517,7 @@ class TestFastPathEquivalence:
         return bytes(mem.to_bytes())
 
     def _write_slow(self, table) -> bytes:
-        from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCOptions
+        from yggdrasil.io.arrow_ipc_file import ArrowIPCOptions
         mem = Memory()
         leaf = ArrowIPCFile(holder=mem, owns_holder=False)
         leaf._write_arrow_batches(iter(table.to_batches()), ArrowIPCOptions())

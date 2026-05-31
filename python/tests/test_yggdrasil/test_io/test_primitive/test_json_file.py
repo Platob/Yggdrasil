@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.primitive.json_file.JSONFile`."""
+"""Tests for :class:`yggdrasil.io.json_file.JSONFile`."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
 from yggdrasil.path.local_path import LocalPath
-from yggdrasil.io.primitive.json_file import JSONFile
+from yggdrasil.io.json_file import JSONFile
 
 
 class TestRegistration:

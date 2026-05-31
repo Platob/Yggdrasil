@@ -153,7 +153,7 @@ class TestVolumeLoadIntegration(DatabricksIntegrationCase):
     def test_large_parquet_streaming_round_trip(self) -> None:
         import pyarrow as pa
 
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         rows = _env_int("DATABRICKS_INTEGRATION_PARQUET_ROWS", 1_000_000)
         table = pa.table({

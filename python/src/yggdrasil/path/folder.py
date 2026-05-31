@@ -94,13 +94,17 @@ from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.url import hive_cast_value, hive_encode, hive_split
 
-# Side-effect import: ensures every primitive leaf (parquet / csv /
-# arrow / ndjson / json / xlsx) has registered itself in the
+# Force the single-buffer format leaves (parquet / csv / arrow / ndjson
+# / json / xlsx / pickle) to register themselves in
 # :data:`yggdrasil.io.holder._HOLDER_FORMAT_REGISTRY` so
-# :meth:`IO.class_for_media_type` actually finds them. Hoisted to
-# module-top so :meth:`Folder._leaf_for` (per-child during
-# :meth:`iter_children`) doesn't pay a dict lookup on every iter.
-import yggdrasil.io.primitive  # noqa: F401
+# :meth:`IO.class_for_media_type` finds them without
+# :meth:`Folder._leaf_for` paying a cold-miss per child. Only the
+# *primitive* leaves are loaded here — the nested ones (zip / delta)
+# depend on :class:`Folder` defined below, so loading them now would
+# close an import cycle; the full bootstrap pulls them lazily later.
+from yggdrasil.io.holder import _bootstrap_primitive_format_leaves
+
+_bootstrap_primitive_format_leaves()
 
 if TYPE_CHECKING:
     from yggdrasil.execution.expr import Predicate

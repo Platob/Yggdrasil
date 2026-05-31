@@ -6,8 +6,8 @@ import dataclasses
 import json as _json
 from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Mapping, Optional
 
-from yggdrasil.io.nested.delta.log import DeltaLog, LogSegment
-from yggdrasil.io.nested.delta.protocol import (
+from yggdrasil.io.delta.log import DeltaLog, LogSegment
+from yggdrasil.io.delta.protocol import (
     AddFile, DeltaAction, DomainMetadata, Metadata, Protocol, RemoveFile, Txn,
 )
 

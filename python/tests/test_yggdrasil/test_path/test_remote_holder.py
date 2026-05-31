@@ -22,10 +22,10 @@ from yggdrasil.databricks.fs.service import DBFSService
 from yggdrasil.databricks.volume.volumes import Volumes
 
 from tests.test_yggdrasil.test_databricks._files_fake import wire_files_session
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
-from yggdrasil.io.primitive.csv_file import CSVFile
-from yggdrasil.io.primitive.ndjson_file import NDJSONFile
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.csv_file import CSVFile
+from yggdrasil.io.ndjson_file import NDJSONFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 
 def _s3_service(client: MagicMock) -> MagicMock:

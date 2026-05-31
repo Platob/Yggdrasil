@@ -295,7 +295,7 @@ class TestRead:
         import io as _io
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         sink = _io.BytesIO()
         pq.write_table(
@@ -555,7 +555,7 @@ class TestFormats:
     def test_parquetfile_reader_over_volume(self, workspace, client, service):
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         store = self._store_backed(workspace)
         table = pa.table({"x": pa.array(range(500), type=pa.int64())})
@@ -573,7 +573,7 @@ class TestFormats:
         # via HTTP Range — a fraction of the whole object.
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         store = self._store_backed(workspace)
         ncols = 16
@@ -605,7 +605,7 @@ class TestFormats:
         # column projection range-backed would flip this assertion.
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         store = self._store_backed(workspace)
         table = pa.table({f"c{i}": pa.array(range(2000), type=pa.int64())
@@ -879,7 +879,7 @@ class TestWriteAll:
         through write_all via _commit_format_payload: 1 upload,
         1 get_metadata (mode guard size check), 0 downloads."""
         import pyarrow as pa
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         table = pa.table(
             {
@@ -914,7 +914,7 @@ class TestWriteAll:
         After: write_all skips truncate — 1 upload total.
         """
         import pyarrow as pa
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         table = pa.table({"x": pa.array([10, 20, 30], type=pa.int32())})
 
@@ -2033,7 +2033,7 @@ class TestStreamingUpload:
         self, workspace, client, service, monkeypatch
     ):
         import pyarrow as pa
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
         from yggdrasil.path.local_path import LocalPath
 
         self._roundtrip_store(workspace)
@@ -2095,7 +2095,7 @@ class TestStreamingUploadWire:
         from yggdrasil.databricks.volume.volumes import Volumes
         from yggdrasil.http_ import HTTPSession
         from yggdrasil.http_ import retry as _retry
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         monkeypatch.setattr(_retry.time, "sleep", lambda *a, **k: None)
 

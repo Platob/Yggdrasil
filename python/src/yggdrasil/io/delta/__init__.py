@@ -13,24 +13,24 @@ Reworked implementation with full Delta read/write protocol:
 
 from __future__ import annotations
 
-from yggdrasil.io.nested.delta.checkpoint import (
+from yggdrasil.io.delta.checkpoint import (
     update_last_checkpoint,
     write_checkpoint,
 )
-from yggdrasil.io.nested.delta.delta_folder import (
+from yggdrasil.io.delta.delta_folder import (
     ConcurrentDeltaCommitError,
     DeltaFolder,
     DeltaOptions,
 )
-from yggdrasil.io.nested.delta.deletion_vector import (
+from yggdrasil.io.delta.deletion_vector import (
     DeletionVector,
     decode_deletion_vector,
     encode_inline_deletion_vector,
     mask_batch_with_dv,
     write_uuid_deletion_vector,
 )
-from yggdrasil.io.nested.delta.log import DeltaLog, LogSegment
-from yggdrasil.io.nested.delta.protocol import (
+from yggdrasil.io.delta.log import DeltaLog, LogSegment
+from yggdrasil.io.delta.protocol import (
     AddFile,
     CommitInfo,
     DeletionVectorDescriptor,
@@ -42,13 +42,13 @@ from yggdrasil.io.nested.delta.protocol import (
     Txn,
     parse_action,
 )
-from yggdrasil.io.nested.delta.schema_codec import (
+from yggdrasil.io.delta.schema_codec import (
     arrow_schema_to_spark_json,
     schema_to_spark_json,
     spark_json_to_arrow_schema,
     spark_json_to_schema,
 )
-from yggdrasil.io.nested.delta.snapshot import Snapshot
+from yggdrasil.io.delta.snapshot import Snapshot
 
 __all__ = [
     "AddFile",

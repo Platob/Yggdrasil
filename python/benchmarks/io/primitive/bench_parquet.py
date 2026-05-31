@@ -35,7 +35,7 @@ import pyarrow as pa
 
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.options import CastOptions
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 from _common import (  # type: ignore[import-not-found]
     bench_roundtrip,

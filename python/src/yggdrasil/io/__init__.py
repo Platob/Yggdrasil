@@ -11,12 +11,33 @@ from __future__ import annotations
 # loading Holder here closes a circular import.
 #
 # IO is lazy for the same reason: pulling it would trigger the
-# buffer/primitive/tabular chain.
+# buffer/tabular chain.
 from .io_stats import IOStats
 
 
 _LAZY_DATA_NAMES = {"Holder", "Memory", "MemoryStream"}
 _LAZY_IO_NAMES = {"IO"}
+
+# The concrete format leaves used to hide behind ``io.primitive`` /
+# ``io.nested`` umbrella packages; the grouping layer is gone — every
+# leaf module sits directly under ``yggdrasil.io``. Their public classes
+# are re-exported here lazily (same circular-import guard as above:
+# importing a leaf pulls Tabular → data, so it must stay deferred) so
+# ``from yggdrasil.io import ArrowIPCFile`` keeps working.
+_LAZY_LEAF_NAMES = {
+    "ArrowIPCFile": "arrow_ipc_file",
+    "ParquetFile": "parquet_file",
+    "CSVFile": "csv_file",
+    "JSONFile": "json_file",
+    "NDJSONFile": "ndjson_file",
+    "XLSXFile": "xlsx_file",
+    "PickleFile": "pickle_file",
+    "ZipFile": "zip_file",
+    "ZipOptions": "zip_file",
+    "ZipEntryFile": "zip_file",
+    "DeltaFolder": "delta",
+    "DeltaOptions": "delta",
+}
 
 
 def __getattr__(name: str):
@@ -38,6 +59,12 @@ def __getattr__(name: str):
         from .base import IO as value
         globals()[name] = value
         return value
+    if name in _LAZY_LEAF_NAMES:
+        from importlib import import_module
+
+        value = getattr(import_module(f"{__name__}.{_LAZY_LEAF_NAMES[name]}"), name)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -46,5 +73,6 @@ def __dir__():
         set(globals())
         | _LAZY_DATA_NAMES
         | _LAZY_IO_NAMES
+        | set(_LAZY_LEAF_NAMES)
         | {"URL", "IOStats"}
     )

@@ -24,25 +24,25 @@ import pyarrow.compute as pc
 
 from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.path.folder import Folder, FolderOptions
-from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
+from yggdrasil.io.parquet_file import ParquetFile, ParquetOptions
 from yggdrasil.pickle import json as ygg_json
 
-from yggdrasil.io.nested.delta._names import format_commit_name
-from yggdrasil.io.nested.delta.checkpoint import update_last_checkpoint, write_checkpoint
-from yggdrasil.io.nested.delta.deletion_vector import (
+from yggdrasil.io.delta._names import format_commit_name
+from yggdrasil.io.delta.checkpoint import update_last_checkpoint, write_checkpoint
+from yggdrasil.io.delta.deletion_vector import (
     DeletionVector, decode_deletion_vector, encode_inline_deletion_vector,
     mask_batch_with_dv, write_uuid_deletion_vector,
 )
-from yggdrasil.io.nested.delta.log import DeltaLog
-from yggdrasil.io.nested.delta.protocol import (
+from yggdrasil.io.delta.log import DeltaLog
+from yggdrasil.io.delta.protocol import (
     AddFile, CommitInfo, DeltaAction, DeletionVectorDescriptor,
     Metadata, Protocol, RemoveFile, Txn,
 )
-from yggdrasil.io.nested.delta.schema_codec import (
+from yggdrasil.io.delta.schema_codec import (
     arrow_schema_to_spark_json, spark_json_to_arrow_schema,
     schema_to_spark_json, spark_json_to_schema,
 )
-from yggdrasil.io.nested.delta.snapshot import Snapshot
+from yggdrasil.io.delta.snapshot import Snapshot
 
 if TYPE_CHECKING:
     from yggdrasil.execution.expr import Predicate
@@ -720,8 +720,8 @@ class DeltaFolder(Folder):
 
         def _read_delta_files(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
             import pickle as _pkl
-            from yggdrasil.io.primitive.parquet_file import ParquetFile as _PF, ParquetOptions as _PO
-            from yggdrasil.io.nested.delta.deletion_vector import decode_deletion_vector as _dv, mask_batch_with_dv as _mask
+            from yggdrasil.io.parquet_file import ParquetFile as _PF, ParquetOptions as _PO
+            from yggdrasil.io.delta.deletion_vector import decode_deletion_vector as _dv, mask_batch_with_dv as _mask
             from yggdrasil.enums import Mode as _M
             for batch in batches:
                 for blob in batch.column("_pkl").to_pylist():

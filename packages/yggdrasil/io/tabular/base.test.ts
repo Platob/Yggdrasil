@@ -5,7 +5,7 @@
 import { describe, it, expect } from "vitest";
 import * as arrow from "apache-arrow";
 import { Tabular } from "./base";
-import { ArrowIPCFile } from "../primitive/arrowIpc";
+import { ArrowIPCFile } from "../arrowIpc";
 import { MimeTypes } from "../../enums";
 import { DataTypeId } from "../../data/types";
 

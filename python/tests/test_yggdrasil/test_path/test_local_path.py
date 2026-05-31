@@ -440,14 +440,14 @@ class TestStaging:
 class TestAsMedia:
 
     def test_as_media_ipc(self, tmp_path: pathlib.Path) -> None:
-        from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
+        from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
 
         p = LocalPath(str(tmp_path / "data.ipc"), singleton_ttl=False)
         leaf = p.as_media()
         assert isinstance(leaf, ArrowIPCFile)
 
     def test_as_media_parquet(self, tmp_path: pathlib.Path) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         p = LocalPath(str(tmp_path / "data.parquet"), singleton_ttl=False)
         leaf = p.as_media()

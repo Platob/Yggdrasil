@@ -11,15 +11,15 @@ import pyarrow as pa
 from yggdrasil.enums import Mode
 from yggdrasil.pickle import json as ygg_json
 
-from yggdrasil.io.nested.delta._names import (
+from yggdrasil.io.delta._names import (
     LAST_CHECKPOINT_NAME, SIDECARS_DIR_NAME,
     format_checkpoint_v1_name, format_checkpoint_v2_manifest_name,
     format_checkpoint_v2_sidecar_name,
 )
-from yggdrasil.io.nested.delta.protocol import Txn
+from yggdrasil.io.delta.protocol import Txn
 
 if TYPE_CHECKING:
-    from yggdrasil.io.nested.delta.snapshot import Snapshot
+    from yggdrasil.io.delta.snapshot import Snapshot
     from yggdrasil.path import Path
 
 __all__ = ["write_checkpoint", "update_last_checkpoint"]
@@ -37,7 +37,7 @@ def write_checkpoint(snap: "Snapshot", *, log_path: "Path",
     if not actions:
         return None
 
-    from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
+    from yggdrasil.io.parquet_file import ParquetFile, ParquetOptions
 
     if kind == "v2":
         sidecar_dir = log_path / SIDECARS_DIR_NAME

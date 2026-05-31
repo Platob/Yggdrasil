@@ -8,11 +8,11 @@ from typing import TYPE_CHECKING, Iterable, Iterator, List, Mapping, Optional, T
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.pickle import json as ygg_json
 
-from yggdrasil.io.nested.delta._names import (
+from yggdrasil.io.delta._names import (
     LAST_CHECKPOINT_NAME, LOG_DIR_NAME, SIDECARS_DIR_NAME,
     format_commit_name, version_from_log_name,
 )
-from yggdrasil.io.nested.delta.protocol import DeltaAction, parse_action
+from yggdrasil.io.delta.protocol import DeltaAction, parse_action
 
 if TYPE_CHECKING:
     from yggdrasil.path import Path

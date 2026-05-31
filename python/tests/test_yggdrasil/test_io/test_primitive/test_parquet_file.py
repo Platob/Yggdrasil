@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.primitive.parquet_file.ParquetFile`."""
+"""Tests for :class:`yggdrasil.io.parquet_file.ParquetFile`."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
 from yggdrasil.path.local_path import LocalPath
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 
 class TestRegistration:
@@ -83,7 +83,7 @@ class TestLocalPathRoundTrip:
 class TestOptions:
 
     def test_options_class(self) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        from yggdrasil.io.parquet_file import ParquetOptions
 
         assert ParquetFile.options_class() is ParquetOptions
 
@@ -97,7 +97,7 @@ class TestWriteArrowTableBypassesBatchHook:
 
     @staticmethod
     def _counting_patch(monkeypatch):
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         calls = {"n": 0}
         original = ParquetFile._write_arrow_batches
@@ -110,7 +110,7 @@ class TestWriteArrowTableBypassesBatchHook:
         return calls
 
     def test_overwrite_on_empty_skips_batch_hook(self, monkeypatch) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         calls = self._counting_patch(monkeypatch)
         table = pa.table({"id": list(range(1000))})
@@ -126,7 +126,7 @@ class TestWriteArrowTableBypassesBatchHook:
         self, monkeypatch,
     ) -> None:
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3]})
         mem = Memory()
@@ -146,7 +146,7 @@ class TestWriteArrowTableBypassesBatchHook:
 
     def test_truncate_routes_to_fast_path(self, monkeypatch) -> None:
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3]})
         mem = Memory()
@@ -163,7 +163,7 @@ class TestWriteArrowTableBypassesBatchHook:
 
     def test_append_to_nonempty_uses_batch_hook(self, monkeypatch) -> None:
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3]})
         mem = Memory()
@@ -183,7 +183,7 @@ class TestWriteArrowTableBypassesBatchHook:
         merge logic has nothing to merge against, so the fast path
         is safe and the batch hook is overhead."""
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         calls = self._counting_patch(monkeypatch)
         table = pa.table({"id": [1, 2, 3]})
@@ -196,7 +196,7 @@ class TestWriteArrowTableBypassesBatchHook:
         """AUTO with no ``match_by`` resolves to APPEND semantics
         on a non-empty buffer — the existing data must survive, so
         the batch hook owns the rewrite."""
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3]})
         mem = Memory()
@@ -215,7 +215,7 @@ class TestWriteArrowTableBypassesBatchHook:
         """IGNORE on a non-empty buffer must NOT clobber existing
         data — that's the batch hook's size-check + return."""
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3]})
         mem = Memory()
@@ -234,7 +234,7 @@ class TestWriteArrowTableBypassesBatchHook:
         self, monkeypatch,
     ) -> None:
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3]})
         mem = Memory()
@@ -251,7 +251,7 @@ class TestWriteArrowTableBypassesBatchHook:
         """UPSERT (or AUTO+match_by) needs the read-modify-rewrite
         path so the keyed dedup actually fires."""
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3], "v": ["a", "b", "c"]})
         mem = Memory()
@@ -274,7 +274,7 @@ class TestWriteArrowTableBypassesBatchHook:
         """The fast path must thread the parquet writer options the
         same way the batch path does — compression, row_group_size,
         statistics, dictionary."""
-        from yggdrasil.io.primitive.parquet_file import (
+        from yggdrasil.io.parquet_file import (
             ParquetFile, ParquetOptions,
         )
 
@@ -304,7 +304,7 @@ class TestWriteArrowTableBypassesBatchHook:
         wrong dtype."""
         from yggdrasil.data.options import CastOptions
         from yggdrasil.data.data_field import Field
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         # int64 source, int32 target — the fast path should cast.
         source = pa.table({"id": pa.array([1, 2, 3], type=pa.int64())})
@@ -323,7 +323,7 @@ class TestWriteArrowTableBypassesBatchHook:
     def test_empty_table_fast_path(self) -> None:
         """An empty pa.Table on the fast path must still produce a
         valid parquet file with the table's schema."""
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         empty = pa.table({"id": pa.array([], type=pa.int64())})
         mem = Memory()
@@ -340,7 +340,7 @@ class TestWriteArrowTableBypassesBatchHook:
         — ``holder_is_overwrite`` is True, so the override's
         ``has_existing`` check short-circuits to False even when the
         underlying file already contains bytes. The fast path runs."""
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         path = LocalPath(str(tmp_path / "x.parquet"))
         # Pre-populate so the file is non-empty on disk.
@@ -438,7 +438,7 @@ class TestPandasIndexRoundTrip(__import__(
     def test_target_bound_write_drops_index(self) -> None:
         """A bound target schema strictly defines columns — index drops out."""
         from yggdrasil.data.schema import Schema
-        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        from yggdrasil.io.parquet_file import ParquetOptions
 
         df = self.df({"a": [1, 2, 3]}, index=self.pd.RangeIndex(5, 8))
         target = Schema.from_arrow(pa.schema([("a", pa.int64())]))
@@ -552,7 +552,7 @@ class TestPandasAppendUpsert(__import__(
     def test_append_pandas_frames(self) -> None:
         """APPEND concatenates rows; the named index round-trips through both writes."""
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        from yggdrasil.io.parquet_file import ParquetOptions
 
         df1 = self.df(
             {"k": ["a", "b", "c"], "v": [1, 2, 3]},
@@ -581,7 +581,7 @@ class TestPandasAppendUpsert(__import__(
         from io import BytesIO
         from yggdrasil.enums import Mode
         from yggdrasil.data.data_field import Field
-        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        from yggdrasil.io.parquet_file import ParquetOptions
 
         df1 = self.df({"v": [1, 2]}, index=self.pd.Index([10, 20], name="i"))
         df2 = self.df({"v": [3, 4]}, index=self.pd.Index([30, 40], name="i"))
@@ -600,7 +600,7 @@ class TestPandasAppendUpsert(__import__(
     def test_upsert_pandas_frames_by_key(self) -> None:
         """UPSERT with match_by replaces existing rows; incoming wins."""
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        from yggdrasil.io.parquet_file import ParquetOptions
 
         df1 = self.df(
             {"k": ["a", "b", "c"], "v": [1, 2, 3]},
@@ -621,7 +621,7 @@ class TestPandasAppendUpsert(__import__(
     def test_append_round_trips_multi_index(self) -> None:
         """MultiIndex levels survive an APPEND — every level stays tagged."""
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        from yggdrasil.io.parquet_file import ParquetOptions
 
         idx1 = self.pd.MultiIndex.from_tuples(
             [("a", 1), ("a", 2)], names=["k1", "k2"],
@@ -652,7 +652,7 @@ class TestPandasAppendUpsert(__import__(
         from io import BytesIO
         from yggdrasil.enums import Mode
         from yggdrasil.data.data_field import Field
-        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        from yggdrasil.io.parquet_file import ParquetOptions
 
         df = self.df({"v": [1, 2]}, index=self.pd.Index([10, 20], name="i"))
 
@@ -673,7 +673,7 @@ class TestPandasAppendUpsert(__import__(
     def test_upsert_round_trips_index_with_match_by(self) -> None:
         """UPSERT preserves the pandas index after merging with existing rows."""
         from yggdrasil.enums import Mode
-        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        from yggdrasil.io.parquet_file import ParquetOptions
 
         # Existing rows keyed by 'k'; the named index 'i' rides along
         # as a regular index column. After upsert by 'k', the index
@@ -713,7 +713,7 @@ class TestReadArrowTableBypassesBatchHook:
 
     @staticmethod
     def _counting_patch(monkeypatch):
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
         calls = {"n": 0}
         original = ParquetFile._read_arrow_batches
 
@@ -725,7 +725,7 @@ class TestReadArrowTableBypassesBatchHook:
         return calls
 
     def test_read_arrow_table_skips_batch_hook(self, monkeypatch) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         table = pa.table({"id": list(range(1000))})
         mem = Memory()
@@ -737,7 +737,7 @@ class TestReadArrowTableBypassesBatchHook:
         assert out.equals(table)
 
     def test_row_limit_applied_on_fast_path(self) -> None:
-        from yggdrasil.io.primitive.parquet_file import (
+        from yggdrasil.io.parquet_file import (
             ParquetFile, ParquetOptions,
         )
 
@@ -757,7 +757,7 @@ class TestReadArrowTableBypassesBatchHook:
         column drop on the Python side."""
         from yggdrasil.data.options import CastOptions
         from yggdrasil.data.data_field import Field
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3], "skip": ["a", "b", "c"], "keep": [10, 20, 30]})
         mem = Memory()
@@ -774,7 +774,7 @@ class TestReadArrowTableBypassesBatchHook:
         assert out.column("keep").to_pylist() == [10, 20, 30]
 
     def test_empty_file_falls_back_to_base(self, monkeypatch) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         mem = Memory()  # size == 0
         # The base path runs because the fast path's
@@ -816,7 +816,7 @@ class TestFastPathEquivalence:
 
     def _write_slow(self, table) -> bytes:
         # Force the batch path by writing through _write_arrow_batches.
-        from yggdrasil.io.primitive.parquet_file import ParquetOptions
+        from yggdrasil.io.parquet_file import ParquetOptions
         mem = Memory()
         leaf = ParquetFile(holder=mem, owns_holder=False)
         leaf._write_arrow_batches(iter(table.to_batches()), ParquetOptions())

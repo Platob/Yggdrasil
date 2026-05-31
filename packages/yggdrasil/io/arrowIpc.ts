@@ -1,12 +1,13 @@
-// Client-side port of ``yggdrasil.io.primitive.arrow_ipc_file``.
+// Client-side port of ``yggdrasil.io.arrow_ipc_file``.
 //
-// PARITY: python/src/yggdrasil/io/primitive/arrow_ipc_file.py. The Arrow IPC
-// (feather v2 / stream) leaf — read a buffer into a Tabular (applying
-// CastOptions projection/limit) and write a Tabular back to IPC bytes.
+// PARITY: python/src/yggdrasil/io/arrow_ipc_file.py. The Arrow IPC (feather v2 /
+// stream) leaf — read a buffer into a Tabular (applying CastOptions
+// projection/limit) and write a Tabular back to IPC bytes. The format leaves
+// live directly under ``io`` (no ``primitive``/``nested`` grouping layer).
 
 import * as arrow from "apache-arrow";
-import { Tabular, type TabularSource } from "../tabular/base";
-import { CastOptions, type CastOptionsArg } from "../../data/options";
+import { Tabular, type TabularSource } from "./tabular/base";
+import { CastOptions, type CastOptionsArg } from "../data/options";
 
 export class ArrowIPCFile implements TabularSource {
   constructor(readonly bytes: Uint8Array) {}

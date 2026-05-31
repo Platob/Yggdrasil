@@ -50,7 +50,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.arrow.tests import ArrowTestCase
-from yggdrasil.io.primitive.parquet_file import ParquetFile, ParquetOptions
+from yggdrasil.io.parquet_file import ParquetFile, ParquetOptions
 
 
 # ---------------------------------------------------------------------------

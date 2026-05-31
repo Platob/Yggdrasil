@@ -9,7 +9,7 @@ plus a ``_delta_log`` transaction log. Two ways to read it:
    features (auth, caching, photon-vectorised execution, row-level
    security, etc.) but pays one warehouse round trip per query.
 
-2. **Direct storage read via** :class:`yggdrasil.io.nested.delta.DeltaFolder`
+2. **Direct storage read via** :class:`yggdrasil.io.delta.DeltaFolder`
    — point :class:`DeltaFolder` at the table's :attr:`storage_location`
    (an S3 / ABFS / GCS URI vended by Unity Catalog's temporary table
    credentials API) and open the parquet files directly. Skips the
@@ -59,7 +59,7 @@ from yggdrasil.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.databricks.table.table import Table
-from yggdrasil.io.nested.delta import DeltaFolder, DeltaOptions
+from yggdrasil.io.delta import DeltaFolder, DeltaOptions
 from yggdrasil.execution.expr import col as expr_col
 
 from .. import DatabricksIntegrationCase

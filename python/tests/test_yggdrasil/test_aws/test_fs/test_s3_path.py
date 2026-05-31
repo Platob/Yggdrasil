@@ -337,7 +337,7 @@ class TestOverwrite:
         streams it: 1 upload_fileobj, 0 put_object, 0 get_object for the write
         itself (no read-modify-write)."""
         import pyarrow as pa
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         client.head_object.side_effect = _client_error()
         client.get_object.side_effect = _client_error()
@@ -370,7 +370,7 @@ class TestOverwrite:
         one upload_fileobj.
         """
         import pyarrow as pa
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         client.head_object.side_effect = _client_error()
         client.get_object.side_effect = _client_error()
@@ -858,7 +858,7 @@ class TestS3StreamingRoundTrip:
 
     def test_parquet_streams_then_reads_back(self, client, service):
         import pyarrow as pa
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         store = self._store_backed(client)
         rows = 2000

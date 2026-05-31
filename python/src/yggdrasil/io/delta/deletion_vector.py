@@ -9,7 +9,7 @@ import struct
 import uuid as _uuid
 from typing import TYPE_CHECKING, Iterable, Optional, Set
 
-from yggdrasil.io.nested.delta.protocol import DeletionVectorDescriptor
+from yggdrasil.io.delta.protocol import DeletionVectorDescriptor
 
 if TYPE_CHECKING:
     import pyarrow as pa

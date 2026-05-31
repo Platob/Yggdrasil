@@ -37,8 +37,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.path.folder import Folder
-from yggdrasil.io.nested.zip_file import ZipFile
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.zip_file import ZipFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 
 # ---------------------------------------------------------------------------

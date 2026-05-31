@@ -175,7 +175,7 @@ def _make_s3_service(mock_s3: _InMemoryS3) -> MagicMock:
 def _s3_delta_folder(mock_s3: _InMemoryS3, bucket: str, prefix: str):
     """Create a DeltaFolder backed by in-memory S3."""
     from yggdrasil.aws.fs.path import S3Path
-    from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+    from yggdrasil.io.delta.delta_folder import DeltaFolder
 
     svc = _make_s3_service(mock_s3)
     root = S3Path(f"s3://{bucket}/{prefix}", service=svc)
@@ -259,7 +259,7 @@ class TestDeltaOnMockS3(DeltaTestCase):
                 ),
             )
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d2 = _s3_delta_folder(self.s3, self.bucket, f"{self.prefix}table")
         out = d2.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), list(range(6)))
@@ -336,7 +336,7 @@ class TestDeltaOnMockS3(DeltaTestCase):
         key = f"{self.bucket}/{log_prefix}00000000000000000001.json"
         self.s3.objects[key] = b'{"commitInfo":{"timestamp":0}}\n'
 
-        from yggdrasil.io.nested.delta.delta_folder import ConcurrentDeltaCommitError
+        from yggdrasil.io.delta.delta_folder import ConcurrentDeltaCommitError
         d.write_arrow_batches(
             pa.table({"id": [2]}).to_batches(),
             options=DeltaOptions(mode=Mode.APPEND, commit_max_retries=1),
@@ -439,7 +439,7 @@ class TestDeltaOnRealS3(DeltaTestCase):
 
     def _s3_folder(self, name: str = "table"):
         from yggdrasil.aws.fs.path import S3Path
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
 
         path = S3Path(f"s3://{self.bucket}/{self.test_prefix}{name}")
         return DeltaFolder(path=path)
@@ -486,7 +486,7 @@ class TestDeltaOnRealS3(DeltaTestCase):
                 options=DeltaOptions(mode=mode, checkpoint_interval=5),
             )
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         from yggdrasil.aws.fs.path import S3Path
 
         d2 = DeltaFolder(path=S3Path(f"s3://{self.bucket}/{self.test_prefix}ckv1"))

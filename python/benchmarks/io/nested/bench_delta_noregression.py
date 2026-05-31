@@ -53,7 +53,7 @@ import pyarrow as pa
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
-from yggdrasil.io.nested.delta import DeltaFolder, DeltaOptions
+from yggdrasil.io.delta import DeltaFolder, DeltaOptions
 from yggdrasil.execution.expr import col as expr_col
 
 

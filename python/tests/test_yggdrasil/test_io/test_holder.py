@@ -67,14 +67,14 @@ class TestFormatDispatch:
 
     def test_bytes_io_with_parquet_path_dispatches(self, tmp_path) -> None:
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         b = IO(path=str(tmp_path / "x.parquet"))
         assert isinstance(b, ParquetFile)
 
     def test_bytes_io_with_csv_path_dispatches(self, tmp_path) -> None:
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         b = IO(path=str(tmp_path / "x.csv"))
         assert isinstance(b, CSVFile)
@@ -82,7 +82,7 @@ class TestFormatDispatch:
     def test_explicit_media_type_wins_over_extension(self, tmp_path) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         b = IO(
             path=str(tmp_path / "x.csv"),
@@ -93,7 +93,7 @@ class TestFormatDispatch:
     def test_storage_holder_media_type_drives_dispatch(self) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         mem = Memory()
         mem.media_type = MediaType(MimeTypes.PARQUET)
@@ -107,7 +107,7 @@ class TestFormatDispatch:
 
     def test_data_string_path_dispatches(self, tmp_path) -> None:
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         b = IO(data=str(tmp_path / "x.csv"))
         assert isinstance(b, CSVFile)
@@ -306,7 +306,7 @@ class TestOpenFormatDispatch:
     """``LocalPath('x.parquet').open()`` lands on :class:`ParquetFile`."""
 
     def test_local_path_parquet_opens_as_parquet_file(self, tmp_path) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         lp = LocalPath(str(tmp_path / "x.parquet"))
         cursor = lp.open(mode="rb", auto_open=False)
@@ -314,7 +314,7 @@ class TestOpenFormatDispatch:
         assert cursor.parent is lp
 
     def test_local_path_csv_opens_as_csv_file(self, tmp_path) -> None:
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         lp = LocalPath(str(tmp_path / "x.csv"))
         cursor = lp.open(mode="rb", auto_open=False)
@@ -329,7 +329,7 @@ class TestOpenFormatDispatch:
 
     def test_explicit_media_type_overrides_extension(self, tmp_path) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         lp = LocalPath(str(tmp_path / "x.csv"))
         cursor = lp.open(
@@ -352,12 +352,12 @@ class TestFormatRegistry:
             assert expected in names
 
     def test_class_for_media_type_parquet(self) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         assert Holder.class_for_media_type("parquet") is ParquetFile
 
     def test_class_for_media_type_csv(self) -> None:
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         assert Holder.class_for_media_type("text/csv") is CSVFile
 
@@ -371,7 +371,7 @@ class TestFormatRegistry:
 
     def test_for_holder_dispatches_via_stamped_media(self) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         mem = Memory()
         mem.media_type = MediaType(MimeTypes.PARQUET)
@@ -380,7 +380,7 @@ class TestFormatRegistry:
 
     def test_for_holder_explicit_media_type(self) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         mem = Memory()
         leaf = Holder.for_holder(mem, media_type=MediaType(MimeTypes.CSV))
@@ -577,7 +577,7 @@ class TestReserveCopyOnWrite:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         table = pa.table({"x": pa.array(range(100), type=pa.int64())})
         pf = ParquetFile()
