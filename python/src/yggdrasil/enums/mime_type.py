@@ -70,6 +70,35 @@ def magic_riff_webp(b: bytes) -> bool:
     return b.startswith(b"RIFF") and len(b) >= 12 and b[8:12] == b"WEBP"
 
 
+class _OffsetMatcher:
+    """Match a fixed signature at a fixed byte *offset* (not a prefix).
+
+    Some formats put their magic mid-header — tar's ``ustar`` lives at
+    byte 257, not 0. These can't ride the first-byte prefix index, so
+    :meth:`MimeType.define` files them on the dynamic-matcher list. They
+    only fire when the sniff buffer is long enough to reach the offset.
+    """
+
+    __slots__ = ("offset", "sig")
+
+    def __init__(self, offset: int, sig: bytes) -> None:
+        self.offset = offset
+        self.sig = sig
+
+    def __call__(self, b: bytes) -> bool:
+        return b[self.offset:self.offset + len(self.sig)] == self.sig
+
+
+def magic_at(offset: int, sig: bytes) -> MagicMatcher:
+    return _OffsetMatcher(offset, sig)
+
+
+# Bytes peeked from the head of a source when sniffing by magic. Big
+# enough to reach mid-header signatures (tar's ``ustar`` at offset 257)
+# while staying a single small read.
+_MAGIC_PEEK = 512
+
+
 # Header only; footer exists too but we usually peek small buffers.
 # Wrapped through :class:`_PrefixMatcher` so it lands on the
 # first-byte fast path alongside the other pure-prefix matchers.
@@ -87,7 +116,11 @@ class MimeType:
     - extensions: dotless, lower-case keys
     - magics: ordered matchers
     - is_codec: compression / wrapper formats
-    - is_tabular: row/tabular-ish formats
+    - is_tabular: row/tabular-ish formats (read into a frame)
+    - is_blob: opaque single-file payload — straight byte IO, no row
+      structure (images, pdf, archives, pickle, …). Mutually exclusive
+      with ``is_tabular``; codecs and directory/connector mimes are
+      neither.
     """
 
     name: str
@@ -97,6 +130,7 @@ class MimeType:
 
     is_codec: bool = False
     is_tabular: bool = False
+    is_blob: bool = False
 
     _BY_NAME: ClassVar[dict[str, "MimeType"]] = {}
     _BY_VALUE: ClassVar[dict[str, "MimeType"]] = {}
@@ -365,7 +399,7 @@ class MimeType:
             IO = io_class()
 
             if isinstance(magic, IO):
-                magic = bytes(magic.pread(64, 0))
+                magic = bytes(magic.pread(_MAGIC_PEEK, 0))
             elif hasattr(magic, "read") and hasattr(magic, "seek"):
                 # Stdlib-style file-like — read head, restore cursor so
                 # the caller's IO comes out exactly as it went in.
@@ -373,7 +407,7 @@ class MimeType:
                 saved = fh.tell()
                 try:
                     fh.seek(0)
-                    magic = fh.read(64)
+                    magic = fh.read(_MAGIC_PEEK)
                 finally:
                     fh.seek(saved)
             else:
@@ -384,7 +418,7 @@ class MimeType:
                     bio = IO(magic)
                     bio.acquire()
                     try:
-                        magic = bytes(bio.pread(64, 0))
+                        magic = bytes(bio.pread(_MAGIC_PEEK, 0))
                     finally:
                         bio.close()
                 except Exception:
@@ -666,31 +700,25 @@ class MimeTypes:
         MimeType("ZZIP", "application/x-compress", extensions=("z",), is_codec=True)
     )
 
-    # --- Containers / docs ---
+    # ------------------------------------------------------------------
+    # Archives & multi-file containers — opaque single files on disk
+    # ------------------------------------------------------------------
     ZIP = MimeType.define(
         MimeType(
             "ZIP",
             "application/zip",
             extensions=("zip",),
             magics=(magic_prefix(b"PK\x03\x04"),),
+            is_blob=True,
         )
     )
-
     ZIP_ENTRY = MimeType.define(
         MimeType(
             "ZIP_ENTRY",
             "application/zip-entry",
             extensions=("zipentry",),
             magics=(magic_prefix(b"PK\x01\x02"),),
-        )
-    )
-
-    PDF = MimeType.define(
-        MimeType(
-            "PDF",
-            "application/pdf",
-            extensions=("pdf",),
-            magics=(magic_prefix(b"%PDF-"),),
+            is_blob=True,
         )
     )
     TAR = MimeType.define(
@@ -698,15 +726,70 @@ class MimeTypes:
             "TAR",
             "application/x-tar",
             extensions=("tar",),
-            magics=(magic_prefix(b"\x75\x73\x74\x61\x72"),),
+            # ``ustar`` sits at byte 257 of the header block, not the start.
+            magics=(magic_at(257, b"ustar"),),
+            is_blob=True,
         )
     )
+    SEVEN_ZIP = MimeType.define(
+        MimeType(
+            "SEVEN_ZIP",
+            "application/x-7z-compressed",
+            extensions=("7z",),
+            magics=(magic_prefix(b"7z\xbc\xaf\x27\x1c"),),
+            is_blob=True,
+        )
+    )
+    RAR = MimeType.define(
+        MimeType(
+            "RAR",
+            "application/vnd.rar",
+            extensions=("rar",),
+            magics=(magic_prefix(b"Rar!\x1a\x07"),),
+            is_blob=True,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Documents / office
+    # ------------------------------------------------------------------
+    PDF = MimeType.define(
+        MimeType(
+            "PDF",
+            "application/pdf",
+            extensions=("pdf",),
+            magics=(magic_prefix(b"%PDF-"),),
+            is_blob=True,
+        )
+    )
+    XLSX = MimeType.define(
+        MimeType(
+            "XLSX",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            extensions=("xlsx", "xls"),
+            is_tabular=True,
+        )
+    )
+    DOCX = MimeType.define(
+        MimeType(
+            "DOCX",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            extensions=("docx",),
+            is_blob=True,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Embedded stores — single-file databases
+    # ------------------------------------------------------------------
     SQLITE = MimeType.define(
         MimeType(
             "SQLITE",
-            "application/x-sqlite3",
+            # IANA-registered value (was the de-facto ``application/x-sqlite3``).
+            "application/vnd.sqlite3",
             extensions=("db", "sqlite", "sqlite3"),
             magics=(magic_prefix(b"SQLite format 3\x00"),),
+            is_blob=True,
         )
     )
     HDF5 = MimeType.define(
@@ -715,20 +798,7 @@ class MimeTypes:
             "application/x-hdf5",
             extensions=("h5", "hdf5", "he5"),
             magics=(magic_prefix(b"\x89HDF\r\n\x1a\n"),),
-        )
-    )
-    XLSX = MimeType.define(
-        MimeType(
-            "XLSX",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            extensions=("xlsx", "xls"),
-        )
-    )
-    DOCX = MimeType.define(
-        MimeType(
-            "DOCX",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            extensions=("docx",),
+            is_blob=True,
         )
     )
 
@@ -776,7 +846,8 @@ class MimeTypes:
     AVRO = MimeType.define(
         MimeType(
             "AVRO",
-            "application/avro",
+            # vendor tree, consistent with PARQUET / ORC / ICEBERG.
+            "application/vnd.apache.avro",
             extensions=("avro",),
             magics=(magic_prefix(b"Obj\x01"),),
             is_tabular=True,
@@ -805,28 +876,30 @@ class MimeTypes:
     TSV = MimeType.define(
         MimeType("TSV", "text/tab-separated-values", extensions=("tsv",), is_tabular=True)
     )
-    XML = MimeType.define(MimeType("XML", "application/xml", extensions=("xml",)))
-    HTML = MimeType.define(MimeType("HTML", "text/html", extensions=("html", "htm")))
-    PLAIN = MimeType.define(MimeType("PLAIN", "text/plain", extensions=("txt", "text")))
-    YAML = MimeType.define(MimeType("YAML", "application/yaml", extensions=("yaml", "yml")))
-    TOML = MimeType.define(MimeType("TOML", "application/toml", extensions=("toml",)))
+    # --- Text / markup (opaque single-file text) ---
+    XML = MimeType.define(MimeType("XML", "application/xml", extensions=("xml",), is_blob=True))
+    HTML = MimeType.define(MimeType("HTML", "text/html", extensions=("html", "htm"), is_blob=True))
+    PLAIN = MimeType.define(MimeType("PLAIN", "text/plain", extensions=("txt", "text"), is_blob=True))
+    MARKDOWN = MimeType.define(MimeType("MARKDOWN", "text/markdown", extensions=("md", "markdown"), is_blob=True))
+    YAML = MimeType.define(MimeType("YAML", "application/yaml", extensions=("yaml", "yml"), is_blob=True))
+    TOML = MimeType.define(MimeType("TOML", "application/toml", extensions=("toml",), is_blob=True))
 
-    # --- Binary serialisation ---
+    # --- Binary serialisation (opaque single-file payloads) ---
     MSGPACK = MimeType.define(
-        MimeType("MSGPACK", "application/msgpack", extensions=("msgpack", "mpk"))
+        MimeType("MSGPACK", "application/msgpack", extensions=("msgpack", "mpk"), is_blob=True)
     )
     PROTOBUF = MimeType.define(
-        MimeType("PROTOBUF", "application/x-protobuf", extensions=("pb", "proto", "protobuf"))
+        MimeType("PROTOBUF", "application/x-protobuf", extensions=("pb", "proto", "protobuf"), is_blob=True)
     )
     FLATBUFFERS = MimeType.define(
         # No ``bin`` extension: ``.bin`` is generic binary and must fall
         # through to OCTET_STREAM, not get claimed as a FlatBuffer.
-        MimeType("FLATBUFFERS", "application/x-flatbuffers", extensions=("fbs",))
+        MimeType("FLATBUFFERS", "application/x-flatbuffers", extensions=("fbs",), is_blob=True)
     )
-    CBOR = MimeType.define(MimeType("CBOR", "application/cbor", extensions=("cbor",)))
-    BSON = MimeType.define(MimeType("BSON", "application/bson", extensions=("bson",)))
+    CBOR = MimeType.define(MimeType("CBOR", "application/cbor", extensions=("cbor",), is_blob=True))
+    BSON = MimeType.define(MimeType("BSON", "application/bson", extensions=("bson",), is_blob=True))
     PICKLE = MimeType.define(
-        MimeType("PICKLE", "application/x-python-pickle", extensions=("pkl", "pickle"))
+        MimeType("PICKLE", "application/x-python-pickle", extensions=("pkl", "pickle"), is_blob=True)
     )
     NUMPY = MimeType.define(
         MimeType(
@@ -834,19 +907,21 @@ class MimeTypes:
             "application/x-npy",
             extensions=("npy",),
             magics=(magic_prefix(b"\x93NUMPY"),),
+            is_blob=True,
         )
     )
     NUMPY_ARCHIVE = MimeType.define(
-        MimeType("NUMPY_ARCHIVE", "application/x-npz", extensions=("npz",))
+        MimeType("NUMPY_ARCHIVE", "application/x-npz", extensions=("npz",), is_blob=True)
     )
 
-    # --- Images ---
+    # --- Images (opaque single-file payloads) ---
     PNG = MimeType.define(
         MimeType(
             "PNG",
             "image/png",
             extensions=("png",),
             magics=(magic_prefix(b"\x89PNG\r\n\x1a\n"),),
+            is_blob=True,
         )
     )
     JPEG = MimeType.define(
@@ -855,6 +930,7 @@ class MimeTypes:
             "image/jpeg",
             extensions=("jpg", "jpeg"),
             magics=(magic_prefix(b"\xff\xd8\xff"),),
+            is_blob=True,
         )
     )
     GIF = MimeType.define(
@@ -863,6 +939,7 @@ class MimeTypes:
             "image/gif",
             extensions=("gif",),
             magics=(magic_prefix(b"GIF87a"), magic_prefix(b"GIF89a")),
+            is_blob=True,
         )
     )
     WEBP = MimeType.define(
@@ -871,6 +948,7 @@ class MimeTypes:
             "image/webp",
             extensions=("webp",),
             magics=(magic_riff_webp,),
+            is_blob=True,
         )
     )
     TIFF = MimeType.define(
@@ -879,6 +957,7 @@ class MimeTypes:
             "image/tiff",
             extensions=("tif", "tiff"),
             magics=(magic_prefix(b"II*\x00"), magic_prefix(b"MM\x00*")),
+            is_blob=True,
         )
     )
     BMP = MimeType.define(
@@ -887,7 +966,83 @@ class MimeTypes:
             "image/bmp",
             extensions=("bmp",),
             magics=(magic_prefix(b"BM"),),
+            is_blob=True,
         )
+    )
+    SVG = MimeType.define(
+        MimeType(
+            "SVG",
+            "image/svg+xml",
+            extensions=("svg",),
+            is_blob=True,
+        )
+    )
+    ICO = MimeType.define(
+        MimeType(
+            "ICO",
+            "image/x-icon",
+            extensions=("ico",),
+            magics=(magic_prefix(b"\x00\x00\x01\x00"),),
+            is_blob=True,
+        )
+    )
+    AVIF = MimeType.define(
+        MimeType("AVIF", "image/avif", extensions=("avif",), is_blob=True)
+    )
+    HEIC = MimeType.define(
+        MimeType("HEIC", "image/heic", extensions=("heic", "heif"), is_blob=True)
+    )
+
+    # --- Audio (opaque single-file payloads) ---
+    MP3 = MimeType.define(
+        MimeType(
+            "MP3",
+            "audio/mpeg",
+            extensions=("mp3",),
+            magics=(magic_prefix(b"ID3"),),
+            is_blob=True,
+        )
+    )
+    WAV = MimeType.define(
+        MimeType("WAV", "audio/wav", extensions=("wav",), is_blob=True)
+    )
+    FLAC = MimeType.define(
+        MimeType(
+            "FLAC",
+            "audio/flac",
+            extensions=("flac",),
+            magics=(magic_prefix(b"fLaC"),),
+            is_blob=True,
+        )
+    )
+    OGG = MimeType.define(
+        MimeType(
+            "OGG",
+            "audio/ogg",
+            extensions=("ogg", "oga"),
+            magics=(magic_prefix(b"OggS"),),
+            is_blob=True,
+        )
+    )
+    AAC = MimeType.define(
+        MimeType("AAC", "audio/aac", extensions=("aac",), is_blob=True)
+    )
+
+    # --- Video (opaque single-file payloads) ---
+    MP4 = MimeType.define(
+        MimeType("MP4", "video/mp4", extensions=("mp4", "m4v"), is_blob=True)
+    )
+    WEBM = MimeType.define(
+        MimeType("WEBM", "video/webm", extensions=("webm",), is_blob=True)
+    )
+    MKV = MimeType.define(
+        MimeType("MKV", "video/x-matroska", extensions=("mkv",), is_blob=True)
+    )
+    MOV = MimeType.define(
+        MimeType("MOV", "video/quicktime", extensions=("mov",), is_blob=True)
+    )
+    AVI = MimeType.define(
+        MimeType("AVI", "video/x-msvideo", extensions=("avi",), is_blob=True)
     )
 
     # --- Filesystem containers ---
@@ -1116,9 +1271,9 @@ class MimeTypes:
         )
     )
 
-    # --- Fallback ---
+    # --- Fallback (generic opaque bytes) ---
     OCTET_STREAM = MimeType.define(
-        MimeType("OCTET_STREAM", "application/octet-stream")
+        MimeType("OCTET_STREAM", "application/octet-stream", is_blob=True)
     )
 
 

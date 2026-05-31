@@ -70,6 +70,31 @@ class TestRegistryConstants:
         # A magic sniff that can't yield bytes is a soft miss, not a crash.
         assert MimeType.from_magic(b"", default=None) is None
 
+    def test_blob_flag_is_set_and_exclusive(self) -> None:
+        # is_blob marks opaque single-file payloads; never overlaps is_tabular,
+        # and codecs/connectors aren't blobs.
+        for m in set(MimeType._BY_NAME.values()):
+            assert not (m.is_blob and m.is_tabular), f"{m.name} is both"
+            assert not (m.is_blob and m.is_codec), f"{m.name} blob+codec"
+        for fmt in (MimeTypes.PNG, MimeTypes.PDF, MimeTypes.ZIP, MimeTypes.SVG,
+                    MimeTypes.PICKLE, MimeTypes.OCTET_STREAM, MimeTypes.MP4):
+            assert fmt.is_blob, f"{fmt.name} should be a blob"
+        assert not MimeTypes.PARQUET.is_blob   # tabular, not blob
+        assert not MimeTypes.GZIP.is_blob      # codec, not blob
+
+    def test_new_formats_resolve(self) -> None:
+        assert MimeType.from_("svg", default=None) is MimeTypes.SVG
+        assert MimeType.from_("md", default=None) is MimeTypes.MARKDOWN
+        assert MimeType.from_("7z", default=None) is MimeTypes.SEVEN_ZIP
+        assert MimeType.from_("mp4", default=None) is MimeTypes.MP4
+
+    def test_tar_magic_at_offset_257(self) -> None:
+        # tar's ``ustar`` lives mid-header; a long-enough buffer matches,
+        # a short head does not false-positive.
+        header = b"f.txt" + b"\x00" * (257 - 5) + b"ustar" + b"\x00" * 250
+        assert MimeType.from_magic(header, default=None) is MimeTypes.TAR
+        assert MimeType.from_magic(header[:64], default=None) is None
+
 
 class TestPureGet:
     """`get` is a side-effect-free dict lookup."""
