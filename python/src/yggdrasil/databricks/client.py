@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from .table.tables import Tables
     from .column.columns import Columns
     from .catalog.catalogs import Catalogs
+    from .credentials import Credentials
     from .external.location import ExternalLocations
     from .schema.schemas import Schemas
     from .volume.volumes import Volumes
@@ -1753,6 +1754,22 @@ class DatabricksClient(Singleton, URLBased):
 
         cached = ExternalLocations(client=self)
         self.__dict__["_external_locations"] = cached
+        return cached
+
+    @property
+    def credentials(self) -> "Credentials":
+        """Unity Catalog credentials service for this client::
+
+            client.credentials.create_aws("prod_s3", "arn:aws:iam::123:role/R")
+            client.credentials["prod_s3"].aws_client(region="us-east-1")  # refreshable
+        """
+        cached = self.__dict__.get("_uc_credentials")
+        if cached is not None:
+            return cached
+        from .credentials import Credentials
+
+        cached = Credentials(client=self)
+        self.__dict__["_uc_credentials"] = cached
         return cached
 
     @property
