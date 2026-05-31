@@ -126,7 +126,7 @@ class Task(_Runnable, Generic[T]):
     """A callable unit of work; deploys as one databricks ``Task``."""
 
     #: wheel / serverless defaults (shared with :class:`Flow`).
-    package_name: str = "yggdrasil"
+    package_name: str = "ygg"
     entry_point: str = "ygg-job"
     serverless: bool = True
     environment_key: str = "default"

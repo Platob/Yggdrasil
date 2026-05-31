@@ -92,20 +92,43 @@ class TableJob(Flow):
             TriggerSettings,
         )
 
+        return TriggerSettings(
+            file_arrival=FileArrivalTriggerConfiguration(url=self._trigger_url()),
+        )
+
+    def _trigger_url(self) -> str:
         # Databricks requires the file-arrival URL to end with '/'.
         url = self.logs_path(self.table).full_path()
-        if not url.endswith("/"):
-            url += "/"
-        return TriggerSettings(
-            file_arrival=FileArrivalTriggerConfiguration(url=url),
-        )
+        return url if url.endswith("/") else url + "/"
 
     # -- get-or-create the live Job -------------------------------------
     def deploy(self, client: Any) -> "Job":
         # The file-arrival trigger watches the logs dir — create it first so
         # Databricks accepts the trigger URL (and the first drop lands cleanly).
         self.logs_path(self.table).mkdir(parents=True, exist_ok=True)
-        return super().deploy(client)
+        job = super().deploy(client)
+        self._prune_duplicates(client, keep=job.job_id)
+        return job
+
+    def _prune_duplicates(self, client: Any, *, keep: Any) -> None:
+        """Delete any *other* job whose file-arrival trigger watches this same
+        logs dir — orphans left by an earlier naming scheme keep firing on the
+        shared trigger (and fail), so the deploy collapses to a single job."""
+        url = self._trigger_url()
+        try:
+            for other in client.jobs.list():
+                if other.job_id == keep:
+                    continue
+                trigger = getattr(other.settings, "trigger", None)
+                file_arrival = getattr(trigger, "file_arrival", None)
+                if file_arrival is not None and file_arrival.url == url:
+                    try:
+                        other.delete()
+                        logger.info("removed stale async job %s (%s)", other.job_id, url)
+                    except Exception:
+                        logger.warning("could not delete stale async job %s", other.job_id)
+        except Exception:
+            logger.debug("stale-async-job prune skipped", exc_info=True)
 
     def ensure(self) -> "TableJob":
         """Get-or-create the underlying Databricks job from :meth:`definition`."""

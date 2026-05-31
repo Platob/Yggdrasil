@@ -144,6 +144,34 @@ class TestEnsure:
         assert tj.ensure() is tj
         t.client.jobs.create_or_update.assert_not_called()
 
+    def test_deploy_prunes_stale_jobs_on_same_trigger(self):
+        t = _table_mock()
+        jobs = MagicMock()
+        t.client.jobs = jobs
+        created = MagicMock()
+        created.job_id = 99
+        jobs.create_or_update.return_value = created
+        t.staging_volume.path.return_value.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
+        url = "/Volumes/c/s/t/.sql/async/logs/"
+
+        def _job(job_id, trigger_url):
+            j = MagicMock()
+            j.job_id = job_id
+            j.settings.trigger.file_arrival.url = trigger_url
+            return j
+
+        keep = _job(99, url)            # the one we just deployed
+        stale = _job(7, url)            # an orphan watching the same logs dir
+        other = _job(8, "/Volumes/other/.sql/async/logs/")  # unrelated job
+        jobs.list.return_value = [keep, stale, other]
+
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value="w.whl"):
+            TableJob(t).deploy(t.client)
+
+        stale.delete.assert_called_once()      # orphan on the shared trigger removed
+        keep.delete.assert_not_called()
+        other.delete.assert_not_called()
+
 
 # --------------------------------------------------------------------------- #
 # TableJob.run (aggregate logs → INSERT per (target, mode))
