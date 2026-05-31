@@ -39,6 +39,7 @@ from yggdrasil.path import RemotePath
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.url import URL
+from yggdrasil.url.explore import ExploreUrlRepr
 
 if TYPE_CHECKING:
     from yggdrasil.aws.fs.service import S3Service
@@ -87,7 +88,7 @@ def _can_virtual_host(bucket: str) -> bool:
 # ---------------------------------------------------------------------------
 # S3Bucket — long-lived bucket singleton owning the HTTP data plane
 # ---------------------------------------------------------------------------
-class S3Bucket(RemotePath):
+class S3Bucket(ExploreUrlRepr, RemotePath):
     """``s3://<bucket>/`` root — owns the signed pure-HTTP S3 client.
 
     One instance per ``(bucket, service)``, cached for an hour. Build it
@@ -266,17 +267,11 @@ class S3Bucket(RemotePath):
 
         return s3_bucket_url(self._bucket, getattr(self.service.client, "region", None))
 
-    def _repr_html_(self) -> str:
-        return f'<a href="{self.explore_url}" target="_blank">S3Bucket: {self._bucket}</a>'
-
-    def __repr__(self) -> str:
-        return f"S3Bucket({self._bucket!r})"
-
 
 # ---------------------------------------------------------------------------
 # S3Path — a key under a bucket; redirects backend ops to its S3Bucket
 # ---------------------------------------------------------------------------
-class S3Path(RemotePath):
+class S3Path(ExploreUrlRepr, RemotePath):
     """:class:`Path` over an S3 object key. Backend ops redirect to
     :attr:`s3_bucket` (the long-lived :class:`S3Bucket` singleton)."""
 
@@ -387,9 +382,6 @@ class S3Path(RemotePath):
         from yggdrasil.aws.console import s3_object_url
 
         return s3_object_url(self.bucket, self.key, getattr(self.service.client, "region", None))
-
-    def _repr_html_(self) -> str:
-        return f'<a href="{self.explore_url}" target="_blank">S3Path: {self.full_path()}</a>'
 
     # ==================================================================
     # Stat
@@ -564,10 +556,6 @@ class S3Path(RemotePath):
 
     def _clear(self) -> None:
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
-
-    def __repr__(self) -> str:
-        marker = ", temporary=True" if self.temporary else ""
-        return f"S3Path({self.full_path()!r}{marker})"
 
 
 # S3Bucket carries the typed scheme but defers the ``s3`` registry slot to

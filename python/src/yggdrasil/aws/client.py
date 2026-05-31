@@ -67,6 +67,7 @@ from typing import (
 
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.url import URL
+from yggdrasil.url.explore import ExploreUrlRepr
 from yggdrasil.lazy_imports import boto3_module, botocore_module
 
 from .config import (
@@ -1092,8 +1093,13 @@ class AWSService(ABC):
 # ===========================================================================
 
 
-class AWSResource(ABC):
-    """Abstract base for AWS-backed entities."""
+class AWSResource(ExploreUrlRepr, ABC):
+    """Abstract base for AWS-backed entities.
+
+    Concrete resources (:class:`~yggdrasil.aws.account.AWSAccount`,
+    :class:`~yggdrasil.aws.fs.path.S3Bucket`, …) override :attr:`explore_url`
+    to return a Console deep-link; the inherited :class:`ExploreUrlRepr` then
+    gives a clickable repr / ``_repr_html_`` for free."""
 
     service: AWSService
 
@@ -1116,34 +1122,3 @@ class AWSResource(ABC):
     @property
     def boto_client(self) -> "BaseClient":
         return self.service.boto_client
-
-    @property
-    def explore_url(self) -> Optional[URL]:
-        """AWS Console deep-link for this resource, or ``None``.
-
-        Concrete resources (:class:`AWSAccount`, :class:`S3Bucket`,
-        :class:`S3Path`, …) override this to return the Console URL that opens
-        the entity in the browser — clickable straight from a repl / notebook.
-        The default :meth:`__repr__` / :meth:`_repr_html_` key off the override,
-        so any resource that returns a URL gets a clickable repr for free.
-        """
-        return None
-
-    def __repr__(self) -> str:
-        try:
-            url = self.explore_url
-        except Exception:
-            url = None
-        if url is None:
-            return super().__repr__()
-        return f"{type(self).__name__}({url!r})"
-
-    def _repr_html_(self) -> Optional[str]:
-        # Real anchor in Jupyter / IPython — one click to the Console.
-        try:
-            url = self.explore_url
-        except Exception:
-            url = None
-        if url is None:
-            return None
-        return f'<a href="{url}" target="_blank">{type(self).__name__}: {url}</a>'
