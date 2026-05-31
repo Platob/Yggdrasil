@@ -784,6 +784,16 @@ def _stamp_partitions(batch: pa.RecordBatch, values: "dict[str, Optional[str]]",
         batch = batch.append_column(
             target_field if target_field is not None else pa.field(col, arrow_type, nullable=True),
             pa.array([value] * batch.num_rows, type=arrow_type))
+    # Partition columns were appended at the end; restore the declared
+    # ``target_schema`` order so positional consumers line up. Spark's
+    # ``mapInArrow`` binds the yielded batch to its result schema *by
+    # position*, so an out-of-order partition column would silently swap
+    # data between columns (e.g. a partition ``region`` reading the ``val``
+    # values). Name-based consumers (the Arrow read path) are unaffected.
+    if target_schema is not None:
+        ordered = [f.name for f in target_schema if f.name in set(batch.schema.names)]
+        if ordered and ordered != batch.schema.names:
+            batch = batch.select(ordered)
     return batch
 
 

@@ -20,6 +20,7 @@ import tempfile
 import unittest
 
 import pyarrow as pa
+import pytest
 
 from yggdrasil.enums import Mode
 from yggdrasil.delta.io import DeltaOptions
@@ -210,6 +211,7 @@ class TestDeltaSparkWritePreparation(DeltaTestCase):
 
 
 @unittest.skipUnless(_has_pyspark(), "PySpark not installed")
+@pytest.mark.spark
 class TestDeltaSparkReadWrite(DeltaTestCase):
     """End-to-end Spark read/write through DeltaFolder."""
 
@@ -343,6 +345,7 @@ class TestDeltaSparkReadWrite(DeltaTestCase):
 
 
 @unittest.skipUnless(_has_pyspark(), "PySpark not installed")
+@pytest.mark.spark
 class TestDeltaSparkBenchmark(DeltaTestCase):
     """Spark-specific benchmarks."""
 

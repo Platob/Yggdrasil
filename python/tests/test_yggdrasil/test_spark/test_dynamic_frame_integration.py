@@ -41,6 +41,11 @@ import pytest
 
 pytest.importorskip("pyspark")
 
+# End-to-end Dataset/dynamic-frame coverage — the heaviest Spark surface in
+# the suite (signal-guarded full pipelines over heterogeneous objects). Gated
+# as integration: skipped unless YGGDRASIL_SPARK_INTEGRATION is set.
+pytestmark = pytest.mark.spark_integration
+
 import pyarrow as pa  # noqa: E402
 
 from yggdrasil.arrow.tests import ArrowTestCase  # noqa: E402

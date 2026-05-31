@@ -80,6 +80,15 @@ class _InMemoryS3:
         self.objects[full] = bytes(Body)
         return {}
 
+    def upload_fileobj(
+        self, Fileobj: Any, Bucket: str, Key: str, **kw: Any
+    ) -> None:
+        # boto3's managed-transfer upload: ``upload_fileobj(Fileobj,
+        # Bucket, Key, ExtraArgs=, Callback=, Config=)``. S3Path streams
+        # large writes through this instead of ``put_object``, so the mock
+        # has to honor it too — read the file object to EOF and store it.
+        self.objects[f"{Bucket}/{Key}"] = Fileobj.read()
+
     def delete_object(self, *, Bucket: str, Key: str, **kw: Any) -> dict:
         full = f"{Bucket}/{Key}"
         self.objects.pop(full, None)

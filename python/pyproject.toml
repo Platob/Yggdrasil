@@ -125,6 +125,8 @@ asyncio_mode = "strict"
 markers = [
   "integration: marks tests that require a live Databricks workspace (skipped when DATABRICKS_HOST is not set)",
   "pyenv_install_integration: marks tests that pip-install a real package into the active venv (skipped when YGGDRASIL_PYENV_INSTALL_TEST is not set)",
+  "spark: marks tests that boot a local PySpark JVM session (auto-applied to SparkTestCase subclasses and `spark` fixture users). Deselect the JVM entirely with `-m 'not spark'` for a fast run.",
+  "spark_integration: marks the heaviest Spark tests (concurrency, end-to-end pipelines, large data, Connect). Skipped by default; set YGGDRASIL_SPARK_INTEGRATION=1 to run. Implies `spark`.",
 ]
 
 [tool.setuptools]
