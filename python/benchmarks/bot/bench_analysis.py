@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.node.api.schemas.analysis import (
-    AggMeasure, AggregateRequest, ForecastRequest, OhlcRequest, SeriesRequest,
+    AggMeasure, AggregateRequest, ForecastRequest, IndicatorsRequest, OhlcRequest, RiskRequest, SeriesRequest,
 )
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService
@@ -96,6 +96,49 @@ def main() -> None:
             print(f"  forecast {model:8s} ({r.model_used:8s}): {ms:8.1f} ms  "
                   f"{len(r.series)} series x 48h  rmse≈{rmse}")
         print()
+
+    # -- risk metrics ---------------------------------------------------------
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        import random, math as _math
+        rng = random.Random(42)
+        m = 5_000
+        # Simulate GBM price series
+        price = [100.0]
+        for _ in range(m - 1):
+            price.append(price[-1] * (1 + rng.gauss(0.0003, 0.015)))
+        pq.write_table(pa.table({"price": price}), str(home / "prices.parquet"))
+        settings = Settings(node_id="bench", node_home=home, front_home=home)
+        svc = AnalysisService(settings, fs=FsService(settings))
+        t0 = time.perf_counter()
+        for _ in range(10):
+            risk = asyncio.run(svc.risk(RiskRequest(path="prices.parquet", column="price", periods_per_year=252)))
+        risk_ms = (time.perf_counter() - t0) / 10 * 1000
+        print(f"  risk metrics ({m:,} price rows, 10x avg): {risk_ms:6.1f} ms")
+        print(f"    sharpe={risk.sharpe_ratio}  max_dd={risk.max_drawdown:.3f}  var95={risk.var_95:.4f}\n")
+
+    # -- technical indicators -------------------------------------------------
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        rng = random.Random(99)
+        m = 2_000
+        price2 = [100.0]
+        for _ in range(m - 1):
+            price2.append(price2[-1] * (1 + rng.gauss(0.0002, 0.012)))
+        high2 = [p * (1 + abs(rng.gauss(0, 0.005))) for p in price2]
+        low2 = [p * (1 - abs(rng.gauss(0, 0.005))) for p in price2]
+        vol2 = [rng.randint(100_000, 5_000_000) for _ in range(m)]
+        pq.write_table(pa.table({"close": price2, "high": high2, "low": low2, "volume": vol2}), str(home / "ohlcv.parquet"))
+        settings = Settings(node_id="bench", node_home=home, front_home=home)
+        svc = AnalysisService(settings, fs=FsService(settings))
+        t0 = time.perf_counter()
+        for _ in range(10):
+            ind = asyncio.run(svc.indicators(IndicatorsRequest(
+                path="ohlcv.parquet", column="close", high="high", low="low", volume="volume",
+                sma=[20, 50], ema=[12, 26], rsi=14, macd=True, bollinger=20, atr=14, stoch=14, obv=True)))
+        ind_ms = (time.perf_counter() - t0) / 10 * 1000
+        print(f"  indicators ({m:,} OHLCV rows, 10x avg): {ind_ms:6.1f} ms  ({len(ind.indicators)} series)")
+        print(f"    computed: {', '.join(ind.indicators.keys())}\n")
 
 
 if __name__ == "__main__":

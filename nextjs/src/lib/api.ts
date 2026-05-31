@@ -654,6 +654,69 @@ export function analysisOhlc(
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
+// ── Risk analytics ──────────────────────────────────────────────────────
+export interface RiskResult {
+  node_id: string;
+  path: string;
+  column: string;
+  n: number;
+  periods_per_year: number;
+  ann_return: number | null;
+  ann_volatility: number | null;
+  sharpe_ratio: number | null;
+  sortino_ratio: number | null;
+  calmar_ratio: number | null;
+  max_drawdown: number | null;
+  max_drawdown_peak_i: number | null;
+  max_drawdown_trough_i: number | null;
+  var_95: number | null;
+  var_99: number | null;
+  cvar_95: number | null;
+  win_rate: number | null;
+  profit_factor: number | null;
+  skewness: number | null;
+  kurtosis: number | null;
+}
+
+export function analysisRisk(
+  path: string,
+  column: string,
+  opts: { order_by?: string; is_returns?: boolean; periods_per_year?: number; limit?: number; filters?: FilterSpec[]; node?: string } = {},
+): Promise<RiskResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/risk${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
+// ── Technical indicators ─────────────────────────────────────────────────
+export interface IndicatorsResult {
+  node_id: string;
+  path: string;
+  column: string;
+  x: (string | number)[];
+  price: (number | null)[];
+  indicators: Record<string, (number | null)[]>;
+  n: number;
+}
+
+export function analysisIndicators(
+  path: string,
+  column: string,
+  opts: {
+    x?: string; high?: string; low?: string; volume?: string;
+    sma?: number[]; ema?: number[]; rsi?: number | null;
+    macd?: boolean; bollinger?: number | null; atr?: number | null;
+    stoch?: number | null; obv?: boolean;
+    filters?: FilterSpec[]; limit?: number; node?: string;
+  } = {},
+): Promise<IndicatorsResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/indicators${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
 // ── Forecasting ─────────────────────────────────────────────────────────
 export interface ForecastSeriesData {
   key: string;

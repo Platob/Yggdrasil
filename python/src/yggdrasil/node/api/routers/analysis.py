@@ -13,8 +13,12 @@ from ..schemas.analysis import (
     FinanceResult,
     ForecastRequest,
     ForecastResult,
+    IndicatorsRequest,
+    IndicatorsResult,
     OhlcRequest,
     OhlcResult,
+    RiskRequest,
+    RiskResult,
     SeriesRequest,
     SeriesResult,
 )
@@ -111,6 +115,34 @@ async def ohlc(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/ohlc", json_body=req.model_dump())
     return await service.ohlc(req)
+
+
+@router.post("/risk", response_model=RiskResult)
+async def risk(
+    req: RiskRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> RiskResult:
+    """Portfolio risk metrics: Sharpe, Sortino, Calmar, max drawdown, VaR 95/99,
+    CVaR, win rate, profit factor, skewness, excess kurtosis."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/risk", json_body=req.model_dump())
+    return await service.risk(req)
+
+
+@router.post("/indicators", response_model=IndicatorsResult)
+async def indicators(
+    req: IndicatorsRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> IndicatorsResult:
+    """Technical indicators: SMA, EMA, RSI, MACD, Bollinger Bands, ATR,
+    Stochastic, OBV. Pure numpy — no TA-Lib dependency."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/indicators", json_body=req.model_dump())
+    return await service.indicators(req)
 
 
 @router.post("/export")

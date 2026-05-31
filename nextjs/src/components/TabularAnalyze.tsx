@@ -368,13 +368,10 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
               <input type="number" min={1} max={candles.bars} value={maWindow} onChange={(e) => setMaWindow(Math.max(1, Number(e.target.value) || 1))} className="w-12 bg-white/[0.04] border border-white/10 rounded px-1 py-0.5 outline-none" />
             </label>
           </div>
-          <Chart type="candle" labels={candles.x} ohlc={{ open: candles.open, high: candles.high, low: candles.low, close: candles.close }} overlay={maLine} yLabel={candles.column} height={300} />
-          {candles.volume && (
-            <>
-              <div className="text-[10px] text-frost/70 font-mono">volume</div>
-              <Chart type="bar" labels={candles.x} values={candles.volume} color="var(--frost)" height={90} />
-            </>
-          )}
+          <Chart type="candle" labels={candles.x}
+            ohlc={{ open: candles.open, high: candles.high, low: candles.low, close: candles.close }}
+            overlay={maLine} volume={candles.volume ?? undefined} yLabel={candles.column}
+            height={candles.volume ? 360 : 300} />
         </div>
       )}
 

@@ -1,8 +1,7 @@
 "use client";
 
-// Dependency-free SVG chart — the visualization "plugin". Fully prop-driven:
-// bar / line / area (value series, with an optional min/max envelope band from
-// the downsampler) and candlestick (OHLC). Values/series may contain nulls.
+// Dependency-free SVG chart — bar / line / area / candlestick with optional
+// volume sub-panel. Fully prop-driven and null-safe throughout.
 
 export type ChartType = "bar" | "line" | "area" | "candle";
 
@@ -10,9 +9,10 @@ interface Props {
   type: ChartType;
   labels: (string | number)[];
   values?: (number | null)[];
-  band?: { min: (number | null)[]; max: (number | null)[] }; // line/area envelope
+  band?: { min: (number | null)[]; max: (number | null)[] };
   ohlc?: { open: (number | null)[]; high: (number | null)[]; low: (number | null)[]; close: (number | null)[] };
-  overlay?: (number | null)[];   // e.g. a moving-average line over candles
+  volume?: (number | null)[];   // renders a volume sub-panel below candles/price
+  overlay?: (number | null)[];  // moving-average line over candles
   height?: number;
   color?: string;
   yLabel?: string;
@@ -20,21 +20,30 @@ interface Props {
 
 const W = 720;
 const padL = 52, padR = 12, padT = 12, padB = 28;
+const VOL_H = 60;   // height reserved for the volume sub-panel
+const VOL_GAP = 6;  // gap between price and volume panels
 
-export default function Chart({ type, labels, values, band, ohlc, overlay, height = 220, color = "var(--emerald)", yLabel }: Props) {
+export default function Chart({
+  type, labels, values, band, ohlc, volume, overlay, height = 220, color = "var(--emerald)", yLabel,
+}: Props) {
+  const hasVol = volume && volume.some((v) => v != null && isFinite(v));
+  const priceH = hasVol ? height - VOL_H - VOL_GAP : height;
+
   const plotW = W - padL - padR;
-  const plotH = height - padT - padB;
+  const plotH = priceH - padT - padB;
 
-  // y-domain spans whatever the mode plots (candle uses high/low).
+  // y-domain for the price panel
   const pool: number[] = [];
   if (type === "candle" && ohlc) {
-    for (const a of [ohlc.high, ohlc.low, ohlc.open, ohlc.close]) for (const v of a) if (v != null && isFinite(v)) pool.push(v);
+    for (const a of [ohlc.high, ohlc.low, ohlc.open, ohlc.close])
+      for (const v of a) if (v != null && isFinite(v)) pool.push(v);
     if (overlay) for (const v of overlay) if (v != null && isFinite(v)) pool.push(v);
   } else if (values) {
     for (const v of values) if (v != null && isFinite(v)) pool.push(v);
     if (band) for (const a of [band.min, band.max]) for (const v of a) if (v != null && isFinite(v)) pool.push(v);
   }
-  if (pool.length === 0) return <div className="text-[11px] text-muted font-mono p-4">no numeric data to plot</div>;
+  if (pool.length === 0)
+    return <div className="text-[11px] text-muted font-mono p-4">no numeric data to plot</div>;
 
   let min = Math.min(...pool), max = Math.max(...pool);
   if (min === max) { max = min + 1; min = min - 1; }
@@ -49,8 +58,17 @@ export default function Chart({ type, labels, values, band, ohlc, overlay, heigh
   const step = Math.max(1, Math.ceil(n / 8));
   const xticks = labels.map((l, i) => ({ l, i })).filter(({ i }) => i % step === 0);
 
+  // Volume panel geometry
+  const volTop = priceH + VOL_GAP;
+  const volPlotH = VOL_H - padB;
+  const volMax = hasVol ? Math.max(...(volume!.filter((v) => v != null && isFinite(v)) as number[])) : 1;
+  const yVol = (v: number) => volTop + volPlotH - (v / (volMax || 1)) * volPlotH;
+
+  const totalH = height;
+
   return (
-    <svg viewBox={`0 0 ${W} ${height}`} width="100%" height={height} className="block" preserveAspectRatio="none">
+    <svg viewBox={`0 0 ${W} ${totalH}`} width="100%" height={totalH} className="block" preserveAspectRatio="none">
+      {/* Price panel grid lines */}
       {[max, min + (max - min) * 0.5, min].map((t, k) => (
         <g key={k}>
           <line x1={padL} x2={W - padR} y1={y(t)} y2={y(t)} stroke="var(--foreground)" strokeOpacity="0.06" />
@@ -58,7 +76,7 @@ export default function Chart({ type, labels, values, band, ohlc, overlay, heigh
         </g>
       ))}
 
-      {/* candlesticks */}
+      {/* Candlesticks */}
       {type === "candle" && ohlc && ohlc.close.map((c, i) => {
         const o = ohlc.open[i], h = ohlc.high[i], l = ohlc.low[i];
         if (o == null || c == null || h == null || l == null) return null;
@@ -74,13 +92,13 @@ export default function Chart({ type, labels, values, band, ohlc, overlay, heigh
         );
       })}
 
-      {/* overlay line (e.g. moving average) over candles */}
+      {/* Overlay (MA line) over candles */}
       {type === "candle" && overlay && (() => {
         const pts = overlay.map((v, i) => (v == null || !isFinite(v) ? null : `${xBand(i)},${y(v)}`)).filter(Boolean) as string[];
         return pts.length ? <polyline points={pts.join(" ")} fill="none" stroke="var(--amber)" strokeWidth="1.4" strokeOpacity="0.9" /> : null;
       })()}
 
-      {/* bars */}
+      {/* Bars */}
       {type === "bar" && values?.map((v, i) =>
         v == null || !isFinite(v) ? null : (
           <rect key={i} x={xBand(i) - Math.max(1, (plotW / n) * 0.36)} width={Math.max(1, (plotW / n) * 0.72)}
@@ -88,7 +106,7 @@ export default function Chart({ type, labels, values, band, ohlc, overlay, heigh
         ),
       )}
 
-      {/* line / area (+ optional envelope band) */}
+      {/* Line / area (+ envelope band) */}
       {(type === "line" || type === "area") && values && (() => {
         const pts = values.map((v, i) => (v == null || !isFinite(v) ? null : `${x(i)},${y(v)}`)).filter(Boolean) as string[];
         if (pts.length === 0) return null;
@@ -108,12 +126,32 @@ export default function Chart({ type, labels, values, band, ohlc, overlay, heigh
         );
       })()}
 
+      {/* X-axis labels */}
       {xticks.map(({ l, i }) => (
-        <text key={i} x={type === "bar" || type === "candle" ? xBand(i) : x(i)} y={height - 8} textAnchor="middle" fontSize="9" fill="var(--muted)" fontFamily="monospace">
+        <text key={i} x={type === "bar" || type === "candle" ? xBand(i) : x(i)} y={priceH - 8} textAnchor="middle" fontSize="9" fill="var(--muted)" fontFamily="monospace">
           {String(l).slice(0, 10)}
         </text>
       ))}
       {yLabel && <text x={6} y={padT + 4} fontSize="9" fill="var(--muted)" fontFamily="monospace">{yLabel}</text>}
+
+      {/* Volume sub-panel */}
+      {hasVol && (
+        <>
+          <line x1={padL} x2={W - padR} y1={volTop} y2={volTop} stroke="var(--foreground)" strokeOpacity="0.08" />
+          <text x={padL - 6} y={volTop + 10} textAnchor="end" fontSize="8" fill="var(--muted)" fontFamily="monospace">vol</text>
+          {volume!.map((v, i) => {
+            if (v == null || !isFinite(v) || v === 0) return null;
+            const up = type === "candle" && ohlc ? (ohlc.close[i] ?? 0) >= (ohlc.open[i] ?? 0) : v > 0;
+            const col = up ? "var(--emerald)" : "var(--rose)";
+            const bw = Math.max(1, (plotW / Math.max(1, n)) * 0.6);
+            const cx = xBand(i);
+            const barH = Math.max(1, volPlotH - (yVol(v) - volTop));
+            return (
+              <rect key={i} x={cx - bw / 2} width={bw} y={yVol(v)} height={barH} fill={col} fillOpacity="0.55" />
+            );
+          })}
+        </>
+      )}
     </svg>
   );
 }

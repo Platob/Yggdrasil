@@ -46,7 +46,8 @@ def make_model(model: str):
     if m in ("auto", "xgboost", "xgb", "gbr", "sklearn"):
         try:
             from sklearn.ensemble import GradientBoostingRegressor
-            return GradientBoostingRegressor(n_estimators=200, max_depth=3, learning_rate=0.1), "gbr"
+            return GradientBoostingRegressor(n_estimators=100, max_depth=3, learning_rate=0.15,
+                                             subsample=0.8, min_samples_leaf=4), "gbr"
         except Exception:
             pass
     return _RidgeNP(alpha=1.0), "ridge"

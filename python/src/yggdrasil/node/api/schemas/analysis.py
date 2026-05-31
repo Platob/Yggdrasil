@@ -133,6 +133,72 @@ class OhlcResult(StrictModel):
     source_rows: int
 
 
+# -- risk analytics ---------------------------------------------------------
+
+class RiskRequest(StrictModel):
+    path: str
+    column: str                    # price or return series
+    order_by: str | None = None    # time/order column
+    is_returns: bool = False       # True if `column` already contains returns
+    periods_per_year: int = 252    # 252 trading days, 52 weeks, 12 months…
+    limit: int = 5000
+    filters: list[FilterSpec] = []
+
+
+class RiskResult(StrictModel):
+    node_id: str
+    path: str
+    column: str
+    n: int                          # number of return observations
+    periods_per_year: int
+    ann_return: float | None
+    ann_volatility: float | None
+    sharpe_ratio: float | None
+    sortino_ratio: float | None
+    calmar_ratio: float | None
+    max_drawdown: float | None      # negative fraction, e.g. -0.35
+    max_drawdown_peak_i: int | None
+    max_drawdown_trough_i: int | None
+    var_95: float | None            # 5th-percentile 1-period loss (negative)
+    var_99: float | None
+    cvar_95: float | None           # expected shortfall at 95%
+    win_rate: float | None          # fraction of positive returns
+    profit_factor: float | None     # sum(gains) / abs(sum(losses))
+    skewness: float | None
+    kurtosis: float | None          # excess kurtosis
+
+
+# -- technical indicators ---------------------------------------------------
+
+class IndicatorsRequest(StrictModel):
+    path: str
+    column: str                    # price column (close)
+    x: str | None = None           # time/order column (x axis)
+    high: str | None = None        # for ATR / stochastic
+    low: str | None = None
+    volume: str | None = None      # for OBV
+    sma: list[int] = [20, 50]      # SMA periods to compute
+    ema: list[int] = [12, 26]      # EMA periods
+    rsi: int | None = 14           # RSI period (None = skip)
+    macd: bool = True              # MACD 12/26/9
+    bollinger: int | None = 20     # Bollinger period (None = skip)
+    atr: int | None = 14           # ATR period — needs high+low (None = skip)
+    stoch: int | None = 14         # Stochastic %K period (None = skip)
+    obv: bool = False              # On-Balance Volume — needs volume
+    filters: list[FilterSpec] = []
+    limit: int = 2000
+
+
+class IndicatorsResult(StrictModel):
+    node_id: str
+    path: str
+    column: str
+    x: list[Any]                   # x axis (order_by or index)
+    price: list[float | None]      # raw close series
+    indicators: dict[str, list[float | None]]   # name -> values aligned to x
+    n: int
+
+
 # -- forecasting ------------------------------------------------------------
 
 class ForecastRequest(StrictModel):

@@ -35,8 +35,12 @@ from ..schemas.analysis import (
     ForecastRequest,
     ForecastResult,
     ForecastSeries,
+    IndicatorsRequest,
+    IndicatorsResult,
     OhlcRequest,
     OhlcResult,
+    RiskRequest,
+    RiskResult,
     SeriesRequest,
     SeriesResult,
     Transform,
@@ -66,6 +70,8 @@ class AnalysisService:
     def __init__(self, settings: Settings, *, fs: FsService) -> None:
         self.settings = settings
         self.fs = fs
+        # per-file cap cache: (path, mtime_ns, size) -> row_cap
+        self._cap_cache: dict[tuple, int] = {}
 
     async def aggregate(self, req: AggregateRequest) -> AggregateResult:
         return await run_in_threadpool(partial(self._aggregate, req))
@@ -86,6 +92,12 @@ class AnalysisService:
         """Apply the transform and write the result in `fmt`. Returns
         (temp_path, download_name) — the caller streams then unlinks it."""
         return await run_in_threadpool(partial(self._export, req))
+
+    async def risk(self, req: "RiskRequest") -> "RiskResult":
+        return await run_in_threadpool(partial(self._risk, req))
+
+    async def indicators(self, req: "IndicatorsRequest") -> "IndicatorsResult":
+        return await run_in_threadpool(partial(self._indicators, req))
 
     async def forecast(self, req: "ForecastRequest") -> "ForecastResult":
         return await run_in_threadpool(partial(self._forecast, req))
@@ -257,19 +269,25 @@ class AnalysisService:
         return lf
 
     def _row_cap_for_bytes(self, plan: pl.LazyFrame, max_bytes: int | None = None) -> int:
-        """How many rows of ``plan`` fit the byte budget — measured, not guessed.
-
-        Streams a small sample, measures its in-memory Arrow size, and divides
-        the budget by the per-row cost. A wide row (many/large columns) yields a
-        small cap; a narrow row a large one. Bounded by ``analysis_max_rows`` so
-        a degenerate estimate can't blow up. Returns the row cap."""
+        """How many rows of ``plan`` fit the byte budget — measured once per
+        (path, mtime, size) tuple then cached, so repeated calls on the same
+        file don't re-sample the data."""
         budget = max_bytes or self.settings.analysis_max_bytes
+        # Build a cheap cache key from the schema hash (covers column selection)
+        schema_key = str(plan.collect_schema())
+        cache_key = (schema_key, budget)
+        if cache_key in self._cap_cache:
+            return self._cap_cache[cache_key]
         sample = plan.head(2048).collect(engine="streaming")
         if sample.height == 0:
             return self.settings.analysis_max_rows
         per_row = max(1, sample.estimated_size() // sample.height)
-        cap = int(budget // per_row)
-        return max(256, min(cap, self.settings.analysis_max_rows))
+        cap = max(256, min(int(budget // per_row), self.settings.analysis_max_rows))
+        # Cap cache at 256 entries — schema diversity is bounded
+        if len(self._cap_cache) >= 256:
+            self._cap_cache.pop(next(iter(self._cap_cache)))
+        self._cap_cache[cache_key] = cap
+        return cap
 
     # -- export -------------------------------------------------------------
 
@@ -486,4 +504,234 @@ class AnalysisService:
             low=_safe_list(out["low"]), close=_safe_list(out["close"]),
             volume=_safe_list(out["volume"]) if has_vol else None,
             bars=out.height, source_rows=source_rows,
+        )
+
+    # -- risk analytics -------------------------------------------------------
+
+    def _risk(self, req: "RiskRequest") -> "RiskResult":
+        """Portfolio/series risk metrics: Sharpe, Sortino, max drawdown, VaR,
+        CVaR, Calmar, win rate, profit factor, skewness, excess kurtosis.
+        All from numpy on the (possibly bounded) returns series."""
+        from ..schemas.analysis import RiskResult
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        cols = set(lf.collect_schema().names())
+        if req.column not in cols:
+            raise BadRequestError(f"column {req.column!r} not found")
+        keep = list(dict.fromkeys([req.column] + ([req.order_by] if req.order_by and req.order_by in cols else [])))
+        plan = lf.select(keep)
+        if req.order_by and req.order_by in cols:
+            plan = plan.sort(req.order_by)
+        cap = min(req.limit, self._row_cap_for_bytes(plan))
+        df = plan.head(cap).collect(engine="streaming")
+        prices = df[req.column].cast(pl.Float64, strict=False).to_numpy()
+        prices = prices[~np.isnan(prices)]
+        if len(prices) < 2:
+            return RiskResult(
+                node_id=self.settings.node_id, path=req.path, column=req.column,
+                n=len(prices), periods_per_year=req.periods_per_year,
+                ann_return=None, ann_volatility=None, sharpe_ratio=None,
+                sortino_ratio=None, calmar_ratio=None, max_drawdown=None,
+                max_drawdown_peak_i=None, max_drawdown_trough_i=None,
+                var_95=None, var_99=None, cvar_95=None, win_rate=None,
+                profit_factor=None, skewness=None, kurtosis=None,
+            )
+        ppy = req.periods_per_year
+        ret = prices[1:] / prices[:-1] - 1.0 if not req.is_returns else prices
+        n = len(ret)
+        mean_r = float(np.mean(ret))
+        std_r = float(np.std(ret, ddof=1)) if n > 1 else 0.0
+        ann_ret = float((1 + mean_r) ** ppy - 1)
+        ann_vol = float(std_r * math.sqrt(ppy))
+        sharpe = float(mean_r / std_r * math.sqrt(ppy)) if std_r > 0 else None
+        down = ret[ret < 0]
+        down_std = float(np.std(down, ddof=1)) if len(down) > 1 else 0.0
+        sortino = float(mean_r / down_std * math.sqrt(ppy)) if down_std > 0 else None
+        # max drawdown on price (or cumulative return if is_returns)
+        series = np.cumprod(1 + ret) if req.is_returns else prices[: n + 1]
+        peak_i, trough_i, max_dd = 0, 0, 0.0
+        running_peak = series[0]
+        running_peak_i = 0
+        for i in range(1, len(series)):
+            if series[i] > running_peak:
+                running_peak = series[i]
+                running_peak_i = i
+            dd = (series[i] - running_peak) / running_peak if running_peak > 0 else 0.0
+            if dd < max_dd:
+                max_dd = dd
+                peak_i = running_peak_i
+                trough_i = i
+        calmar = float(ann_ret / abs(max_dd)) if max_dd != 0 else None
+        var95 = float(np.percentile(ret, 5))
+        var99 = float(np.percentile(ret, 1))
+        cvar95 = float(np.mean(ret[ret <= var95])) if np.any(ret <= var95) else var95
+        win_rate = float(np.mean(ret > 0))
+        gains = ret[ret > 0].sum()
+        losses = abs(ret[ret < 0].sum())
+        profit_factor = float(gains / losses) if losses > 0 else None
+        # moments (numpy)
+        skew_val: float | None = None
+        kurt_val: float | None = None
+        if n >= 4 and std_r > 0:
+            z = (ret - mean_r) / std_r
+            skew_val = float(np.mean(z ** 3))
+            kurt_val = float(np.mean(z ** 4) - 3)  # excess kurtosis
+        return RiskResult(
+            node_id=self.settings.node_id, path=req.path, column=req.column,
+            n=n, periods_per_year=ppy,
+            ann_return=round(ann_ret, 6), ann_volatility=round(ann_vol, 6),
+            sharpe_ratio=round(sharpe, 4) if sharpe is not None else None,
+            sortino_ratio=round(sortino, 4) if sortino is not None else None,
+            calmar_ratio=round(calmar, 4) if calmar is not None else None,
+            max_drawdown=round(max_dd, 6),
+            max_drawdown_peak_i=int(peak_i), max_drawdown_trough_i=int(trough_i),
+            var_95=round(var95, 6), var_99=round(var99, 6), cvar_95=round(cvar95, 6),
+            win_rate=round(win_rate, 4),
+            profit_factor=round(profit_factor, 4) if profit_factor is not None else None,
+            skewness=round(skew_val, 4) if skew_val is not None else None,
+            kurtosis=round(kurt_val, 4) if kurt_val is not None else None,
+        )
+
+    # -- technical indicators -------------------------------------------------
+
+    def _indicators(self, req: "IndicatorsRequest") -> "IndicatorsResult":
+        """Compute technical indicators (SMA, EMA, RSI, MACD, Bollinger,
+        ATR, Stochastic, OBV) from a price series. Pure numpy — no TA-Lib dep.
+        Returns a columnar dict aligned to the x axis."""
+        from ..schemas.analysis import IndicatorsResult
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        cols = set(lf.collect_schema().names())
+        if req.column not in cols:
+            raise BadRequestError(f"column {req.column!r} not found")
+        has_x = bool(req.x and req.x in cols)
+        has_h = bool(req.high and req.high in cols)
+        has_l = bool(req.low and req.low in cols)
+        has_v = bool(req.volume and req.volume in cols)
+        keep = list(dict.fromkeys(
+            [req.column]
+            + ([req.x] if has_x else [])
+            + ([req.high] if has_h else [])
+            + ([req.low] if has_l else [])
+            + ([req.volume] if has_v else [])
+        ))
+        plan = lf.select(keep)
+        if has_x:
+            plan = plan.sort(req.x)
+        cap = min(req.limit, self._row_cap_for_bytes(plan))
+        df = plan.head(cap).collect(engine="streaming")
+        close = df[req.column].cast(pl.Float64, strict=False).to_numpy()
+        high = df[req.high].cast(pl.Float64, strict=False).to_numpy() if has_h else None
+        low = df[req.low].cast(pl.Float64, strict=False).to_numpy() if has_l else None
+        volume = df[req.volume].cast(pl.Float64, strict=False).to_numpy() if has_v else None
+        x_vals = df[req.x].to_list() if has_x else list(range(len(close)))
+        n = len(close)
+
+        def _sma(arr: np.ndarray, p: int) -> np.ndarray:
+            # cumsum-based O(n) rolling mean — much faster than per-element slice
+            out = np.full(n, np.nan)
+            if p > n:
+                return out
+            filled = np.where(np.isnan(arr), 0.0, arr)
+            cs = np.cumsum(filled)
+            out[p - 1:] = (cs[p - 1:] - np.concatenate([[0], cs[:-p]])) / p
+            return out
+
+        def _ema(arr: np.ndarray, span: int) -> np.ndarray:
+            out = np.full(n, np.nan)
+            if span > n:
+                return out
+            k = 2.0 / (span + 1)
+            seed_i = span - 1
+            valid = arr[:span]
+            valid = valid[~np.isnan(valid)]
+            if len(valid) == 0:
+                return out
+            out[seed_i] = np.mean(valid)
+            for i in range(seed_i + 1, n):
+                v = arr[i]
+                out[i] = v * k + out[i - 1] * (1 - k) if not np.isnan(v) else out[i - 1]
+            return out
+
+        result: dict[str, list[float | None]] = {}
+        for p in req.sma:
+            result[f"sma_{p}"] = [_safe(v) for v in _sma(close, p)]
+        for p in req.ema:
+            result[f"ema_{p}"] = [_safe(v) for v in _ema(close, p)]
+
+        if req.bollinger:
+            p = req.bollinger
+            mid = _sma(close, p)
+            std_arr = np.full(n, np.nan)
+            for i in range(p - 1, n):
+                std_arr[i] = np.nanstd(close[i - p + 1:i + 1], ddof=0)
+            result["bb_mid"] = [_safe(v) for v in mid]
+            result["bb_upper"] = [_safe(m + 2 * s) if not np.isnan(m) else None for m, s in zip(mid, std_arr)]
+            result["bb_lower"] = [_safe(m - 2 * s) if not np.isnan(m) else None for m, s in zip(mid, std_arr)]
+
+        if req.rsi:
+            p = req.rsi
+            delta = np.diff(close, prepend=np.nan)
+            gains = np.where(delta > 0, delta, 0.0)
+            losses = np.where(delta < 0, -delta, 0.0)
+            rsi_arr = np.full(n, np.nan)
+            if n > p:
+                avg_gain = np.nanmean(gains[1:p + 1])
+                avg_loss = np.nanmean(losses[1:p + 1])
+                for i in range(p, n):
+                    avg_gain = (avg_gain * (p - 1) + gains[i]) / p
+                    avg_loss = (avg_loss * (p - 1) + losses[i]) / p
+                    rs = avg_gain / avg_loss if avg_loss > 0 else float("inf")
+                    rsi_arr[i] = 100 - 100 / (1 + rs)
+            result[f"rsi_{p}"] = [_safe(v) for v in rsi_arr]
+
+        if req.macd:
+            ema12 = _ema(close, 12)
+            ema26 = _ema(close, 26)
+            macd_line = ema12 - ema26
+            signal = _ema(macd_line, 9)
+            hist_arr = macd_line - signal
+            result["macd"] = [_safe(v) for v in macd_line]
+            result["macd_signal"] = [_safe(v) for v in signal]
+            result["macd_hist"] = [_safe(v) for v in hist_arr]
+
+        if req.atr and has_h and has_l:
+            p = req.atr
+            # Vectorised true range, then Wilder smoothing (no Python loop)
+            tr_hl = high[1:] - low[1:]
+            tr_hc = np.abs(high[1:] - close[:-1])
+            tr_lc = np.abs(low[1:] - close[:-1])
+            tr = np.maximum(tr_hl, np.maximum(tr_hc, tr_lc))
+            atr_arr = np.full(n, np.nan)
+            if p <= n:
+                atr_arr[p] = np.mean(tr[:p])
+                for i in range(p + 1, n):
+                    atr_arr[i] = (atr_arr[i - 1] * (p - 1) + tr[i - 1]) / p
+            result[f"atr_{p}"] = [_safe(v) for v in atr_arr]
+
+        if req.stoch and has_h and has_l:
+            p = req.stoch
+            # Rolling min/max via stride-tricks — O(n) amortised using sliding window
+            from numpy.lib.stride_tricks import sliding_window_view
+            k_arr = np.full(n, np.nan)
+            if p <= n:
+                win_h = sliding_window_view(high, p)
+                win_l = sliding_window_view(low, p)
+                roll_hi = win_h.max(axis=1)
+                roll_lo = win_l.min(axis=1)
+                rng_hl = roll_hi - roll_lo
+                k_arr[p - 1:] = np.where(rng_hl > 0, 100 * (close[p - 1:] - roll_lo) / rng_hl, 50.0)
+            result[f"stoch_k_{p}"] = [_safe(v) for v in k_arr]
+            result[f"stoch_d_{p}"] = [_safe(v) for v in _sma(k_arr, 3)]
+
+        if req.obv and has_v:
+            # Vectorised OBV: sign of daily change, then cumsum of signed volume
+            direction = np.sign(np.diff(close, prepend=close[0]))
+            obv_arr = np.cumsum(direction * volume)
+            result["obv"] = [_safe(v) for v in obv_arr]
+
+        return IndicatorsResult(
+            node_id=self.settings.node_id, path=req.path, column=req.column,
+            x=[_safe(v) for v in x_vals],
+            price=[_safe(v) for v in close],
+            indicators=result,
+            n=n,
         )

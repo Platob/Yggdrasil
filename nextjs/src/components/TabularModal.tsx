@@ -698,13 +698,8 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                 </div>
                 <Chart type="candle" labels={candles.x}
                   ohlc={{ open: candles.open, high: candles.high, low: candles.low, close: candles.close }}
-                  overlay={maLine} yLabel={candles.column} height={300} />
-                {candles.volume && (
-                  <>
-                    <div className="text-[10px] text-frost/70 font-mono">volume</div>
-                    <Chart type="bar" labels={candles.x} values={candles.volume} color="var(--frost)" height={90} />
-                  </>
-                )}
+                  overlay={maLine} volume={candles.volume ?? undefined} yLabel={candles.column}
+                  height={candles.volume ? 360 : 300} />
               </div>
             )}
 
