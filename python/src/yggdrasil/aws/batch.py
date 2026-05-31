@@ -1,31 +1,55 @@
-"""AWS Batch (and ECS/Fargate) runtime introspection.
+"""AWS Batch runtime — resource + service.
 
-When a job runs under AWS Batch, the agent injects a well-known set of
-environment variables into the container — the job id, attempt, queue, compute
-environment, and (for array / multi-node jobs) the index/topology. This module
-captures them into one structured, picklable :class:`AWSBatchEnvironment` so
-code can branch on "am I in Batch?", find its array index, point at the job in
-the Console, or just log the full runtime context.
+When a job runs under AWS Batch the agent injects a well-known set of env vars
+(job id, attempt, queue, compute environment, array / multi-node topology). This
+module exposes them the same way the rest of the AWS surface is shaped:
 
-Reach it from a client as ``AWSClient.current().batch`` (no network, no
-credentials — it's pure ``os.environ``), or directly via
-``AWSBatchEnvironment.current()``.
+* :class:`BatchService` — the :class:`~yggdrasil.aws.client.AWSService` binding
+  (``service_name == "batch"``), so ``BatchService.current()`` and
+  ``client.batch`` follow the established singleton pattern instead of a
+  free-floating dataclass.
+* :class:`AWSBatch` — the :class:`~yggdrasil.aws.client.AWSResource` carrying
+  the captured runtime context, a clickable :attr:`explore_url` to the job in
+  the Console, and the ``is_*`` flags. Reach it as ``client.batch`` or
+  ``AWSBatch.current()``.
+
+:func:`in_aws_environment` is the lightweight, network-free "are we running
+inside AWS?" probe (Batch / ECS / Fargate / Lambda — all set a tell-tale env
+var); the S3 layer uses it to skip an egress proxy that doesn't apply in-VPC.
 """
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
+from yggdrasil.aws.client import AWSResource, AWSService
 from yggdrasil.aws.console import batch_job_url
 from yggdrasil.url import URL
 
-__all__ = ["AWSBatchEnvironment"]
+__all__ = ["AWSBatch", "BatchService", "in_aws_environment"]
+
+# Env vars any AWS-managed compute sets — used as a network-free "in AWS" probe.
+_AWS_ENV_SIGNALS = (
+    "AWS_EXECUTION_ENV",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_BATCH_JOB_ID",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "ECS_CONTAINER_METADATA_URI",
+    "ECS_CONTAINER_METADATA_URI_V4",
+)
+
+
+def in_aws_environment(env: Optional[Mapping[str, str]] = None) -> bool:
+    """True when running inside AWS-managed compute (Batch / ECS / Fargate /
+    Lambda). Pure env-var probe — no IMDS round trip."""
+    e = os.environ if env is None else env
+    return any(e.get(k) for k in _AWS_ENV_SIGNALS)
 
 
 def _int(env: Mapping[str, str], name: str) -> Optional[int]:
     raw = env.get(name)
-    if raw is None or raw == "":
+    if not raw:
         return None
     try:
         return int(raw)
@@ -33,75 +57,115 @@ def _int(env: Mapping[str, str], name: str) -> Optional[int]:
         return None
 
 
-def _str(env: Mapping[str, str], name: str) -> Optional[str]:
-    v = env.get(name)
-    return v or None
+class BatchService(AWSService):
+    """AWS Batch service binding (the boto ``batch`` client lives on
+    :attr:`boto_client` for future control-plane calls)."""
+
+    @classmethod
+    def service_name(cls) -> str:
+        return "batch"
 
 
-@dataclass(frozen=True)
-class AWSBatchEnvironment:
-    """The AWS Batch runtime context, read from the job container's env.
+class AWSBatch(AWSResource):
+    """The AWS Batch runtime context this process is running under.
 
-    Every field is ``None`` off-Batch, so :attr:`is_batch` is the gate before
-    trusting the rest. Multi-node fields (``node_*`` / ``num_nodes``) are only
-    set for multi-node parallel jobs; ``array_index`` only for array jobs.
+        >>> AWSClient.current().batch.is_batch
+        True
+        >>> AWSClient.current().batch
+        AWSBatch(URL('https://eu-west-1.console.aws.amazon.com/batch/home?region=eu-west-1#jobs/detail/abc'))
+
+    Off-Batch every field is ``None`` and :attr:`is_batch` is ``False``; the
+    captured env is snapshotted at construction so the resource is stable and
+    picklable.
     """
 
-    job_id: Optional[str] = None
-    job_attempt: Optional[int] = None
-    job_queue: Optional[str] = None
-    compute_environment: Optional[str] = None
-    array_index: Optional[int] = None
-    node_index: Optional[int] = None
-    main_node_index: Optional[int] = None
-    num_nodes: Optional[int] = None
-    main_node_ip: Optional[str] = None
-    execution_env: Optional[str] = None
-    region: Optional[str] = None
-    container_credentials_uri: Optional[str] = None
-    #: The raw captured ``AWS_BATCH_*`` / runtime vars — handy for logging.
-    raw: Mapping[str, str] = field(default_factory=dict)
+    def __init__(
+        self,
+        service: Optional[AWSService] = None,
+        *,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        self._env: dict[str, str] = dict(os.environ if env is None else env)
+        super().__init__(service=service if service is not None else BatchService.current())
 
-    # ------------------------------------------------------------------
     @classmethod
-    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "AWSBatchEnvironment":
-        e = os.environ if env is None else env
-        captured = {
-            k: e[k] for k in (
-                "AWS_BATCH_JOB_ID", "AWS_BATCH_JOB_ATTEMPT", "AWS_BATCH_JQ_NAME",
-                "AWS_BATCH_CE_NAME", "AWS_BATCH_JOB_ARRAY_INDEX",
-                "AWS_BATCH_JOB_NODE_INDEX", "AWS_BATCH_JOB_MAIN_NODE_INDEX",
-                "AWS_BATCH_JOB_NUM_NODES", "AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS",
-                "AWS_EXECUTION_ENV", "AWS_REGION", "AWS_DEFAULT_REGION",
-                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-            ) if e.get(k)
-        }
-        return cls(
-            job_id=_str(e, "AWS_BATCH_JOB_ID"),
-            job_attempt=_int(e, "AWS_BATCH_JOB_ATTEMPT"),
-            job_queue=_str(e, "AWS_BATCH_JQ_NAME"),
-            compute_environment=_str(e, "AWS_BATCH_CE_NAME"),
-            array_index=_int(e, "AWS_BATCH_JOB_ARRAY_INDEX"),
-            node_index=_int(e, "AWS_BATCH_JOB_NODE_INDEX"),
-            main_node_index=_int(e, "AWS_BATCH_JOB_MAIN_NODE_INDEX"),
-            num_nodes=_int(e, "AWS_BATCH_JOB_NUM_NODES"),
-            main_node_ip=_str(e, "AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS"),
-            execution_env=_str(e, "AWS_EXECUTION_ENV"),
-            region=_str(e, "AWS_REGION") or _str(e, "AWS_DEFAULT_REGION"),
-            container_credentials_uri=(
-                _str(e, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
-                or _str(e, "AWS_CONTAINER_CREDENTIALS_FULL_URI")
-            ),
-            raw=captured,
+    def current(cls, *, env: Optional[Mapping[str, str]] = None) -> "AWSBatch":
+        """The Batch context for the default client + live process env."""
+        return cls(service=BatchService.current(), env=env)
+
+    # -- pickling: keep the env snapshot alongside the service ----------
+    def __getstate__(self) -> dict:
+        return {"service": self.service, "env": self._env}
+
+    def __setstate__(self, state: dict) -> None:
+        self.service = state["service"]
+        self._env = state.get("env", {})
+
+    # -- captured fields ------------------------------------------------
+    @property
+    def job_id(self) -> Optional[str]:
+        return self._env.get("AWS_BATCH_JOB_ID") or None
+
+    @property
+    def job_attempt(self) -> Optional[int]:
+        return _int(self._env, "AWS_BATCH_JOB_ATTEMPT")
+
+    @property
+    def job_queue(self) -> Optional[str]:
+        return self._env.get("AWS_BATCH_JQ_NAME") or None
+
+    @property
+    def compute_environment(self) -> Optional[str]:
+        return self._env.get("AWS_BATCH_CE_NAME") or None
+
+    @property
+    def array_index(self) -> Optional[int]:
+        return _int(self._env, "AWS_BATCH_JOB_ARRAY_INDEX")
+
+    @property
+    def node_index(self) -> Optional[int]:
+        return _int(self._env, "AWS_BATCH_JOB_NODE_INDEX")
+
+    @property
+    def main_node_index(self) -> Optional[int]:
+        return _int(self._env, "AWS_BATCH_JOB_MAIN_NODE_INDEX")
+
+    @property
+    def num_nodes(self) -> Optional[int]:
+        return _int(self._env, "AWS_BATCH_JOB_NUM_NODES")
+
+    @property
+    def main_node_ip(self) -> Optional[str]:
+        return self._env.get("AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS") or None
+
+    @property
+    def execution_env(self) -> Optional[str]:
+        return self._env.get("AWS_EXECUTION_ENV") or None
+
+    @property
+    def region(self) -> Optional[str]:
+        return (
+            self._env.get("AWS_REGION")
+            or self._env.get("AWS_DEFAULT_REGION")
+            or self.service.region
         )
 
-    #: ``current()`` reads the live process environment.
-    current = from_env
+    @property
+    def container_credentials_uri(self) -> Optional[str]:
+        return (
+            self._env.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+            or self._env.get("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+            or None
+        )
 
-    # ------------------------------------------------------------------
+    # -- derived flags --------------------------------------------------
     @property
     def is_batch(self) -> bool:
         return self.job_id is not None
+
+    @property
+    def is_aws_environment(self) -> bool:
+        return in_aws_environment(self._env)
 
     @property
     def is_array_job(self) -> bool:
@@ -109,7 +173,8 @@ class AWSBatchEnvironment:
 
     @property
     def is_multinode(self) -> bool:
-        return bool(self.num_nodes and self.num_nodes > 1)
+        n = self.num_nodes
+        return bool(n and n > 1)
 
     @property
     def is_main_node(self) -> bool:
@@ -120,20 +185,18 @@ class AWSBatchEnvironment:
 
     @property
     def is_fargate(self) -> bool:
-        return bool(self.execution_env and "FARGATE" in self.execution_env.upper())
+        ee = self.execution_env
+        return bool(ee and "FARGATE" in ee.upper())
 
     @property
     def has_container_credentials(self) -> bool:
-        """Whether the ECS/Batch task-role credential endpoint is wired up
-        (boto3 picks these up automatically — this just reports it)."""
         return self.container_credentials_uri is not None
 
+    # -- explore / serialize -------------------------------------------
     @property
     def explore_url(self) -> Optional[URL]:
         """Console deep-link to this Batch job, or ``None`` off-Batch."""
-        if not self.job_id:
-            return None
-        return batch_job_url(self.job_id, self.region)
+        return batch_job_url(self.job_id, self.region) if self.job_id else None
 
     def to_dict(self) -> dict:
         return {
@@ -153,11 +216,6 @@ class AWSBatchEnvironment:
             "is_multinode": self.is_multinode,
             "is_main_node": self.is_main_node,
             "is_fargate": self.is_fargate,
+            "is_aws_environment": self.is_aws_environment,
             "has_container_credentials": self.has_container_credentials,
         }
-
-    def _repr_html_(self) -> Optional[str]:
-        url = self.explore_url
-        if url is None:
-            return None
-        return f'<a href="{url}" target="_blank">AWS Batch job {self.job_id}</a>'

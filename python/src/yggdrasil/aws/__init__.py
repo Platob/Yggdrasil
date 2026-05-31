@@ -50,7 +50,7 @@ Quick start
 from __future__ import annotations
 
 from .account import AWSAccount, AccountService
-from .batch import AWSBatchEnvironment
+from .batch import AWSBatch, BatchService, in_aws_environment
 from .client import AWSClient, AWSResource, AWSService
 from .config import AwsCredentials, DatabricksSQLCredentialsRefresher
 from .provider import AwsCredentialsProvider
@@ -62,7 +62,9 @@ __all__ = [
     "AWSResource",
     "AWSAccount",
     "AccountService",
-    "AWSBatchEnvironment",
+    "AWSBatch",
+    "BatchService",
+    "in_aws_environment",
     "AwsCredentials",
     "AwsCredentialsProvider",
     "DatabricksSQLCredentialsRefresher",

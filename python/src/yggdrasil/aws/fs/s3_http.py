@@ -102,11 +102,15 @@ class S3HttpClient:
         path_style: bool = False,
         region: Optional[str] = None,
         managed: bool = True,
+        no_proxy: Optional[str] = None,
     ) -> None:
         self.bucket = bucket
         self.endpoint = endpoint
         self.signer = signer
         self.path_style = path_style
+        # ``no_proxy`` forwarded to the HTTPSession so S3 requests can skip an
+        # egress proxy that doesn't apply (e.g. in-VPC under AWS Batch/ECS).
+        self._no_proxy = no_proxy
         # ``managed`` AWS endpoints can self-correct their region on a redirect
         # (boto3 does the same); a custom ``endpoint_url`` (MinIO/localstack) is
         # left alone.
@@ -170,7 +174,7 @@ class S3HttpClient:
         if self._session is None:
             from yggdrasil.http_.session import HTTPSession
 
-            self._session = HTTPSession()
+            self._session = HTTPSession(no_proxy=self._no_proxy) if self._no_proxy else HTTPSession()
         resp = self._session.request(
             method,
             str(url),

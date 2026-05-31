@@ -162,9 +162,19 @@ class S3Bucket(ExploreUrlRepr, RemotePath):
                 # TLS cert — fall back to path-style, exactly as boto3 does.
                 endpoint, path_style = URL.from_(f"https://s3.{region}.amazonaws.com"), True
             signer = SigV4Signer(region=region, credentials_provider=self._credentials)
+            # Inside AWS-managed compute (Batch/ECS/Fargate/Lambda) S3 is
+            # reachable directly over the AWS network / a VPC endpoint, so a
+            # corporate egress proxy doesn't apply — bypass it for the AWS S3
+            # domains. Custom endpoints (MinIO, etc.) keep the proxy.
+            no_proxy = None
+            if managed:
+                from yggdrasil.aws.batch import in_aws_environment
+
+                if in_aws_environment():
+                    no_proxy = "amazonaws.com,amazonaws.com.cn,amazonaws-us-gov.com"
             self._http = S3HttpClient(
                 bucket=self._bucket, endpoint=endpoint, signer=signer,
-                path_style=path_style, region=region, managed=managed,
+                path_style=path_style, region=region, managed=managed, no_proxy=no_proxy,
             )
         return self._http
 

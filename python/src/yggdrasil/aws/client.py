@@ -779,15 +779,15 @@ class AWSClient(Singleton):
         return AWSAccount(service=AccountService(client=self))
 
     @property
-    def batch(self) -> "AWSBatchEnvironment":
-        """The AWS Batch runtime context from the process environment.
+    def batch(self) -> "AWSBatch":
+        """The :class:`AWSBatch` runtime resource for this client.
 
         Pure ``os.environ`` read — no network, no credentials. ``.is_batch``
         gates whether the job-id / queue / array-index fields are meaningful.
         """
-        from yggdrasil.aws.batch import AWSBatchEnvironment
+        from yggdrasil.aws.batch import AWSBatch, BatchService
 
-        return AWSBatchEnvironment.current()
+        return AWSBatch(service=BatchService(client=self))
 
     # ==================================================================
     # Session construction internals
