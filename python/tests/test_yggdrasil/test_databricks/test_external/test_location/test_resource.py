@@ -69,9 +69,9 @@ def test_is_hashable(service):
 
 def test_explore_url_and_clickable_repr(service):
     el = service["raw_zone"]
-    assert str(el.explore_url) == "https://dbc-x.cloud.databricks.com/explore/location/raw_zone"
+    assert str(el.explore_url) == "https://dbc-x.cloud.databricks.com/explore/locations/raw_zone"
     assert repr(el) == f"ExternalLocation({el.explore_url!r})"
-    assert el._repr_html_().startswith('<a href="https://dbc-x.cloud.databricks.com/explore/location/raw_zone"')
+    assert el._repr_html_().startswith('<a href="https://dbc-x.cloud.databricks.com/explore/locations/raw_zone"')
 
 
 def test_instance_update_refreshes_cache(service):

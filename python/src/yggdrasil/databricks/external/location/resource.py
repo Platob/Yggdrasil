@@ -234,4 +234,4 @@ class ExternalLocation(DatabricksResource, ProxyPathMixin, Singleton):
     @property
     def explore_url(self) -> URL:
         """Catalog Explorer deep-link to this external location."""
-        return self.client.base_url.with_path(f"/explore/location/{self.name}")
+        return self.client.base_url.with_path(f"/explore/locations/{self.name}")
