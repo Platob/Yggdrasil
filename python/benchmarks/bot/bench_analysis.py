@@ -21,7 +21,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.node.api.schemas.analysis import (
-    AggMeasure, AggregateRequest, ForecastRequest, IndicatorsRequest, OhlcRequest, RiskRequest, SeriesRequest,
+    AggMeasure, AggregateRequest, CorrelationRequest, ForecastRequest, IndicatorsRequest,
+    OhlcRequest, RiskRequest, SeriesRequest,
 )
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService
@@ -139,6 +140,22 @@ def main() -> None:
         ind_ms = (time.perf_counter() - t0) / 10 * 1000
         print(f"  indicators ({m:,} OHLCV rows, 10x avg): {ind_ms:6.1f} ms  ({len(ind.indicators)} series)")
         print(f"    computed: {', '.join(ind.indicators.keys())}\n")
+
+    # -- correlation matrix ---------------------------------------------------
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        rng = random.Random(42)
+        m = 3_000
+        assets = {f"asset_{i}": [100.0 * (1 + rng.gauss(0.0003, 0.015)) ** j for j in range(m)] for i in range(10)}
+        pq.write_table(pa.table(assets), str(home / "assets.parquet"))
+        settings = Settings(node_id="bench", node_home=home, front_home=home)
+        svc = AnalysisService(settings, fs=FsService(settings))
+        cols = list(assets.keys())
+        t0 = time.perf_counter()
+        for _ in range(10):
+            cr = asyncio.run(svc.correlate(CorrelationRequest(path="assets.parquet", columns=cols, method="pearson")))
+        corr_ms = (time.perf_counter() - t0) / 10 * 1000
+        print(f"  correlation ({m:,} rows x {len(cols)} assets, 10x avg): {corr_ms:6.1f} ms")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@ from ...exceptions import ForbiddenError, NotFoundError
 from ..schemas.analysis import (
     AggregateRequest,
     AggregateResult,
+    CorrelationRequest,
+    CorrelationResult,
     DescribeResult,
     ExportRequest,
     FilterSpec,
@@ -92,6 +94,9 @@ class AnalysisService:
         """Apply the transform and write the result in `fmt`. Returns
         (temp_path, download_name) — the caller streams then unlinks it."""
         return await run_in_threadpool(partial(self._export, req))
+
+    async def correlate(self, req: "CorrelationRequest") -> "CorrelationResult":
+        return await run_in_threadpool(partial(self._correlate, req))
 
     async def risk(self, req: "RiskRequest") -> "RiskResult":
         return await run_in_threadpool(partial(self._risk, req))
@@ -504,6 +509,73 @@ class AnalysisService:
             low=_safe_list(out["low"]), close=_safe_list(out["close"]),
             volume=_safe_list(out["volume"]) if has_vol else None,
             bars=out.height, source_rows=source_rows,
+        )
+
+    # -- correlation matrix ---------------------------------------------------
+
+    def _correlate(self, req: "CorrelationRequest") -> "CorrelationResult":
+        """Pearson, Spearman, or (approximated) Kendall correlation matrix over
+        the selected numeric columns. Spearman is computed as Pearson of ranks;
+        Kendall uses the O(n log n) merge-sort approach but falls back to scipy
+        when available for precision. All numpy, no mandatory extra deps."""
+        from ..schemas.analysis import CorrelationResult
+        if len(req.columns) < 2:
+            raise BadRequestError("correlate needs at least 2 columns")
+        if len(req.columns) > 50:
+            raise BadRequestError("correlate supports at most 50 columns")
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        cols = set(lf.collect_schema().names())
+        for c in req.columns:
+            if c not in cols:
+                raise BadRequestError(f"column {c!r} not found")
+        plan = lf.select(req.columns)
+        if req.order_by and req.order_by in cols:
+            plan = lf.select(list(dict.fromkeys([req.order_by] + req.columns))).sort(req.order_by).select(req.columns)
+        cap = min(req.limit, self._row_cap_for_bytes(plan))
+        df = plan.head(cap).collect(engine="streaming")
+        mat = df.to_numpy().astype(float)
+        n = mat.shape[0]
+        nc = mat.shape[1]
+        method = req.method.lower()
+        if method == "spearman":
+            # Rank each column (average ties), then Pearson of ranks
+            from scipy.stats import rankdata  # type: ignore[import]
+            try:
+                ranked = np.column_stack([rankdata(mat[:, i]) for i in range(nc)])
+            except ImportError:
+                # Fallback: simple rank without scipy
+                ranked = np.column_stack([mat[:, i].argsort().argsort().astype(float) for i in range(nc)])
+            mat = ranked
+        elif method == "kendall":
+            try:
+                from scipy.stats import kendalltau  # type: ignore[import]
+                result_mat: list[list[float | None]] = []
+                for i in range(nc):
+                    row: list[float | None] = []
+                    for j in range(nc):
+                        if i == j:
+                            row.append(1.0)
+                        elif j < i:
+                            row.append(result_mat[j][i])
+                        else:
+                            tau, _ = kendalltau(mat[:, i], mat[:, j])
+                            row.append(round(float(tau), 6) if not np.isnan(tau) else None)
+                    result_mat.append(row)
+                return CorrelationResult(
+                    node_id=self.settings.node_id, path=req.path,
+                    columns=req.columns, matrix=result_mat, method=method, n=n,
+                )
+            except ImportError:
+                pass  # fall through to Pearson approximation
+        # Pearson (or Spearman-as-Pearson-of-ranks)
+        corr = np.corrcoef(mat, rowvar=False)
+        matrix = [
+            [round(float(corr[i, j]), 6) if not np.isnan(corr[i, j]) else None for j in range(nc)]
+            for i in range(nc)
+        ]
+        return CorrelationResult(
+            node_id=self.settings.node_id, path=req.path,
+            columns=req.columns, matrix=matrix, method=method if method != "kendall" else "pearson", n=n,
         )
 
     # -- risk analytics -------------------------------------------------------

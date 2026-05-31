@@ -133,6 +133,26 @@ class OhlcResult(StrictModel):
     source_rows: int
 
 
+# -- correlation matrix -----------------------------------------------------
+
+class CorrelationRequest(StrictModel):
+    path: str
+    columns: list[str]          # numeric columns to correlate (2–50)
+    method: str = "pearson"     # pearson | spearman | kendall (approx)
+    order_by: str | None = None
+    limit: int = 5000
+    filters: list[FilterSpec] = []
+
+
+class CorrelationResult(StrictModel):
+    node_id: str
+    path: str
+    columns: list[str]
+    matrix: list[list[float | None]]  # n×n correlation matrix (rows = columns order)
+    method: str
+    n: int
+
+
 # -- risk analytics ---------------------------------------------------------
 
 class RiskRequest(StrictModel):

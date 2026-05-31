@@ -654,6 +654,27 @@ export function analysisOhlc(
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
+// ── Correlation matrix ──────────────────────────────────────────────────
+export interface CorrelationResult {
+  node_id: string;
+  path: string;
+  columns: string[];
+  matrix: (number | null)[][];
+  method: string;
+  n: number;
+}
+
+export function analysisCorrelate(
+  path: string,
+  columns: string[],
+  opts: { method?: string; order_by?: string; limit?: number; filters?: FilterSpec[]; node?: string } = {},
+): Promise<CorrelationResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/correlate${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, columns, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
 // ── Risk analytics ──────────────────────────────────────────────────────
 export interface RiskResult {
   node_id: string;

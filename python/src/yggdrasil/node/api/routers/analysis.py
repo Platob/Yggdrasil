@@ -7,6 +7,8 @@ from ..deps import get_analysis_service, get_network_service
 from ..schemas.analysis import (
     AggregateRequest,
     AggregateResult,
+    CorrelationRequest,
+    CorrelationResult,
     DescribeResult,
     ExportRequest,
     FinanceRequest,
@@ -115,6 +117,20 @@ async def ohlc(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/ohlc", json_body=req.model_dump())
     return await service.ohlc(req)
+
+
+@router.post("/correlate", response_model=CorrelationResult)
+async def correlate(
+    req: CorrelationRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> CorrelationResult:
+    """Pearson, Spearman, or Kendall correlation matrix over selected columns.
+    Spearman = Pearson of ranks. Kendall uses scipy when available, else Pearson."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/correlate", json_body=req.model_dump())
+    return await service.correlate(req)
 
 
 @router.post("/risk", response_model=RiskResult)

@@ -6,10 +6,12 @@ import {
   analysisIndicators,
   analysisOhlc,
   analysisForecast,
+  analysisCorrelate,
   type RiskResult,
   type IndicatorsResult,
   type OhlcResult,
   type ForecastResult,
+  type CorrelationResult,
   type FilterSpec,
 } from "@/lib/api";
 import Chart from "@/components/Chart";
@@ -156,7 +158,7 @@ const INDICATOR_COLORS: Record<string, string> = {
 };
 void INDICATOR_COLORS;
 
-type Tab = "risk" | "indicators" | "candles" | "forecast";
+type Tab = "risk" | "indicators" | "candles" | "forecast" | "correlation";
 
 export default function TradingPage() {
   const [path, setPath] = useState("");
@@ -171,10 +173,13 @@ export default function TradingPage() {
   const [buckets, setBuckets] = useState(200);
   const [fcHorizon, setFcHorizon] = useState(30);
   const [fcModel, setFcModel] = useState("auto");
+  const [corrCols, setCorrCols] = useState("close,volume");
+  const [corrMethod, setCorrMethod] = useState("pearson");
   const [risk, setRisk] = useState<RiskResult | null>(null);
   const [ind, setInd] = useState<IndicatorsResult | null>(null);
   const [ohlc, setOhlc] = useState<OhlcResult | null>(null);
   const [forecast, setForecast] = useState<ForecastResult | null>(null);
+  const [corr, setCorr] = useState<CorrelationResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [maWindow, setMaWindow] = useState(20);
@@ -202,6 +207,9 @@ export default function TradingPage() {
         setOhlc(await analysisOhlc(path, priceCol, {
           x: xCol || undefined, volume: volCol || undefined, buckets,
         }));
+      } else if (tab === "correlation") {
+        const cols = corrCols.split(",").map((s) => s.trim()).filter(Boolean);
+        setCorr(await analysisCorrelate(path, cols, { method: corrMethod, order_by: orderBy || undefined }));
       } else {
         setForecast(await analysisForecast(path, priceCol, {
           x: xCol || undefined, horizon: fcHorizon, model: fcModel,
@@ -227,6 +235,7 @@ export default function TradingPage() {
     { id: "indicators", label: "Indicators" },
     { id: "candles", label: "OHLC" },
     { id: "forecast", label: "Forecast" },
+    { id: "correlation", label: "Correlation" },
   ];
 
   return (
@@ -278,6 +287,13 @@ export default function TradingPage() {
             <input type="number" min={1} max={500} value={fcHorizon} onChange={(e) => setFcHorizon(Number(e.target.value) || 30)} className={`${inp} w-16`} />
             <select value={fcModel} onChange={(e) => setFcModel(e.target.value)} className={inp}>
               {["auto", "xgboost", "gbr", "ridge"].map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </>}
+          {tab === "correlation" && <>
+            <label className="text-muted">columns</label>
+            <input value={corrCols} onChange={(e) => setCorrCols(e.target.value)} placeholder="open,high,low,close,volume" className={`${inp} w-52`} title="comma-separated column names" />
+            <select value={corrMethod} onChange={(e) => setCorrMethod(e.target.value)} className={inp}>
+              {["pearson", "spearman", "kendall"].map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
           </>}
           <button
@@ -384,6 +400,65 @@ export default function TradingPage() {
           ) : !loading && (
             <div className="py-10 text-center text-muted text-sm">
               Configure model + horizon and click <span className="text-emerald">Analyze</span>.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Correlation heatmap tab */}
+      {tab === "correlation" && (
+        <div className="runic-card p-4 space-y-3">
+          {corr ? (
+            <>
+              <div className="text-[10px] text-muted font-mono">
+                {corr.method} correlation · {corr.n.toLocaleString()} observations · {corr.columns.length} variables
+              </div>
+              {/* Color-coded heatmap table */}
+              <div className="overflow-auto">
+                <table className="text-[11px] font-mono border-collapse">
+                  <thead>
+                    <tr>
+                      <th className="px-2 py-1 text-muted"></th>
+                      {corr.columns.map((c) => (
+                        <th key={c} className="px-2 py-1 text-frost/80 text-right whitespace-nowrap">{c}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {corr.matrix.map((row, i) => (
+                      <tr key={i}>
+                        <td className="px-2 py-1 text-frost/80 whitespace-nowrap">{corr.columns[i]}</td>
+                        {row.map((v, j) => {
+                          const diag = i === j;
+                          const abs = v == null ? 0 : Math.abs(v);
+                          const bg = diag
+                            ? "rgba(103,232,249,0.12)"
+                            : v == null ? "transparent"
+                            : v > 0
+                            ? `rgba(52,211,153,${abs * 0.4})`
+                            : `rgba(244,63,94,${abs * 0.4})`;
+                          const color = diag ? "var(--frost)"
+                            : v == null ? "var(--muted)"
+                            : abs > 0.7 ? "var(--foreground)"
+                            : "var(--foreground-dim)";
+                          return (
+                            <td key={j} className="px-2 py-1 text-right font-mono tabular-nums" style={{ background: bg, color }}>
+                              {v == null ? "—" : v.toFixed(3)}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="text-[10px] text-muted/60 font-mono">
+                green = positive correlation · red = negative · diagonal = 1.0
+              </div>
+            </>
+          ) : !loading && (
+            <div className="py-10 text-center text-muted text-sm">
+              Enter comma-separated column names and click <span className="text-emerald">Analyze</span>.
             </div>
           )}
         </div>
