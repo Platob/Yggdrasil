@@ -12,7 +12,7 @@ from typing import Optional
 
 from yggdrasil.url import URL
 
-__all__ = ["account_console_url", "s3_bucket_url", "s3_object_url", "partition_for_region"]
+__all__ = ["account_console_url", "s3_bucket_url", "s3_object_url", "batch_job_url", "partition_for_region"]
 
 
 def partition_for_region(region: Optional[str]) -> str:
@@ -52,6 +52,15 @@ def s3_bucket_url(bucket: str, region: Optional[str] = None) -> URL:
     """Console view of an S3 bucket's object list."""
     url = URL.from_(f"https://{_s3_console_host(region)}/s3/buckets/{bucket}")
     return url.with_query_items({"region": region}) if region else url
+
+
+def batch_job_url(job_id: str, region: Optional[str] = None) -> URL:
+    """Console deep-link to an AWS Batch job's detail page."""
+    url = URL.from_(f"https://{_console_host(region)}/batch/home")
+    if region:
+        url = url.with_query_items({"region": region})
+    # The Batch console routes the job detail behind a SPA fragment.
+    return url.with_fragment(f"jobs/detail/{job_id}")
 
 
 def s3_object_url(bucket: str, key: str, region: Optional[str] = None) -> URL:
