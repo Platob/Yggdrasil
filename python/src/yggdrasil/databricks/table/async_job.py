@@ -153,7 +153,9 @@ class TableJob(Flow):
         """
         table = self.table
         logs_dir = self.logs_path(table)
+        logger.info("async loader: scanning %s", logs_dir.full_path())
         if not logs_dir.exists():
+            logger.info("async loader: logs dir does not exist yet — nothing to do")
             return 0
 
         # Parse pending logs into (target, mode, data-path, log-path).
@@ -170,15 +172,20 @@ class TableJob(Flow):
             if limit is not None and len(ops) >= limit:
                 break
         if not ops:
+            logger.info("async loader: no pending operation logs")
             return 0
 
         groups: dict[tuple[str, str], list[tuple[str, Any]]] = {}
         for target, mode, data, log_file in ops:
             groups.setdefault((target, mode), []).append((data, log_file))
+        logger.info(
+            "async loader: %d operation(s) in %d group(s)", len(ops), len(groups)
+        )
 
         processed = 0
         for (target_name, mode), items in groups.items():
             target = self._resolve_target(target_name)
+            logger.info("loading %d file(s) into %s (%s)", len(items), target_name, mode)
             union = " UNION ALL ".join(
                 f"SELECT * FROM parquet.`{data}`" for data, _ in items
             )
