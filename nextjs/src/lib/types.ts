@@ -393,3 +393,47 @@ export interface UserCard {
   online: boolean;
   last_seen_at: string;
 }
+
+// ── Analysis (POST /api/v2/analysis/*) ─────────────────────────────────────
+
+export interface RiskResult {
+  node_id: string;
+  path: string;
+  column: string;
+  n: number;
+  periods_per_year: number;
+  ann_return: number | null;
+  ann_volatility: number | null;
+  sharpe_ratio: number | null;
+  sortino_ratio: number | null;
+  calmar_ratio: number | null;
+  max_drawdown: number | null;
+  max_drawdown_peak_i: number | null;
+  max_drawdown_trough_i: number | null;
+  var_95: number | null;
+  var_99: number | null;
+  cvar_95: number | null;
+  win_rate: number | null;
+  profit_factor: number | null;
+  skewness: number | null;
+  kurtosis: number | null;
+}
+
+export interface IndicatorsResult {
+  node_id: string;
+  path: string;
+  column: string;
+  n: number;
+  x: (string | number)[];
+  price: (number | null)[];
+  indicators: Record<string, (number | null)[]>;
+}
+
+export interface CorrelationResult {
+  node_id: string;
+  path: string;
+  columns: string[];
+  method: string;
+  n: number;
+  matrix: (number | null)[][];
+}

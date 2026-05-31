@@ -110,21 +110,29 @@ function IndicatorChart({
         <span className="ml-auto text-muted/60">{ind.n.toLocaleString()} pts</span>
       </div>
 
-      {view === "price" && (
-        <div className="space-y-1">
-          <Chart type="line" labels={labels} values={ind.price} color="var(--emerald)" yLabel={priceLabel} height={280} />
-          {priceKeys.filter((k) => !k.startsWith("bb_")).map((k) => (
-            <div key={k} className="flex items-center gap-2 text-[10px] font-mono text-muted">
-              <span className={k.startsWith("sma_") ? "text-amber/80" : "text-frost/80"}>{k}</span>
+      {view === "price" && (() => {
+        const maOverlays = Object.entries(ind.indicators)
+          .filter(([k]) => k.startsWith("sma_") || k.startsWith("ema_"))
+          .map(([k, vals], idx) => ({
+            values: vals as (number | null)[],
+            color: k.startsWith("sma_") ? ["var(--amber)", "rgba(251,191,36,0.6)"][idx % 2] : ["var(--frost)", "rgba(103,232,249,0.6)"][idx % 2],
+          }));
+        const bbBand = ind.indicators.bb_upper && ind.indicators.bb_lower
+          ? { min: ind.indicators.bb_lower as (number|null)[], max: ind.indicators.bb_upper as (number|null)[] }
+          : undefined;
+        return (
+          <div className="space-y-1">
+            <Chart type="line" labels={labels} values={ind.price} color="var(--emerald)"
+              overlays={maOverlays} band={bbBand} yLabel={priceLabel} height={300} />
+            <div className="flex flex-wrap gap-3 text-[10px] font-mono mt-1">
+              {Object.keys(ind.indicators).filter((k) => k.startsWith("sma_") || k.startsWith("ema_")).map((k) => (
+                <span key={k} className={k.startsWith("sma_") ? "text-amber/80" : "text-frost/80"}>{k}</span>
+              ))}
+              {bbBand && <span className="text-foreground-dim/60">BB±2σ</span>}
             </div>
-          ))}
-          {ind.indicators.bb_upper && (
-            <div className="text-[10px] text-muted font-mono">
-              Bollinger: mid={num(ind.indicators.bb_mid?.[ind.indicators.bb_mid.length - 1])} ±2σ
-            </div>
-          )}
-        </div>
-      )}
+          </div>
+        );
+      })()}
 
       {view === "rsi" && rsiKey && (
         <div className="space-y-1">

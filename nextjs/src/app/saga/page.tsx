@@ -37,6 +37,25 @@ import PlanGraphView from "@/components/PlanGraph";
 
 const DIALECTS = ["postgres", "sqlite", "mysql", "databricks"];
 
+const SQL_TEMPLATES: { label: string; sql: string }[] = [
+  { label: "select *", sql: "SELECT *\nFROM catalog.schema.table\nLIMIT 100" },
+  { label: "count by group", sql: "SELECT col, COUNT(*) AS cnt\nFROM catalog.schema.table\nGROUP BY col\nORDER BY cnt DESC" },
+  { label: "OHLCV snapshot", sql: "SELECT date, open, high, low, close, volume\nFROM catalog.schema.prices\nORDER BY date DESC\nLIMIT 30" },
+  { label: "daily returns", sql: "SELECT date,\n  (close - LAG(close) OVER (ORDER BY date))\n    / NULLIF(LAG(close) OVER (ORDER BY date), 0) AS daily_return\nFROM catalog.schema.prices\nORDER BY date" },
+  { label: "SMA 20/50", sql: "SELECT date, close,\n  AVG(close) OVER (ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS sma_20,\n  AVG(close) OVER (ORDER BY date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS sma_50\nFROM catalog.schema.prices\nORDER BY date" },
+  { label: "min/max/avg", sql: "SELECT\n  COUNT(*) AS n,\n  MIN(col) AS min_val,\n  MAX(col) AS max_val,\n  AVG(col) AS avg_val,\n  STDDEV(col) AS std_val\nFROM catalog.schema.table" },
+  { label: "schema tables", sql: "SELECT table_name, table_type\nFROM information_schema.tables\nWHERE table_schema = 'public'\nORDER BY table_name" },
+  { label: "volatility window", sql: "SELECT date, close,\n  STDDEV(close) OVER (ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS vol_20\nFROM catalog.schema.prices\nORDER BY date" },
+];
+
+const HISTORY_KEY = "saga_sql_history";
+function loadHistory(): string[] {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]"); } catch { return []; }
+}
+function saveHistory(h: string[]) {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 12))); } catch { /* ignore */ }
+}
+
 function fmtBytes(b: number | null | undefined): string {
   if (!b) return "--";
   if (b < 1024) return `${b} B`;
@@ -90,6 +109,12 @@ export default function SagaPage() {
   const [dlOpen, setDlOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [expanded, setExpanded] = useState(false);   // fullscreen result viewer
+  const [templatesOpen, setTemplatesOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [queryHistory, setQueryHistory] = useState<string[]>(() => {
+    if (typeof window === "undefined") return [];
+    return loadHistory();
+  });
 
   const loadCatalogs = useCallback(async () => {
     setTreeErr("");
@@ -298,6 +323,12 @@ export default function SagaPage() {
     try {
       setRanQuery(queryFor(sql)); setTab("results");
       getPlan(planBody()).then(setPlan).catch(() => {});
+      const trimmed = sql.trim();
+      if (trimmed) {
+        const next = [trimmed, ...queryHistory.filter((q) => q !== trimmed)].slice(0, 12);
+        setQueryHistory(next);
+        saveHistory(next);
+      }
     } catch (e) { setSqlErr(String(e)); setRanQuery(null); }
     finally { setRunning(false); }
   };
@@ -618,10 +649,46 @@ export default function SagaPage() {
             </button>
           </div>
 
+          {/* Templates + history quick-access strip */}
+          <div className="flex items-center gap-2 mb-1.5 text-[11px]">
+            <button onClick={() => { setTemplatesOpen((v) => !v); setHistoryOpen(false); }}
+              className={`px-2 py-0.5 rounded border text-[10px] font-mono transition-colors ${templatesOpen ? "border-frost/30 text-frost bg-frost/10" : "border-white/[0.08] text-muted hover:text-foreground-dim"}`}>
+              Templates ▾
+            </button>
+            <button onClick={() => { setHistoryOpen((v) => !v); setTemplatesOpen(false); }}
+              className={`px-2 py-0.5 rounded border text-[10px] font-mono transition-colors ${historyOpen ? "border-frost/30 text-frost bg-frost/10" : "border-white/[0.08] text-muted hover:text-foreground-dim"}`}>
+              History ({queryHistory.length}) ▾
+            </button>
+            <span className="ml-auto text-[10px] text-muted/50 font-mono">⌘/Ctrl+Enter to run</span>
+          </div>
+          {templatesOpen && (
+            <div className="mb-2 flex flex-wrap gap-1.5">
+              {SQL_TEMPLATES.map((t) => (
+                <button key={t.label} onClick={() => { setSql(t.sql); setTemplatesOpen(false); }}
+                  className="px-2 py-1 rounded text-[10px] font-mono border border-white/[0.08] bg-white/[0.03] text-foreground-dim hover:border-frost/30 hover:text-frost transition-colors">
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          )}
+          {historyOpen && queryHistory.length > 0 && (
+            <div className="mb-2 space-y-1 max-h-40 overflow-auto border border-white/[0.06] rounded-lg p-1.5">
+              {queryHistory.map((q, i) => (
+                <button key={i} onClick={() => { setSql(q); setHistoryOpen(false); }}
+                  className="block w-full text-left px-2 py-1 rounded text-[10px] font-mono text-foreground-dim hover:bg-white/[0.06] hover:text-foreground truncate">
+                  {q.replace(/\s+/g, " ").slice(0, 120)}
+                </button>
+              ))}
+            </div>
+          )}
+          {historyOpen && queryHistory.length === 0 && (
+            <div className="mb-2 text-[10px] text-muted font-mono px-2">No history yet — run a query first.</div>
+          )}
+
           <textarea value={sql} onChange={(e) => setSql(e.target.value)} onKeyDown={onKey}
             spellCheck={false}
             className="w-full h-40 resize-y bg-[#06060f] border border-white/[0.08] rounded-lg p-3 text-[13px] font-mono text-foreground placeholder-muted/50 outline-none focus:border-frost/30 leading-relaxed"
-            placeholder="SELECT * FROM catalog.schema.table  —  ⌘/Ctrl+Enter to run" />
+            placeholder="SELECT * FROM catalog.schema.table" />
 
           {sqlErr && <div className="mt-2 text-[12px] text-rose/90 font-mono break-words bg-rose/5 border border-rose/20 rounded-lg p-2">{sqlErr}</div>}
 

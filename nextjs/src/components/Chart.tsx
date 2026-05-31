@@ -12,7 +12,8 @@ interface Props {
   band?: { min: (number | null)[]; max: (number | null)[] };
   ohlc?: { open: (number | null)[]; high: (number | null)[]; low: (number | null)[]; close: (number | null)[] };
   volume?: (number | null)[];   // renders a volume sub-panel below candles/price
-  overlay?: (number | null)[];  // moving-average line over candles
+  overlay?: (number | null)[];  // single moving-average line over candles
+  overlays?: { values: (number | null)[]; color: string }[];  // multiple overlay lines (MAs, etc.)
   height?: number;
   color?: string;
   yLabel?: string;
@@ -24,7 +25,7 @@ const VOL_H = 60;   // height reserved for the volume sub-panel
 const VOL_GAP = 6;  // gap between price and volume panels
 
 export default function Chart({
-  type, labels, values, band, ohlc, volume, overlay, height = 220, color = "var(--emerald)", yLabel,
+  type, labels, values, band, ohlc, volume, overlay, overlays, height = 220, color = "var(--emerald)", yLabel,
 }: Props) {
   const hasVol = volume && volume.some((v) => v != null && isFinite(v));
   const priceH = hasVol ? height - VOL_H - VOL_GAP : height;
@@ -38,9 +39,11 @@ export default function Chart({
     for (const a of [ohlc.high, ohlc.low, ohlc.open, ohlc.close])
       for (const v of a) if (v != null && isFinite(v)) pool.push(v);
     if (overlay) for (const v of overlay) if (v != null && isFinite(v)) pool.push(v);
+    if (overlays) for (const ol of overlays) for (const v of ol.values) if (v != null && isFinite(v)) pool.push(v);
   } else if (values) {
     for (const v of values) if (v != null && isFinite(v)) pool.push(v);
     if (band) for (const a of [band.min, band.max]) for (const v of a) if (v != null && isFinite(v)) pool.push(v);
+    if (overlays) for (const ol of overlays) for (const v of ol.values) if (v != null && isFinite(v)) pool.push(v);
   }
   if (pool.length === 0)
     return <div className="text-[11px] text-muted font-mono p-4">no numeric data to plot</div>;
@@ -92,11 +95,16 @@ export default function Chart({
         );
       })}
 
-      {/* Overlay (MA line) over candles */}
+      {/* Overlay (single MA line) over candles */}
       {type === "candle" && overlay && (() => {
         const pts = overlay.map((v, i) => (v == null || !isFinite(v) ? null : `${xBand(i)},${y(v)}`)).filter(Boolean) as string[];
         return pts.length ? <polyline points={pts.join(" ")} fill="none" stroke="var(--amber)" strokeWidth="1.4" strokeOpacity="0.9" /> : null;
       })()}
+      {/* Multiple overlays over candles */}
+      {type === "candle" && overlays && overlays.map((ol, oi) => {
+        const pts = ol.values.map((v, i) => (v == null || !isFinite(v) ? null : `${xBand(i)},${y(v)}`)).filter(Boolean) as string[];
+        return pts.length ? <polyline key={oi} points={pts.join(" ")} fill="none" stroke={ol.color} strokeWidth="1.3" strokeOpacity="0.85" /> : null;
+      })}
 
       {/* Bars */}
       {type === "bar" && values?.map((v, i) =>
@@ -122,6 +130,10 @@ export default function Chart({
             {bandPoly && <polygon points={bandPoly} fill={color} fillOpacity="0.12" />}
             {type === "area" && <polygon points={`${padL},${zeroY} ${pts.join(" ")} ${x(n - 1)},${zeroY}`} fill={color} fillOpacity="0.18" />}
             <polyline points={pts.join(" ")} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" />
+            {overlays && overlays.map((ol, oi) => {
+              const opts = ol.values.map((v, i) => (v == null || !isFinite(v) ? null : `${x(i)},${y(v)}`)).filter(Boolean) as string[];
+              return opts.length ? <polyline key={oi} points={opts.join(" ")} fill="none" stroke={ol.color} strokeWidth="1.3" strokeOpacity="0.85" strokeLinejoin="round" /> : null;
+            })}
           </>
         );
       })()}
