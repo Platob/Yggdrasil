@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from .column.columns import Columns
     from .catalog.catalogs import Catalogs
     from .credentials import Credentials
+    from .external import DatabricksExternal
     from .external.location import ExternalLocations
     from .schema.schemas import Schemas
     from .volume.volumes import Volumes
@@ -1740,37 +1741,47 @@ class DatabricksClient(Singleton, URLBased):
         return cached
 
     @property
+    def external(self) -> "DatabricksExternal":
+        """Unity Catalog **external data** umbrella service for this client.
+
+        Groups the securables that bind UC to outside storage —
+        external locations and storage credentials::
+
+            client.external.locations["raw_zone"]          # ExternalLocation
+            client.external.credentials.create_aws("prod_s3", "arn:aws:iam::123:role/R")
+            client.external.credentials["prod_s3"].aws_client(region="us-east-1")
+        """
+        cached = self.__dict__.get("_external")
+        if cached is not None:
+            return cached
+        from .external import DatabricksExternal
+
+        cached = DatabricksExternal(client=self)
+        self.__dict__["_external"] = cached
+        return cached
+
+    @property
     def external_locations(self) -> "ExternalLocations":
-        """Unity Catalog external-locations service for this client::
+        """Unity Catalog external-locations service for this client.
+
+        Flat alias onto :attr:`external` — ``client.external.locations``::
 
             client.external_locations["raw_zone"]          # ExternalLocation
             client.external_locations.list()               # Iterator[ExternalLocation]
             client.external_locations.create(name, url, credential_name)
         """
-        cached = self.__dict__.get("_external_locations")
-        if cached is not None:
-            return cached
-        from .external.location import ExternalLocations
-
-        cached = ExternalLocations(client=self)
-        self.__dict__["_external_locations"] = cached
-        return cached
+        return self.external.locations
 
     @property
     def credentials(self) -> "Credentials":
-        """Unity Catalog credentials service for this client::
+        """Unity Catalog storage-credentials service for this client.
+
+        Flat alias onto :attr:`external` — ``client.external.credentials``::
 
             client.credentials.create_aws("prod_s3", "arn:aws:iam::123:role/R")
             client.credentials["prod_s3"].aws_client(region="us-east-1")  # refreshable
         """
-        cached = self.__dict__.get("_uc_credentials")
-        if cached is not None:
-            return cached
-        from .credentials import Credentials
-
-        cached = Credentials(client=self)
-        self.__dict__["_uc_credentials"] = cached
-        return cached
+        return self.external.credentials
 
     @property
     def schemas(self) -> "Schemas":

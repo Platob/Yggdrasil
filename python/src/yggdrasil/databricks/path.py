@@ -89,10 +89,24 @@ _POSIX_NAMESPACES: dict[str, str] = {
     "Workspace": Scheme.DATABRICKS_WORKSPACE.value,
 }
 
+#: Multi-segment POSIX namespaces — matched as a leading path prefix
+#: (case-insensitive), unlike the single-segment :data:`_POSIX_NAMESPACES`.
+#: The segment after the prefix is the Unity Catalog external-location
+#: *name*; any deeper path is a child below it on the backing store.
+#: ``/External/Locations/raw_zone`` → ``dbfs+location:///raw_zone``.
+#: Listed longest-first so the most specific prefix wins.
+EXTERNAL_LOCATION_PATH_PREFIX = "/External/Locations/"
+_POSIX_PATH_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    (EXTERNAL_LOCATION_PATH_PREFIX, Scheme.DATABRICKS_EXTERNAL_LOCATION.value),
+)
+
 
 def _looks_like_posix(value: str) -> bool:
     if not isinstance(value, str) or not value.startswith("/"):
         return False
+    low = value.lower()
+    if any(low.startswith(prefix.lower()) for prefix, _ in _POSIX_PATH_PREFIXES):
+        return True
     parts = value.split("/", 2)
     if len(parts) < 2:
         return False
@@ -100,11 +114,17 @@ def _looks_like_posix(value: str) -> bool:
 
 
 def _parse_posix(value: str) -> Tuple[str, str]:
-    """``/dbfs/x`` → ``("dbfs", "/x")``, etc.
+    """``/dbfs/x`` → ``("dbfs", "/x")``, ``/External/Locations/raw`` →
+    ``("dbfs+location", "/raw")``, etc.
 
     Case-insensitive on the namespace; the rest of the path is
     preserved verbatim.
     """
+    low = value.lower()
+    for prefix, scheme in _POSIX_PATH_PREFIXES:
+        if low.startswith(prefix.lower()):
+            rest = value[len(prefix):].lstrip("/")
+            return scheme, "/" + rest
     parts = value.split("/", 2)
     if len(parts) < 2:
         raise ValueError(f"Not a Databricks POSIX path: {value!r}")
@@ -389,6 +409,10 @@ def _resolve_databricks_subclass(
         from yggdrasil.databricks.table.table import Table
 
         return Table, candidate
+    if scheme == Scheme.DATABRICKS_EXTERNAL_LOCATION.value:
+        from yggdrasil.databricks.external.location.resource import ExternalLocation
+
+        return ExternalLocation, candidate
     if scheme == Scheme.DATABRICKS_CATALOG.value:
         from yggdrasil.databricks.catalog.catalog import UCCatalog
 

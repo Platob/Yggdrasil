@@ -5,6 +5,7 @@ Public surface
 - :class:`Path`             — abstract ``pathlib.Path``-like path
 - :class:`RemotePath`       — abstract base for network-backed paths (S3, Databricks, …)
 - :class:`LocalPath`        — local :class:`Path` backed by :mod:`os` syscalls
+- :class:`ProxyPathMixin`   — be a path by delegating to an inner one
 
 Stat-related types live on :mod:`yggdrasil.io.io_stats`
 (:class:`IOStats` / :class:`IOKind`).
@@ -22,6 +23,7 @@ from .memory import Memory
 from .memory_stream import MemoryStream
 from .remote_path import RemotePath
 from .local_path import LocalPath
+from .proxy import ProxyPathMixin
 
 __all__ = [
     "Path",
@@ -31,4 +33,5 @@ __all__ = [
     "MemoryStream",
     "RemotePath",
     "LocalPath",
+    "ProxyPathMixin",
 ]

@@ -26,6 +26,7 @@ from databricks.sdk.service.catalog import ExternalLocationInfo
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.databricks.resource import DatabricksResource
+from yggdrasil.path import ProxyPathMixin
 from yggdrasil.url import URL
 
 if TYPE_CHECKING:
@@ -41,12 +42,16 @@ _RESOURCE_TTL: float = 30 * 60.0
 _S3_SCHEMES = ("s3", "s3a", "s3n")
 
 
-class ExternalLocation(DatabricksResource, Singleton):
+class ExternalLocation(DatabricksResource, ProxyPathMixin, Singleton):
     """A single Unity Catalog external location, usable as its storage path.
 
     Cached as a singleton per ``(service, name)`` for 30 min
-    (``_SINGLETON_TTL``). Filesystem ops are mirrored to the inner
-    credential-backed :attr:`path`; only AWS S3 is handled for now.
+    (``_SINGLETON_TTL``). Via :class:`~yggdrasil.path.ProxyPathMixin` the
+    whole filesystem surface is mirrored to the inner credential-backed
+    :attr:`path` (its :meth:`_internal_path` hook); only AWS S3 is handled
+    for now. UC metadata / lifecycle (``url`` / ``credential_name`` /
+    ``update`` / ``delete`` / ``explore_url`` / …) stays on the wrapper and
+    shadows the delegated surface.
     """
 
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=_RESOURCE_TTL, max_size=4096)
@@ -55,6 +60,41 @@ class ExternalLocation(DatabricksResource, Singleton):
     @classmethod
     def _singleton_key(cls, name: Any = None, *, service: Any = None, **kwargs: Any) -> Any:
         return (cls, service, name)
+
+    @classmethod
+    def from_url(
+        cls,
+        url: Any,
+        *,
+        service: "Optional[Any]" = None,
+        client: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Build a location from a ``dbfs+location:///<name>[/<sub>]`` URL.
+
+        The first path segment is the external-location *name*; any deeper
+        path is joined onto the resolved storage path, so a file address
+        (``/External/Locations/raw_zone/sub/f.parquet``) returns the inner
+        storage :class:`~yggdrasil.path.Path` for that file while a bare
+        name returns the :class:`ExternalLocation` itself. ``client=`` /
+        ``service=`` bind it to a workspace the same way the rest of the
+        :class:`~yggdrasil.databricks.path.DatabricksPath` family does.
+        """
+        segments = [s for s in (URL.from_(url).path or "").split("/") if s]
+        if not segments:
+            raise ValueError(f"external-location URL carries no name: {url!r}")
+        if service is None:
+            from yggdrasil.databricks.external.location.service import ExternalLocations
+
+            service = (
+                ExternalLocations(client=client)
+                if client is not None
+                else ExternalLocations.current()
+            )
+        location = cls(segments[0], service=service)
+        if len(segments) > 1:
+            return location.joinpath(*segments[1:])
+        return location
 
     def __init__(
         self,
@@ -144,14 +184,19 @@ class ExternalLocation(DatabricksResource, Singleton):
         """The storage :class:`Credential` backing this location."""
         return self.client.credentials.credential(self.credential_name)
 
-    @property
-    def path(self) -> "Path":
-        """The inner :class:`~yggdrasil.path.Path` over this location's storage,
-        built once with credentials vended by its storage credential (so it
-        lives on its own). Only AWS S3 for now; other schemes raise."""
+    def _internal_path(self) -> "Path":
+        """:class:`~yggdrasil.path.ProxyPathMixin` hook — the inner
+        :class:`~yggdrasil.path.Path` every filesystem op delegates to.
+
+        Built once with credentials vended by this location's storage
+        credential (so the path lives on its own), then cached. Only AWS
+        S3 for now; other schemes raise."""
         if self._external_path is None:
             self._external_path = self._build_path()
         return self._external_path
+
+    #: The inner storage path (alias for :meth:`_internal_path`).
+    path = property(_internal_path)
 
     def _build_path(self) -> "Path":
         url = self.url
@@ -171,24 +216,9 @@ class ExternalLocation(DatabricksResource, Singleton):
         aws = self.credential.aws_client(region=str(region) if region else None)
         return aws.s3.path(url)
 
-    # -- mirror filesystem ops straight to the inner path --------------
-    def __getattr__(self, item: str) -> Any:
-        # Only fires for names not found on the resource itself — forward the
-        # whole filesystem surface (ls / read_* / write_* / stat / exists /
-        # parent / iterdir / size / unlink / …) to the inner path. Never
-        # delegate private/dunder names (avoids recursion while building it).
-        if item.startswith("_"):
-            raise AttributeError(item)
-        return getattr(self.path, item)
-
-    def __truediv__(self, other: Any) -> "Path":
-        return self.path / other
-
-    def __rtruediv__(self, other: Any) -> "Path":
-        return other / self.path
-
-    def __fspath__(self) -> str:
-        return self.path.__fspath__()
+    # The whole filesystem surface (ls / read_* / write_* / stat / exists /
+    # parent / iterdir / size / unlink / ``/`` / ``with`` / …) is mirrored to
+    # :meth:`_internal_path` by :class:`~yggdrasil.path.ProxyPathMixin`.
 
     # -- lifecycle (UC ops — stay on the wrapper) ----------------------
     def update(self, **changes: Any) -> "ExternalLocation":

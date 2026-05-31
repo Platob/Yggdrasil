@@ -34,11 +34,15 @@ def test_delete(service):
 
 
 def test_client_credentials_property_cached():
+    # ``client.credentials`` is a flat alias onto the ``client.external``
+    # umbrella (centralized external-data services).
     client = MagicMock(spec=DatabricksClient)
+    type(client).external = DatabricksClient.external
     type(client).credentials = DatabricksClient.credentials
     a = client.credentials
     assert isinstance(a, Credentials)
-    assert client.credentials is a
+    assert client.credentials is a                  # cached on the umbrella
+    assert client.external.credentials is a         # same instance both ways
 
 
 # --- flexible finder -------------------------------------------------------
