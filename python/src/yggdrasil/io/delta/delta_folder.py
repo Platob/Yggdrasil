@@ -559,7 +559,16 @@ class DeltaFolder(Folder):
     # Row-level delete
     # ==================================================================
 
-    def _delete(self, predicate: "Predicate", options: DeltaOptions) -> int:
+    def _delete(
+        self,
+        predicate: "Predicate" = None,
+        *,
+        wait: Any = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: Any,
+    ) -> int:
+        options = self.check_options(kwargs.pop("options", None), **kwargs)
         snap = self.snapshot(fresh=True)
         if snap.metadata is None:
             return 0
@@ -636,7 +645,7 @@ class DeltaFolder(Folder):
 
     _ROW_INDEX_COL = "__yggdrasil_dv_row_index__"
 
-    def _partition_file_rows(self, *, leaf: ParquetFile, predicate: "Predicate",
+    def _partition_file_rows(self, *, leaf: ParquetFile, predicate: "Predicate" = None,
                              existing_dv: "Optional[DeletionVector]") -> "tuple[list[int], list[int]]":
         already_masked = existing_dv.deleted_rows if existing_dv is not None else set()
         kept, all_visible, total = [], [], 0
@@ -651,7 +660,8 @@ class DeltaFolder(Folder):
                 idx_col = pa.array([total + i for i in visible], type=pa.int64())
                 tagged = vis_table.append_column(self._ROW_INDEX_COL, idx_col)
                 all_visible.extend(idx_col.to_pylist())
-                matched = predicate.filter_arrow_table(tagged)
+                # ``None`` predicate → no filter, every visible row matches.
+                matched = tagged if predicate is None else predicate.filter_arrow_table(tagged)
                 if matched.num_rows:
                     kept.extend(matched.column(self._ROW_INDEX_COL).to_pylist())
                 total += n

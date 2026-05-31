@@ -119,21 +119,25 @@ class TestDeleteByRewrite(DeltaTestCase):
         d.write_arrow_table(
             self.pa.table({"id": [1, 2, 3, 4, 5], "v": ["a", "b", "c", "d", "e"]}),
         )
-        n = d.delete("id IN (2, 4)")
-        self.assertEqual(n, 2)
+        self.assertIs(d.delete("id IN (2, 4)"), d)   # returns the tabular
 
         out = d.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), [1, 3, 5])
         # Snapshot moved one version forward.
         self.assertGreaterEqual(d.snapshot(fresh=True).version, 1)
 
+    def test_delete_without_predicate_removes_every_row(self) -> None:
+        d = self.delta_io()
+        d.write_arrow_table(self.pa.table({"id": [1, 2, 3], "v": ["a", "b", "c"]}))
+        self.assertIs(d.delete(), d)  # no predicate → delete all, returns self
+        self.assertEqual(d.read_arrow_table().num_rows, 0)
+
     def test_rewrite_no_match_no_commit(self) -> None:
         d = self.delta_io()
         d.write_arrow_table(self.pa.table({"id": [1, 2, 3]}))
         before = d.snapshot(fresh=True).version
 
-        n = d.delete("id > 999")
-        self.assertEqual(n, 0)
+        d.delete("id > 999")
         # No matched rows → no commit.
         self.assertEqual(d.snapshot(fresh=True).version, before)
 
@@ -162,8 +166,7 @@ class TestDeleteByDV(DeltaTestCase):
         ]
         original_sizes = {p.full_path(): p.size for p in original_files}
 
-        n = d.delete("id IN (20, 40)", options=self._opts())
-        self.assertEqual(n, 2)
+        d.delete("id IN (20, 40)", options=self._opts())
 
         # The snapshot's AddFiles still point at the same paths, but
         # they now carry a deletion vector descriptor.
