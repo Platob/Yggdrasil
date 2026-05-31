@@ -149,8 +149,13 @@ class S3Bucket(ExploreUrlRepr, RemotePath):
     def http(self) -> S3HttpClient:
         """The signed pure-HTTP S3 client, built once from the service creds."""
         if self._http is None:
+            from yggdrasil.enums.aws import AWSRegion
+
             client = self.service.client
-            region = getattr(client, "region", None) or "us-east-1"
+            # Configured region first; otherwise sniff it out of the bucket name
+            # (people bake it in: ``acme-dls3-eu-central-1-p``); else us-east-1.
+            region = getattr(client, "region", None) or AWSRegion.from_text(self._bucket) or "us-east-1"
+            region = str(region)
             endpoint_url = getattr(client, "endpoint_url", None)
             managed = not endpoint_url
             if endpoint_url:  # S3-compatible store (MinIO / localstack) → path-style
