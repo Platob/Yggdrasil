@@ -1,125 +1,156 @@
-"""Unit tests for the generic JobSkeleton (declarative Python-job definition)."""
+"""Unit tests for the dataclass skeletons + @job / @task decorators."""
 from __future__ import annotations
 
+import dataclasses
 from unittest.mock import MagicMock
 
 import pytest
 
-from yggdrasil.databricks.job import JobSkeleton
+from yggdrasil.databricks.job import (
+    CallableSkeleton,
+    JobSkeleton,
+    TaskSkeleton,
+    job,
+    task,
+)
 
 
-class _Demo(JobSkeleton):
-    entry_point = "ygg-demo"
-    task_key = "demo"
+# --------------------------------------------------------------------------- #
+# CallableSkeleton — fields are the parameters; callable
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass
+class _Greeter(CallableSkeleton):
+    who: str
+    times: int = 1
 
-    @property
-    def name(self) -> str:
-        return "ygg-demo-job"
-
-    def parameters(self):
-        return ["a", "b"]
-
-    def run(self, *args, **kwargs):
-        return "ran"
+    def run(self):
+        return "hi " * self.times + self.who
 
 
-def test_is_abstract():
-    with pytest.raises(TypeError):
-        JobSkeleton()  # name + run are abstract
+class TestCallableSkeleton:
+    def test_fields_are_parameters(self):
+        assert _Greeter("ada", 2).parameters() == ["ada", "2"]
+
+    def test_is_callable(self):
+        assert _Greeter("ada")() == "hi ada"
 
 
-def test_default_definition_builds_python_wheel_task():
-    spec = _Demo().definition()
-    assert spec["name"] == "ygg-demo-job"
-    assert "trigger" not in spec               # default trigger is None → omitted
-    task = spec["tasks"][0]
-    assert task.task_key == "demo"
-    assert task.python_wheel_task.package_name == "yggdrasil"
-    assert task.python_wheel_task.entry_point == "ygg-demo"
-    assert task.python_wheel_task.parameters == ["a", "b"]
-
-
-def test_trigger_included_when_set():
-    class Triggered(_Demo):
-        def trigger(self):
-            return {"file_arrival": {"url": "/Volumes/x"}}
-
-    spec = Triggered().definition()
-    assert spec["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
-
-
-def test_deploy_get_or_creates_via_service():
-    jobs = MagicMock()
-    job = _Demo().deploy(jobs)
-    jobs.create_or_update.assert_called_once()
-    kwargs = jobs.create_or_update.call_args.kwargs
-    assert kwargs["name"] == "ygg-demo-job"
-    assert "tasks" in kwargs and "name" not in kwargs.get("tasks", [])
-    assert job is jobs.create_or_update.return_value
-
-
-def test_run_is_the_python_body():
-    assert _Demo().run() == "ran"
-
-
-def test_callable_runs_the_body_when_no_tasks():
-    # No @task methods → calling the skeleton calls run().
-    assert _Demo()() == "ran"
-
-
-class _Etl(JobSkeleton):
-    @property
-    def name(self) -> str:
-        return "ygg-etl"
-
-    @JobSkeleton.task
-    def extract(self):
-        self.calls.append("extract")
-        return "x"
-
-    @JobSkeleton.task(key="load", depends_on=["extract"])
-    def load(self):
-        self.calls.append("load")
-        return "l"
-
-    def __init__(self):
-        self.calls = []
-
-
+# --------------------------------------------------------------------------- #
+# @task — build a TaskSkeleton from a function signature
+# --------------------------------------------------------------------------- #
 class TestTaskDecorator:
-    def test_discovers_tasks(self):
-        specs = {s.key: s for s in _Etl._task_specs()}
-        assert set(specs) == {"extract", "load"}
-        assert specs["load"].depends_on == ("extract",)
+    def test_builds_task_skeleton_from_signature(self):
+        @task(depends_on=["extract"], timeout_seconds=600)
+        def load(table: str, mode: str = "append"):
+            return (table, mode)
 
-    def test_definition_builds_one_task_per_method_with_deps(self):
-        spec = _Etl().definition()
+        assert issubclass(load, TaskSkeleton)
+        assert [f.name for f in dataclasses.fields(load)] == ["table", "mode"]
+        inst = load(table="c.s.t")
+        assert inst.parameters() == ["c.s.t", "append"]   # from the fields
+        assert inst() == ("c.s.t", "append")              # runs the function
+        assert load.task_key == "load"
+        assert load.depends_on == ("extract",)
+        assert load.task_options == {"timeout_seconds": 600}
+
+    def test_to_task_renders_python_wheel(self):
+        @task(key="ld")
+        def load(table: str):
+            return table
+
+        t = load(table="c.s.t").to_task()
+        assert t.task_key == "ld"
+        assert t.python_wheel_task.parameters == ["c.s.t"]
+
+
+# --------------------------------------------------------------------------- #
+# @job — build a JobSkeleton from a function signature
+# --------------------------------------------------------------------------- #
+class TestJobDecorator:
+    def test_builds_job_skeleton_from_signature(self):
+        @job(name="ygg-etl")
+        def etl(src: str, dst: str = "out"):
+            return f"{src}->{dst}"
+
+        assert issubclass(etl, JobSkeleton)
+        inst = etl(src="a")
+        assert inst.name == "ygg-etl"
+        assert inst.parameters() == ["a", "out"]
+        assert inst() == "a->out"                          # callable
+
+    def test_default_single_task_definition(self):
+        @job
+        def etl(src: str):
+            return src
+
+        spec = etl(src="a").definition()
+        assert spec["name"] == "etl"
+        assert "trigger" not in spec
+        task_obj = spec["tasks"][0]
+        assert task_obj.python_wheel_task.parameters == ["a"]
+
+    def test_trigger_included_when_set(self):
+        @job(trigger={"file_arrival": {"url": "/Volumes/x"}})
+        def etl(src: str):
+            return src
+
+        assert etl(src="a").definition()["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
+
+
+# --------------------------------------------------------------------------- #
+# JobSkeleton with composed task steps
+# --------------------------------------------------------------------------- #
+class TestComposedJob:
+    def _steps(self):
+        @task
+        def extract(src: str):
+            return f"x:{src}"
+
+        @task(depends_on=["extract"])
+        def load(src: str):
+            return f"l:{src}"
+
+        return extract, load
+
+    def test_definition_one_task_per_step_with_deps(self):
+        extract, load = self._steps()
+
+        @job(name="ygg-pipe", steps=[extract, load])
+        def pipe(src: str):
+            ...
+
+        spec = pipe(src="a").definition()
         tasks = {t.task_key: t for t in spec["tasks"]}
         assert set(tasks) == {"extract", "load"}
         assert tasks["extract"].depends_on is None
         assert tasks["load"].depends_on[0].task_key == "extract"
-        # multi-task → the task key is prepended to the wheel parameters
-        assert tasks["load"].python_wheel_task.parameters == ["load"]
+        # the job's field binds into each step by name
+        assert tasks["extract"].python_wheel_task.parameters == ["a"]
 
-    def test_call_runs_tasks_in_dependency_order(self):
-        etl = _Etl()
-        results = etl()
-        assert etl.calls == ["extract", "load"]     # topo order honoured
-        assert results == {"extract": "x", "load": "l"}
+    def test_call_runs_steps_in_dependency_order(self):
+        extract, load = self._steps()
 
-    def test_single_task_forwards_call_args(self):
-        seen = {}
+        @job(steps=[load, extract])     # declared out of order
+        def pipe(src: str):
+            ...
 
-        class One(JobSkeleton):
-            @property
-            def name(self):
-                return "one"
+        result = pipe(src="a")()
+        assert result == {"extract": "x:a", "load": "l:a"}
 
-            @JobSkeleton.task
-            def go(self, *, n=0):
-                seen["n"] = n
-                return n
 
-        assert One()(n=5) == 5                       # *args/**kwargs forwarded
-        assert seen["n"] == 5
+def test_deploy_get_or_creates_via_service():
+    @job(name="ygg-demo")
+    def demo(src: str):
+        return src
 
+    jobs = MagicMock()
+    deployed = demo(src="a").deploy(jobs)
+    jobs.create_or_update.assert_called_once()
+    assert jobs.create_or_update.call_args.kwargs["name"] == "ygg-demo"
+    assert deployed is jobs.create_or_update.return_value
+
+
+def test_jobskeleton_requires_name():
+    # abstract `name` → can't instantiate the bare base
+    with pytest.raises(TypeError):
+        JobSkeleton()

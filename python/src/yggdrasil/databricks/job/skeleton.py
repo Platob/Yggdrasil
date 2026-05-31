@@ -1,179 +1,188 @@
-"""``JobSkeleton`` — define a Python-backed job and render its definition.
+"""Skeletons — dataclass-defined, callable job / task definitions.
 
-A :class:`~yggdrasil.databricks.job.Job` is the *runtime handle* to a job that
-already exists in a workspace. A :class:`JobSkeleton` is the other half: a small
-declarative class that describes a Python job in code — its name, trigger, and
-the Python work to run — and renders that into a **job definition** (the kwargs
-:meth:`Jobs.create_or_update` consumes), then deploys it into a live
-:class:`Job`.
+Three layers:
 
-Declare the work with the :meth:`task` decorator; the skeleton is **callable**
-like a plain function — calling it runs the tasks locally (in dependency
-order)::
+- :class:`CallableSkeleton` — a dataclass that is **callable** like a function.
+  Its dataclass *fields are its parameters*; calling it runs :meth:`run` (or,
+  when built from a function, that function with the field values). The field
+  values also render into the deployed task's wheel parameters.
+- :class:`TaskSkeleton` — a single job task: a :class:`CallableSkeleton` plus
+  task metadata (key / depends_on / databricks ``Task`` options) and
+  :meth:`~TaskSkeleton.to_task`.
+- :class:`JobSkeleton` — a whole job: a name, a trigger, and either a body
+  (:meth:`run`) for a single-task job or a tuple of :class:`TaskSkeleton`
+  ``steps``. Renders the :meth:`Jobs.create_or_update` kwargs via
+  :meth:`~JobSkeleton.definition` and get-or-creates a live :class:`Job` via
+  :meth:`~JobSkeleton.deploy`.
 
-    class Etl(JobSkeleton):
-        @property
-        def name(self): return "ygg-etl"
+The :func:`task` / :func:`job` decorators turn a plain function into a
+``TaskSkeleton`` / ``JobSkeleton`` subclass, **grabbing the fields from the
+function's signature**::
 
-        @JobSkeleton.task
-        def extract(self): ...
+    @task(depends_on=["extract"])
+    def load(table: str, mode: str = "append"):
+        ...
 
-        @JobSkeleton.task(depends_on=["extract"])
-        def load(self): ...
-
-    Etl()()                       # run locally: extract → load
-    job = Etl().deploy(client.jobs)   # get-or-create the live Job (two tasks)
-
-A skeleton with no ``@task`` methods falls back to a single Python-wheel task
-invoking :attr:`entry_point`, and calling it runs :meth:`run`.
+    load(table="c.s.t").parameters()   # ["c.s.t", "append"]  (from the fields)
+    load(table="c.s.t")()              # runs the function with those fields
 """
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields, make_dataclass
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.databricks.job.job import Job
     from yggdrasil.databricks.job.service import Jobs
 
-__all__ = ["JobSkeleton"]
-
-#: Attribute the :meth:`JobSkeleton.task` decorator stamps onto a method.
-_TASK_ATTR = "__job_task__"
+__all__ = ["CallableSkeleton", "TaskSkeleton", "JobSkeleton", "task", "job"]
 
 
-@dataclass(frozen=True)
-class _TaskSpec:
-    method: str
-    key: str
-    depends_on: tuple[str, ...]
-    options: dict
+def _render(value: Any) -> str:
+    return value if isinstance(value, str) else str(value)
 
 
-class JobSkeleton(ABC):
-    """Declarative, callable definition of a Python-backed Databricks job."""
+@dataclass
+class CallableSkeleton:
+    """A callable whose dataclass fields are its parameters."""
 
-    #: Wheel package + console entry point the deployed task invokes (the
-    #: installed ``ygg`` script that re-enters this skeleton on the cluster).
-    package_name: ClassVar[str] = "yggdrasil"
-    entry_point: ClassVar[str] = "ygg-job"
-
-    #: Task key for the default single-task job (no ``@task`` methods).
-    task_key: ClassVar[str] = "run"
-
-    # -- task decorator -------------------------------------------------
-    @staticmethod
-    def task(
-        func: Optional[Callable] = None,
-        *,
-        key: Optional[str] = None,
-        depends_on: "tuple[str, ...] | list[str]" = (),
-        **options: Any,
-    ) -> Any:
-        """Mark a method as a job task.
-
-        Use bare (``@JobSkeleton.task``) or parameterised
-        (``@JobSkeleton.task(key="load", depends_on=["extract"], ...)``).
-        ``key`` defaults to the method name; ``depends_on`` lists upstream task
-        keys; extra ``**options`` ride onto the databricks ``Task`` (timeout,
-        retries, compute, …)."""
-
-        def deco(f: Callable) -> Callable:
-            setattr(f, _TASK_ATTR, (key, tuple(depends_on), options))
-            return f
-
-        return deco(func) if callable(func) else deco
-
-    # -- declarative surface (override in subclasses) -------------------
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Stable job display name — the upsert key for create-or-update."""
+    #: Set when the skeleton is built from a function (:func:`task` / :func:`job`)
+    #: — the body :meth:`run` invokes with the field values.
+    _func: ClassVar[Optional[Callable]] = None
 
     def run(self, *args: Any, **kwargs: Any) -> Any:
-        """Body for a skeleton with no ``@task`` methods. Override it, or
-        declare ``@task`` methods and let :meth:`__call__` drive them."""
-        raise NotImplementedError(
-            f"{type(self).__name__} declares no @task methods and no run() override"
-        )
-
-    def parameters(self) -> list[str]:
-        """Positional arguments passed to :attr:`entry_point` (and the task)."""
-        return []
-
-    def trigger(self) -> Any:
-        """A databricks ``TriggerSettings`` (file-arrival / schedule / …), or
-        ``None`` for a manually-run job. Default ``None``."""
-        return None
-
-    # -- task discovery + local execution -------------------------------
-    @classmethod
-    def _task_specs(cls) -> list[_TaskSpec]:
-        """All ``@task``-decorated methods across the MRO (base-first, deduped
-        by method name so an override replaces its parent)."""
-        specs: dict[str, _TaskSpec] = {}
-        for klass in reversed(cls.__mro__):
-            for attr, value in vars(klass).items():
-                meta = getattr(value, _TASK_ATTR, None)
-                if meta is None:
-                    continue
-                key, depends_on, options = meta
-                specs[attr] = _TaskSpec(attr, key or attr, depends_on, options)
-        return list(specs.values())
-
-    @staticmethod
-    def _ordered(specs: list[_TaskSpec]) -> list[_TaskSpec]:
-        """Topologically order *specs* by ``depends_on`` (stable)."""
-        by_key = {s.key: s for s in specs}
-        seen: set[str] = set()
-        order: list[_TaskSpec] = []
-
-        def visit(s: _TaskSpec) -> None:
-            if s.key in seen:
-                return
-            seen.add(s.key)
-            for dep in s.depends_on:
-                upstream = by_key.get(dep)
-                if upstream is not None:
-                    visit(upstream)
-            order.append(s)
-
-        for s in specs:
-            visit(s)
-        return order
+        """The body. Override it, or build the skeleton from a function."""
+        func = type(self)._func
+        if func is None:
+            raise NotImplementedError(f"{type(self).__name__} has no run() body")
+        merged = {f.name: getattr(self, f.name) for f in fields(self)}
+        merged.update(kwargs)
+        return func(*args, **merged)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Run the job locally, like a plain function.
+        """Run the skeleton locally, like a plain function."""
+        return self.run(*args, **kwargs)
 
-        With ``@task`` methods, invokes them in dependency order — a single
-        task receives ``*args/**kwargs``, several return a ``{task_key: result}``
-        dict. With no ``@task`` methods, calls :meth:`run`.
-        """
-        specs = self._task_specs()
-        if not specs:
-            return self.run(*args, **kwargs)
-        ordered = self._ordered(specs)
-        if len(ordered) == 1:
-            return getattr(self, ordered[0].method)(*args, **kwargs)
-        return {s.key: getattr(self, s.method)() for s in ordered}
+    def parameters(self) -> list[str]:
+        """Positional parameters for the deployed task — the field values."""
+        return [_render(getattr(self, f.name)) for f in fields(self)]
 
-    # -- databricks tasks + rendering -----------------------------------
-    def tasks(self) -> list[Any]:
-        """Build the databricks ``Task`` list.
+    @classmethod
+    def from_function(cls, func: Callable, **namespace: Any) -> type:
+        """Build a *cls* subclass (a dataclass) whose fields mirror *func*'s
+        signature, running *func* with those fields on call."""
+        flds: list = []
+        for p in inspect.signature(func).parameters.values():
+            if p.name == "self" or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                continue
+            ann = p.annotation if p.annotation is not inspect.Parameter.empty else Any
+            if p.default is inspect.Parameter.empty:
+                flds.append((p.name, ann))
+            else:
+                flds.append((p.name, ann, field(default=p.default)))
+        new_cls = make_dataclass(
+            func.__name__,
+            flds,
+            bases=(cls,),
+            namespace={"_func": staticmethod(func), **namespace},
+        )
+        new_cls.__doc__ = func.__doc__
+        new_cls.__module__ = getattr(func, "__module__", new_cls.__module__)
+        return new_cls
 
-        One Python-wheel task per ``@task`` method (invoking :attr:`entry_point`
-        with the task key + :meth:`parameters` when there's more than one task,
-        else just :meth:`parameters`), or a single default task when none are
-        declared."""
+
+@dataclass
+class TaskSkeleton(CallableSkeleton):
+    """A single job task — a :class:`CallableSkeleton` + task metadata."""
+
+    package_name: ClassVar[str] = "yggdrasil"
+    entry_point: ClassVar[str] = "ygg-job"
+    task_key: ClassVar[str] = "run"
+    depends_on: ClassVar[tuple[str, ...]] = ()
+    task_options: ClassVar[dict] = {}
+
+    def to_task(self) -> Any:
+        """Render the databricks ``Task`` (python-wheel) for this task."""
         from databricks.sdk.service.jobs import (
             PythonWheelTask,
             Task,
             TaskDependency,
         )
 
-        specs = self._ordered(self._task_specs())
-        if not specs:
+        cls = type(self)
+        return Task(
+            task_key=cls.task_key,
+            depends_on=([TaskDependency(task_key=d) for d in cls.depends_on] or None),
+            python_wheel_task=PythonWheelTask(
+                package_name=cls.package_name,
+                entry_point=cls.entry_point,
+                parameters=self.parameters(),
+            ),
+            **cls.task_options,
+        )
+
+
+@dataclass
+class JobSkeleton(CallableSkeleton, ABC):
+    """A whole job — name + trigger + body (:meth:`run`) or ``steps``."""
+
+    package_name: ClassVar[str] = "yggdrasil"
+    entry_point: ClassVar[str] = "ygg-job"
+    task_key: ClassVar[str] = "run"
+
+    #: Ordered :class:`TaskSkeleton` subclasses composing this job. Empty → a
+    #: single default task that runs :meth:`run`.
+    steps: ClassVar[tuple[type, ...]] = ()
+
+    #: Trigger for function-built jobs (the :func:`job` decorator stores it
+    #: here); class-based jobs override :meth:`trigger` instead.
+    trigger_settings: ClassVar[Any] = None
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Stable job display name — the upsert key for create-or-update."""
+
+    def trigger(self) -> Any:
+        """A databricks ``TriggerSettings`` (file-arrival / schedule / …), or
+        ``None`` for a manually-run job."""
+        return type(self).trigger_settings
+
+    # -- steps -> task skeletons ----------------------------------------
+    def _step_instances(self) -> list["TaskSkeleton"]:
+        """Instantiate each ``steps`` :class:`TaskSkeleton`, binding the job's
+        fields to the step's matching fields by name."""
+        out: list[TaskSkeleton] = []
+        for step_cls in type(self).steps:
+            kwargs = {
+                f.name: getattr(self, f.name)
+                for f in fields(step_cls)
+                if hasattr(self, f.name)
+            }
+            out.append(step_cls(**kwargs))
+        return out
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the job locally. A single-task job (no ``steps``) runs
+        :meth:`run`; composed jobs run each step in order — one step receives
+        the call args, several return a ``{task_key: result}`` dict."""
+        steps = self._step_instances()
+        if not steps:
+            return self.run(*args, **kwargs)
+        if len(steps) == 1:
+            return steps[0](*args, **kwargs)
+        return {type(s).task_key: s() for s in steps}
+
+    # -- databricks tasks + rendering -----------------------------------
+    def tasks(self) -> list[Any]:
+        """One ``Task`` per ``step``, or a single default python-wheel task
+        running :meth:`run` when there are no steps."""
+        from databricks.sdk.service.jobs import PythonWheelTask, Task
+
+        steps = self._step_instances()
+        if not steps:
             return [
                 Task(
                     task_key=self.task_key,
@@ -184,27 +193,10 @@ class JobSkeleton(ABC):
                     ),
                 )
             ]
-        multi = len(specs) > 1
-        out: list[Any] = []
-        for s in specs:
-            out.append(
-                Task(
-                    task_key=s.key,
-                    depends_on=(
-                        [TaskDependency(task_key=d) for d in s.depends_on] or None
-                    ),
-                    python_wheel_task=PythonWheelTask(
-                        package_name=self.package_name,
-                        entry_point=self.entry_point,
-                        parameters=([s.key, *self.parameters()] if multi else self.parameters()),
-                    ),
-                    **s.options,
-                )
-            )
-        return out
+        return [s.to_task() for s in steps]
 
     def definition(self) -> dict:
-        """Render the :meth:`Jobs.create_or_update` kwargs for this skeleton."""
+        """Render the :meth:`Jobs.create_or_update` kwargs for this job."""
         spec: dict[str, Any] = {"name": self.name, "tasks": self.tasks()}
         trigger = self.trigger()
         if trigger is not None:
@@ -215,3 +207,70 @@ class JobSkeleton(ABC):
         """Get-or-create the live :class:`Job` from :meth:`definition`."""
         spec = self.definition()
         return service.create_or_update(name=spec.pop("name"), **spec)
+
+
+# ---------------------------------------------------------------------------
+# Decorators — build a skeleton from a function's signature
+# ---------------------------------------------------------------------------
+
+
+def task(
+    func: Optional[Callable] = None,
+    *,
+    key: Optional[str] = None,
+    depends_on: "tuple[str, ...] | list[str]" = (),
+    entry_point: Optional[str] = None,
+    package_name: Optional[str] = None,
+    **options: Any,
+) -> Any:
+    """Turn a function into a :class:`TaskSkeleton` subclass.
+
+    The fields are grabbed from the function signature; ``key`` defaults to the
+    function name, ``depends_on`` lists upstream task keys, and extra
+    ``**options`` ride onto the databricks ``Task``.
+    """
+
+    def deco(f: Callable) -> type:
+        ns: dict[str, Any] = {
+            "task_key": key or f.__name__,
+            "depends_on": tuple(depends_on),
+            "task_options": options,
+        }
+        if entry_point is not None:
+            ns["entry_point"] = entry_point
+        if package_name is not None:
+            ns["package_name"] = package_name
+        return TaskSkeleton.from_function(f, **ns)
+
+    return deco(func) if callable(func) else deco
+
+
+def job(
+    func: Optional[Callable] = None,
+    *,
+    name: Optional[str] = None,
+    trigger: Any = None,
+    steps: "tuple[type, ...] | list[type]" = (),
+    entry_point: Optional[str] = None,
+    package_name: Optional[str] = None,
+) -> Any:
+    """Turn a function into a :class:`JobSkeleton` subclass.
+
+    The fields are grabbed from the function signature; ``name`` defaults to the
+    function name, ``trigger`` / ``steps`` configure the job.
+    """
+
+    def deco(f: Callable) -> type:
+        display = name or f.__name__
+        ns: dict[str, Any] = {
+            "name": property(lambda self, _n=display: _n),
+            "steps": tuple(steps),
+            "trigger_settings": trigger,
+        }
+        if entry_point is not None:
+            ns["entry_point"] = entry_point
+        if package_name is not None:
+            ns["package_name"] = package_name
+        return JobSkeleton.from_function(f, **ns)
+
+    return deco(func) if callable(func) else deco

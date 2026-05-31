@@ -28,6 +28,8 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
+from dataclasses import dataclass, field
+
 from yggdrasil.databricks.job.skeleton import JobSkeleton
 from yggdrasil.enums.mode import Mode
 
@@ -51,21 +53,24 @@ LOGS_SUBDIR = f"{ASYNC_ROOT}/logs"
 ASYNC_MODES = (Mode.OVERWRITE, Mode.APPEND)
 
 
+@dataclass
 class TableJob(JobSkeleton):
     """File-arrival job skeleton that aggregates a table's async inserts.
 
-    Bound to a single :class:`Table` (its ``.sql/async`` area). Build via
-    ``TableJob(table)``; :meth:`ensure` / :attr:`job` get-or-create the live
-    Databricks job from :meth:`definition`, and :meth:`run` is the loader the
-    deployed task executes. Usually reached through :attr:`Table.async_job`.
+    A single-task :class:`~yggdrasil.databricks.job.JobSkeleton` bound to one
+    :class:`Table` (its ``.sql/async`` area). Build via ``TableJob(table)``;
+    :meth:`ensure` / :attr:`job` get-or-create the live Databricks job from
+    :meth:`definition`, and :meth:`run` (the body) is the loader the deployed
+    task executes. Usually reached through :attr:`Table.async_job`.
     """
 
     entry_point: ClassVar[str] = "ygg-table-async-load"
+    task_key: ClassVar[str] = "async-load"
     _NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
 
-    def __init__(self, table: "Table") -> None:
-        self._table = table
-        self._job: "Job | None" = None
+    #: The bound table (the single job/loader parameter).
+    table: "Table"
+    _job: "Job | None" = field(default=None, init=False, repr=False, compare=False)
 
     # -- identity / paths -----------------------------------------------
     @staticmethod
@@ -80,10 +85,11 @@ class TableJob(JobSkeleton):
     # -- JobSkeleton definition surface ---------------------------------
     @property
     def name(self) -> str:
-        return self.job_name(self._table)
+        return self.job_name(self.table)
 
     def parameters(self) -> list[str]:
-        return [self._table.full_name()]
+        # The wheel param is the table's full name, not the live handle.
+        return [self.table.full_name()]
 
     def trigger(self) -> Any:
         from databricks.sdk.service.jobs import (
@@ -93,7 +99,7 @@ class TableJob(JobSkeleton):
 
         return TriggerSettings(
             file_arrival=FileArrivalTriggerConfiguration(
-                url=self.logs_path(self._table).full_path(),
+                url=self.logs_path(self.table).full_path(),
             ),
         )
 
@@ -101,7 +107,7 @@ class TableJob(JobSkeleton):
     def ensure(self) -> "TableJob":
         """Get-or-create the underlying Databricks job from :meth:`definition`."""
         if self._job is None:
-            self._job = self.deploy(self._table.client.jobs)
+            self._job = self.deploy(self.table.client.jobs)
         return self
 
     @property
@@ -109,8 +115,7 @@ class TableJob(JobSkeleton):
         """The live :class:`Job` (deployed on first access)."""
         return self.ensure()._job
 
-    # -- the loader the trigger runs (the job's single @task) -----------
-    @JobSkeleton.task(key="async-load")
+    # -- the loader the trigger runs (the job body) ---------------------
     def run(self, *, wait: Any = True, limit: Optional[int] = None) -> int:
         """Consume pending operation logs and load them into their targets.
 
@@ -120,7 +125,7 @@ class TableJob(JobSkeleton):
         ALL …``), runs it through ygg, then deletes the consumed logs + data.
         Returns the number of operations processed.
         """
-        table = self._table
+        table = self.table
         logs_dir = self.logs_path(table)
         if not logs_dir.exists():
             return 0
@@ -164,7 +169,7 @@ class TableJob(JobSkeleton):
         return self.run(wait=wait, limit=limit)
 
     def _resolve_target(self, full_name: str) -> "Table":
-        table = self._table
+        table = self.table
         if table is not None and table.full_name() == full_name:
             return table
         return table.service[full_name]
@@ -173,7 +178,7 @@ class TableJob(JobSkeleton):
         """Reconstruct the staged-Parquet :class:`Path` from its logged path."""
         from yggdrasil.databricks.path import DatabricksPath
 
-        return DatabricksPath.from_(path, client=self._table.client)
+        return DatabricksPath.from_(path, client=self.table.client)
 
 
 def _best_effort_unlink(path: Any) -> None:
