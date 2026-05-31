@@ -22,13 +22,20 @@ Object-oriented, mirroring the Python classes:
 
 | JS/TS (`packages/yggdrasil/`) | Python (`python/src/yggdrasil/`) |
 |---|---|
-| `enums/mimeType.ts` | `enums/mime_type.py` |
-| `enums/mediaType.ts` | `enums/media_type.py` |
-| `enums/index.ts` | `enums/__init__.py` |
+| `enums/mimeType.ts` · `mediaType.ts` · `state.ts` · `byteUnit.ts` | `enums/mime_type.py` · `media_type.py` · `state.py` · `byteunit.py` |
+| `url/url.ts` | `url/url.py` |
+| `path/path.ts` | `path/path.py` (value identity) |
+| `http_/request.ts` | `http_/request.py` + session |
+| `io/tabular.ts` | `io/tabular/` (Arrow IPC) |
 | `index.ts` | `__init__.py` |
 
-Implemented so far: **`enums`** (MIME / media-type registry). More modules
-follow the same one-to-one mapping.
+Implemented: **`enums`** (MIME/media-type, State, ByteUnit), **`url`** (URL
+value type — parity-tested against the Python reference), **`path`** (URL-backed
+pathlib identity), **`http_`** (HTTPRequest/HTTPSession over `fetch`), **`io`**
+(Arrow IPC `Tabular`; `apache-arrow` is a peer dependency). Tested with
+**vitest** (`npm test`) + benchmarks (`npm run bench`). Follow-on: full `path`
+IO holders (Local/S3/Node), `io` parquet/csv readers + a polars adapter, and the
+`http_` cache / identity-hash layer.
 
 ## Usage
 

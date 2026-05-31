@@ -4,4 +4,12 @@
 // rule). Implemented incrementally; start with ``enums``.
 
 export * as enums from "./enums";
+export * as url from "./url";
+export * as path from "./path";
+export * as http from "./http_";
+export * as io from "./io";
 export { MimeType, MimeTypes, MediaType, State, ByteUnit, type Magic, type MimeOpts, type StateLike } from "./enums";
+export { URL, type URLParts } from "./url";
+export { Path } from "./path";
+export { HTTPRequest, HTTPSession, type HTTPHeaders, type HTTPResponse } from "./http_";
+export { Tabular } from "./io";

@@ -1,7 +1,7 @@
 {
   "name": "@platob/yggdrasil",
-  "version": "0.1.0",
-  "description": "Client-side replication of the Python yggdrasil package — MIME/media-type registry and more. Kept in parity with python/src/yggdrasil.",
+  "version": "0.2.0",
+  "description": "Client-side replication of the Python yggdrasil package — MIME/media-type registry, URL value type, and more. Kept in parity with python/src/yggdrasil.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -15,10 +15,18 @@
   "files": ["dist", "README.md"],
   "sideEffects": false,
   "scripts": {
-    "build": "tsup index.ts --format esm --dts --clean --out-dir dist",
-    "prepublishOnly": "npm run build"
+    "build": "tsup index.ts --format esm --dts --clean --out-dir dist --external apache-arrow",
+    "test": "vitest run",
+    "bench": "vitest bench --run",
+    "prepublishOnly": "npm run test && npm run build"
   },
-  "keywords": ["yggdrasil", "mime", "media-type", "arrow"],
+  "keywords": ["yggdrasil", "mime", "media-type", "url", "path", "http", "arrow"],
+  "peerDependencies": {
+    "apache-arrow": ">=17"
+  },
+  "peerDependenciesMeta": {
+    "apache-arrow": { "optional": true }
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -29,7 +37,9 @@
     "access": "public"
   },
   "devDependencies": {
+    "apache-arrow": "^17.0.0",
     "tsup": "^8.3.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
   }
 }
