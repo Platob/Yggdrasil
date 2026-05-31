@@ -5,7 +5,7 @@ Covers:
   no match_by), and the sync path otherwise;
 * ``async_insert`` staging a Parquet + dropping a JSON operation log;
 * ``TableJob.ensure`` get-or-create with a file-arrival trigger;
-* ``TableJob.process`` aggregating logs into one INSERT per (target, mode),
+* ``TableJob.run`` aggregating logs into one INSERT per (target, mode),
   then cleaning up consumed logs + data.
 """
 from __future__ import annotations
@@ -145,7 +145,7 @@ class TestEnsure:
 
 
 # --------------------------------------------------------------------------- #
-# TableJob.process (aggregate logs → INSERT per (target, mode))
+# TableJob.run (aggregate logs → INSERT per (target, mode))
 # --------------------------------------------------------------------------- #
 class TestProcess:
     def _wire_logs(self, table):
@@ -170,7 +170,7 @@ class TestProcess:
         t.client.jobs = MagicMock()
         logs_dir = self._wire_logs(t)
         logs_dir.exists.return_value = False
-        assert TableJob(t).process() == 0
+        assert TableJob(t).run() == 0
         t.insert.assert_not_called()
 
     def test_aggregates_same_group_into_one_insert(self):
@@ -186,7 +186,7 @@ class TestProcess:
             TableJob, "_data_file",
             lambda self, p: data_files.setdefault(p, MagicMock()),
         ):
-            processed = TableJob(t).process(wait=False)
+            processed = TableJob(t).run(wait=False)
 
         assert processed == 2
         t.insert.assert_called_once()
@@ -226,7 +226,7 @@ class TestProcess:
         ]
 
         with patch.object(TableJob, "_data_file", lambda self, p: MagicMock()):
-            processed = TableJob(t).process()
+            processed = TableJob(t).run()
 
         assert processed == 2
         modes = {c.kwargs["mode"] for c in t.insert.call_args_list}

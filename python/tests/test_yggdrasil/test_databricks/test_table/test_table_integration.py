@@ -893,7 +893,7 @@ class TestTableAsyncInsertIntegration(_TableFixture):
         self.assertTrue(data_path.exists())
 
         # 2. loader: aggregate + load through ygg, then clean up.
-        processed = TableJob(self.table).process(wait=True)
+        processed = TableJob(self.table).run(wait=True)
         self.assertGreaterEqual(processed, 1)
         self.assertEqual(self._count(), 3)
 
@@ -924,7 +924,7 @@ class TestTableAsyncInsertIntegration(_TableFixture):
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(f"async insert failed: {exc}.")
 
-        TableJob(self.table).process(wait=True)
+        TableJob(self.table).run(wait=True)
         self.assertEqual(self._count(), 1)
 
     def test_async_rejects_merge_mode(self) -> None:

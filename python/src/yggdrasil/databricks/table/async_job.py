@@ -167,10 +167,6 @@ class TableJob(Flow):
             processed += len(items)
         return processed
 
-    #: Descriptive alias for :meth:`run` — calling the skeleton runs it too.
-    def process(self, *, wait: Any = True, limit: Optional[int] = None) -> int:
-        return self.run(wait=wait, limit=limit)
-
     def _resolve_target(self, full_name: str) -> "Table":
         table = self.table
         if table is not None and table.full_name() == full_name:
