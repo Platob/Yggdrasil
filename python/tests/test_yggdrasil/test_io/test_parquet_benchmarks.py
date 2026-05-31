@@ -3,7 +3,7 @@
 What this file is
 -----------------
 A wall-clock harness over :class:`ParquetFile._write_arrow_batches`
-(``python/src/yggdrasil/io/primitive/parquet_io.py``) and the raw
+(``python/src/yggdrasil/io/parquet_file.py``) and the raw
 ``pq.write_table`` baseline. The goal is to make the cost of each
 write-side knob visible per release, not to lock in a hard SLA.
 

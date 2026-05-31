@@ -15,8 +15,8 @@ bridge cost shows up alongside the codec.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/primitive/bench_parquet.py
-    PYTHONPATH=src python benchmarks/io/primitive/bench_parquet.py --repeat 5
+    PYTHONPATH=src python benchmarks/io/bench_parquet.py
+    PYTHONPATH=src python benchmarks/io/bench_parquet.py --repeat 5
 """
 from __future__ import annotations
 

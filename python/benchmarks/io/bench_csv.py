@@ -7,7 +7,7 @@ of the parse cost.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/primitive/bench_csv.py
+    PYTHONPATH=src python benchmarks/io/bench_csv.py
 """
 from __future__ import annotations
 

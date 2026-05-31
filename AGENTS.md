@@ -415,7 +415,7 @@ Performance changes go through `python/benchmarks/` — not through
 intuition.
 
 The benches are organized to mirror the source tree
-(`benchmarks/data/`, `benchmarks/io/primitive/`,
+(`benchmarks/data/`, `benchmarks/io/`,
 `benchmarks/io/path/`, …). Each module that ships a hot path has
 a paired `bench_<name>.py` that exercises the public surface.
 

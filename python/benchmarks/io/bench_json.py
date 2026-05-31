@@ -6,7 +6,7 @@ flat analytics + nested (matches the API-response ingest shape).
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/primitive/bench_json.py
+    PYTHONPATH=src python benchmarks/io/bench_json.py
 """
 from __future__ import annotations
 

@@ -1,7 +1,7 @@
 """Local-dev no-regression bench — yggdrasil :class:`DeltaFolder` vs ``deltalake``.
 
 **This is not run in CI** and is not part of the canonical
-``benchmarks/io/nested/bench_delta.py`` flow. It exists so a
+``benchmarks/io/delta/bench_delta.py`` flow. It exists so a
 developer poking at the Delta read/write paths on a laptop can
 sanity-check that a change didn't blow yggdrasil's numbers out vs
 the rust-backed reference implementation in the
@@ -29,7 +29,7 @@ Usage::
     uv pip install deltalake>=1.0
 
     # Run the comparison:
-    PYTHONPATH=src python benchmarks/io/nested/bench_delta_noregression.py \\
+    PYTHONPATH=src python benchmarks/io/delta/bench_delta_noregression.py \\
         --rows 50000 --partitions 16 --repeat 5 --allow-deltalake
 
 The script exits with status 2 (and prints a hint) when the gate

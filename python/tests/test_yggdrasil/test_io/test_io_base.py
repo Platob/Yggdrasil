@@ -8,7 +8,7 @@ exposes the stdlib :class:`typing.BinaryIO` surface (``read``,
 
 These tests pin the cursor surface itself; format-specific behavior
 (Parquet / CSV / JSON / ...) lives under
-``test_yggdrasil/test_io/test_primitive/``.
+``test_yggdrasil/test_io/``.
 
 Cursor tests use ``_cursor(data)`` which opens a ``Memory`` parent
 in ``"rb+"`` mode, returning a proper IO cursor with seek/tell state.

@@ -37,8 +37,8 @@ how much work the predicate actually did.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/nested/bench_delta.py
-    PYTHONPATH=src python benchmarks/io/nested/bench_delta.py \\
+    PYTHONPATH=src python benchmarks/io/delta/bench_delta.py
+    PYTHONPATH=src python benchmarks/io/delta/bench_delta.py \\
         --rows 200000 --partitions 32 --batch-rows 5000 --repeat 5
 """
 from __future__ import annotations

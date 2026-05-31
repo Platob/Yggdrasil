@@ -7,8 +7,8 @@ primitive benches so the formats are directly comparable.
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/primitive/bench_arrow_ipc.py
-    PYTHONPATH=src python benchmarks/io/primitive/bench_arrow_ipc.py --repeat 5
+    PYTHONPATH=src python benchmarks/io/bench_arrow_ipc.py
+    PYTHONPATH=src python benchmarks/io/bench_arrow_ipc.py --repeat 5
 """
 from __future__ import annotations
 

@@ -7,7 +7,7 @@ common ingest format for JSON-shaped event streams).
 
 Usage::
 
-    PYTHONPATH=src python benchmarks/io/primitive/bench_ndjson.py
+    PYTHONPATH=src python benchmarks/io/bench_ndjson.py
 """
 from __future__ import annotations
 
