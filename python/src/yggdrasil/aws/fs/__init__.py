@@ -7,11 +7,12 @@ disturbing the API.
 
 from __future__ import annotations
 
-from .path import S3Path
+from .path import S3Bucket, S3Path
 from .service import S3Service
 
 
 __all__ = [
+    "S3Bucket",
     "S3Path",
     "S3Service",
 ]

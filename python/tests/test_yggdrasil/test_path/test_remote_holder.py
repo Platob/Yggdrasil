@@ -22,21 +22,23 @@ from yggdrasil.databricks.fs.service import DBFSService
 from yggdrasil.databricks.volume.volumes import Volumes
 
 from tests.test_yggdrasil.test_databricks._files_fake import wire_files_session
+from tests.test_yggdrasil.test_aws._fake_s3 import FakeS3, wire_s3_path, reset_s3_singletons
 from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.io.csv_file import CSVFile
 from yggdrasil.io.ndjson_file import NDJSONFile
 from yggdrasil.io.parquet_file import ParquetFile
 
 
-def _s3_service(client: MagicMock) -> MagicMock:
-    """Wrap a boto-shaped mock client in a mock :class:`S3Service`.
+def _s3(url: str = "s3://my-bucket/data.bin"):
+    """A real (pure-HTTP) :class:`S3Path` backed by an in-memory FakeS3.
 
-    :class:`S3Path` reaches the boto surface through
-    ``self.service.boto_client``.
+    Returns ``(path, fake)``; ``fake.objects`` is the ``{key: bytes}`` store
+    and ``fake.calls`` counts the REST primitives (``put`` / ``get`` /
+    ``head`` / ``delete`` / multipart) the path issued.
     """
-    svc = MagicMock(spec=S3Service)
-    svc.boto_client = client
-    return svc
+    reset_s3_singletons()
+    fake = FakeS3()
+    return wire_s3_path(fake, url, bucket="my-bucket"), fake
 
 
 def _dbfs_service(client: MagicMock) -> MagicMock:
@@ -83,56 +85,6 @@ class _Body:
         pass
 
 
-def _s3_round_trip_client(payload_holder: dict) -> MagicMock:
-    """Return a Mock that round-trips a single object's bytes.
-
-    ``payload_holder`` is a one-key dict (e.g. ``{"buf": b""}``)
-    that the client mutates on put_object and reads on get_object,
-    so the test can write through the path and read back the same
-    bytes via the same mock.
-    """
-    client = MagicMock()
-
-    def head_object(*, Bucket, Key):
-        buf = payload_holder.get("buf")
-        if buf is None:
-            err = Exception("NoSuchKey")
-            err.response = {  # type: ignore[attr-defined]
-                "Error": {"Code": "NoSuchKey"},
-                "ResponseMetadata": {"HTTPStatusCode": 404},
-            }
-            raise err
-        return {"ContentLength": len(buf), "LastModified": None}
-
-    def get_object(*, Bucket, Key, Range=None):
-        buf = payload_holder.get("buf") or b""
-        if Range:
-            # bytes=N-M format; closed range, inclusive end.
-            spec = Range.split("=", 1)[1]
-            start_str, end_str = spec.split("-", 1)
-            start = int(start_str)
-            end = int(end_str) if end_str else len(buf) - 1
-            return {"Body": _Body(buf[start : end + 1])}
-        return {"Body": _Body(buf)}
-
-    def put_object(*, Bucket, Key, Body):
-        payload_holder["buf"] = Body if isinstance(Body, (bytes, bytearray)) else bytes(Body)
-        return {}
-
-    def upload_fileobj(Fileobj, Bucket, Key, Config=None):
-        # Streamed write (managed transfer): drain the file handle.
-        payload_holder["buf"] = Fileobj.read()
-        return {}
-
-    def list_objects_v2(**kwargs):
-        return {"KeyCount": 0}
-
-    client.head_object.side_effect = head_object
-    client.get_object.side_effect = get_object
-    client.put_object.side_effect = put_object
-    client.upload_fileobj.side_effect = upload_fileobj
-    client.list_objects_v2.side_effect = list_objects_v2
-    return client
 
 
 # ---------------------------------------------------------------------------
@@ -210,25 +162,16 @@ def _dbfs_round_trip_client(payload_holder: dict) -> MagicMock:
 class TestParquetOverS3:
 
     def test_round_trip(self, table) -> None:
-        store = {}
-        client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.parquet", service=_s3_service(client))
+        s3, fake = _s3("s3://my-bucket/data.parquet")
+        ParquetFile(holder=s3, owns_holder=False).write_arrow_table(table)
+        assert fake.objects["data.parquet"].startswith(b"PAR1")
 
-        writer = ParquetFile(holder=s3, owns_holder=False)
-        writer.write_arrow_table(table)
-        # Bytes ended up in the mock store.
-        assert store["buf"].startswith(b"PAR1")
-
-        reader = ParquetFile(holder=s3, owns_holder=False)
-        loaded = reader.read_arrow_table()
+        loaded = ParquetFile(holder=s3, owns_holder=False).read_arrow_table()
         assert loaded.equals(table)
 
     def test_collect_schema(self, table) -> None:
-        store = {}
-        client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.parquet", service=_s3_service(client))
+        s3, _ = _s3("s3://my-bucket/data.parquet")
         ParquetFile(holder=s3, owns_holder=False).write_arrow_table(table)
-
         schema = ParquetFile(holder=s3, owns_holder=False).collect_schema()
         assert set(schema.field_names()) == {"id", "name"}
 
@@ -241,9 +184,7 @@ class TestParquetOverS3:
 class TestCsvOverS3:
 
     def test_round_trip(self, table) -> None:
-        store = {}
-        client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.csv", service=_s3_service(client))
+        s3, fake = _s3("s3://my-bucket/data.csv")
 
         CSVFile(holder=s3, owns_holder=False).write_arrow_table(table)
         loaded = CSVFile(holder=s3, owns_holder=False).read_arrow_table()
@@ -258,9 +199,7 @@ class TestCsvOverS3:
 class TestArrowIPCOverS3:
 
     def test_round_trip(self, table) -> None:
-        store = {}
-        client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.arrow", service=_s3_service(client))
+        s3, fake = _s3("s3://my-bucket/data.arrow")
 
         ArrowIPCFile(holder=s3, owns_holder=False).write_arrow_table(table)
         loaded = ArrowIPCFile(holder=s3, owns_holder=False).read_arrow_table()
@@ -275,13 +214,11 @@ class TestArrowIPCOverS3:
 class TestNDJsonOverS3:
 
     def test_round_trip(self, table) -> None:
-        store = {}
-        client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.ndjson", service=_s3_service(client))
+        s3, fake = _s3("s3://my-bucket/data.ndjson")
 
         NDJSONFile(holder=s3, owns_holder=False).write_arrow_table(table)
         # Sanity check the line shape on the wire.
-        lines = store["buf"].decode("utf-8").splitlines()
+        lines = fake.objects["data.ndjson"].decode("utf-8").splitlines()
         assert len(lines) == 3
         loaded = NDJSONFile(holder=s3, owns_holder=False).read_arrow_table()
         assert loaded.column("id").to_pylist() == [1, 2, 3]
@@ -381,106 +318,72 @@ class TestArrowIPCOverVolume:
 # ---------------------------------------------------------------------------
 
 
-def _s3_call_counts(client: MagicMock) -> dict[str, int]:
-    return {
-        name: getattr(client, name).call_count
-        for name in ("head_object", "get_object", "put_object", "delete_object")
-    }
-
-
 class TestS3WriteColdPath:
-    """A cold remote path (no prior stat) must write in 1 SDK call."""
-
-    def _fresh_s3(self, store: dict) -> S3Path:
-        from yggdrasil.path.remote_path import RemotePath
-        RemotePath._INSTANCES.clear()
-        client = _s3_round_trip_client(store)
-        s3 = S3Path("s3://my-bucket/data.bin", service=_s3_service(client))
-        client.head_object.reset_mock()
-        client.get_object.reset_mock()
-        client.put_object.reset_mock()
-        client.delete_object.reset_mock()
-        return s3
+    """A cold remote path (no prior stat) writes in one signed PUT — no
+    speculative HEAD/GET probe first."""
 
     def test_write_all_one_call(self, table) -> None:
-        store = {}
-        s3 = self._fresh_s3(store)
+        s3, fake = _s3()
         s3.write_bytes(b"hello", overwrite=True)
-        assert s3.service.boto_client.put_object.call_count == 1
-        assert s3.service.boto_client.head_object.call_count == 0
-        assert s3.service.boto_client.get_object.call_count == 0
-        assert store["buf"] == b"hello"
+        assert fake.calls.get("put") == 1
+        assert fake.calls.get("head", 0) == 0
+        assert fake.calls.get("get", 0) == 0
+        assert fake.objects["data.bin"] == b"hello"
 
     def test_cursor_write_one_call(self, table) -> None:
-        store = {}
-        s3 = self._fresh_s3(store)
+        s3, fake = _s3()
         with s3.open("wb") as f:
             f.write(b"cursor-data")
-        assert s3.service.boto_client.put_object.call_count == 1
-        assert s3.service.boto_client.head_object.call_count == 0
-        assert s3.service.boto_client.get_object.call_count == 0
-        assert store["buf"] == b"cursor-data"
+        assert fake.calls.get("put") == 1
+        assert fake.calls.get("head", 0) == 0
+        assert fake.calls.get("get", 0) == 0
+        assert fake.objects["data.bin"] == b"cursor-data"
 
     def test_cursor_seek_write_one_call(self, table) -> None:
-        store = {}
-        s3 = self._fresh_s3(store)
+        s3, fake = _s3()
         with s3.open("wb") as f:
             f.write(b"head")
             f.seek(10)
             f.write(b"tail")
-        assert s3.service.boto_client.put_object.call_count == 1
-        assert s3.service.boto_client.get_object.call_count == 0
-        assert len(store["buf"]) == 14
-        assert store["buf"][:4] == b"head"
-        assert store["buf"][10:] == b"tail"
+        assert fake.calls.get("put") == 1
+        assert fake.calls.get("get", 0) == 0
+        buf = fake.objects["data.bin"]
+        assert len(buf) == 14 and buf[:4] == b"head" and buf[10:] == b"tail"
 
     def test_parquet_write_one_call(self, table) -> None:
-        store = {}
-        s3 = self._fresh_s3(store)
-        s3 = S3Path("s3://my-bucket/data.parquet", service=s3.service)
-        s3.service.boto_client.upload_fileobj.reset_mock()
+        s3, fake = _s3("s3://my-bucket/data.parquet")
         ParquetFile(holder=s3, owns_holder=False).write_arrow_table(table)
-        # Format writes spill + stream → one upload_fileobj, no put/head/get.
-        assert s3.service.boto_client.upload_fileobj.call_count == 1
-        assert s3.service.boto_client.put_object.call_count == 0
-        assert s3.service.boto_client.head_object.call_count == 0
-        assert store["buf"].startswith(b"PAR1")
+        # Format writes spill + stream → one PUT, no put-then-probe.
+        assert fake.calls.get("put") == 1
+        assert fake.calls.get("head", 0) == 0
+        assert fake.objects["data.parquet"].startswith(b"PAR1")
 
     def test_arrow_ipc_write_one_call(self, table) -> None:
-        store = {}
-        s3 = self._fresh_s3(store)
+        s3, fake = _s3("s3://my-bucket/data.arrow")
         ArrowIPCFile(holder=s3, owns_holder=False).write_arrow_table(table)
-        assert s3.service.boto_client.upload_fileobj.call_count == 1
-        assert s3.service.boto_client.put_object.call_count == 0
-        assert s3.service.boto_client.head_object.call_count == 0
+        assert fake.calls.get("put") == 1
+        assert fake.calls.get("head", 0) == 0
 
     def test_csv_write_one_call(self, table) -> None:
-        store = {}
-        s3 = self._fresh_s3(store)
+        s3, fake = _s3("s3://my-bucket/data.csv")
         CSVFile(holder=s3, owns_holder=False).write_arrow_table(table)
-        assert s3.service.boto_client.upload_fileobj.call_count == 1
-        assert s3.service.boto_client.put_object.call_count == 0
-        assert s3.service.boto_client.head_object.call_count == 0
+        assert fake.calls.get("put") == 1
+        assert fake.calls.get("head", 0) == 0
 
     def test_ndjson_write_one_call(self, table) -> None:
-        store = {}
-        s3 = self._fresh_s3(store)
+        s3, fake = _s3("s3://my-bucket/data.ndjson")
         NDJSONFile(holder=s3, owns_holder=False).write_arrow_table(table)
-        assert s3.service.boto_client.upload_fileobj.call_count == 1
-        assert s3.service.boto_client.put_object.call_count == 0
-        assert s3.service.boto_client.head_object.call_count == 0
+        assert fake.calls.get("put") == 1
+        assert fake.calls.get("head", 0) == 0
 
     def test_stat_correct_after_write(self, table) -> None:
-        store = {}
-        s3 = self._fresh_s3(store)
+        s3, _ = _s3()
         s3.write_bytes(b"hello world", overwrite=True)
         assert s3.size == 11
         assert s3.size_known
 
     def test_read_back_after_cursor_write(self) -> None:
-        store = {}
-        s3 = self._fresh_s3(store)
+        s3, _ = _s3()
         with s3.open("wb") as f:
             f.write(b"round-trip")
-        data = s3.read_bytes()
-        assert data == b"round-trip"
+        assert s3.read_bytes() == b"round-trip"

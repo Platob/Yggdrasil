@@ -333,48 +333,36 @@ class TestS3PathSingleton:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(_RealS3Path is None, reason="boto3 / S3Path not available")
+@pytest.mark.skipif(_RealS3Path is None, reason="S3Path not available")
 class TestS3MultipartUpload:
-    """Mirror of VolumePath's multipart: a large upload runs through
-    boto3's parallel managed transfer; a small one stays a single PUT."""
+    """A small upload is a single signed PUT; a large one streams as a
+    pure-HTTP multipart upload (create / parts / complete)."""
 
     @staticmethod
-    def _real_with_mock_client():
-        from unittest.mock import MagicMock
+    def _path(key="obj.bin"):
+        from tests.test_yggdrasil.test_aws._fake_s3 import FakeS3, wire_s3_path, reset_s3_singletons
 
-        svc = MagicMock()
-        client = MagicMock()
-        svc.boto_client = client
-        p = _RealS3Path(url=URL.from_("s3://bucket/obj.bin"), service=svc,
-                        singleton_ttl=False)
-        return p, client
+        reset_s3_singletons()
+        fake = FakeS3()
+        return wire_s3_path(fake, f"s3://bucket/{key}", bucket="bucket"), fake
 
     def test_small_upload_uses_put_object(self):
-        p, client = self._real_with_mock_client()
+        p, fake = self._path()
         p._upload(b"small payload")
-        client.put_object.assert_called_once()
-        client.upload_fileobj.assert_not_called()
+        assert fake.calls.get("put") == 1
+        assert fake.calls.get("create_multipart", 0) == 0
+        assert fake.objects["obj.bin"] == b"small payload"
 
     def test_large_upload_uses_managed_multipart(self, monkeypatch):
-        from boto3.s3.transfer import TransferConfig
-
-        p, client = self._real_with_mock_client()
+        p, fake = self._path()
         monkeypatch.setattr(type(p), "MULTIPART_THRESHOLD", 1024)
         monkeypatch.setattr(type(p), "MULTIPART_CHUNKSIZE", 256)
-        monkeypatch.setattr(type(p), "MULTIPART_CONCURRENCY", 4)
-
         p._upload(b"x" * 4096)
-
-        client.upload_fileobj.assert_called_once()
-        client.put_object.assert_not_called()
-        args, kwargs = client.upload_fileobj.call_args
-        # (fileobj, bucket, key, Config=TransferConfig)
-        assert args[1] == "bucket"
-        assert args[2] == "obj.bin"
-        config = kwargs["Config"]
-        assert isinstance(config, TransferConfig)
-        assert config.multipart_chunksize == 256
-        assert config.max_request_concurrency == 4
+        assert fake.calls.get("create_multipart") == 1
+        assert fake.calls.get("upload_part") == 16
+        assert fake.calls.get("complete_multipart") == 1
+        assert fake.calls.get("put", 0) == 0
+        assert fake.objects["obj.bin"] == b"x" * 4096
 
 
 # ---------------------------------------------------------------------------
