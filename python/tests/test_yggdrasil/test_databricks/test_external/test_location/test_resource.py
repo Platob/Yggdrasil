@@ -1,6 +1,8 @@
 """Resource: yggdrasil.databricks.external.location.resource.ExternalLocation."""
 from __future__ import annotations
 
+import pytest
+
 from databricks.sdk.service.catalog import ExternalLocationInfo
 
 
@@ -20,12 +22,47 @@ def test_lazy_info_single_fetch(service):
     api.get.assert_called_once()
 
 
-def test_path_is_an_s3path(service):
+def test_path_is_a_credential_backed_s3path(service):
     from yggdrasil.aws.fs.path import S3Path
 
     p = service.get("raw_zone").path
     assert isinstance(p, S3Path)
     assert p.bucket == "my-bucket" and p.key == "raw/"
+    # built via the storage credential's AWS client.
+    service.client.credentials.credential.assert_called_with("prod-cred")
+
+
+def test_filesystem_ops_mirror_to_inner_path(service):
+    el = service.get("raw_zone")
+    # write + read through the wrapper delegate to the inner S3Path.
+    (el / "f.txt").write_bytes(b"hello")
+    assert bytes((el / "f.txt").read_bytes()) == b"hello"
+    assert el.exists()
+    assert [c.key for c in el.ls()] == ["raw/f.txt"]
+
+
+def test_parent_and_children_use_inner_path(service):
+    from yggdrasil.aws.fs.path import S3Path
+
+    el = service.get("raw_zone")
+    assert isinstance(el.parent, S3Path)        # navigation leaves the wrapper
+    assert isinstance(el / "sub/x.parquet", S3Path)
+
+
+def test_non_s3_scheme_raises(service, store):
+    from databricks.sdk.service.catalog import ExternalLocationInfo
+
+    store["az"] = ExternalLocationInfo(
+        name="az", url="abfss://c@acct.dfs.core.windows.net/x", credential_name="az-cred",
+    )
+    with pytest.raises(NotImplementedError):
+        service.get("az").path
+
+
+def test_is_hashable(service):
+    el = service.get("raw_zone")
+    assert hash(el) is not None
+    assert el in {el}
 
 
 def test_explore_url_and_clickable_repr(service):

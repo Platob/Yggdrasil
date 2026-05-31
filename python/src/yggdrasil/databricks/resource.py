@@ -24,6 +24,12 @@ __all__ = ["DatabricksResource"]
 
 class DatabricksResource(ExploreUrlRepr, ABC):
 
+    # Resources are identity objects (singleton-cached handles), so hash/eq on
+    # identity — like the client and services they hang off of — so they stay
+    # usable as dict / set keys regardless of any value-based __eq__ a subclass
+    # (or mixin) might introduce.
+    __hash__ = object.__hash__
+
     @property
     def explore_url(self) -> Optional[URL]:
         """Workspace UI deep-link for this resource, or ``None``.

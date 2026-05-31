@@ -28,9 +28,24 @@ def store():
 
 @pytest.fixture
 def service(store):
+    from tests.test_yggdrasil.test_aws._fake_s3 import FakeS3, wire_s3_path, reset_s3_singletons
+
+    reset_s3_singletons()
+    fake = FakeS3()
     client = MagicMock(spec=DatabricksClient)
     client.base_url = URL.from_("https://dbc-x.cloud.databricks.com")
     api = client.workspace_client.return_value.external_locations
+
+    # The inner storage path is vended by the location's storage credential:
+    # client.credentials.credential(name).aws_client(region).s3.path(url).
+    # Wire that chain to a fake-backed S3Path so delegation hits an in-memory S3.
+    def _s3_path(url):
+        bucket = url.split("://", 1)[1].split("/", 1)[0]
+        return wire_s3_path(fake, url, bucket=bucket)
+
+    aws = MagicMock()
+    aws.s3.path.side_effect = _s3_path
+    client.credentials.credential.return_value.aws_client.return_value = aws
 
     def _get(name, **k):
         if name not in store:
@@ -52,4 +67,6 @@ def service(store):
     api.create.side_effect = _create
     api.update.side_effect = _update
     api.delete.side_effect = lambda name, **k: store.pop(name, None)
-    return ExternalLocations(client=client)
+    svc = ExternalLocations(client=client)
+    svc._fake = fake  # the in-memory S3 backing the inner storage paths
+    return svc

@@ -1,15 +1,21 @@
-"""Per-external-location resource: metadata, storage path, lifecycle.
+"""Per-external-location resource: metadata + a credential-backed storage path.
 
-An :class:`ExternalLocation` wraps one Unity Catalog external location — a
-named binding of a cloud storage URL (``s3://`` / ``abfss://`` / ``gs://``) to a
-storage credential. Collection operations (list / create) live on
-:class:`~yggdrasil.databricks.external.location.service.ExternalLocations`.
+An :class:`ExternalLocation` wraps one Unity Catalog external location — a named
+binding of a cloud storage URL to a storage credential — and **behaves like the
+storage path itself**. It holds a single inner ``_external_path`` (an
+:class:`~yggdrasil.aws.fs.path.S3Path` built from the location's URL + a
+credentials-vended AWS client, so the path lives on its own) and mirrors every
+filesystem operation straight to it; ``parent`` / children navigation returns
+that inner path, leaving the UC wrapper behind.
 
     el = client.external_locations["raw_zone"]
     el.url                 # 's3://my-bucket/raw/'
     el.credential_name     # 'prod-storage-cred'
-    el.path                # S3Path('s3://my-bucket/raw/') — browse the storage
+    el.ls() / el.read_bytes() / el / "sub/file.parquet"   # → inner S3Path I/O
     el.explore_url         # clickable Catalog Explorer link
+
+Only AWS S3 (``s3://`` / ``s3a://`` / ``s3n://``) is supported for now; any other
+scheme raises.
 """
 from __future__ import annotations
 
@@ -23,7 +29,7 @@ from yggdrasil.databricks.resource import DatabricksResource
 from yggdrasil.url import URL
 
 if TYPE_CHECKING:
-    from yggdrasil.databricks.external.location.service import ExternalLocations
+    from yggdrasil.databricks.credentials import Credential
     from yggdrasil.path import Path
 
 __all__ = ["ExternalLocation"]
@@ -32,13 +38,15 @@ __all__ = ["ExternalLocation"]
 #: info) for 30 min before re-resolving.
 _RESOURCE_TTL: float = 30 * 60.0
 
+_S3_SCHEMES = ("s3", "s3a", "s3n")
+
 
 class ExternalLocation(DatabricksResource, Singleton):
-    """A single Unity Catalog external location.
+    """A single Unity Catalog external location, usable as its storage path.
 
     Cached as a singleton per ``(service, name)`` for 30 min
-    (``_SINGLETON_TTL``) — repeated ``client.external_locations[name]`` share
-    one handle (and its fetched info) without re-resolving.
+    (``_SINGLETON_TTL``). Filesystem ops are mirrored to the inner
+    credential-backed :attr:`path`; only AWS S3 is handled for now.
     """
 
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(default_ttl=_RESOURCE_TTL, max_size=4096)
@@ -52,7 +60,7 @@ class ExternalLocation(DatabricksResource, Singleton):
         self,
         name: str,
         *,
-        service: "Optional[ExternalLocations]" = None,
+        service: "Optional[Any]" = None,
         info: Optional[ExternalLocationInfo] = None,
         singleton_ttl: Any = ...,
     ) -> None:
@@ -68,6 +76,7 @@ class ExternalLocation(DatabricksResource, Singleton):
         super().__init__(service=service)
         self.name = name
         self._info = info
+        self._external_path: "Optional[Path]" = None
         self._initialized = True
 
     def __getstate__(self) -> dict:
@@ -77,6 +86,7 @@ class ExternalLocation(DatabricksResource, Singleton):
         self.service = state["service"]
         self.name = state["name"]
         self._info = state.get("info")
+        self._external_path = None
         self._initialized = True
 
     # -- metadata (lazy fetch + cache) ---------------------------------
@@ -87,8 +97,9 @@ class ExternalLocation(DatabricksResource, Singleton):
         return self._info
 
     def refresh(self) -> "ExternalLocation":
-        """Drop the cached :class:`ExternalLocationInfo` and re-fetch."""
+        """Drop the cached info + inner path and re-fetch."""
         self._info = self.service.get_info(self.name)
+        self._external_path = None
         return self
 
     @property
@@ -127,22 +138,63 @@ class ExternalLocation(DatabricksResource, Singleton):
     def browse_only(self) -> bool:
         return bool(self.info.browse_only)
 
-    # -- storage path ---------------------------------------------------
+    # -- the inner credential-backed storage path ----------------------
+    @property
+    def credential(self) -> "Credential":
+        """The storage :class:`Credential` backing this location."""
+        return self.client.credentials.credential(self.credential_name)
+
     @property
     def path(self) -> "Path":
-        """A :class:`~yggdrasil.path.Path` over this location's storage URL —
-        e.g. an :class:`S3Path` for an ``s3://`` location, so you can ``ls`` /
-        read the backing storage directly."""
-        from yggdrasil.path import Path
+        """The inner :class:`~yggdrasil.path.Path` over this location's storage,
+        built once with credentials vended by its storage credential (so it
+        lives on its own). Only AWS S3 for now; other schemes raise."""
+        if self._external_path is None:
+            self._external_path = self._build_path()
+        return self._external_path
 
-        if not self.url:
+    def _build_path(self) -> "Path":
+        url = self.url
+        if not url:
             raise ValueError(f"external location {self.name!r} has no url yet")
-        return Path.from_(self.url)
+        scheme = (URL.from_(url).scheme or "").lower()
+        if scheme not in _S3_SCHEMES:
+            raise NotImplementedError(
+                f"external location {self.name!r}: only AWS S3 is supported for now "
+                f"(got {scheme!r} in {url!r})"
+            )
+        from yggdrasil.enums.aws import AWSRegion
 
-    # -- lifecycle (delegate to the service) ---------------------------
+        region = AWSRegion.from_text(url)
+        # The path carries its own credentials — an AWS client vended by this
+        # location's storage credential — so it can read/write standalone.
+        aws = self.credential.aws_client(region=str(region) if region else None)
+        return aws.s3.path(url)
+
+    # -- mirror filesystem ops straight to the inner path --------------
+    def __getattr__(self, item: str) -> Any:
+        # Only fires for names not found on the resource itself — forward the
+        # whole filesystem surface (ls / read_* / write_* / stat / exists /
+        # parent / iterdir / size / unlink / …) to the inner path. Never
+        # delegate private/dunder names (avoids recursion while building it).
+        if item.startswith("_"):
+            raise AttributeError(item)
+        return getattr(self.path, item)
+
+    def __truediv__(self, other: Any) -> "Path":
+        return self.path / other
+
+    def __rtruediv__(self, other: Any) -> "Path":
+        return other / self.path
+
+    def __fspath__(self) -> str:
+        return self.path.__fspath__()
+
+    # -- lifecycle (UC ops — stay on the wrapper) ----------------------
     def update(self, **changes: Any) -> "ExternalLocation":
         updated = self.service.update(self.name, **changes)
         self._info = updated._info
+        self._external_path = None  # url/credential may have changed
         return self
 
     def delete(self, *, force: bool = False) -> None:
