@@ -70,11 +70,11 @@ class ExternalLocation(DatabricksResource, ProxyPathMixin, Singleton):
         client: Any = None,
         **kwargs: Any,
     ) -> Any:
-        """Build a location from a ``dbfs+location:///<name>[/<sub>]`` URL.
+        """Build a location from a ``dbfs+extloc:///<name>[/<sub>]`` URL.
 
         The first path segment is the external-location *name*; any deeper
         path is joined onto the resolved storage path, so a file address
-        (``/External/Locations/raw_zone/sub/f.parquet``) returns the inner
+        (``/ExternalLocations/raw_zone/sub/f.parquet``) returns the inner
         storage :class:`~yggdrasil.path.Path` for that file while a bare
         name returns the :class:`ExternalLocation` itself. ``client=`` /
         ``service=`` bind it to a workspace the same way the rest of the

@@ -89,7 +89,7 @@ def test_refresh_refetches(service, store):
 
 
 def test_from_url_bare_name_returns_location(service):
-    el = ExternalLocation.from_url("dbfs+location:///raw_zone", service=service)
+    el = ExternalLocation.from_url("dbfs+extloc:///raw_zone", service=service)
     assert isinstance(el, ExternalLocation)
     assert el.name == "raw_zone"
     assert el.url == "s3://my-bucket/raw/"
@@ -99,17 +99,17 @@ def test_from_url_subpath_returns_inner_storage_path(service):
     from yggdrasil.aws.fs.path import S3Path
 
     child = ExternalLocation.from_url(
-        "dbfs+location:///raw_zone/sub/f.parquet", service=service,
+        "dbfs+extloc:///raw_zone/sub/f.parquet", service=service,
     )
     assert isinstance(child, S3Path)            # left the wrapper
     assert child.bucket == "my-bucket" and child.key == "raw/sub/f.parquet"
 
 
 def test_databrickspath_posix_prefix_dispatches_to_location(service):
-    # ``/External/Locations/<name>`` POSIX form coerces to the
-    # ``dbfs+location://`` scheme and dispatches to ExternalLocation.
+    # ``/ExternalLocations/<name>`` POSIX form coerces to the
+    # ``dbfs+extloc://`` scheme and dispatches to ExternalLocation.
     from yggdrasil.databricks.path import DatabricksPath
 
-    el = DatabricksPath.from_("/External/Locations/raw_zone", service=service)
+    el = DatabricksPath.from_("/ExternalLocations/raw_zone", service=service)
     assert isinstance(el, ExternalLocation)
     assert el.name == "raw_zone"

@@ -83,30 +83,22 @@ _PENDING_URL_STASH: dict[int, "URL"] = {}
 #: leading directory the user types (case-insensitive); values are the
 #: scheme each subclass registers under (the ``dbfs+<surface>``
 #: convention — see :class:`Scheme`).
+#: Leading POSIX namespace segment → canonical ``dbfs+<surface>`` scheme.
+#: The segment after the namespace is the rest of the path — for
+#: ``ExternalLocations`` that's the Unity Catalog external-location *name*
+#: (``/ExternalLocations/raw_zone`` → ``dbfs+extloc:///raw_zone``), with any
+#: deeper path a child below it on the backing store.
 _POSIX_NAMESPACES: dict[str, str] = {
     "dbfs": Scheme.DATABRICKS_DBFS.value,
     "Volumes": Scheme.DATABRICKS_VOLUME.value,
     "Workspace": Scheme.DATABRICKS_WORKSPACE.value,
+    "ExternalLocations": Scheme.DATABRICKS_EXTERNAL_LOCATION.value,
 }
-
-#: Multi-segment POSIX namespaces — matched as a leading path prefix
-#: (case-insensitive), unlike the single-segment :data:`_POSIX_NAMESPACES`.
-#: The segment after the prefix is the Unity Catalog external-location
-#: *name*; any deeper path is a child below it on the backing store.
-#: ``/External/Locations/raw_zone`` → ``dbfs+location:///raw_zone``.
-#: Listed longest-first so the most specific prefix wins.
-EXTERNAL_LOCATION_PATH_PREFIX = "/External/Locations/"
-_POSIX_PATH_PREFIXES: Tuple[Tuple[str, str], ...] = (
-    (EXTERNAL_LOCATION_PATH_PREFIX, Scheme.DATABRICKS_EXTERNAL_LOCATION.value),
-)
 
 
 def _looks_like_posix(value: str) -> bool:
     if not isinstance(value, str) or not value.startswith("/"):
         return False
-    low = value.lower()
-    if any(low.startswith(prefix.lower()) for prefix, _ in _POSIX_PATH_PREFIXES):
-        return True
     parts = value.split("/", 2)
     if len(parts) < 2:
         return False
@@ -114,17 +106,12 @@ def _looks_like_posix(value: str) -> bool:
 
 
 def _parse_posix(value: str) -> Tuple[str, str]:
-    """``/dbfs/x`` → ``("dbfs", "/x")``, ``/External/Locations/raw`` →
-    ``("dbfs+location", "/raw")``, etc.
+    """``/dbfs/x`` → ``("dbfs", "/x")``, ``/ExternalLocations/raw`` →
+    ``("dbfs+extloc", "/raw")``, etc.
 
     Case-insensitive on the namespace; the rest of the path is
     preserved verbatim.
     """
-    low = value.lower()
-    for prefix, scheme in _POSIX_PATH_PREFIXES:
-        if low.startswith(prefix.lower()):
-            rest = value[len(prefix):].lstrip("/")
-            return scheme, "/" + rest
     parts = value.split("/", 2)
     if len(parts) < 2:
         raise ValueError(f"Not a Databricks POSIX path: {value!r}")
