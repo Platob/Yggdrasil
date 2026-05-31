@@ -1215,7 +1215,6 @@ class Table(DatabricksPath):
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
         self._staging_volume: Volume | None = None
-        self._async_job = None
         self._initialized = True
 
     # ------------------------------------
@@ -3183,7 +3182,7 @@ class Table(DatabricksPath):
         ``wait=False`` switches to the **async drop** path
         (:meth:`async_insert`): the staged Parquet + a JSON operation log are
         written under the table's ``.sql/async`` area and a file-arrival job
-        (:attr:`async_job`) aggregates and loads them later — no warehouse
+        (:meth:`async_job`) aggregates and loads them later — no warehouse
         statement runs here. Only ``OVERWRITE`` / ``APPEND`` with no
         ``match_by`` qualify; anything else (or a query / Spark source) falls
         through to the normal synchronous path.
@@ -3359,19 +3358,17 @@ class Table(DatabricksPath):
     # async insert — drop Parquet + an operation log; a file-arrival job loads
     # =========================================================================
 
-    @property
     def async_job(self) -> "TableJob":
-        """The file-arrival :class:`TableJob` for this table (lazy get-or-create).
+        """The file-arrival :class:`TableJob` handle for this table.
 
-        Watches ``<staging_volume>/.sql/async/logs`` and aggregates the
-        operation logs that :meth:`async_insert` drops into one ``INSERT``
-        per ``(target, mode)`` group. Created on first access from
-        :meth:`TableJob.definition`."""
-        if self._async_job is None:
-            from yggdrasil.databricks.table.async_job import TableJob
+        A cheap handle — call :meth:`TableJob.ensure` / :meth:`TableJob.deploy`
+        to create the Databricks job (watches ``.sql/async/logs`` and aggregates
+        the operation logs :meth:`async_insert` drops into one ``INSERT`` per
+        ``(target, mode)`` group), or :meth:`TableJob.run` to drive the loader
+        directly."""
+        from yggdrasil.databricks.table.async_job import TableJob
 
-            self._async_job = TableJob(self).ensure()
-        return self._async_job
+        return TableJob(self)
 
     def async_insert(
         self,
@@ -3388,7 +3385,7 @@ class Table(DatabricksPath):
         (:meth:`insert_volume_path`) and an operation log to
         ``<staging_volume>/.sql/async/logs/<op>.json`` that records the target,
         mode, and the data's **full path** (so the data can live anywhere —
-        only the log location is fixed), then ensures :attr:`async_job` exists
+        only the log location is fixed), then returns the log path
         so the file-arrival trigger picks it up. Returns the log path.
 
         Only ``OVERWRITE`` / ``APPEND`` with no ``match_by``; the data is staged
@@ -3426,17 +3423,10 @@ class Table(DatabricksPath):
                 }
             ).encode()
         )
-        # Best-effort: make sure the file-arrival job exists so the drop gets
-        # picked up automatically. The staged data + log are already durable,
-        # so don't fail the insert if the job can't be (re)created right now
-        # (e.g. compute not yet wired into the definition, or no job-create
-        # grant) — an explicit ``table.async_job`` access still surfaces it.
-        try:
-            self.async_job
-        except Exception:
-            logger.warning(
-                "async_insert: could not ensure async_job for %s", self, exc_info=True
-            )
+        # The staged data + log are durable; the file-arrival job (deploy it
+        # once via ``table.async_job().ensure()``) picks the drop up. We don't
+        # deploy here — building/creating a job on every insert would be far too
+        # heavy.
         return log_file
 
     def arrow_insert(

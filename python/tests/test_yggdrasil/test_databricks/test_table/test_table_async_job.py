@@ -92,8 +92,6 @@ class TestAsyncInsert:
         assert payload["target"] == "c.s.t"
         assert payload["mode"] == "append"
         assert payload["data"] == "/Volumes/c/s/t/.sql/tmp/tmp-1-ab.parquet"
-        # touched async_job so the file-arrival trigger exists
-        assert t.async_job is not None
 
 
 # --------------------------------------------------------------------------- #

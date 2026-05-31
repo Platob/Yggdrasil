@@ -16,7 +16,7 @@ insert into a *drop-and-aggregate* pipeline:
 
 Only ``OVERWRITE`` and ``APPEND`` (no ``match_by``) are supported for now.
 
-Reach it lazily via :attr:`yggdrasil.databricks.table.table.Table.async_job`,
+Reach it lazily via :meth:`yggdrasil.databricks.table.table.Table.async_job`,
 which get-or-creates the live :class:`~yggdrasil.databricks.job.Job` from this
 skeleton's :meth:`definition`.
 """
@@ -60,7 +60,7 @@ class TableJob(Flow):
     get-or-create the live Databricks job from :meth:`definition`, and
     :meth:`run` (the flow body, callable via ``TableJob(table)()``) is the
     loader the deployed task executes. Usually reached through
-    :attr:`Table.async_job`.
+    :meth:`Table.async_job`.
     """
 
     task_key: ClassVar[str] = "async-load"
