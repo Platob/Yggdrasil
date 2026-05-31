@@ -216,13 +216,18 @@ class Flow(_Runnable):
     dependencies: "tuple[str, ...]" = ("ygg[databricks]",)
 
     #: Always-installed extras, on top of the wheel / :attr:`dependencies` —
-    #: ``databricks-sdk`` (latest) so the runtime SDK is current.
+    #: ``databricks-sdk`` (latest) so the runtime SDK is current. When building a
+    #: wheel these are also bundled (so they ship as wheels, no index install).
     extra_dependencies: "tuple[str, ...]" = ("databricks-sdk",)
 
-    #: Build the ygg wheel from source on :meth:`deploy` and ship *that* instead
-    #: of installing the published ``ygg`` from an index. Default ``False`` —
-    #: ``ygg`` is published, so the serverless env just pip-installs it; set
-    #: ``True`` for an air-gapped workspace with no index access.
+    #: Project extras to include when building the wheel with its dependencies
+    #: (e.g. ``("databricks",)`` to pull the project's ``[databricks]`` extra).
+    wheel_extras: "tuple[str, ...]" = ()
+
+    #: Build the project wheel **with its dependencies** on :meth:`deploy` and
+    #: ship them all instead of installing the published ``ygg`` from an index.
+    #: Default ``False`` — ``ygg`` is published, so the serverless env just
+    #: pip-installs it; set ``True`` for an air-gapped workspace.
     build_wheel: bool = False
 
     def __init__(
@@ -243,8 +248,7 @@ class Flow(_Runnable):
         self.retries = retries
         self.retry_delay_seconds = retry_delay_seconds
         self._parameters = tuple(parameters)
-        self._wheel_path: Optional[str] = None
-        self._extra_wheel_paths: list[str] = []
+        self._wheel_paths: list[str] = []
         if entry_point is not None:
             self.entry_point = entry_point
         if package_name is not None:
@@ -282,13 +286,12 @@ class Flow(_Runnable):
 
     def effective_dependencies(self) -> list[str]:
         """The serverless dependencies. Once :meth:`deploy` has shipped wheels,
-        it's the uploaded ygg wheel + each :attr:`extra_dependencies` shipped as
-        its own uploaded wheel (no index install); otherwise the published
-        :attr:`dependencies` (``ygg`` **pinned to the running version** so the
-        cluster gets exactly this code, not a stale cached one) +
+        it's the project wheel + every bundled dependency wheel (no index
+        install); otherwise the published :attr:`dependencies` (``ygg`` **pinned
+        to the running version** so the cluster gets exactly this code) +
         :attr:`extra_dependencies` names."""
-        if getattr(self, "_wheel_path", None):
-            return [self._wheel_path, *getattr(self, "_extra_wheel_paths", ())]
+        if getattr(self, "_wheel_paths", None):
+            return list(self._wheel_paths)
         return [self._pin(d) for d in self.dependencies] + list(self.extra_dependencies)
 
     @staticmethod
@@ -357,22 +360,19 @@ class Flow(_Runnable):
         ensure_console_logging()  # so the deploy CRUD is visible interactively
         logger.info("deploying flow %r", self.name)
         if self.build_wheel and self.serverless:
-            from yggdrasil.databricks.job.wheel import (
-                ensure_requirement_wheel,
-                ensure_wheel,
-            )
+            from yggdrasil.databricks.job.wheel import ensure_wheel
 
-            # Isolated build of this flow's own project (adapts to any project),
-            # uploaded under the job-named folder, rebuilt each deploy.
-            self._wheel_path = ensure_wheel(
-                client, self.wheel_source(), workspace_dir=self.wheel_dir()
+            # Isolated build of this flow's own project (adapts to any project)
+            # WITH its dependencies — project + extras + extra_dependencies are
+            # resolved into wheels and all uploaded under the job folder, so the
+            # cluster installs everything by path (no index access).
+            self._wheel_paths = ensure_wheel(
+                client,
+                self.wheel_source(),
+                workspace_dir=self.wheel_dir(),
+                extras=self.wheel_extras,
+                requirements=self.extra_dependencies,
             )
-            # Each extra (latest databricks-sdk) ships as a wheel centralized by
-            # lib name (precheck → reuse, else download + upload), so the cluster
-            # needs no index access and versions are shared across jobs.
-            self._extra_wheel_paths = [
-                ensure_requirement_wheel(client, req) for req in self.extra_dependencies
-            ]
         spec = self.definition()
         logger.info("create-or-update job %r", self.name)
         job = client.jobs.create_or_update(name=spec.pop("name"), **spec)

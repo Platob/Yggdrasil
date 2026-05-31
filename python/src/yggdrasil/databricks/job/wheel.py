@@ -1,22 +1,22 @@
-"""Build the ygg wheel and upload it to a workspace dir for serverless jobs.
+"""Build a project (with its dependencies) into wheels and upload them to a
+workspace dir, so a serverless :class:`~yggdrasil.databricks.job.Flow` installs
+everything by path — no index access on the cluster.
 
-A deployed :class:`~yggdrasil.databricks.job.Flow` doesn't pull ``ygg`` from an
-index — it ships the wheel built from *this* source tree. :func:`ensure_wheel`
-builds the wheel (``python -m build``) and uploads it under
-``/Workspace/Shared/.ygg/whl/pkg/<job>/`` (the :class:`Flow` builds per-job),
-and :func:`ensure_requirement_wheel` ships extra deps (latest ``databricks-sdk``)
-as their own uploaded wheels — so the serverless environment installs everything
-by path, no index access.
+:func:`build_wheel` runs ``pip wheel`` (isolated): the project at *source* — with
+any extras — plus every transitive dependency are resolved into one directory of
+wheels. :func:`ensure_wheel` uploads them all and returns their workspace paths.
+
+(``uv`` has no ``pip wheel`` equivalent — ``uv build`` only produces the project
+wheel — so the dependency-bundling build uses ``pip``.)
 """
 from __future__ import annotations
 
 import logging
-import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +26,9 @@ __all__ = [
     "build_wheel",
     "upload_wheel",
     "ensure_wheel",
-    "download_wheel",
-    "ensure_requirement_wheel",
 ]
 
-#: Root for workspace wheels — one subfolder per package (the job name for the
-#: built wheel, the lib name for external deps) to centralize versions.
+#: Root for workspace wheels — one subfolder per job to keep each self-contained.
 WORKSPACE_WHL_DIR = "/Workspace/Shared/.ygg/whl"
 
 #: Files that mark a buildable Python project root.
@@ -85,81 +82,42 @@ def upload_wheel(client: Any, wheel: "str | Path", *, workspace_dir: str = WORKS
 def ensure_wheel(client: Any, source: "str | Path", *, workspace_dir: str = WORKSPACE_WHL_DIR) -> str:
     """Build the project at *source* (isolated) + upload the wheel; return its
     workspace path. Built fresh each call so the deployed job ships current code."""
-    wheel = build_wheel(source)
-    return upload_wheel(client, wheel, workspace_dir=workspace_dir)
-
-
-def download_wheel(requirement: str, dest_dir: "str | Path | None" = None) -> Path:
-    """``pip download <requirement> --no-deps`` the **latest** wheel for a pinned
-    or unpinned requirement (e.g. ``"databricks-sdk"``); return the ``.whl``."""
-    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-dep-"))
-    logger.info("downloading wheel for %s", requirement)
+def build_wheel(
+    source: "str | Path",
+    *,
+    extras: "tuple[str, ...] | list[str]" = (),
+    requirements: "tuple[str, ...] | list[str]" = (),
+    dest_dir: "str | Path | None" = None,
+) -> list[Path]:
+    """Build the project at (or above) *source* **with its dependencies** —
+    ``pip wheel`` resolves and builds/downloads a wheel for the project (with any
+    *extras*) plus every transitive dependency (and any extra *requirements*)
+    into one dir. Isolated; works for any project. Returns all ``.whl`` paths.
+    """
+    root = find_project_root(source)
+    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-wheel-"))
+    spec = str(root) + (f"[{','.join(extras)}]" if extras else "")
+    logger.info("building wheel (+ dependencies) for %s into %s", spec, out)
     subprocess.run(
-        [
-            sys.executable, "-m", "pip", "download", requirement,
-            "--no-deps", "--only-binary=:all:", "--dest", str(out),
-        ],
+        [sys.executable, "-m", "pip", "wheel", spec, *requirements, "--wheel-dir", str(out)],
         check=True,
     )
     wheels = sorted(out.glob("*.whl"))
     if not wheels:
-        raise FileNotFoundError(f"no wheel downloaded for {requirement!r} in {out}")
-    return wheels[-1]
+        raise FileNotFoundError(f"no wheels produced in {out}")
+    return wheels
 
 
-def _req_name(requirement: str) -> str:
-    """Bare distribution name from a requirement (``databricks-sdk==1.2`` →
-    ``databricks-sdk``)."""
-    return re.split(r"[<>=!~;\s\[]", requirement, 1)[0].strip()
-
-
-def _pinned_version(requirement: str) -> Optional[str]:
-    m = re.search(r"==\s*([0-9][^,;\s]*)", requirement)
-    return m.group(1) if m else None
-
-
-def latest_version(name: str) -> Optional[str]:
-    """Best-effort latest version on the index via ``pip index versions``."""
-    try:
-        out = subprocess.run(
-            [sys.executable, "-m", "pip", "index", "versions", name],
-            check=True, capture_output=True, text=True,
-        ).stdout
-    except Exception:  # noqa: BLE001 - best effort; fall back to download
-        return None
-    m = re.search(r"Available versions:\s*([^\n]+)", out)
-    if m:
-        return m.group(1).split(",")[0].strip()
-    m = re.search(rf"{re.escape(name)}\s*\(([^)]+)\)", out)
-    return m.group(1).strip() if m else None
-
-
-def ensure_requirement_wheel(
+def ensure_wheel(
     client: Any,
-    requirement: str,
+    source: "str | Path",
     *,
     workspace_dir: str = WORKSPACE_WHL_DIR,
-) -> str:
-    """Ship an external lib (e.g. ``databricks-sdk``) as a wheel under
-    ``<workspace_dir>/<lib>/`` — centralized by lib name so every job shares
-    one copy per version.
-
-    Pre-checks: resolve the version (pinned, else latest on the index) and reuse
-    the wheel when it already exists in the workspace; otherwise download +
-    upload it. Returns the workspace path."""
-    from yggdrasil.databricks.path import DatabricksPath
-
-    name = _req_name(requirement)
-    lib_dir = f"{workspace_dir.rstrip('/')}/{name}"
-    version = _pinned_version(requirement) or latest_version(name)
-    if version:
-        predicted = f"{name.replace('-', '_')}-{version}-py3-none-any.whl"
-        dest = f"{lib_dir}/{predicted}"
-        if DatabricksPath.from_(dest, client=client).exists():
-            return dest  # version already uploaded — skip download
-    # Not present (or version unknown): download + upload.
-    wheel = download_wheel(requirement)
-    dest = f"{lib_dir}/{wheel.name}"
-    if DatabricksPath.from_(dest, client=client).exists():
-        return dest
-    return upload_wheel(client, wheel, workspace_dir=lib_dir)
+    extras: "tuple[str, ...] | list[str]" = (),
+    requirements: "tuple[str, ...] | list[str]" = (),
+) -> list[str]:
+    """Build the project at *source* with its dependencies (:func:`build_wheel`)
+    and upload every wheel to *workspace_dir*; return their workspace paths.
+    Built fresh each call so the deployed job ships current code + deps."""
+    wheels = build_wheel(source, extras=extras, requirements=requirements)
+    return [upload_wheel(client, w, workspace_dir=workspace_dir) for w in wheels]

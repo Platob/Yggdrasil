@@ -163,8 +163,7 @@ class TestEnsure:
         other = _job(8, "/Volumes/other/.sql/async/logs/")  # unrelated job
         jobs.list.return_value = [keep, stale, other]
 
-        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value="w.whl"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_requirement_wheel", return_value="sdk.whl"):
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=["w.whl"]):
             TableJob(t).deploy(t.client)
 
         stale.delete.assert_called_once()      # orphan on the shared trigger removed
