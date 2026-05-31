@@ -56,6 +56,8 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
     numericCols[0] ? [{ column: numericCols[0], agg: "sum" }] : []);
   const [pivotData, setPivotData] = useState<PivotResult | null>(null);
   const [pivotChart, setPivotChart] = useState(false);
+  const [pTotals, setPTotals] = useState(true);
+  const [pSort, setPSort] = useState<{ col: number; dir: "asc" | "desc" } | null>(null);
   const [seriesCol, setSeriesCol] = useState(numericCols[0] ?? allCols[0] ?? "");
   const [xCol, setXCol] = useState("");
   const [volCol, setVolCol] = useState("");
@@ -111,7 +113,7 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
     const id = setTimeout(async () => {
       setAnalyzing(true); setErr(null);
       try {
-        const res = await runPivotApi(path, pRows, pCols, pMeas, node, { filters });
+        const res = await runPivotApi(path, pRows, pCols, pMeas, node, { filters, totals: pTotals });
         if (!cancelled) setPivotData(res);
       } catch (e) {
         if (!cancelled) setErr(e instanceof Error ? e.message : "pivot failed");
@@ -120,7 +122,34 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
       }
     }, 250);
     return () => { cancelled = true; clearTimeout(id); };
-  }, [kind, pRows, pCols, pMeas, filters, path, node]);
+  }, [kind, pRows, pCols, pMeas, filters, pTotals, path, node]);
+
+  // A layout change invalidates the sort column index — clear it.
+  useEffect(() => { setPSort(null); }, [pRows, pCols, pMeas, pTotals]);
+
+  // Derived pivot view: pin the grand-total row at the bottom, sort the data
+  // rows by the clicked value column (totals stay put), and mark total columns.
+  const pivotView = useMemo(() => {
+    if (!pivotData) return null;
+    const totalRow = pivotData.has_total_row ? pivotData.rows[pivotData.rows.length - 1] : null;
+    const base = totalRow ? pivotData.rows.slice(0, -1) : pivotData.rows;
+    let data = base;
+    if (pSort) {
+      const ci = pSort.col;
+      data = [...base].sort((a, b) => {
+        const an = Number(a[ci]), bn = Number(b[ci]);
+        const c = Number.isNaN(an) || Number.isNaN(bn)
+          ? String(a[ci] ?? "").localeCompare(String(b[ci] ?? ""))
+          : an - bn;
+        return pSort.dir === "asc" ? c : -c;
+      });
+    }
+    return {
+      rows: totalRow ? [...data, totalRow] : data,
+      hasTotalRow: !!totalRow,
+      firstTotalCol: pivotData.columns.length - pivotData.total_columns,
+    };
+  }, [pivotData, pSort]);
   const runSeries = async (z: { min: number; max: number } | null = zoom) => {
     if (!seriesCol) return;
     setAnalyzing(true); setErr(null);
@@ -201,6 +230,7 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
           <>
             <span className="text-muted/70">{pivotData ? `${pivotData.row_count} rows × ${pivotData.col_count} cols · ${pivotData.source_rows.toLocaleString()} streamed` : "drag fields into the wells →"}</span>
             <span className="ml-auto flex items-center gap-1">
+              <button onClick={() => setPTotals((v) => !v)} className={`px-2 py-1 rounded ${pTotals ? "bg-emerald/15 text-emerald" : "text-muted hover:text-foreground"}`} title="grand totals row + column">Σ totals</button>
               <button onClick={() => setPivotChart((v) => !v)} className={`px-2 py-1 rounded ${pivotChart ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>chart</button>
               {pivotChart && (["bar", "line", "area"] as ChartType[]).map((t) => (
                 <button key={t} onClick={() => setChartType(t)} className={`px-2 py-1 rounded ${chartType === t ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{t}</button>
@@ -353,30 +383,49 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
         <div className="flex gap-3 items-start">
           {/* result grid (+ optional chart) */}
           <div className="flex-1 min-w-0 space-y-2">
-            {pivotChart && pivotData && pivotData.rows.length > 0 && (
-              <Chart type={chartType}
-                labels={pivotData.rows.map((r) => String(r[0] ?? ""))}
-                values={pivotData.rows.map((r) => Number(r[pivotData.row_fields.length] ?? r[r.length - 1]))}
-                color="var(--emerald)" yLabel={pivotData.columns[pivotData.row_fields.length]} />
-            )}
-            {pivotData && pivotData.rows.length > 0 ? (
+            {pivotChart && pivotData && pivotView && pivotData.rows.length > 0 && (() => {
+              const rows = pivotView.hasTotalRow ? pivotView.rows.slice(0, -1) : pivotView.rows;
+              const vc = pivotData.row_fields.length;  // first measure/value column
+              return (
+                <Chart type={chartType}
+                  labels={rows.map((r) => String(r[0] ?? ""))}
+                  values={rows.map((r) => Number(r[vc] ?? r[r.length - 1]))}
+                  color="var(--emerald)" yLabel={pivotData.columns[vc]} />
+              );
+            })()}
+            {pivotData && pivotView && pivotData.rows.length > 0 ? (
               <div className="overflow-auto rounded border border-white/[0.06] max-h-[52vh]">
                 <table className="text-[11px] font-mono border-collapse">
                   <thead className="sticky top-0 z-10">
-                    <tr>{pivotData.columns.map((c, ci) => (
-                      <th key={ci} className={`px-2 py-1.5 border-b border-white/[0.1] bg-[#0d1117] whitespace-nowrap ${ci < pivotData.row_fields.length ? "text-left text-frost/80 sticky left-0 z-20" : "text-right text-emerald/80"}`}>{c}</th>
-                    ))}</tr>
+                    <tr>{pivotData.columns.map((c, ci) => {
+                      const isRowField = ci < pivotData.row_fields.length;
+                      const isTotalCol = ci >= pivotView.firstTotalCol;
+                      return (
+                        <th key={ci}
+                          onClick={() => !isRowField && setPSort((s) => s && s.col === ci ? (s.dir === "desc" ? { col: ci, dir: "asc" } : null) : { col: ci, dir: "desc" })}
+                          className={`px-2 py-1.5 border-b border-white/[0.1] bg-[#0d1117] whitespace-nowrap ${isRowField ? "text-left text-frost/80 sticky left-0 z-20" : `text-right cursor-pointer select-none ${isTotalCol ? "text-emerald font-semibold" : "text-emerald/80 hover:text-emerald"}`}`}>
+                          {c}{pSort?.col === ci ? (pSort.dir === "desc" ? " ▾" : " ▴") : ""}
+                        </th>
+                      );
+                    })}</tr>
                   </thead>
                   <tbody>
-                    {pivotData.rows.map((r, i) => (
-                      <tr key={i} className="hover:bg-white/[0.02]">
-                        {r.map((v, j) => (
-                          <td key={j} className={`px-2 py-1 border-b border-white/[0.03] ${j < pivotData.row_fields.length ? "text-frost/70 font-semibold whitespace-nowrap sticky left-0 bg-[#0b0e14]" : "text-right text-foreground/80 tabular-nums"}`}>
-                            {v == null ? "·" : typeof v === "number" ? Number(v).toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(v)}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
+                    {pivotView.rows.map((r, i) => {
+                      const isTotalRow = pivotView.hasTotalRow && i === pivotView.rows.length - 1;
+                      return (
+                        <tr key={i} className={isTotalRow ? "bg-emerald/[0.06] border-t border-emerald/20" : "hover:bg-white/[0.02]"}>
+                          {r.map((v, j) => {
+                            const isRowField = j < pivotData.row_fields.length;
+                            const isTotalCol = j >= pivotView.firstTotalCol;
+                            return (
+                              <td key={j} className={`px-2 py-1 border-b border-white/[0.03] ${isRowField ? `whitespace-nowrap sticky left-0 ${isTotalRow ? "text-emerald font-semibold bg-[#0b1410]" : "text-frost/70 font-semibold bg-[#0b0e14]"}` : `text-right tabular-nums ${isTotalRow || isTotalCol ? "text-emerald font-semibold" : "text-foreground/80"}`}`}>
+                                {v == null ? "·" : typeof v === "number" ? Number(v).toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(v)}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

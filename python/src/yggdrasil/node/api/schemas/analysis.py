@@ -62,6 +62,7 @@ class PivotRequest(StrictModel):
     filters: list[FilterSpec] = []
     row_limit: int = 1000     # max distinct row groups returned
     col_limit: int = 50       # max distinct column groups (top-N by 1st measure)
+    totals: bool = True       # append grand-total row + per-measure total column
 
 
 class PivotResult(StrictModel):
@@ -74,6 +75,8 @@ class PivotResult(StrictModel):
     rows: list[list[Any]]
     row_count: int            # distinct row groups before row_limit
     col_count: int            # distinct column groups before col_limit
+    total_columns: int        # trailing per-measure "Total" columns (0 if none)
+    has_total_row: bool       # last row is the grand-total row
     source_rows: int
     truncated: bool           # column groups exceeded col_limit (top-N kept)
 

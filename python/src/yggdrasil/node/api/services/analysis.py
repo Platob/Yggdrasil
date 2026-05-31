@@ -374,12 +374,18 @@ class AnalysisService:
             out = grouped.sort(req.rows) if req.rows else grouped
             row_count = out.height
             out = out.head(req.row_limit)
+            result_rows = [[_safe(v) for v in r] for r in out.iter_rows()]
+            has_total = bool(req.totals and req.rows)
+            if has_total:  # grand-total row aggregated over the whole frame
+                grand = plan.select(exprs).collect(engine="streaming")
+                total_row = ["Total"] + [""] * (len(req.rows) - 1) + [_safe(grand[mn][0]) for mn in measure_names]
+                result_rows.append(total_row)
             return PivotResult(
                 node_id=self.settings.node_id, path=req.path,
                 row_fields=req.rows, column_fields=[], measures=measure_names,
-                columns=out.columns,
-                rows=[[_safe(v) for v in r] for r in out.iter_rows()],
+                columns=out.columns, rows=result_rows,
                 row_count=row_count, col_count=0,
+                total_columns=0, has_total_row=has_total,
                 source_rows=source_rows, truncated=False,
             )
 
@@ -410,6 +416,24 @@ class AnalysisService:
                 header.append(f"{col_labels[ct]} · {mn}" if multi_measure else col_labels[ct])
                 plan_cols.append((ct, mi))
 
+        # Totals: aggregated over the *source* (not summed cells), so the total
+        # of a mean/median is correct. Row totals group by rows, the grand-total
+        # row groups by columns, the corner cell groups by nothing.
+        do_totals = req.totals
+        row_tot: dict[tuple, list] = {}
+        col_tot: dict[tuple, list] = {}
+        grand_vals: list = [None] * len(measure_names)
+        if do_totals:
+            if req.rows:
+                for r in plan.group_by(req.rows).agg(exprs).collect(engine="streaming").iter_rows(named=True):
+                    row_tot[tuple(r[k] for k in req.rows)] = [r[mn] for mn in measure_names]
+            for r in plan.group_by(req.columns).agg(exprs).collect(engine="streaming").iter_rows(named=True):
+                col_tot[tuple(r[k] for k in req.columns)] = [r[mn] for mn in measure_names]
+            g = plan.select(exprs).collect(engine="streaming")
+            grand_vals = [g[mn][0] for mn in measure_names]
+            for mn in measure_names:
+                header.append(f"Total · {mn}" if multi_measure else "Total")
+
         row_tuples = sorted(cell, key=lambda rt: tuple("" if v is None else str(v) for v in rt))
         row_count = len(row_tuples)
         row_tuples = row_tuples[:req.row_limit]
@@ -420,13 +444,29 @@ class AnalysisService:
             for ct, mi in plan_cols:
                 vals = bycol.get(ct)
                 row.append(_safe(vals[mi]) if vals is not None else None)
+            if do_totals:
+                tv = (row_tot.get(rt) if req.rows else grand_vals)
+                for mi in range(len(measure_names)):
+                    row.append(_safe(tv[mi]) if tv is not None else None)
             result_rows.append(row)
+
+        has_total_row = bool(do_totals and req.rows)
+        if has_total_row:  # bottom grand-total row: column totals + corner
+            grow = ["Total"] + [""] * (len(req.rows) - 1)
+            for ct, mi in plan_cols:
+                cv = col_tot.get(ct)
+                grow.append(_safe(cv[mi]) if cv is not None else None)
+            for mi in range(len(measure_names)):
+                grow.append(_safe(grand_vals[mi]))
+            result_rows.append(grow)
 
         return PivotResult(
             node_id=self.settings.node_id, path=req.path,
             row_fields=req.rows, column_fields=req.columns, measures=measure_names,
             columns=header, rows=result_rows,
             row_count=row_count, col_count=col_count,
+            total_columns=len(measure_names) if do_totals else 0,
+            has_total_row=has_total_row,
             source_rows=source_rows, truncated=truncated,
         )
 

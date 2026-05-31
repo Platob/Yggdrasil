@@ -574,6 +574,8 @@ export interface PivotResult {
   rows: TabularCell[][];
   row_count: number;
   col_count: number;
+  total_columns: number;   // trailing per-measure "Total" columns
+  has_total_row: boolean;  // last row is the grand total
   source_rows: number;
   truncated: boolean;
 }
@@ -584,12 +586,13 @@ export function pivot(
   columns: string[],
   measures: PivotMeasure[],
   node?: string,
-  opts: { row_limit?: number; col_limit?: number; filters?: { column: string; op: string; value?: unknown }[] } = {},
+  opts: { row_limit?: number; col_limit?: number; totals?: boolean; filters?: { column: string; op: string; value?: unknown }[] } = {},
 ): Promise<PivotResult> {
   const url = `/api/v2/analysis/pivot${node ? `?node=${encodeURIComponent(node)}` : ""}`;
   const payload = {
     path, rows, columns, measures,
     row_limit: opts.row_limit ?? 1000, col_limit: opts.col_limit ?? 50,
+    totals: opts.totals ?? true,
     filters: opts.filters ?? [],
   };
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));

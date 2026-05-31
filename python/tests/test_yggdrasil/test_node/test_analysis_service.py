@@ -91,7 +91,7 @@ class TestPivot(unittest.TestCase):
             home = Path(d); _sales(home)
             res = asyncio.run(_svc(home).pivot(PivotRequest(
                 path="s.parquet", rows=["region"], columns=["product"],
-                measures=[AggMeasure(column="rev", agg="sum")])))
+                measures=[AggMeasure(column="rev", agg="sum")], totals=False)))
             self.assertEqual(res.columns, ["region", "A", "B"])  # one col per product value
             by = {r[0]: r for r in res.rows}
             self.assertEqual(by["EU"], ["EU", 150.0, 30.0])      # A=70+80, B=30
@@ -108,7 +108,7 @@ class TestPivot(unittest.TestCase):
             res = asyncio.run(_svc(home).pivot(PivotRequest(
                 path="s.parquet", rows=["region"], columns=["product"],
                 measures=[AggMeasure(column="rev", agg="sum"),
-                          AggMeasure(column="qty", agg="mean")])))
+                          AggMeasure(column="qty", agg="mean")], totals=False)))
             self.assertEqual(res.columns,
                              ["region", "A · rev_sum", "A · qty_mean", "B · rev_sum", "B · qty_mean"])
 
@@ -117,7 +117,7 @@ class TestPivot(unittest.TestCase):
             home = Path(d); _sales(home)
             res = asyncio.run(_svc(home).pivot(PivotRequest(
                 path="s.parquet", rows=["region"], columns=[],
-                measures=[AggMeasure(column="rev", agg="sum")])))
+                measures=[AggMeasure(column="rev", agg="sum")], totals=False)))
             self.assertEqual(res.columns, ["region", "rev_sum"])
             self.assertEqual({r[0] for r in res.rows}, {"NA", "EU", "APAC"})
 
@@ -133,7 +133,7 @@ class TestPivot(unittest.TestCase):
             home = Path(d); _sales(home)
             res = asyncio.run(_svc(home).pivot(PivotRequest(
                 path="s.parquet", rows=["region"], columns=["product"],
-                measures=[AggMeasure(column="rev", agg="sum")], col_limit=1)))
+                measures=[AggMeasure(column="rev", agg="sum")], col_limit=1, totals=False)))
             # B (40+60+50+30=180) outweighs A (70+80+20+100? no: A=70+80+20=170) -> keep B
             self.assertEqual(res.col_count, 2)
             self.assertTrue(res.truncated)
@@ -153,9 +153,45 @@ class TestPivot(unittest.TestCase):
             res = asyncio.run(_svc(home).pivot(PivotRequest(
                 path="s.parquet", rows=["region"], columns=["product"],
                 measures=[AggMeasure(column="rev", agg="sum")],
-                filters=[FilterSpec(column="region", op="==", value="EU")])))
+                filters=[FilterSpec(column="region", op="==", value="EU")], totals=False)))
             self.assertEqual([r[0] for r in res.rows], ["EU"])
             self.assertEqual(res.source_rows, 3)
+
+    def test_grand_totals_row_and_column(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _sales(home)
+            res = asyncio.run(_svc(home).pivot(PivotRequest(
+                path="s.parquet", rows=["region"], columns=["product"],
+                measures=[AggMeasure(column="rev", agg="sum")], totals=True)))
+            self.assertEqual(res.columns, ["region", "A", "B", "Total"])
+            self.assertEqual(res.total_columns, 1)
+            self.assertTrue(res.has_total_row)
+            by = {r[0]: r for r in res.rows}
+            self.assertEqual(by["EU"][3], 180.0)        # row total A(150)+B(30)
+            self.assertEqual(by["Total"], ["Total", 270.0, 180.0, 450.0])  # col + grand
+
+    def test_totals_reaggregate_not_sum_of_cells(self):
+        # The total of a *mean* is the mean over the group's source rows — not
+        # the mean/sum of the displayed cells.
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _sales(home)
+            res = asyncio.run(_svc(home).pivot(PivotRequest(
+                path="s.parquet", rows=["region"], columns=["product"],
+                measures=[AggMeasure(column="rev", agg="mean")], totals=True)))
+            by = {r[0]: r for r in res.rows}
+            self.assertEqual(by["EU"][3], 60.0)         # mean(70,80,30) over EU rows
+            self.assertEqual(by["Total"][3], 56.25)     # grand mean of all 8 rows
+
+    def test_totals_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _sales(home)
+            res = asyncio.run(_svc(home).pivot(PivotRequest(
+                path="s.parquet", rows=["region"], columns=["product"],
+                measures=[AggMeasure(column="rev", agg="sum")], totals=False)))
+            self.assertEqual(res.columns, ["region", "A", "B"])
+            self.assertEqual(res.total_columns, 0)
+            self.assertFalse(res.has_total_row)
+            self.assertNotIn("Total", [r[0] for r in res.rows])
 
 
 class TestDescribe(unittest.TestCase):
