@@ -275,14 +275,13 @@ class Flow(_Runnable):
         slug = re.sub(r"[^0-9A-Za-z._-]+", "_", self.name).strip("_") or "flow"
         return f"{WORKSPACE_WHL_DIR}/{slug}"
 
-    def wheel_source(self) -> str:
-        """The project to build when :attr:`build_wheel` is set — derived from
-        where this flow is defined, so it adapts to any project (not just ygg).
-        Override to point at a different source tree."""
-        import inspect
-
+    def wheel_package(self) -> str:
+        """The top-level import package to build when :attr:`build_wheel` is set
+        — derived from where this flow is defined, so it adapts to any project.
+        The wheel is synthesized from this package's *live* files on disk (no
+        source checkout / published release needed). Override to build another."""
         target = self.fn if self.fn is not None else type(self)
-        return inspect.getfile(target)
+        return target.__module__.split(".")[0]
 
     def effective_dependencies(self) -> list[str]:
         """The serverless dependencies. Once :meth:`deploy` has shipped wheels,
@@ -353,22 +352,22 @@ class Flow(_Runnable):
         """Get-or-create the live :class:`Job` from :meth:`definition`.
 
         Takes a :class:`DatabricksClient` and resolves its jobs service
-        (``client.jobs``). When :attr:`build_wheel` is set (default), builds the
-        ygg wheel from source and uploads it to ``/Workspace/Shared/.ygg/whl/``
-        first, shipping that wheel as the serverless dependency instead of an
-        index ``ygg[databricks]`` install."""
+        (``client.jobs``). When :attr:`build_wheel` is set, synthesizes a project
+        from this flow's *live* package and builds it (with deps) into wheels,
+        uploaded to ``/Workspace/Shared/.ygg/whl/`` and shipped as the serverless
+        dependencies — instead of installing the published ``ygg`` from an index."""
         ensure_console_logging()  # so the deploy CRUD is visible interactively
         logger.info("deploying flow %r", self.name)
         if self.build_wheel and self.serverless:
             from yggdrasil.databricks.job.wheel import ensure_wheel
 
-            # Isolated build of this flow's own project (adapts to any project)
-            # WITH its dependencies — project + extras + extra_dependencies are
-            # resolved into wheels and all uploaded under the job folder, so the
-            # cluster installs everything by path (no index access).
+            # Synthesize a buildable project from this flow's *live* package on
+            # disk (no checkout / published release) and build it WITH its deps —
+            # all wheels are uploaded under the job folder, so the cluster
+            # installs everything by path (no index access).
             self._wheel_paths = ensure_wheel(
                 client,
-                self.wheel_source(),
+                self.wheel_package(),
                 workspace_dir=self.wheel_dir(),
                 extras=self.wheel_extras,
                 requirements=self.extra_dependencies,

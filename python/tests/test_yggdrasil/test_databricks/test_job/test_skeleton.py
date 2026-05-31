@@ -174,8 +174,9 @@ class TestFlow:
         with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheels) as ew:
             demo.deploy(client)
 
-        # isolated build of the flow's own project + deps, uploaded under the job folder
+        # builds from the flow's live package + deps, uploaded under the job folder
         assert ew.call_count == 1
+        assert ew.call_args.args[1] == demo.wheel_package()     # (client, package, ...)
         assert ew.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/.ygg/whl/ygg-demo"
         assert ew.call_args.kwargs["requirements"] == ("databricks-sdk",)
         kwargs = client.jobs.create_or_update.call_args.kwargs

@@ -1,17 +1,23 @@
-"""Build a project (with its dependencies) into wheels and upload them to a
-workspace dir, so a serverless :class:`~yggdrasil.databricks.job.Flow` installs
-everything by path — no index access on the cluster.
+"""Build a wheel from the **live** package on disk and upload it for serverless jobs.
 
-:func:`build_wheel` runs ``pip wheel`` (isolated): the project at *source* — with
-any extras — plus every transitive dependency are resolved into one directory of
-wheels. :func:`ensure_wheel` uploads them all and returns their workspace paths.
+Instead of relying on a published release or a source checkout, the deploy
+*synthesizes* a buildable project from the installed package's own files +
+metadata (:func:`synthesize_project`) and builds it — so the cluster runs exactly
+the code that's running now, whether the package is a dev checkout or pip-installed.
 
-(``uv`` has no ``pip wheel`` equivalent — ``uv build`` only produces the project
-wheel — so the dependency-bundling build uses ``pip``.)
+:func:`build_wheel` synthesizes the project, then ``pip wheel`` resolves it **with
+its dependencies** into a directory of wheels; :func:`ensure_wheel` uploads them
+all and returns their workspace paths (installed by path on the cluster — no index).
+
+(``uv`` has no ``pip wheel`` equivalent, so the dependency build uses ``pip``.)
 """
 from __future__ import annotations
 
+import importlib
+import importlib.metadata as ilmd
 import logging
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "WORKSPACE_WHL_DIR",
-    "find_project_root",
+    "synthesize_project",
     "build_wheel",
     "upload_wheel",
     "ensure_wheel",
@@ -31,39 +37,111 @@ __all__ = [
 #: Root for workspace wheels — one subfolder per job to keep each self-contained.
 WORKSPACE_WHL_DIR = "/Workspace/Shared/.ygg/whl"
 
-#: Files that mark a buildable Python project root.
-_PROJECT_MARKERS = ("pyproject.toml", "setup.py", "setup.cfg")
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def find_project_root(start: "str | Path") -> Path:
-    """Walk up from *start* (a file or dir) to the nearest project root — a dir
-    holding a ``pyproject.toml`` / ``setup.py`` / ``setup.cfg``. Generic, so it
-    locates whatever project a flow is defined in, not just ygg."""
-    p = Path(start).resolve()
-    candidates = (p, *p.parents) if p.is_dir() else p.parents
-    for parent in candidates:
-        if any((parent / marker).exists() for marker in _PROJECT_MARKERS):
-            return parent
-    raise FileNotFoundError(
-        f"no Python project ({' / '.join(_PROJECT_MARKERS)}) found from {start!r}"
+def distribution_for(package: str) -> str:
+    """The distribution (pip) name providing the import *package* (``yggdrasil``
+    → ``ygg``). Falls back to *package* itself when unmapped."""
+    dists = ilmd.packages_distributions().get(package)
+    return dists[0] if dists else package
+
+
+def _project_dependencies(dist: str, extras: "set[str]") -> list[str]:
+    """Base requirements + those gated by the requested *extras* (flattened),
+    dropping other-extra-only deps."""
+    out: list[str] = []
+    for req in ilmd.requires(dist) or []:
+        head, _, marker = req.partition(";")
+        head, marker = head.strip(), marker.strip()
+        extra_match = re.search(r'extra\s*==\s*["\']([^"\']+)["\']', marker)
+        if extra_match is None:
+            out.append(req)              # base dep (keep any non-extra marker)
+        elif extra_match.group(1) in extras:
+            out.append(head)             # requested extra → flatten in
+    return out
+
+
+def _console_scripts(dist: str) -> dict[str, str]:
+    """``{entry-point name: module:attr}`` console scripts of *dist*."""
+    out: dict[str, str] = {}
+    for ep in ilmd.entry_points(group="console_scripts"):
+        ep_dist = getattr(ep, "dist", None)
+        if ep_dist is None or _norm(ep_dist.name) == _norm(dist):
+            out[ep.name] = ep.value
+    return out
+
+
+def synthesize_project(
+    package: str,
+    *,
+    extras: "tuple[str, ...] | list[str]" = (),
+    dest_dir: "str | Path | None" = None,
+) -> Path:
+    """Create a buildable project from the **installed** *package* — copy its
+    on-disk files and write a ``pyproject.toml`` reconstructed from the
+    distribution metadata (version, console scripts, dependencies incl. the
+    requested *extras*). Returns the project dir."""
+    module = importlib.import_module(package)
+    pkg_dir = Path(module.__file__).resolve().parent
+    dist = distribution_for(package)
+    meta = ilmd.metadata(dist)
+
+    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-synth-"))
+    shutil.copytree(pkg_dir, out / package, dirs_exist_ok=True)
+
+    deps = _project_dependencies(dist, set(extras))
+    scripts = _console_scripts(dist)
+    (out / "pyproject.toml").write_text(
+        _render_pyproject(meta["Name"], meta["Version"], package, deps, scripts)
+    )
+    logger.info("synthesized project for %s (%s) at %s", package, dist, out)
+    return out
+
+
+def _render_pyproject(name: str, version: str, package: str, deps: list[str], scripts: dict[str, str]) -> str:
+    dep_block = "\n".join(f'  "{d}",' for d in deps)
+    script_block = "\n".join(f'{k} = "{v}"' for k, v in scripts.items())
+    return (
+        "[build-system]\n"
+        'requires = ["setuptools>=61"]\n'
+        'build-backend = "setuptools.build_meta"\n\n'
+        "[project]\n"
+        f'name = "{name}"\n'
+        f'version = "{version}"\n'
+        "dependencies = [\n"
+        f"{dep_block}\n"
+        "]\n\n"
+        "[project.scripts]\n"
+        f"{script_block}\n\n"
+        "[tool.setuptools.packages.find]\n"
+        f'include = ["{package}*"]\n'
     )
 
 
-def build_wheel(source: "str | Path", dest_dir: "str | Path | None" = None) -> Path:
-    """Build a wheel for the project at (or above) *source* via an **isolated**
-    ``python -m build`` (PEP 517 build env — independent of the current
-    install). Works for any project. Returns the produced ``.whl`` path."""
-    root = find_project_root(source)
+def build_wheel(
+    package: str,
+    *,
+    extras: "tuple[str, ...] | list[str]" = (),
+    requirements: "tuple[str, ...] | list[str]" = (),
+    dest_dir: "str | Path | None" = None,
+) -> list[Path]:
+    """Build the live *package* (synthesized project) **with its dependencies**
+    via an isolated ``pip wheel`` — returns every produced ``.whl`` (the project
+    plus all transitive deps + any extra *requirements*)."""
+    project = synthesize_project(package, extras=extras)
     out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-wheel-"))
-    logger.info("building wheel from %s (isolated build)", root)
+    logger.info("building wheel (+ dependencies) for %s into %s", package, out)
     subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--outdir", str(out), str(root)],
+        [sys.executable, "-m", "pip", "wheel", str(project), *requirements, "--wheel-dir", str(out)],
         check=True,
     )
     wheels = sorted(out.glob("*.whl"))
     if not wheels:
-        raise FileNotFoundError(f"no wheel produced in {out}")
-    return wheels[-1]
+        raise FileNotFoundError(f"no wheels produced in {out}")
+    return wheels
 
 
 def upload_wheel(client: Any, wheel: "str | Path", *, workspace_dir: str = WORKSPACE_WHL_DIR) -> str:
@@ -79,45 +157,16 @@ def upload_wheel(client: Any, wheel: "str | Path", *, workspace_dir: str = WORKS
     return dest
 
 
-def ensure_wheel(client: Any, source: "str | Path", *, workspace_dir: str = WORKSPACE_WHL_DIR) -> str:
-    """Build the project at *source* (isolated) + upload the wheel; return its
-    workspace path. Built fresh each call so the deployed job ships current code."""
-def build_wheel(
-    source: "str | Path",
-    *,
-    extras: "tuple[str, ...] | list[str]" = (),
-    requirements: "tuple[str, ...] | list[str]" = (),
-    dest_dir: "str | Path | None" = None,
-) -> list[Path]:
-    """Build the project at (or above) *source* **with its dependencies** —
-    ``pip wheel`` resolves and builds/downloads a wheel for the project (with any
-    *extras*) plus every transitive dependency (and any extra *requirements*)
-    into one dir. Isolated; works for any project. Returns all ``.whl`` paths.
-    """
-    root = find_project_root(source)
-    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-wheel-"))
-    spec = str(root) + (f"[{','.join(extras)}]" if extras else "")
-    logger.info("building wheel (+ dependencies) for %s into %s", spec, out)
-    subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", spec, *requirements, "--wheel-dir", str(out)],
-        check=True,
-    )
-    wheels = sorted(out.glob("*.whl"))
-    if not wheels:
-        raise FileNotFoundError(f"no wheels produced in {out}")
-    return wheels
-
-
 def ensure_wheel(
     client: Any,
-    source: "str | Path",
+    package: str,
     *,
     workspace_dir: str = WORKSPACE_WHL_DIR,
     extras: "tuple[str, ...] | list[str]" = (),
     requirements: "tuple[str, ...] | list[str]" = (),
 ) -> list[str]:
-    """Build the project at *source* with its dependencies (:func:`build_wheel`)
-    and upload every wheel to *workspace_dir*; return their workspace paths.
-    Built fresh each call so the deployed job ships current code + deps."""
-    wheels = build_wheel(source, extras=extras, requirements=requirements)
+    """Build the live *package* with its dependencies (:func:`build_wheel`) and
+    upload every wheel to *workspace_dir*; return their workspace paths. Built
+    fresh each call so the deployed job ships current code."""
+    wheels = build_wheel(package, extras=extras, requirements=requirements)
     return [upload_wheel(client, w, workspace_dir=workspace_dir) for w in wheels]
