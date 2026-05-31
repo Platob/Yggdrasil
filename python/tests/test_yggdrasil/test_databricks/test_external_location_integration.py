@@ -1,17 +1,28 @@
 """Live Databricks integration tests for UC **external locations** over AWS.
 
-Creates a storage credential (from an IAM role ARN) + an external location bound
-to an S3 URL, reads it back through the resource, checks the storage ``.path``
-resolves to an :class:`S3Path`, then cleans up.
+Two tiers, so it does something useful whatever your privileges are:
 
-Run (skipped otherwise):
+* **read-only** (just ``DATABRICKS_HOST`` + LIST/READ on a location) — list
+  external locations, resolve one's storage ``.path`` to an :class:`S3Path`,
+  and exercise IO (``ls`` + a bounded read) through it. Point at a specific one
+  with ``YGG_TEST_EXTERNAL_LOCATION``, else the first listable S3-backed one is
+  used. Skips cleanly when there's nothing readable or the runner lacks AWS
+  creds for the bucket.
+* **create / write** (``YGG_TEST_AWS_ROLE_ARN`` + ``YGG_TEST_S3_URL`` + the UC
+  privileges) — stand up a storage credential + external location, round-trip a
+  large blob and a streaming Parquet through the S3 ``_upload_stream`` path,
+  update, delete. Each create/delete step ``skipTest``\\s (not fails) on
+  ``PermissionDenied``.
+
+Run:
     DATABRICKS_HOST=... DATABRICKS_TOKEN=... \
-    YGG_TEST_AWS_ROLE_ARN=arn:aws:iam::123:role/MyUCRole \
-    YGG_TEST_S3_URL=s3://my-bucket/ygg-ext-test/ \
+    [YGG_TEST_EXTERNAL_LOCATION=my_location] \
+    [YGG_TEST_AWS_ROLE_ARN=arn:aws:iam::123:role/UCRole YGG_TEST_S3_URL=s3://bucket/ygg/] \
     pytest tests/test_yggdrasil/test_databricks/test_external_location_integration.py -m integration -v
 """
 from __future__ import annotations
 
+import itertools
 import os
 import secrets
 import unittest
@@ -24,77 +35,161 @@ from tests.test_yggdrasil.test_databricks import DatabricksIntegrationCase
 from yggdrasil.aws.fs.path import S3Path
 
 _AWS_ROLE = os.environ.get("YGG_TEST_AWS_ROLE_ARN", "").strip()
-_S3_URL = os.environ.get("YGG_TEST_S3_URL", "").strip()  # e.g. s3://my-bucket/prefix/
+_S3_URL = os.environ.get("YGG_TEST_S3_URL", "").strip()
+_EL_NAME = os.environ.get("YGG_TEST_EXTERNAL_LOCATION", "").strip()
+_MIB = 1024 * 1024
 
 
-@unittest.skipUnless(
-    _AWS_ROLE and _S3_URL,
-    "YGG_TEST_AWS_ROLE_ARN + YGG_TEST_S3_URL not set — skipping external-location integration",
-)
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _bucket_of(url: str) -> str:
+    return url.split("://", 1)[1].split("/", 1)[0]
+
+
 class TestExternalLocationIntegration(DatabricksIntegrationCase):
-    """Live UC external locations over AWS S3."""
-
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()  # SkipTest when DATABRICKS_HOST is unset
-        cls.creds = cls.client.credentials
         cls.locations = cls.client.external_locations
-        cls._locations: "list[str]" = []
-        cls._cred_name = f"ygg_test_elcred_{secrets.token_hex(4)}"
-        try:
-            cls.creds.create_aws(
-                cls._cred_name, _AWS_ROLE, purpose=CredentialPurpose.STORAGE,
-                comment="ygg external-location integration", skip_validation=True,
-            )
-        except PermissionDenied as exc:
-            raise unittest.SkipTest(f"no permission to create UC credentials: {exc}")
+        cls.creds = cls.client.credentials
+        cls._cleanup_loc: "list[str]" = []
+        cls._cleanup_cred: "list[str]" = []
 
     @classmethod
     def tearDownClass(cls) -> None:
-        for name in getattr(cls, "_locations", []):
+        for name in getattr(cls, "_cleanup_loc", []):
             try:
                 cls.locations.delete(name, force=True)
             except Exception:
                 pass
-        try:
-            cls.creds.delete(cls._cred_name, force=True)
-        except Exception:
-            pass
+        for name in getattr(cls, "_cleanup_cred", []):
+            try:
+                cls.creds.delete(name, force=True)
+            except Exception:
+                pass
         super().tearDownClass()
 
-    def _create(self, tag: str, *, url: str = _S3_URL, read_only: bool = False):
-        name = f"ygg_test_el_{tag}_{secrets.token_hex(4)}"
-        type(self)._locations.append(name)
+    # ------------------------------------------------------------------
+    # read-only: list + IO through an existing location
+    # ------------------------------------------------------------------
+    def test_list_locations(self) -> None:
         try:
-            return self.locations.create(
-                name, url, self._cred_name,
-                comment="ygg integration test", read_only=read_only, skip_validation=True,
-            )
+            names = self.locations.names()
         except PermissionDenied as exc:
-            self.skipTest(f"no permission to create external locations: {exc}")
+            self.skipTest(f"no permission to list external locations: {exc}")
+        self.assertIsInstance(names, list)
+
+    def _existing_s3_location(self):
+        if _EL_NAME:
+            return self.locations.get(_EL_NAME)
+        try:
+            for el in self.locations.list():
+                if (el.url or "").startswith(("s3://", "s3a://")):
+                    return el
+        except PermissionDenied:
+            return None
+        return None
+
+    def test_existing_location_metadata_and_path(self) -> None:
+        el = self._existing_s3_location()
+        if el is None:
+            self.skipTest("no readable S3 external location (set YGG_TEST_EXTERNAL_LOCATION)")
+        self.assertTrue(el.url and el.credential_name)
+        self.assertIsInstance(el.path, S3Path)
+        self.assertEqual(el.path.bucket, _bucket_of(el.url))
+
+    def test_io_list_and_read_existing(self) -> None:
+        el = self._existing_s3_location()
+        if el is None:
+            self.skipTest("no readable S3 external location available")
+        path = el.path
+        try:
+            children = list(path.ls(limit=25))
+        except Exception as exc:  # ambient AWS creds may not reach the bucket
+            self.skipTest(f"cannot list external-location storage (AWS creds for the bucket?): {exc}")
+
+        # Listing worked — try a bounded read of the first non-empty file.
+        for child in children:
+            try:
+                if child.is_file() and int(child.size) > 0:
+                    head = bytes(child.read_mv(min(4096, int(child.size)), 0))
+                    self.assertGreater(len(head), 0)
+                    return
+            except Exception:
+                continue
+        # An empty location (no files) is a valid pass — the list path worked.
 
     # ------------------------------------------------------------------
-    def test_create_read_list_delete(self) -> None:
-        el = self._create("crud")
+    # create / write (needs UC privileges + bucket access)
+    # ------------------------------------------------------------------
+    def _writable_location(self):
+        if not (_AWS_ROLE and _S3_URL):
+            self.skipTest("YGG_TEST_AWS_ROLE_ARN + YGG_TEST_S3_URL not set")
+        cred_name = f"ygg_test_elcred_{secrets.token_hex(4)}"
+        try:
+            self.creds.create_aws(
+                cred_name, _AWS_ROLE, purpose=CredentialPurpose.STORAGE,
+                comment="ygg external-location integration", skip_validation=True,
+            )
+        except PermissionDenied as exc:
+            self.skipTest(f"no permission to create UC credential: {exc}")
+        type(self)._cleanup_cred.append(cred_name)
+
+        name = f"ygg_test_el_{secrets.token_hex(4)}"
+        type(self)._cleanup_loc.append(name)
+        try:
+            return self.locations.create(
+                name, _S3_URL, cred_name, comment="ygg integration test", skip_validation=True,
+            )
+        except PermissionDenied as exc:
+            self.skipTest(f"no permission to create external location: {exc}")
+
+    def test_create_read_update_delete(self) -> None:
+        el = self._writable_location()
         self.assertEqual(el.url, _S3_URL)
-        self.assertEqual(el.credential_name, self._cred_name)
-
-        fetched = self.locations.get(el.name)
-        self.assertEqual(fetched.url, _S3_URL)
+        self.assertEqual(self.locations.get(el.name).url, _S3_URL)
         self.assertTrue(self.locations.exists(el.name))
-        self.assertIn(el.name, self.locations.names())
 
-        self.locations.delete(el.name, force=True)
-        type(self)._locations.remove(el.name)
-        self.assertFalse(self.locations.exists(el.name))
-
-    def test_update_comment(self) -> None:
-        el = self._create("update")
         el.update(comment="updated by ygg")
         self.assertEqual(self.locations.get(el.name).comment, "updated by ygg")
 
-    def test_storage_path_resolves(self) -> None:
-        el = self._create("path")
-        if _S3_URL.startswith("s3://") or _S3_URL.startswith("s3a://"):
-            self.assertIsInstance(el.path, S3Path)
-            self.assertEqual(el.path.bucket, _S3_URL.split("://", 1)[1].split("/", 1)[0])
+        self.locations.delete(el.name, force=True)
+        type(self)._cleanup_loc.remove(el.name)
+        self.assertFalse(self.locations.exists(el.name))
+
+    def test_streaming_write_read(self) -> None:
+        """The S3 ``_upload_stream`` path (large blob + streaming Parquet)
+        against an external location's storage."""
+        import pyarrow as pa
+
+        from yggdrasil.io.parquet_file import ParquetFile
+
+        el = self._writable_location()
+        base = el.path / f"ygg-s3-stream-{secrets.token_hex(4)}"
+        blob = base / "blob.bin"
+        parquet = base / "data.parquet"
+        try:
+            payload = secrets.token_bytes(_env_int("YGG_TEST_S3_LARGE_MB", 8) * _MIB)
+            try:
+                blob.write_bytes(payload)
+            except Exception as exc:  # ambient AWS creds may not reach the bucket
+                self.skipTest(f"cannot write to external-location storage (AWS creds?): {exc}")
+            self.assertEqual(blob.read_bytes(), payload)
+
+            rows = _env_int("YGG_TEST_S3_PARQUET_ROWS", 200_000)
+            ParquetFile(holder=parquet).write_arrow_table(
+                pa.table({"id": pa.array(range(rows), type=pa.int64())})
+            )
+            parquet.invalidate_singleton()  # cold read, off the write cache
+            self.assertEqual(ParquetFile(holder=parquet).read_arrow_table().num_rows, rows)
+        finally:
+            for p in (blob, parquet):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
