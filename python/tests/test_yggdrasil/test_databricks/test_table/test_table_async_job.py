@@ -113,6 +113,10 @@ class TestEnsure:
         tj = TableJob(t)
         assert tj.ensure() is tj
         assert tj.job is created
+        # the watched logs dir is created so the trigger URL is valid
+        t.staging_volume.path.return_value.mkdir.assert_called_with(
+            parents=True, exist_ok=True
+        )
 
         kwargs = jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-async-insert-c.s.t"

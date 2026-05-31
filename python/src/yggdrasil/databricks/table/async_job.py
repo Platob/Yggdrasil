@@ -102,6 +102,12 @@ class TableJob(Flow):
         )
 
     # -- get-or-create the live Job -------------------------------------
+    def deploy(self, service: Any) -> "Job":
+        # The file-arrival trigger watches the logs dir — create it first so
+        # Databricks accepts the trigger URL (and the first drop lands cleanly).
+        self.logs_path(self.table).mkdir(parents=True, exist_ok=True)
+        return super().deploy(service)
+
     def ensure(self) -> "TableJob":
         """Get-or-create the underlying Databricks job from :meth:`definition`."""
         if self._job is None:
