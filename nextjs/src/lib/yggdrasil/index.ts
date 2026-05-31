@@ -4,4 +4,4 @@
 // rule). Implemented incrementally; start with ``enums``.
 
 export * as enums from "./enums";
-export { MimeType, MimeTypes, MediaType, type Magic, type MimeOpts } from "./enums";
+export { MimeType, MimeTypes, MediaType, State, ByteUnit, type Magic, type MimeOpts, type StateLike } from "./enums";

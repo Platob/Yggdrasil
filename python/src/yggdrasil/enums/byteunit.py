@@ -1,5 +1,8 @@
 """Centralized byte-unit enum for memory / capacity / spill thresholds.
 
+PARITY: ported to JS/TS at nextjs/src/lib/yggdrasil/enums/byteUnit.ts — keep in sync.
+
+
 Across Yggdrasil, a "size in bytes" appears in many places: ``Memory``'s
 ``spill_bytes`` threshold, the Arrow tabular spill cutoff, request /
 response body limits, codec hints, hash batch sizes. Before this
