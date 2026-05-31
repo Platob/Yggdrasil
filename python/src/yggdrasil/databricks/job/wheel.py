@@ -17,7 +17,15 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["WORKSPACE_JOBS_DIR", "wheel_name", "build_wheel", "upload_wheel", "ensure_wheel"]
+__all__ = [
+    "WORKSPACE_JOBS_DIR",
+    "wheel_name",
+    "build_wheel",
+    "upload_wheel",
+    "ensure_wheel",
+    "download_wheel",
+    "ensure_requirement_wheel",
+]
 
 #: Where built job wheels live in the workspace.
 WORKSPACE_JOBS_DIR = "/Workspace/Shared/.ygg/jobs"
@@ -87,4 +95,40 @@ def ensure_wheel(
     if not rebuild and DatabricksPath.from_(dest, client=client).exists():
         return dest
     wheel = build_wheel()
+    return upload_wheel(client, wheel, workspace_dir=workspace_dir)
+
+
+def download_wheel(requirement: str, dest_dir: "str | Path | None" = None) -> Path:
+    """``pip download <requirement> --no-deps`` the **latest** wheel for a pinned
+    or unpinned requirement (e.g. ``"databricks-sdk"``); return the ``.whl``."""
+    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-dep-"))
+    logger.info("downloading wheel for %s", requirement)
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "download", requirement,
+            "--no-deps", "--only-binary=:all:", "--dest", str(out),
+        ],
+        check=True,
+    )
+    wheels = sorted(out.glob("*.whl"))
+    if not wheels:
+        raise FileNotFoundError(f"no wheel downloaded for {requirement!r} in {out}")
+    return wheels[-1]
+
+
+def ensure_requirement_wheel(
+    client: Any,
+    requirement: str,
+    *,
+    workspace_dir: str = WORKSPACE_JOBS_DIR,
+) -> str:
+    """Download *requirement*'s latest wheel and upload it to *workspace_dir*,
+    so a serverless job ships it by path instead of installing from an index.
+    Returns the workspace path. Reused when the same wheel already exists."""
+    from yggdrasil.databricks.path import DatabricksPath
+
+    wheel = download_wheel(requirement)
+    dest = f"{workspace_dir.rstrip('/')}/{wheel.name}"
+    if DatabricksPath.from_(dest, client=client).exists():
+        return dest
     return upload_wheel(client, wheel, workspace_dir=workspace_dir)

@@ -111,7 +111,9 @@ class TestEnsure:
         t.staging_volume.path.return_value.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
 
         wheel = "/Workspace/Shared/.ygg/jobs/ygg-1.2.3-py3-none-any.whl"
-        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheel) as ew:
+        sdk = "/Workspace/Shared/.ygg/jobs/databricks_sdk-9-py3-none-any.whl"
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheel) as ew, \
+             patch("yggdrasil.databricks.job.wheel.ensure_requirement_wheel", return_value=sdk):
             tj = TableJob(t)
             assert tj.ensure() is tj
         assert tj.job is created
@@ -133,7 +135,7 @@ class TestEnsure:
         # databricks-sdk (latest)
         env = kwargs["environments"][0]
         assert env.spec.environment_version == "5"
-        assert env.spec.dependencies == [wheel, "databricks-sdk"]
+        assert env.spec.dependencies == [wheel, sdk]
         assert task.environment_key == env.environment_key
 
     def test_ensure_is_noop_when_already_deployed(self):
@@ -165,7 +167,8 @@ class TestEnsure:
         other = _job(8, "/Volumes/other/.sql/async/logs/")  # unrelated job
         jobs.list.return_value = [keep, stale, other]
 
-        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value="w.whl"):
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value="w.whl"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_requirement_wheel", return_value="sdk.whl"):
             TableJob(t).deploy(t.client)
 
         stale.delete.assert_called_once()      # orphan on the shared trigger removed

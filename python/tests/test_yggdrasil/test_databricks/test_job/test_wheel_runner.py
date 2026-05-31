@@ -74,6 +74,21 @@ class TestWheel:
         assert dest == "/Workspace/Shared/.ygg/jobs/ygg-1.0-py3-none-any.whl"
         bw.assert_not_called()                         # reused, no rebuild
 
+    def test_ensure_requirement_downloads_and_uploads(self):
+        client = MagicMock()
+        downloaded = Path("/tmp/databricks_sdk-9.9-py3-none-any.whl")
+        missing = MagicMock()
+        missing.exists.return_value = False
+        with patch("yggdrasil.databricks.job.wheel.download_wheel", return_value=downloaded) as dw, \
+             patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.job.wheel.upload_wheel",
+                   return_value="/Workspace/Shared/.ygg/jobs/databricks_sdk-9.9-py3-none-any.whl") as up:
+            DP.from_.return_value = missing
+            dest = wheel.ensure_requirement_wheel(client, "databricks-sdk")
+        dw.assert_called_once_with("databricks-sdk")
+        up.assert_called_once()
+        assert dest.endswith("databricks_sdk-9.9-py3-none-any.whl")
+
     def test_ensure_builds_and_uploads_when_absent(self):
         client = MagicMock()
         missing = MagicMock()

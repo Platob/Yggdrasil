@@ -224,6 +224,7 @@ class Flow(_Runnable):
         self.retry_delay_seconds = retry_delay_seconds
         self._parameters = tuple(parameters)
         self._wheel_path: Optional[str] = None
+        self._extra_wheel_paths: list[str] = []
         if entry_point is not None:
             self.entry_point = entry_point
         if package_name is not None:
@@ -242,11 +243,14 @@ class Flow(_Runnable):
         return self._trigger
 
     def effective_dependencies(self) -> list[str]:
-        """The serverless dependencies — the uploaded wheel once :meth:`deploy`
-        has shipped it (else :attr:`dependencies`), plus
-        :attr:`extra_dependencies` (``databricks-sdk``)."""
-        base = [self._wheel_path] if getattr(self, "_wheel_path", None) else list(self.dependencies)
-        return base + list(self.extra_dependencies)
+        """The serverless dependencies. Once :meth:`deploy` has shipped wheels,
+        it's the uploaded ygg wheel + each :attr:`extra_dependencies` shipped as
+        its own uploaded wheel (the latest ``databricks-sdk`` embedded by path,
+        no index install); otherwise the plain :attr:`dependencies` +
+        :attr:`extra_dependencies` names."""
+        if getattr(self, "_wheel_path", None):
+            return [self._wheel_path, *getattr(self, "_extra_wheel_paths", ())]
+        return [*self.dependencies, *self.extra_dependencies]
 
     def environments(self) -> Optional[list]:
         """Serverless environment list (v5 + :meth:`effective_dependencies`),
@@ -302,9 +306,17 @@ class Flow(_Runnable):
         first, shipping that wheel as the serverless dependency instead of an
         index ``ygg[databricks]`` install."""
         if self.build_wheel and self.serverless:
-            from yggdrasil.databricks.job.wheel import ensure_wheel
+            from yggdrasil.databricks.job.wheel import (
+                ensure_requirement_wheel,
+                ensure_wheel,
+            )
 
             self._wheel_path = ensure_wheel(client)
+            # Embed each extra (latest databricks-sdk) as its own uploaded wheel
+            # so the cluster needs no index access.
+            self._extra_wheel_paths = [
+                ensure_requirement_wheel(client, req) for req in self.extra_dependencies
+            ]
         spec = self.definition()
         return client.jobs.create_or_update(name=spec.pop("name"), **spec)
 

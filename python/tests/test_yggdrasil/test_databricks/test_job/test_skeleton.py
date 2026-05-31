@@ -151,16 +151,19 @@ class TestFlow:
 
         client = MagicMock()                         # deploy takes a client
         wheel = "/Workspace/Shared/.ygg/jobs/ygg-9.9-py3-none-any.whl"
-        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheel) as ew:
+        sdk = "/Workspace/Shared/.ygg/jobs/databricks_sdk-1.2.3-py3-none-any.whl"
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheel) as ew, \
+             patch("yggdrasil.databricks.job.wheel.ensure_requirement_wheel", return_value=sdk) as erw:
             deployed = demo.deploy(client)
 
-        ew.assert_called_once_with(client)            # built + uploaded the wheel
+        ew.assert_called_once_with(client)            # built + uploaded the ygg wheel
+        erw.assert_called_once_with(client, "databricks-sdk")  # downloaded + uploaded the sdk wheel
         client.jobs.create_or_update.assert_called_once()
         kwargs = client.jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-demo"
         assert kwargs["tasks"][0].python_wheel_task.parameters == ["a"]
-        # the shipped wheel is the serverless dependency (not ygg[databricks])
-        assert kwargs["environments"][0].spec.dependencies == [wheel, "databricks-sdk"]
+        # shipped wheels only — ygg + the embedded databricks-sdk (no index names)
+        assert kwargs["environments"][0].spec.dependencies == [wheel, sdk]
         assert deployed is client.jobs.create_or_update.return_value
 
 
