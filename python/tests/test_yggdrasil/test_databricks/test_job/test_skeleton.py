@@ -89,6 +89,29 @@ class TestJobDecorator:
         task_obj = spec["tasks"][0]
         assert task_obj.python_wheel_task.parameters == ["a"]
 
+    def test_defaults_to_serverless_v5_with_ygg_databricks(self):
+        @job
+        def etl(src: str):
+            return src
+
+        spec = etl(src="a").definition()
+        env = spec["environments"][0]
+        assert env.environment_key == "default"
+        assert env.spec.environment_version == "5"
+        assert env.spec.dependencies == ["ygg[databricks]"]
+        # the task runs in that serverless environment
+        assert spec["tasks"][0].environment_key == "default"
+
+    def test_serverless_false_drops_environments(self):
+        @job
+        def etl(src: str):
+            return src
+
+        etl.serverless = False
+        spec = etl(src="a").definition()
+        assert "environments" not in spec
+        assert spec["tasks"][0].environment_key is None
+
     def test_trigger_included_when_set(self):
         @job(trigger={"file_arrival": {"url": "/Volumes/x"}})
         def etl(src: str):

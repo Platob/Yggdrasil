@@ -52,6 +52,14 @@ class CallableSkeleton:
     #: — the body :meth:`run` invokes with the field values.
     _func: ClassVar[Optional[Callable]] = None
 
+    #: Run the deployed task on **serverless** compute (default). When ``True``
+    #: each task references :attr:`environment_key` and the job carries a
+    #: matching serverless environment (see :class:`JobSkeleton`).
+    serverless: ClassVar[bool] = True
+
+    #: Serverless environment key shared by the job's tasks + its environment.
+    environment_key: ClassVar[str] = "default"
+
     def run(self, *args: Any, **kwargs: Any) -> Any:
         """The body. Override it, or build the skeleton from a function."""
         func = type(self)._func
@@ -115,6 +123,7 @@ class TaskSkeleton(CallableSkeleton):
         return Task(
             task_key=cls.task_key,
             depends_on=([TaskDependency(task_key=d) for d in cls.depends_on] or None),
+            environment_key=(cls.environment_key if cls.serverless else None),
             python_wheel_task=PythonWheelTask(
                 package_name=cls.package_name,
                 entry_point=cls.entry_point,
@@ -139,6 +148,13 @@ class JobSkeleton(CallableSkeleton, ABC):
     #: Trigger for function-built jobs (the :func:`job` decorator stores it
     #: here); class-based jobs override :meth:`trigger` instead.
     trigger_settings: ClassVar[Any] = None
+
+    #: Serverless environment for the job's tasks (default: serverless **v5**
+    #: with the ``ygg[databricks]`` dependency installed). Set
+    #: :attr:`~CallableSkeleton.serverless` to ``False`` to drop it (e.g. to
+    #: attach your own cluster via per-task ``options``).
+    environment_version: ClassVar[str] = "5"
+    dependencies: ClassVar[tuple[str, ...]] = ("ygg[databricks]",)
 
     @property
     @abstractmethod
@@ -186,6 +202,7 @@ class JobSkeleton(CallableSkeleton, ABC):
             return [
                 Task(
                     task_key=self.task_key,
+                    environment_key=(self.environment_key if self.serverless else None),
                     python_wheel_task=PythonWheelTask(
                         package_name=self.package_name,
                         entry_point=self.entry_point,
@@ -195,9 +212,33 @@ class JobSkeleton(CallableSkeleton, ABC):
             ]
         return [s.to_task() for s in steps]
 
+    def environments(self) -> Optional[list]:
+        """The serverless environment list, or ``None`` when not serverless.
+
+        Defaults to one serverless **v5** environment (keyed
+        :attr:`environment_key`) with :attr:`dependencies` (``ygg[databricks]``)
+        installed, so the wheel task has ygg on the cluster."""
+        if not self.serverless:
+            return None
+        from databricks.sdk.service.compute import Environment
+        from databricks.sdk.service.jobs import JobEnvironment
+
+        return [
+            JobEnvironment(
+                environment_key=self.environment_key,
+                spec=Environment(
+                    environment_version=self.environment_version,
+                    dependencies=list(self.dependencies),
+                ),
+            )
+        ]
+
     def definition(self) -> dict:
         """Render the :meth:`Jobs.create_or_update` kwargs for this job."""
         spec: dict[str, Any] = {"name": self.name, "tasks": self.tasks()}
+        environments = self.environments()
+        if environments is not None:
+            spec["environments"] = environments
         trigger = self.trigger()
         if trigger is not None:
             spec["trigger"] = trigger
