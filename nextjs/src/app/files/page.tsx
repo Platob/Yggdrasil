@@ -14,6 +14,7 @@ import {
   mkdirFs,
   isTabularName,
   type FsNodeRoot,
+  type FsMount,
 } from "@/lib/api";
 import type { FsEntry } from "@/lib/types";
 import TabularDisplay from "@/components/TabularDisplay";
@@ -121,6 +122,7 @@ type ViewMode = "preview" | "tail";
 
 export default function FilesPage() {
   const [nodes, setNodes] = useState<FsNodeRoot[]>([]);
+  const [mounts, setMounts] = useState<FsMount[]>([]);
   const [nodesLoading, setNodesLoading] = useState(true);
   const [nodesError, setNodesError] = useState(false);
 
@@ -161,6 +163,7 @@ export default function FilesPage() {
     try {
       const res = await getFsNodes(fresh);
       setNodes(res.nodes);
+      setMounts(res.mounts ?? []);
     } catch {
       setNodesError(true);
       setNodes([]);
@@ -534,6 +537,28 @@ export default function FilesPage() {
         </div>
       ) : (
         <div className="space-y-3">
+          {/* Saga mounts as global-tree roots — a Databricks volume, S3 prefix,
+              node folder or live database, each addressable in SQL as alias/… */}
+          {mounts.length > 0 && (
+            <div className="glass-card overflow-hidden">
+              <div className="flex items-center gap-2 px-4 py-2.5 border-b border-white/[0.05]">
+                <span className="text-violet-400">⛁</span>
+                <span className="text-xs font-semibold text-foreground">Mounts</span>
+                <span className="text-[10px] text-muted">{mounts.length} alias{mounts.length === 1 ? "" : "es"} · query in Saga as <span className="font-mono">alias/…</span></span>
+                <a href="/saga" className="ml-auto text-[10px] text-frost/80 hover:text-frost">manage →</a>
+              </div>
+              <div className="px-4 py-2 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-1.5">
+                {mounts.map((m) => (
+                  <div key={m.alias} className="flex items-center gap-2 py-1 px-2 rounded hover:bg-white/[0.03]" title={m.target}>
+                    <span className="text-[11px]">{m.kind === "database" ? "⛁" : m.kind === "databricks" ? "◆" : m.kind === "s3" ? "☁" : m.kind === "node" ? "⬡" : "▢"}</span>
+                    <span className="text-xs font-mono truncate">{m.alias}</span>
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-white/[0.04] text-muted">{m.kind}</span>
+                    <span className="text-[10px] text-muted/60 truncate ml-auto hidden md:inline">{m.target}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {nodes.map((n) => {
             const rootKey = dirKey(n.node_id, "");
             const rootOpen = expanded.has(rootKey);

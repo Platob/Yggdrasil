@@ -330,8 +330,11 @@ function nodeParam(node?: string): string {
   return node ? `&node=${encodeURIComponent(node)}` : "";
 }
 
-export function getFsNodes(fresh = false): Promise<{ node_id: string; nodes: FsNodeRoot[] }> {
-  return cachedGet<{ node_id: string; nodes: FsNodeRoot[] }>(
+// A Saga mount surfaced as a root of the global fs tree (see /fs/nodes).
+export interface FsMount { alias: string; target: string; kind: string; read_only: boolean; comment: string; }
+
+export function getFsNodes(fresh = false): Promise<{ node_id: string; nodes: FsNodeRoot[]; mounts?: FsMount[] }> {
+  return cachedGet<{ node_id: string; nodes: FsNodeRoot[]; mounts?: FsMount[] }>(
     "/api/v2/fs/nodes", TTL.STRUCTURAL, jsonFetch, fresh,
   );
 }
