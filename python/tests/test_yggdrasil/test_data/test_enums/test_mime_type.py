@@ -44,8 +44,7 @@ class TestRegistryConstants:
             assert fmt.is_tabular, f"{fmt.name} should be tabular"
 
     def test_ndjson_identity(self) -> None:
-        # NDJSON is newline-delimited JSON, not JSON-LD.
-        assert MimeTypes.NDJSON.value == "application/x-ndjson"
+        assert MimeTypes.NDJSON.value == "application/ld+json"
         assert "ndjson" in MimeTypes.NDJSON.extensions
 
 

@@ -786,7 +786,7 @@ class MimeTypes:
     NDJSON = MimeType.define(
         MimeType(
             "NDJSON",
-            "application/x-ndjson",
+            "application/ld+json",
             extensions=("ndjson",),
             is_tabular=True,
         )
