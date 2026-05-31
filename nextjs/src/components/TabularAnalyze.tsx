@@ -1,15 +1,16 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
-  aggregate,
+  pivot as runPivotApi,
   analysisSeries,
   analysisOhlc,
   analysisForecast,
   registerForecastWorkflow,
   downloadExport,
   type AggFunc,
-  type AggregateResult,
+  type PivotResult,
+  type PivotMeasure,
   type SeriesResult,
   type OhlcResult,
   type ForecastResult,
@@ -33,8 +34,9 @@ interface Props {
 }
 
 /**
- * Reusable analytics + download surface over a tabular *path*: pivot (aggregate
- * → table + chart), adaptive series with zoom, OHLC candles with MA + volume,
+ * Reusable analytics + download surface over a tabular *path*: an Excel-style
+ * pivot (rows × columns cross-tab × measures, drag-and-drop field panel),
+ * adaptive series with zoom, OHLC candles with MA + volume,
  * a filters+casts transform, and download-as in any media type. Shared by the
  * Saga result viewer and the Files browser so both analyse the same way.
  */
@@ -43,11 +45,17 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
   const numericCols = useMemo(() => columns.filter((c) => NUMERIC.test(c.type ?? "")).map((c) => c.name), [columns]);
 
   const [kind, setKind] = useState<"pivot" | "series" | "candles" | "forecast">("pivot");
-  const [groupBy, setGroupBy] = useState("");
-  const [measureCol, setMeasureCol] = useState(numericCols[0] ?? allCols[0] ?? "");
-  const [aggFn, setAggFn] = useState<AggFunc>("sum");
   const [chartType, setChartType] = useState<ChartType>("bar");
-  const [pivot, setPivot] = useState<AggregateResult | null>(null);
+  // Excel-style pivot field wells (rows × columns × measures), seeded from schema
+  const [pRows, setPRows] = useState<string[]>(() => {
+    const dim = columns.find((c) => !NUMERIC.test(c.type ?? ""))?.name;
+    return dim ? [dim] : [];
+  });
+  const [pCols, setPCols] = useState<string[]>([]);
+  const [pMeas, setPMeas] = useState<PivotMeasure[]>(() =>
+    numericCols[0] ? [{ column: numericCols[0], agg: "sum" }] : []);
+  const [pivotData, setPivotData] = useState<PivotResult | null>(null);
+  const [pivotChart, setPivotChart] = useState(false);
   const [seriesCol, setSeriesCol] = useState(numericCols[0] ?? allCols[0] ?? "");
   const [xCol, setXCol] = useState("");
   const [volCol, setVolCol] = useState("");
@@ -80,13 +88,39 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
   const [dlOpen, setDlOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
 
-  const runPivot = async () => {
-    if (!measureCol) return;
-    setAnalyzing(true); setErr(null);
-    try { setPivot(await aggregate(path, groupBy ? [groupBy] : [], [{ column: measureCol, agg: aggFn }], node, 500, filters)); }
-    catch (e) { setErr(e instanceof Error ? e.message : "aggregate failed"); }
-    finally { setAnalyzing(false); }
+  // Field-well helpers — assign a column to a well (Excel-style: a field lives
+  // in one dimension at a time), or remove it.
+  const placeField = (col: string, well: "rows" | "cols" | "meas") => {
+    setPRows((r) => r.filter((c) => c !== col));
+    setPCols((c) => c.filter((x) => x !== col));
+    if (well === "rows") setPRows((r) => (r.includes(col) ? r : [...r, col]));
+    else if (well === "cols") setPCols((c) => (c.includes(col) ? c : [...c, col]));
+    else setPMeas((m) => (m.some((x) => x.column === col) ? m : [...m, { column: col, agg: NUMERIC.test(columns.find((c) => c.name === col)?.type ?? "") ? "sum" : "count" }]));
   };
+  const removeField = (col: string, well: "rows" | "cols" | "meas") => {
+    if (well === "rows") setPRows((r) => r.filter((c) => c !== col));
+    else if (well === "cols") setPCols((c) => c.filter((x) => x !== col));
+    else setPMeas((m) => m.filter((x) => x.column !== col));
+  };
+
+  // Auto-run the pivot whenever wells or filters change (debounced) — the grid
+  // recomputes live like Excel; results are client-cached by payload.
+  useEffect(() => {
+    if (kind !== "pivot" || pMeas.length === 0) return;
+    let cancelled = false;
+    const id = setTimeout(async () => {
+      setAnalyzing(true); setErr(null);
+      try {
+        const res = await runPivotApi(path, pRows, pCols, pMeas, node, { filters });
+        if (!cancelled) setPivotData(res);
+      } catch (e) {
+        if (!cancelled) setErr(e instanceof Error ? e.message : "pivot failed");
+      } finally {
+        if (!cancelled) setAnalyzing(false);
+      }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(id); };
+  }, [kind, pRows, pCols, pMeas, filters, path, node]);
   const runSeries = async (z: { min: number; max: number } | null = zoom) => {
     if (!seriesCol) return;
     setAnalyzing(true); setErr(null);
@@ -165,21 +199,10 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
         <span className="w-px h-4 bg-white/10 mx-1" />
         {kind === "pivot" && (
           <>
-            <label className="text-muted">group</label>
-            <select value={groupBy} onChange={(e) => setGroupBy(e.target.value)} className={sel}>
-              <option value="">(none)</option>
-              {allCols.map((c) => <option key={c} value={c}>{c}</option>)}
-            </select>
-            <label className="text-muted">of</label>
-            <select value={measureCol} onChange={(e) => setMeasureCol(e.target.value)} className={sel}>
-              {(numericCols.length ? numericCols : allCols).map((c) => <option key={c} value={c}>{c}</option>)}
-            </select>
-            <select value={aggFn} onChange={(e) => setAggFn(e.target.value as AggFunc)} className={sel}>
-              {AGGS.map((a) => <option key={a} value={a}>{a}</option>)}
-            </select>
-            <button onClick={runPivot} disabled={analyzing || !measureCol} className="px-2.5 py-1 rounded bg-emerald/15 text-emerald border border-emerald/30 disabled:opacity-40">run</button>
+            <span className="text-muted/70">{pivotData ? `${pivotData.row_count} rows × ${pivotData.col_count} cols · ${pivotData.source_rows.toLocaleString()} streamed` : "drag fields into the wells →"}</span>
             <span className="ml-auto flex items-center gap-1">
-              {(["bar", "line", "area"] as ChartType[]).map((t) => (
+              <button onClick={() => setPivotChart((v) => !v)} className={`px-2 py-1 rounded ${pivotChart ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>chart</button>
+              {pivotChart && (["bar", "line", "area"] as ChartType[]).map((t) => (
                 <button key={t} onClick={() => setChartType(t)} className={`px-2 py-1 rounded ${chartType === t ? "bg-frost/15 text-frost" : "text-muted hover:text-foreground"}`}>{t}</button>
               ))}
             </span>
@@ -326,22 +349,98 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
       {err && <div className="text-[11px] text-rose/90 font-mono">{err}</div>}
       {analyzing && <div className="text-[11px] text-muted font-mono">computing…</div>}
 
-      {kind === "pivot" && pivot && !analyzing && (
-        <div className="space-y-3">
-          <Chart type={chartType} labels={pivot.rows.map((r) => String(r[0]))}
-            values={pivot.rows.map((r) => Number(r[pivot.columns.length - 1]))}
-            color="var(--emerald)" yLabel={pivot.columns[pivot.columns.length - 1]} />
-          <div className="text-[10px] text-muted font-mono">{pivot.group_count} groups · {pivot.source_rows.toLocaleString()} rows streamed</div>
-          <table className="w-full text-[11px] font-mono border-collapse">
-            <thead><tr>{pivot.columns.map((c) => <th key={c} className="px-2 py-1 text-left text-frost/80 border-b border-white/[0.06]">{c}</th>)}</tr></thead>
-            <tbody>
-              {pivot.rows.slice(0, 50).map((r, i) => (
-                <tr key={i} className="hover:bg-white/[0.02]">
-                  {r.map((v, j) => <td key={j} className="px-2 py-1 border-b border-white/[0.03] text-foreground/80">{v == null ? "" : typeof v === "number" ? Number(v).toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(v)}</td>)}
-                </tr>
+      {kind === "pivot" && (
+        <div className="flex gap-3 items-start">
+          {/* result grid (+ optional chart) */}
+          <div className="flex-1 min-w-0 space-y-2">
+            {pivotChart && pivotData && pivotData.rows.length > 0 && (
+              <Chart type={chartType}
+                labels={pivotData.rows.map((r) => String(r[0] ?? ""))}
+                values={pivotData.rows.map((r) => Number(r[pivotData.row_fields.length] ?? r[r.length - 1]))}
+                color="var(--emerald)" yLabel={pivotData.columns[pivotData.row_fields.length]} />
+            )}
+            {pivotData && pivotData.rows.length > 0 ? (
+              <div className="overflow-auto rounded border border-white/[0.06] max-h-[52vh]">
+                <table className="text-[11px] font-mono border-collapse">
+                  <thead className="sticky top-0 z-10">
+                    <tr>{pivotData.columns.map((c, ci) => (
+                      <th key={ci} className={`px-2 py-1.5 border-b border-white/[0.1] bg-[#0d1117] whitespace-nowrap ${ci < pivotData.row_fields.length ? "text-left text-frost/80 sticky left-0 z-20" : "text-right text-emerald/80"}`}>{c}</th>
+                    ))}</tr>
+                  </thead>
+                  <tbody>
+                    {pivotData.rows.map((r, i) => (
+                      <tr key={i} className="hover:bg-white/[0.02]">
+                        {r.map((v, j) => (
+                          <td key={j} className={`px-2 py-1 border-b border-white/[0.03] ${j < pivotData.row_fields.length ? "text-frost/70 font-semibold whitespace-nowrap sticky left-0 bg-[#0b0e14]" : "text-right text-foreground/80 tabular-nums"}`}>
+                            {v == null ? "·" : typeof v === "number" ? Number(v).toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(v)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="text-[11px] text-muted font-mono py-10 text-center border border-dashed border-white/10 rounded-lg">
+                {pMeas.length === 0 ? "Add a field to the Values (Σ) well →" : analyzing ? "computing…" : "no rows"}
+              </div>
+            )}
+            {pivotData?.truncated && (
+              <div className="text-[10px] text-amber/80 font-mono">
+                columns capped to top {pivotData.columns.length - pivotData.row_fields.length} of {pivotData.col_count} by first measure — add a filter to narrow
+              </div>
+            )}
+          </div>
+
+          {/* field panel — drag a field into a well, or use the R/C/Σ buttons */}
+          <aside className="w-52 shrink-0 rounded-lg border border-white/[0.08] bg-white/[0.02] p-2 space-y-2 text-[11px] font-mono">
+            <div className="text-[9px] uppercase tracking-wider text-frost/70">PivotTable fields</div>
+            <div className="max-h-32 overflow-auto space-y-0.5 pr-1">
+              {allCols.map((c) => (
+                <div key={c} draggable onDragStart={(e) => e.dataTransfer.setData("text/col", c)}
+                  className="flex items-center justify-between gap-1 px-1.5 py-1 rounded bg-white/[0.03] hover:bg-white/[0.06] cursor-grab group">
+                  <span className="truncate" title={c}>{c}</span>
+                  <span className="flex gap-0.5 opacity-0 group-hover:opacity-100 shrink-0 text-[10px]">
+                    <button onClick={() => placeField(c, "rows")} title="add to Rows" className="px-1 rounded bg-frost/10 text-frost">R</button>
+                    <button onClick={() => placeField(c, "cols")} title="add to Columns" className="px-1 rounded bg-frost/10 text-frost">C</button>
+                    <button onClick={() => placeField(c, "meas")} title="add to Values" className="px-1 rounded bg-emerald/10 text-emerald">Σ</button>
+                  </span>
+                </div>
               ))}
-            </tbody>
-          </table>
+            </div>
+            {([["Rows", pRows, "rows"], ["Columns", pCols, "cols"]] as const).map(([label, vals, well]) => (
+              <div key={well} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { const c = e.dataTransfer.getData("text/col"); if (c) placeField(c, well); }}
+                className="rounded border border-dashed border-white/10 p-1.5 min-h-[2.4rem]">
+                <div className="text-[9px] uppercase tracking-wider text-muted/60 mb-1">{label}</div>
+                <div className="flex flex-wrap gap-1">
+                  {vals.length === 0 && <span className="text-muted/40 text-[10px]">drop here</span>}
+                  {vals.map((c) => (
+                    <span key={c} draggable onDragStart={(e) => e.dataTransfer.setData("text/col", c)}
+                      className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-frost/15 text-frost cursor-grab">
+                      {c}<button onClick={() => removeField(c, well)} className="text-frost/60 hover:text-rose">✕</button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))}
+            <div onDragOver={(e) => e.preventDefault()} onDrop={(e) => { const c = e.dataTransfer.getData("text/col"); if (c) placeField(c, "meas"); }}
+              className="rounded border border-dashed border-white/10 p-1.5 min-h-[2.4rem]">
+              <div className="text-[9px] uppercase tracking-wider text-muted/60 mb-1">Values (Σ)</div>
+              <div className="space-y-1">
+                {pMeas.length === 0 && <span className="text-muted/40 text-[10px]">drop here</span>}
+                {pMeas.map((m, i) => (
+                  <div key={m.column} className="flex items-center gap-1">
+                    <select value={m.agg} onChange={(e) => setPMeas((ms) => ms.map((x, j) => j === i ? { ...x, agg: e.target.value as AggFunc } : x))}
+                      className="bg-white/[0.04] border border-white/10 rounded px-1 py-0.5 outline-none">
+                      {AGGS.map((a) => <option key={a} value={a}>{a}</option>)}
+                    </select>
+                    <span className="flex-1 truncate text-emerald" title={m.column}>{m.column}</span>
+                    <button onClick={() => removeField(m.column, "meas")} className="text-emerald/60 hover:text-rose">✕</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </aside>
         </div>
       )}
 
@@ -407,11 +506,11 @@ export default function TabularAnalyze({ path, node, columns }: Props) {
         </div>
       )}
 
-      {((kind === "pivot" && !pivot) || (kind === "series" && !seriesData) || (kind === "candles" && !candles) || (kind === "forecast" && !fcData)) && !analyzing && !err && (
+      {((kind === "series" && !seriesData) || (kind === "candles" && !candles) || (kind === "forecast" && !fcData)) && !analyzing && !err && (
         <div className="text-[11px] text-muted font-mono py-8 text-center">
           {kind === "forecast"
             ? "Pick a value (+ time / by) and hit run to forecast — then register it as a live Saga workflow."
-            : `Pick a ${kind === "pivot" ? "group + measure" : kind === "candles" ? "price (+ x / volume)" : "series (+ x)"} and hit run.`}
+            : `Pick a ${kind === "candles" ? "price (+ x / volume)" : "series (+ x)"} and hit run.`}
         </div>
       )}
     </div>

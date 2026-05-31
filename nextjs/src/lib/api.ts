@@ -564,6 +564,37 @@ export function aggregate(
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
+export interface PivotMeasure { column: string; agg: AggFunc }
+
+export interface PivotResult {
+  row_fields: string[];
+  column_fields: string[];
+  measures: string[];
+  columns: string[];
+  rows: TabularCell[][];
+  row_count: number;
+  col_count: number;
+  source_rows: number;
+  truncated: boolean;
+}
+
+export function pivot(
+  path: string,
+  rows: string[],
+  columns: string[],
+  measures: PivotMeasure[],
+  node?: string,
+  opts: { row_limit?: number; col_limit?: number; filters?: { column: string; op: string; value?: unknown }[] } = {},
+): Promise<PivotResult> {
+  const url = `/api/v2/analysis/pivot${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = {
+    path, rows, columns, measures,
+    row_limit: opts.row_limit ?? 1000, col_limit: opts.col_limit ?? 50,
+    filters: opts.filters ?? [],
+  };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
 export interface DescribeResult {
   statistics: string[];
   columns: string[];
