@@ -142,30 +142,40 @@ class TestFlow:
 
         assert etl.definition()["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
 
-    def test_deploy_builds_wheel_and_ships_it(self):
+    def test_deploy_uses_published_ygg_by_default(self):
+        @flow(name="ygg-demo", parameters=["a"])
+        def demo(x):
+            ...
+
+        client = MagicMock()
+        deployed = demo.deploy(client)
+        client.jobs.create_or_update.assert_called_once()
+        kwargs = client.jobs.create_or_update.call_args.kwargs
+        assert kwargs["name"] == "ygg-demo"
+        assert kwargs["tasks"][0].python_wheel_task.parameters == ["a"]
+        # published ygg from the index + latest databricks-sdk — no built wheel
+        assert kwargs["environments"][0].spec.dependencies == ["ygg[databricks]", "databricks-sdk"]
+        assert deployed is client.jobs.create_or_update.return_value
+
+    def test_deploy_can_build_and_ship_wheel(self):
         from unittest.mock import patch
 
         @flow(name="ygg-demo", parameters=["a"])
         def demo(x):
             ...
 
-        client = MagicMock()                         # deploy takes a client
-        wheel = "/Workspace/Shared/.ygg/jobs/ygg-9.9-py3-none-any.whl"
-        sdk = "/Workspace/Shared/.ygg/jobs/databricks_sdk-1.2.3-py3-none-any.whl"
+        demo.build_wheel = True                       # opt in (air-gapped)
+        client = MagicMock()
+        wheel = "/Workspace/Shared/.ygg/whl/ygg-demo/ygg-9.9-py3-none-any.whl"
+        sdk = "/Workspace/Shared/.ygg/whl/databricks-sdk/databricks_sdk-1.2.3-py3-none-any.whl"
         with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheel) as ew, \
              patch("yggdrasil.databricks.job.wheel.ensure_requirement_wheel", return_value=sdk) as erw:
-            deployed = demo.deploy(client)
+            demo.deploy(client)
 
-        wheel_dir = "/Workspace/Shared/.ygg/whl/ygg-demo"   # built wheel named by the job
-        ew.assert_called_once_with(client, workspace_dir=wheel_dir, rebuild=True)
-        erw.assert_called_once_with(client, "databricks-sdk")   # external lib centralized by name
-        client.jobs.create_or_update.assert_called_once()
+        ew.assert_called_once_with(client, workspace_dir="/Workspace/Shared/.ygg/whl/ygg-demo", rebuild=True)
+        erw.assert_called_once_with(client, "databricks-sdk")
         kwargs = client.jobs.create_or_update.call_args.kwargs
-        assert kwargs["name"] == "ygg-demo"
-        assert kwargs["tasks"][0].python_wheel_task.parameters == ["a"]
-        # shipped wheels only — ygg + the embedded databricks-sdk (no index names)
         assert kwargs["environments"][0].spec.dependencies == [wheel, sdk]
-        assert deployed is client.jobs.create_or_update.return_value
 
 
 def test_class_based_flow_overrides_run():

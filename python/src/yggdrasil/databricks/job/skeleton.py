@@ -211,18 +211,19 @@ class Flow(_Runnable):
     environment_key: str = "default"
     environment_version: str = "5"
 
-    #: Fallback dependency when not shipping a built wheel (see
-    #: :attr:`build_wheel`) — e.g. ``ygg`` from an index.
+    #: Fallback dependency when not shipping a built wheel — ``ygg`` (the
+    #: published package, pulling its ``[databricks]`` extra) from an index.
     dependencies: "tuple[str, ...]" = ("ygg[databricks]",)
 
     #: Always-installed extras, on top of the wheel / :attr:`dependencies` —
     #: ``databricks-sdk`` (latest) so the runtime SDK is current.
     extra_dependencies: "tuple[str, ...]" = ("databricks-sdk",)
 
-    #: Build the ygg wheel from source on :meth:`deploy` and ship *that* (not a
-    #: ``ygg[databricks]`` index install) as the serverless dependency. Uploaded
-    #: to ``/Workspace/Shared/.ygg/jobs/`` and referenced by path.
-    build_wheel: bool = True
+    #: Build the ygg wheel from source on :meth:`deploy` and ship *that* instead
+    #: of installing the published ``ygg`` from an index. Default ``False`` —
+    #: ``ygg`` is published, so the serverless env just pip-installs it; set
+    #: ``True`` for an air-gapped workspace with no index access.
+    build_wheel: bool = False
 
     def __init__(
         self,
