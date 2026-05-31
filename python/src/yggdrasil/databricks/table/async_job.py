@@ -61,7 +61,6 @@ class TableJob(JobSkeleton):
     """
 
     entry_point: ClassVar[str] = "ygg-table-async-load"
-    task_key: ClassVar[str] = "async-load"
     _NAME_PREFIX: ClassVar[str] = "ygg-async-insert"
 
     def __init__(self, table: "Table") -> None:
@@ -110,7 +109,8 @@ class TableJob(JobSkeleton):
         """The live :class:`Job` (deployed on first access)."""
         return self.ensure()._job
 
-    # -- the loader the trigger runs ------------------------------------
+    # -- the loader the trigger runs (the job's single @task) -----------
+    @JobSkeleton.task(key="async-load")
     def run(self, *, wait: Any = True, limit: Optional[int] = None) -> int:
         """Consume pending operation logs and load them into their targets.
 
@@ -159,8 +159,9 @@ class TableJob(JobSkeleton):
             processed += len(items)
         return processed
 
-    #: Descriptive alias for :meth:`run` (the JobSkeleton entry point).
-    process = run
+    #: Descriptive alias for :meth:`run` — calling the skeleton runs it too.
+    def process(self, *, wait: Any = True, limit: Optional[int] = None) -> int:
+        return self.run(wait=wait, limit=limit)
 
     def _resolve_target(self, full_name: str) -> "Table":
         table = self._table

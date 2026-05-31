@@ -60,3 +60,66 @@ def test_deploy_get_or_creates_via_service():
 
 def test_run_is_the_python_body():
     assert _Demo().run() == "ran"
+
+
+def test_callable_runs_the_body_when_no_tasks():
+    # No @task methods → calling the skeleton calls run().
+    assert _Demo()() == "ran"
+
+
+class _Etl(JobSkeleton):
+    @property
+    def name(self) -> str:
+        return "ygg-etl"
+
+    @JobSkeleton.task
+    def extract(self):
+        self.calls.append("extract")
+        return "x"
+
+    @JobSkeleton.task(key="load", depends_on=["extract"])
+    def load(self):
+        self.calls.append("load")
+        return "l"
+
+    def __init__(self):
+        self.calls = []
+
+
+class TestTaskDecorator:
+    def test_discovers_tasks(self):
+        specs = {s.key: s for s in _Etl._task_specs()}
+        assert set(specs) == {"extract", "load"}
+        assert specs["load"].depends_on == ("extract",)
+
+    def test_definition_builds_one_task_per_method_with_deps(self):
+        spec = _Etl().definition()
+        tasks = {t.task_key: t for t in spec["tasks"]}
+        assert set(tasks) == {"extract", "load"}
+        assert tasks["extract"].depends_on is None
+        assert tasks["load"].depends_on[0].task_key == "extract"
+        # multi-task → the task key is prepended to the wheel parameters
+        assert tasks["load"].python_wheel_task.parameters == ["load"]
+
+    def test_call_runs_tasks_in_dependency_order(self):
+        etl = _Etl()
+        results = etl()
+        assert etl.calls == ["extract", "load"]     # topo order honoured
+        assert results == {"extract": "x", "load": "l"}
+
+    def test_single_task_forwards_call_args(self):
+        seen = {}
+
+        class One(JobSkeleton):
+            @property
+            def name(self):
+                return "one"
+
+            @JobSkeleton.task
+            def go(self, *, n=0):
+                seen["n"] = n
+                return n
+
+        assert One()(n=5) == 5                       # *args/**kwargs forwarded
+        assert seen["n"] == 5
+

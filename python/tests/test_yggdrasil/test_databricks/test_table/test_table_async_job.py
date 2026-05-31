@@ -186,6 +186,20 @@ class TestProcess:
         data_files["/Volumes/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
         data_files["/Volumes/c/s/t/.sql/tmp/b.parquet"].unlink.assert_called_once()
 
+    def test_callable_runs_the_loader(self):
+        # TableJob is callable like a function — calling it runs the loader.
+        t = _table_mock()
+        t.client.jobs = MagicMock()
+        logs_dir = self._wire_logs(t)
+        logs_dir.exists.return_value = True
+        logs_dir.iterdir.return_value = [self._log("a")]
+
+        with patch.object(TableJob, "_data_file", lambda self, p: MagicMock()):
+            processed = TableJob(t)(wait=False)       # __call__ → run
+
+        assert processed == 1
+        t.insert.assert_called_once()
+
     def test_splits_by_mode(self):
         t = _table_mock()
         t.client.jobs = MagicMock()
