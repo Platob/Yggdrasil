@@ -27,6 +27,7 @@ import type {
 } from "./types";
 import { cachedGet, cachedPost, invalidate, TTL } from "./cache";
 import { downloadBlob } from "./format";
+import { mimeType } from "./yggdrasil/enums";
 
 // ── Low-level fetch helper ─────────────────────────────────────────────────
 
@@ -473,16 +474,10 @@ export interface TabularPreview {
   truncated: boolean;
 }
 
-const TABULAR_EXTS = new Set(["csv", "parquet", "pq", "json", "ndjson", "arrow", "feather", "xlsx", "xls"]);
-// Compression wrappers the backend sniffs (yggdrasil MimeTypes codec exts) — a
-// trailing one is stripped so `data.csv.gz` still resolves to its inner `csv`.
-const CODEC_EXTS = new Set(["gz", "gzip", "tgz", "zst", "zstd", "bz2", "bzip2", "tbz2", "xz", "txz", "lz4", "lzma", "br", "brotli", "sz", "snappy", "zlib", "z"]);
+// Tabularness comes from the shared yggdrasil MIME registry (mirrors the
+// backend), honoring a trailing codec wrapper so `data.csv.gz` resolves to csv.
 export function isTabularName(name: string): boolean {
-  const parts = name.toLowerCase().split(".");
-  if (parts.length < 2) return false;
-  let ext = parts[parts.length - 1];
-  if (CODEC_EXTS.has(ext) && parts.length >= 3) ext = parts[parts.length - 2];
-  return TABULAR_EXTS.has(ext);
+  return mimeType.fromName(name).mime?.isTabular ?? false;
 }
 
 export function getTabularInspect(path: string, node?: string): Promise<TabularInspect> {
