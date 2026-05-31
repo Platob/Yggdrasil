@@ -250,8 +250,7 @@ class MimeType:
                 return
 
             # Try full string first — keeps registered composites intact
-            # (PARQUET_DELTA = "application/vnd.apache.parquet+delta",
-            #  NDJSON = "application/ld+json").
+            # (e.g. PARQUET_DELTA = "application/vnd.apache.parquet+delta").
             mt = cls.get(candidate)
             if mt is not None:
                 emit(mt)
