@@ -12,7 +12,7 @@
 // to grow into the full Excel grid (virtualization, formulas) without touching
 // callers.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getTabularInspect,
   getFsStat,
@@ -38,6 +38,7 @@ import {
   type CastSpec,
 } from "@/lib/api";
 import { fetchArrowTable, clearArrowCache } from "@/lib/arrow";
+import { svgToImage, tableToImage, downloadBlob } from "@/lib/image";
 import Chart, { type ChartType } from "@/components/Chart";
 
 const AGGS: AggFunc[] = ["sum", "mean", "min", "max", "count", "median", "std", "var"];
@@ -157,6 +158,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
   const [exporting, setExporting] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
   const [stat, setStat] = useState<{ modified_at?: string; size?: number } | null>(null);
+  const analyzeRef = useRef<HTMLDivElement>(null);                 // analyze panel (for chart→image capture)
   const [facetCol, setFacetCol] = useState<number | null>(null);   // open column profile
   const [sort, setSort] = useState<{ col: number; dir: "asc" | "desc" } | null>(null);
   const [hidden, setHidden] = useState<Set<number>>(new Set());    // hidden columns
@@ -390,6 +392,31 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
     }
   };
 
+  // Download-as image: in analyze mode rasterize the rendered chart SVG (png/
+  // jpeg/svg), otherwise paint the current grid view (filters + sort + hidden
+  // applied) to a png/jpeg/webp — all client-side, no round-trip.
+  const exportImage = async (fmt: string) => {
+    setDlOpen(false); setExporting(true); setAnalyzeErr(null);
+    try {
+      const base = path.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "table";
+      const ext = fmt === "jpeg" ? "jpg" : fmt;
+      if (mode === "analyze") {
+        const svg = analyzeRef.current?.querySelector("svg");
+        if (!svg) throw new Error("run an analysis to render a chart first");
+        downloadBlob(await svgToImage(svg as SVGSVGElement, fmt), `${base}.${ext}`);
+      } else {
+        const vis = columns.map((_, i) => i).filter((i) => !hidden.has(i));
+        const head = vis.map((i) => columns[i].name);
+        const rows = viewOrder.map((ri) => vis.map((i) => grid[ri][i] ?? ""));
+        downloadBlob(await tableToImage(head, rows, fmt), `${base}.${ext}`);
+      }
+    } catch (e) {
+      setAnalyzeErr(e instanceof Error ? e.message : "image export failed");
+    } finally {
+      setExporting(false);
+    }
+  };
+
   // Client-side moving average over the candle closes — computed on the client
   // so the node doesn't recompute it on every overlay toggle.
   const maLine = candles
@@ -530,7 +557,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
 
         {/* Analyze panel — pivot + adaptive series + candlesticks */}
         {mode === "analyze" && (
-          <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30 p-3 space-y-3">
+          <div ref={analyzeRef} className="flex-1 min-h-0 overflow-auto rounded-lg border border-white/[0.06] bg-black/30 p-3 space-y-3">
             <div className="flex items-center gap-2 text-[11px] font-mono flex-wrap">
               {(["pivot", "series", "candles"] as const).map((k) => (
                 <button key={k} onClick={() => setAnalyzeKind(k)}
@@ -837,6 +864,7 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
             </button>
           )}
           {dirty && <span className="text-[10px] text-amber/80 font-mono">unsaved edits</span>}
+          {mode === "grid" && analyzeErr && <span className="text-[10px] text-rose/90 font-mono">{analyzeErr}</span>}
           {readOnly && total > PAGE && (
             <div className="flex items-center gap-2 text-[10px] font-mono text-muted">
               <button
@@ -866,6 +894,13 @@ export default function TabularModal({ node, nodeLabel, path, name, onClose }: P
                 {["csv", "parquet", "json", "ndjson", "arrow", "xlsx"].map((fmt) => (
                   <button key={fmt} onClick={() => exportAs(fmt)} className="block w-full text-left px-2 py-1.5 rounded hover:bg-emerald/10 text-foreground/80 hover:text-emerald">
                     {fmt}{filters.length + casts.length ? " · transformed" : ""}
+                  </button>
+                ))}
+                <div className="h-px bg-white/10 my-1" />
+                <div className="px-2 py-0.5 text-[9px] uppercase tracking-wider text-muted/50">{mode === "analyze" ? "chart image" : "table image"}</div>
+                {(mode === "analyze" ? ["png", "jpeg", "svg"] : ["png", "jpeg", "webp"]).map((fmt) => (
+                  <button key={fmt} onClick={() => exportImage(fmt)} className="block w-full text-left px-2 py-1.5 rounded hover:bg-frost/10 text-foreground/80 hover:text-frost">
+                    {fmt}
                   </button>
                 ))}
               </div>
