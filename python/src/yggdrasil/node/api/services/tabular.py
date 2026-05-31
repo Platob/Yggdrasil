@@ -133,9 +133,17 @@ class TabularService:
         if resolved.is_dir():
             raise ForbiddenError(f"Not a file: {path!r}")
 
-        ext = resolved.suffix.lstrip(".").lower()
+        # Honor compression wrappers (``data.csv.gz``, ``trades.parquet.zst``):
+        # strip a trailing codec suffix so the *inner* format decides whether
+        # the file is tabular — the IO layer decompresses transparently on read.
+        suffixes = [s.lower() for s in resolved.name.split(".")[1:]]
+        ext = suffixes[-1] if suffixes else ""
+        codec_media = MediaType.from_(ext, default=None) if ext else None
+        compressed = bool(codec_media and codec_media.codec)
+        if compressed and len(suffixes) >= 2:
+            ext = suffixes[-2]
         is_tabular = ext in TABULAR_EXTS
-        media = MediaType.from_(ext, default=None) if ext else None
+        media = MediaType.from_(resolved, default=None)
         cap = self.settings.tabular_preview_max_rows
         columns: list[TabularColumn] = []
         row_count: int | None = None
@@ -145,11 +153,12 @@ class TabularService:
 
         if is_tabular:
             try:
-                if ext in ("parquet", "pq"):
+                if ext in ("parquet", "pq") and not compressed:
                     # Parquet carries schema + exact row count in its footer —
                     # an O(1) read. No need to pull cap+1 rows just to size the
                     # file, so even a multi-GB parquet inspects instantly and
-                    # still reports its true row_count.
+                    # still reports its true row_count. (An externally-compressed
+                    # parquet falls to the codec-aware read below instead.)
                     import pyarrow.parquet as _pq
                     pf = _pq.ParquetFile(str(resolved))
                     arrow_schema = pf.schema_arrow

@@ -473,9 +473,15 @@ export interface TabularPreview {
 }
 
 const TABULAR_EXTS = new Set(["csv", "parquet", "pq", "json", "ndjson", "arrow", "feather", "xlsx", "xls"]);
+// Compression wrappers the backend sniffs (yggdrasil MimeTypes codec exts) — a
+// trailing one is stripped so `data.csv.gz` still resolves to its inner `csv`.
+const CODEC_EXTS = new Set(["gz", "gzip", "tgz", "zst", "zstd", "bz2", "bzip2", "tbz2", "xz", "txz", "lz4", "lzma", "br", "brotli", "sz", "snappy", "zlib", "z"]);
 export function isTabularName(name: string): boolean {
-  const idx = name.lastIndexOf(".");
-  return idx >= 0 && TABULAR_EXTS.has(name.slice(idx + 1).toLowerCase());
+  const parts = name.toLowerCase().split(".");
+  if (parts.length < 2) return false;
+  let ext = parts[parts.length - 1];
+  if (CODEC_EXTS.has(ext) && parts.length >= 3) ext = parts[parts.length - 2];
+  return TABULAR_EXTS.has(ext);
 }
 
 export function getTabularInspect(path: string, node?: string): Promise<TabularInspect> {
