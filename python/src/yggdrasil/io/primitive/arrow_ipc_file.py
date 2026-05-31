@@ -209,14 +209,9 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                 except pa.ArrowInvalid:
                     return super()._read_arrow_table(options)
                 table = reader.read_all()
-                columns = self._projection_columns(options, reader.schema.names)
-                if columns is not None:
-                    # Zero-copy projection: the kept columns keep viewing the
-                    # mmap / buffer payload; the rest are dropped (and on an
-                    # mmap their pages are never faulted in).
-                    table = table.select(columns)
         except FileNotFoundError:
             return super()._read_arrow_table(options)
+        # Projection (+ fill / reshape to the target) is applied by the cast.
         table = options.cast_arrow_table(table)
         table = options.apply_post_read_table(table)
         if options.row_limit is not None and table.num_rows > options.row_limit:
