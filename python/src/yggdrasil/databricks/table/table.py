@@ -3384,10 +3384,12 @@ class Table(DatabricksPath):
     ) -> "VolumePath":
         """Stage *data* as Parquet + drop a JSON operation log — no warehouse.
 
-        Writes the rows to ``<staging_volume>/.sql/async/data/<op>.parquet`` and
-        an operation log to ``<staging_volume>/.sql/async/logs/<op>.json`` that
-        records the target, mode, and data leaf, then ensures :attr:`async_job`
-        exists so the file-arrival trigger picks it up. Returns the log path.
+        Writes the rows to the table's **default tmp staging path**
+        (:meth:`insert_volume_path`) and an operation log to
+        ``<staging_volume>/.sql/async/logs/<op>.json`` that records the target,
+        mode, and the data's **full path** (so the data can live anywhere —
+        only the log location is fixed), then ensures :attr:`async_job` exists
+        so the file-arrival trigger picks it up. Returns the log path.
 
         Only ``OVERWRITE`` / ``APPEND`` with no ``match_by``; the data is staged
         with its own schema (the aggregating ``INSERT`` casts at load time).
@@ -3406,7 +3408,10 @@ class Table(DatabricksPath):
             raise ValueError("async insert (wait=False) does not support match_by")
 
         op_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
-        data_file = TableJob.data_path(self) / f"{op_id}.parquet"
+        # Data goes to the default tmp staging path; the log carries its full
+        # path so the loader reads it wherever it landed. ``temporary=False``
+        # keeps it around until the async job consumes it.
+        data_file = self.insert_volume_path(self, temporary=False)
         data_file.write_table(data, cast_options, mode=Mode.OVERWRITE)
 
         log_file = TableJob.logs_path(self) / f"{op_id}.json"
@@ -3416,7 +3421,7 @@ class Table(DatabricksPath):
                     "op_id": op_id,
                     "target": self.full_name(),
                     "mode": mode_enum.name.lower(),
-                    "data": f"{op_id}.parquet",
+                    "data": data_file.full_path(),
                     "ts": time.time(),
                 }
             ).encode()

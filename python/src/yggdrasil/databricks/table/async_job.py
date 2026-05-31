@@ -4,9 +4,10 @@
 declarative Python-job definition) that turns a table's synchronous warehouse
 insert into a *drop-and-aggregate* pipeline:
 
-- ``table.insert(..., wait=False)`` writes the staged Parquet under the table's
-  staging volume at ``.sql/async/data/`` and drops a small JSON *operation log*
-  next to it at ``.sql/async/logs/`` — no warehouse statement runs at call time.
+- ``table.insert(..., wait=False)`` writes the staged Parquet to the table's
+  default tmp staging path and drops a small JSON *operation log* at
+  ``.sql/async/logs/`` that **records where the data was written** (so the data
+  can live anywhere) — no warehouse statement runs at call time.
 - A **file-arrival trigger** on the ``logs/`` directory wakes the deployed job,
   whose Python entry point calls :meth:`TableJob.run`: read every pending log,
   group the operations by ``(target table, mode)``, build one aggregated
@@ -35,16 +36,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.databricks.job.job import Job
     from yggdrasil.databricks.table.table import Table
 
-__all__ = ["TableJob", "ASYNC_ROOT", "LOGS_SUBDIR", "DATA_SUBDIR", "ASYNC_MODES"]
+__all__ = ["TableJob", "ASYNC_ROOT", "LOGS_SUBDIR", "ASYNC_MODES"]
 
 logger = logging.getLogger(__name__)
 
-#: Root (under a table's staging volume) for the async drop pipeline, plus the
-#: two sibling directories it splits into — ``logs/`` (the JSON operation logs
-#: the file-arrival trigger watches) and ``data/`` (the staged Parquet).
+#: Root (under a table's staging volume) for the async drop pipeline. Only the
+#: ``logs/`` directory is fixed — the file-arrival trigger watches it. The
+#: staged Parquet lives wherever the producer wrote it (the table's default tmp
+#: staging path); each operation log records that location.
 ASYNC_ROOT = ".sql/async"
 LOGS_SUBDIR = f"{ASYNC_ROOT}/logs"
-DATA_SUBDIR = f"{ASYNC_ROOT}/data"
 
 #: Modes the async path accepts — keyed merges have no aggregation story here.
 ASYNC_MODES = (Mode.OVERWRITE, Mode.APPEND)
@@ -76,11 +77,6 @@ class TableJob(JobSkeleton):
     def logs_path(table: "Table") -> "VolumePath":
         """``<staging_volume>/.sql/async/logs`` — the trigger's watch dir."""
         return table.staging_volume.path(LOGS_SUBDIR)
-
-    @staticmethod
-    def data_path(table: "Table") -> "VolumePath":
-        """``<staging_volume>/.sql/async/data`` — the staged Parquet."""
-        return table.staging_volume.path(DATA_SUBDIR)
 
     # -- JobSkeleton definition surface ---------------------------------
     @property
@@ -126,11 +122,10 @@ class TableJob(JobSkeleton):
         """
         table = self._table
         logs_dir = self.logs_path(table)
-        data_dir = self.data_path(table)
         if not logs_dir.exists():
             return 0
 
-        # Parse pending logs into (target, mode, data-leaf, log-path).
+        # Parse pending logs into (target, mode, data-path, log-path).
         ops: list[tuple[str, str, str, Any]] = []
         for log_file in logs_dir.iterdir():
             if not str(log_file.name).endswith(".json"):
@@ -154,14 +149,13 @@ class TableJob(JobSkeleton):
         for (target_name, mode), items in groups.items():
             target = self._resolve_target(target_name)
             union = " UNION ALL ".join(
-                f"SELECT * FROM parquet.`{(data_dir / leaf).full_path()}`"
-                for leaf, _ in items
+                f"SELECT * FROM parquet.`{data}`" for data, _ in items
             )
             target.insert(union, mode=mode, wait=wait)
             # Clear consumed logs + data only after a successful load.
-            for leaf, log_file in items:
+            for data, log_file in items:
                 _best_effort_unlink(log_file)
-                _best_effort_unlink(data_dir / leaf)
+                _best_effort_unlink(self._data_file(data))
             processed += len(items)
         return processed
 
@@ -173,6 +167,12 @@ class TableJob(JobSkeleton):
         if table is not None and table.full_name() == full_name:
             return table
         return table.service[full_name]
+
+    def _data_file(self, path: str) -> Any:
+        """Reconstruct the staged-Parquet :class:`Path` from its logged path."""
+        from yggdrasil.databricks.path import DatabricksPath
+
+        return DatabricksPath.from_(path, client=self._table.client)
 
 
 def _best_effort_unlink(path: Any) -> None:

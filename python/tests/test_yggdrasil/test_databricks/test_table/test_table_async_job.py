@@ -16,11 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from yggdrasil.databricks.table import async_job as aj
-from yggdrasil.databricks.table.async_job import (
-    DATA_SUBDIR,
-    LOGS_SUBDIR,
-    TableJob,
-)
+from yggdrasil.databricks.table.async_job import LOGS_SUBDIR, TableJob
 from yggdrasil.databricks.table.table import Table
 
 
@@ -76,15 +72,17 @@ class TestAsyncInsert:
         with pytest.raises(ValueError, match="match_by"):
             Table._async_insert(t, object(), mode="append", match_by=["id"])
 
-    def test_writes_parquet_and_log(self):
+    def test_writes_parquet_to_staging_and_logs_its_path(self):
         t = _table_mock()
-        data_dir, logs_dir = MagicMock(), MagicMock()
-        data_file, log_file = MagicMock(), MagicMock()
-        data_dir.__truediv__.return_value = data_file
+        # data goes to the default tmp staging path
+        data_file = MagicMock()
+        data_file.full_path.return_value = "/Volumes/c/s/t/.sql/tmp/tmp-1-ab.parquet"
+        t.insert_volume_path.return_value = data_file
+        # log dir
+        logs_dir, log_file = MagicMock(), MagicMock()
         logs_dir.__truediv__.return_value = log_file
 
-        with patch.object(TableJob, "data_path", staticmethod(lambda tbl: data_dir)), \
-             patch.object(TableJob, "logs_path", staticmethod(lambda tbl: logs_dir)):
+        with patch.object(TableJob, "logs_path", staticmethod(lambda tbl: logs_dir)):
             result = Table._async_insert(t, {"a": [1]}, mode="append")
 
         assert result is log_file
@@ -93,7 +91,7 @@ class TestAsyncInsert:
         payload = json.loads(log_file.write_bytes.call_args[0][0])
         assert payload["target"] == "c.s.t"
         assert payload["mode"] == "append"
-        assert payload["data"].endswith(".parquet")
+        assert payload["data"] == "/Volumes/c/s/t/.sql/tmp/tmp-1-ab.parquet"
         # touched async_job so the file-arrival trigger exists
         assert t.async_job is not None
 
@@ -135,35 +133,27 @@ class TestEnsure:
 # TableJob.process (aggregate logs → INSERT per (target, mode))
 # --------------------------------------------------------------------------- #
 class TestProcess:
-    def _wire_dirs(self, table):
-        logs_dir, data_dir = MagicMock(), MagicMock()
+    def _wire_logs(self, table):
+        logs_dir = MagicMock()
         table.staging_volume.path.side_effect = (
-            lambda sub, *a, **k: logs_dir if sub == LOGS_SUBDIR else data_dir
+            lambda sub, *a, **k: logs_dir if sub == LOGS_SUBDIR else MagicMock()
         )
-        data_files: dict[str, MagicMock] = {}
-
-        def _div(leaf):
-            m = MagicMock()
-            m.full_path.return_value = f"/Volumes/c/s/t/{DATA_SUBDIR}/{leaf}"
-            data_files[leaf] = m
-            return m
-
-        data_dir.__truediv__.side_effect = _div
-        return logs_dir, data_dir, data_files
+        return logs_dir
 
     @staticmethod
     def _log(op, *, target="c.s.t", mode="append"):
         f = MagicMock()
         f.name = f"{op}.json"
+        # the log records the data's full path (it can live anywhere)
         f.read_bytes.return_value = json.dumps(
-            {"target": target, "mode": mode, "data": f"{op}.parquet"}
+            {"target": target, "mode": mode, "data": f"/Volumes/c/s/t/.sql/tmp/{op}.parquet"}
         ).encode()
         return f
 
     def test_no_logs_returns_zero(self):
         t = _table_mock()
         t.client.jobs = MagicMock()
-        logs_dir, _, _ = self._wire_dirs(t)
+        logs_dir = self._wire_logs(t)
         logs_dir.exists.return_value = False
         assert TableJob(t).process() == 0
         t.insert.assert_not_called()
@@ -171,37 +161,43 @@ class TestProcess:
     def test_aggregates_same_group_into_one_insert(self):
         t = _table_mock()
         t.client.jobs = MagicMock()
-        logs_dir, data_dir, data_files = self._wire_dirs(t)
+        logs_dir = self._wire_logs(t)
         logs_dir.exists.return_value = True
         log_a, log_b = self._log("a"), self._log("b")
         logs_dir.iterdir.return_value = [log_a, log_b]
 
-        processed = TableJob(t).process(wait=False)
+        data_files: dict[str, MagicMock] = {}
+        with patch.object(
+            TableJob, "_data_file",
+            lambda self, p: data_files.setdefault(p, MagicMock()),
+        ):
+            processed = TableJob(t).process(wait=False)
 
         assert processed == 2
         t.insert.assert_called_once()
         union = t.insert.call_args.args[0]
         assert "UNION ALL" in union
-        assert f"parquet.`/Volumes/c/s/t/{DATA_SUBDIR}/a.parquet`" in union
-        assert f"parquet.`/Volumes/c/s/t/{DATA_SUBDIR}/b.parquet`" in union
+        assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
+        assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in union
         assert t.insert.call_args.kwargs["mode"] == "append"
-        # consumed logs + data cleaned up
+        # consumed logs + data cleaned up (data resolved from the logged path)
         log_a.unlink.assert_called_once()
         log_b.unlink.assert_called_once()
-        data_files["a.parquet"].unlink.assert_called_once()
-        data_files["b.parquet"].unlink.assert_called_once()
+        data_files["/Volumes/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
+        data_files["/Volumes/c/s/t/.sql/tmp/b.parquet"].unlink.assert_called_once()
 
     def test_splits_by_mode(self):
         t = _table_mock()
         t.client.jobs = MagicMock()
-        logs_dir, data_dir, _ = self._wire_dirs(t)
+        logs_dir = self._wire_logs(t)
         logs_dir.exists.return_value = True
         logs_dir.iterdir.return_value = [
             self._log("a", mode="append"),
             self._log("b", mode="overwrite"),
         ]
 
-        processed = TableJob(t).process()
+        with patch.object(TableJob, "_data_file", lambda self, p: MagicMock()):
+            processed = TableJob(t).process()
 
         assert processed == 2
         modes = {c.kwargs["mode"] for c in t.insert.call_args_list}
