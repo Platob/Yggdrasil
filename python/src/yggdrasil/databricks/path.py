@@ -456,7 +456,7 @@ class DatabricksPath(RemotePath, DatabricksResource):
     :class:`VolumePath`, ``/Workspace/...`` → :class:`WorkspacePath`,
     everything else → :class:`DBFSPath`).
 
-    Singleton identity caching uses the 5-minute default TTL via a
+    Singleton identity caching uses the 1-minute default TTL via a
     PER-CLASS ``_INSTANCES`` cache so a hot ``DatabricksPath(...)``
     race never contends on the same lock as a hot ``S3Path(...)`` /
     ``HTTPPath(...)`` construction. Concrete subclasses

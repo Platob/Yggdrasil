@@ -455,3 +455,28 @@ class TestRemoteDirectory:
         assert "/dir/sub/a.txt" not in _StubRemotePath._STORAGE
         assert "/dir/sub/b.txt" not in _StubRemotePath._STORAGE
         assert "/dir/other.txt" in _StubRemotePath._STORAGE
+
+    def test_remove_ignores_stale_missing_cache(self) -> None:
+        # A read primes the stat cache as MISSING, then the object appears
+        # on the backend (another instance, node, or external tool). The
+        # delete must observe current state — not the stale snapshot — and
+        # actually remove the object instead of silently no-op'ing.
+        p = _make("/dir/race.bin")
+        assert not p.exists()  # caches MISSING within the TTL window
+        _StubRemotePath._STORAGE["/dir/race.bin"] = b"appeared"
+        p.remove()
+        assert "/dir/race.bin" not in _StubRemotePath._STORAGE
+
+    def test_exists_fresh_after_remove(self) -> None:
+        p = _make("/dir/gone.bin")
+        _StubRemotePath._STORAGE["/dir/gone.bin"] = b"here"
+        assert p.exists()
+        p.remove()
+        assert not p.exists()
+
+    def test_unlink_ignores_stale_missing_cache(self) -> None:
+        p = _make("/dir/unlink_race.bin")
+        assert not p.exists()  # caches MISSING
+        _StubRemotePath._STORAGE["/dir/unlink_race.bin"] = b"appeared"
+        p.unlink()
+        assert "/dir/unlink_race.bin" not in _StubRemotePath._STORAGE

@@ -30,12 +30,15 @@ __all__ = ["RemotePath"]
 
 #: Default freshness window for a seeded :class:`IOStats` entry.
 #: Beyond this, :meth:`RemotePath._stat` discards the cached entry
-#: and re-issues the backend probe. Five minutes matches the
-#: lifetime of a typical Databricks / S3 credential refresh cycle —
-#: long enough to collapse the dozen probes a Delta replay makes
-#: against the same key, short enough that a stale entry doesn't
-#: outlive a meaningful change to the underlying object.
-_STAT_CACHE_TTL: float = 300.0
+#: and re-issues the backend probe. One minute is short enough that a
+#: stale ``exists`` / ``is_file`` / ``size`` read can't outlive a
+#: mutation made through another path instance, node, or external tool
+#: (Databricks UI, ``aws s3 rm`` …) by more than a tick — while still
+#: collapsing the burst of probes a single Delta replay or directory
+#: walk makes against the same key. Mutating ops (write, remove) drop
+#: the entry immediately via :meth:`invalidate_singleton`; this TTL only
+#: governs how long a *read*-populated snapshot is trusted.
+_STAT_CACHE_TTL: float = 60.0
 
 #: Default page size for the inner read/write buffer. A 4 MiB grain
 #: matches Parquet row-group / Arrow IPC chunk sizes — one page covers
@@ -118,7 +121,7 @@ class RemotePath(Path):
     ``RemotePath`` activates the :class:`Singleton` machinery that
     :class:`Holder` ships deactivated by default: two callers asking
     for the same URL (and client, where the subclass keys on it)
-    inside the 5-minute window share the live instance — same stat
+    inside the 1-minute window share the live instance — same stat
     cache, same lazily-bound transport. ``iterdir``-style hot loops
     pass ``singleton_ttl=False`` to keep the bounded cache from
     filling with short-lived children; long-lived consumers that
@@ -128,7 +131,7 @@ class RemotePath(Path):
     # Bound the freshness window for both probe-populated and
     # listing-seeded entries. ``Path`` ships the slot at ``None``
     # (live forever) since LocalPath / Memory don't need a TTL;
-    # remote backends pay 5-minute round trips and want a window
+    # remote backends pay round-trip stat probes and want a window
     # that beats credential / consistency drift.
     STAT_CACHE_TTL: ClassVar["float | None"] = _STAT_CACHE_TTL
 
@@ -165,7 +168,7 @@ class RemotePath(Path):
     # and keep the in-memory commit. Defaults False; :class:`VolumePath` opts in.
     SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = False
 
-    # Activate the :class:`Singleton` cache: 5-minute default TTL,
+    # Activate the :class:`Singleton` cache: 1-minute default TTL,
     # bounded at 10 000 entries as defence-in-depth against
     # accidental cardinality explosions.
     #
@@ -274,7 +277,7 @@ class RemotePath(Path):
     def _ensure_pages(self) -> "ExpiringDict[int, Memory]":
         if self._pages is None:
             # Pages share the stat cache's TTL: a backend object that's
-            # been quiet for 5 minutes is the same horizon at which a
+            # been quiet for a minute is the same horizon at which a
             # cached size / mtime is no longer trusted. No ``max_size``
             # — dirty pages must not be evicted under the caller's feet;
             # callers manage memory via explicit :meth:`flush` /
