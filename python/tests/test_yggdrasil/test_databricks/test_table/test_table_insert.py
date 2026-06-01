@@ -432,14 +432,26 @@ class TestEnsureAsyncJob:
         logs.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
         jobs.list.return_value = []
 
-        wheels = ["/Workspace/Shared/.ygg/whl/ygg-9.9-py3-none-any.whl",
-                  "/Workspace/Shared/.ygg/whl/databricks_sdk-1.2-py3-none-any.whl"]
-        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel", return_value=wheels) as ew:
-            job = ensure_async_job(t)
+        # The serverless env (versioned ygg image) is resolved through the
+        # client's global ygg_environment() — a get-or-created v5 + wheel bundle.
+        from databricks.sdk.service.compute import Environment
+        from databricks.sdk.service.jobs import JobEnvironment
+
+        wheels = ["/Workspace/Shared/.ygg/whl/9.9/ygg-9.9-py3-none-any.whl",
+                  "/Workspace/Shared/.ygg/whl/9.9/databricks_sdk-1.2-py3-none-any.whl"]
+        environment = JobEnvironment(
+            environment_key="default",
+            spec=Environment(environment_version="5", dependencies=wheels),
+        )
+        t.client.ygg_environment.return_value = environment
+
+        job = ensure_async_job(t)
 
         assert job is created
-        # the full ygg wheel is built + shipped as the env dependencies
-        assert ew.call_count == 1
+        # the versioned ygg image is resolved once for the create path
+        t.client.ygg_environment.assert_called_once_with(
+            environment_key="default", rebuild=False,
+        )
         # the watched logs dir is created so the trigger URL is valid
         logs.mkdir.assert_called_with(parents=True, exist_ok=True)
 
@@ -457,8 +469,9 @@ class TestEnsureAsyncJob:
             "databricks", "table", "execute_async_insert",
             "--logs", "/Volumes/c/s/t/.sql/async/logs",
         ]
-        # serverless v5; the built ygg wheel is shipped as the dependencies
+        # serverless v5 image shipped as the env, wired to the task
         env = kwargs["environments"][0]
+        assert env is environment
         assert env.spec.environment_version == "5"
         assert env.spec.dependencies == wheels
         assert task.environment_key == env.environment_key
@@ -487,15 +500,14 @@ class TestEnsureAsyncJob:
         other = _job(8, "/Volumes/other/.sql/async/logs/")  # unrelated job
         jobs.list.return_value = [keep, stale, other]
 
-        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel", return_value=["w.whl"]):
-            ensure_async_job(t)
+        ensure_async_job(t)
 
         stale.delete.assert_called_once()      # orphan on the shared trigger removed
         keep.delete.assert_not_called()
         other.delete.assert_not_called()
 
     def test_get_returns_existing_job_without_building(self):
-        # Get-or-create: an existing job short-circuits — no wheel build, no
+        # Get-or-create: an existing job short-circuits — no image resolve, no
         # upsert, no logs-dir provisioning.
         from yggdrasil.databricks.table.insert import ensure_async_job
 
@@ -506,12 +518,11 @@ class TestEnsureAsyncJob:
         existing.job_id = 7
         jobs.get.return_value = existing
 
-        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ew:
-            job = ensure_async_job(t)
+        job = ensure_async_job(t)
 
         assert job is existing
         jobs.get.assert_called_once_with(name="[YGG][ASYNC] c.s.t", default=None)
-        ew.assert_not_called()                 # no wheel build on the get path
+        t.client.ygg_environment.assert_not_called()   # no image resolve on the get path
         jobs.create_or_update.assert_not_called()
         t.staging_volume.path.return_value.mkdir.assert_not_called()
 
@@ -528,12 +539,14 @@ class TestEnsureAsyncJob:
         t.staging_volume.path.return_value.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
         jobs.list.return_value = []
 
-        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel", return_value=["w.whl"]) as ew:
-            job = ensure_async_job(t, rebuild=True)
+        job = ensure_async_job(t, rebuild=True)
 
         assert job is created
         jobs.get.assert_not_called()           # rebuild bypasses the get
-        ew.assert_called_once_with(t.client, rebuild=True)
+        # rebuild flows through to a forced image rebuild
+        t.client.ygg_environment.assert_called_once_with(
+            environment_key="default", rebuild=True,
+        )
         jobs.create_or_update.assert_called_once()
 
 

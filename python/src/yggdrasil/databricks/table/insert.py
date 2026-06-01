@@ -1175,17 +1175,14 @@ def ensure_async_job(
     <dir>`` when a log lands. Any stale job watching the same logs dir is pruned
     so a single job owns the trigger.
     """
-    from databricks.sdk.service.compute import Environment
     from databricks.sdk.service.jobs import (
         FileArrivalTriggerConfiguration,
-        JobEnvironment,
         PythonWheelTask,
         Task as DBTask,
         TriggerSettings,
     )
 
     from yggdrasil.databricks.job.skeleton import ensure_console_logging
-    from yggdrasil.databricks.job.wheel import ensure_ygg_wheel
 
     client = client or table.client
     name = job_name(table)
@@ -1207,7 +1204,9 @@ def ensure_async_job(
     logger.info("async job: ensuring logs dir %s", logs.full_path())
     logs.mkdir(parents=True, exist_ok=True)
 
-    wheels = ensure_ygg_wheel(client, rebuild=rebuild)
+    # The pinned, versioned ygg image (latest serverless v5 + ygg CLI +
+    # databricks-sdk + deps, installed by path) — get-or-created on the client.
+    environment = client.ygg_environment(environment_key="default", rebuild=rebuild)
 
     logger.info("create-or-update async job %r", name)
     job = client.jobs.create_or_update(
@@ -1228,12 +1227,7 @@ def ensure_async_job(
                 ),
             )
         ],
-        environments=[
-            JobEnvironment(
-                environment_key="default",
-                spec=Environment(environment_version="5", dependencies=wheels),
-            )
-        ],
+        environments=[environment],
         trigger=TriggerSettings(
             file_arrival=FileArrivalTriggerConfiguration(
                 url=_trigger_url(table),

@@ -33,6 +33,8 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar
 
+from yggdrasil.databricks.job.wheel import SERVERLESS_ENVIRONMENT_VERSION
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.concurrent.threading import ThreadJob
     from yggdrasil.databricks.job.job import Job
@@ -206,10 +208,12 @@ class Flow(_Runnable):
     entry_point: str = "ygg"
     task_key: str = "run"
 
-    #: Serverless environment version (default **v5**).
+    #: Serverless environment version (default **v5**, the latest — sourced from
+    #: :data:`~yggdrasil.databricks.job.wheel.SERVERLESS_ENVIRONMENT_VERSION` so
+    #: every serverless surface advances together).
     serverless: bool = True
     environment_key: str = "default"
-    environment_version: str = "5"
+    environment_version: str = SERVERLESS_ENVIRONMENT_VERSION
 
     #: Fallback dependency when not shipping a built wheel — ``ygg`` (the
     #: published package, pulling its ``[databricks]`` extra) from an index.

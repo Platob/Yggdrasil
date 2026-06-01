@@ -232,6 +232,32 @@ class TestWheel:
         with patch("yggdrasil.databricks.path.DatabricksPath.from_", return_value=folder):
             assert wheel.deployed_wheels(client, "ygg", "9.9", workspace_dir="/ws/9.9") == []
 
+    def test_ygg_environment_pairs_v5_with_the_wheel_bundle(self):
+        # The versioned ygg image: latest serverless v5 + the get-or-created
+        # wheel bundle, installed by path.
+        client = MagicMock()
+        wheels = ["/ws/9.9/ygg-9.9-py3-none-any.whl"]
+        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel", return_value=wheels) as ew:
+            env = wheel.ygg_environment(client)
+        ew.assert_called_once_with(
+            client, workspace_dir=wheel.WORKSPACE_WHL_DIR, rebuild=False,
+        )
+        assert env.environment_key == "default"
+        assert env.spec.environment_version == wheel.SERVERLESS_ENVIRONMENT_VERSION == "5"
+        assert env.spec.dependencies == wheels
+
+    def test_ygg_environment_forwards_key_and_rebuild(self):
+        client = MagicMock()
+        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel", return_value=["w.whl"]) as ew:
+            env = wheel.ygg_environment(
+                client, environment_key="etl", environment_version="6", rebuild=True,
+            )
+        ew.assert_called_once_with(
+            client, workspace_dir=wheel.WORKSPACE_WHL_DIR, rebuild=True,
+        )
+        assert env.environment_key == "etl"
+        assert env.spec.environment_version == "6"
+
     def test_build_wheel_produces_a_real_wheel(self, tmp_path, monkeypatch):
         """Isolated, offline end-to-end: a synthesized dep-free project is really
         ``pip wheel``-ed into a wheel carrying the entry point."""

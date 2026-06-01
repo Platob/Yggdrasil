@@ -28,17 +28,23 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "WORKSPACE_WHL_DIR",
+    "SERVERLESS_ENVIRONMENT_VERSION",
     "synthesize_project",
     "build_wheel",
     "upload_wheel",
     "ensure_wheel",
     "deployed_wheels",
     "ensure_ygg_wheel",
+    "ygg_environment",
 ]
 
 #: Root for workspace wheels — one subfolder per version to keep each bundle
 #: self-contained (and so a deploy can reuse an existing version's bundle).
 WORKSPACE_WHL_DIR = "/Workspace/Shared/.ygg/whl"
+
+#: Default serverless environment version — **v5 (latest)**, used everywhere a
+#: serverless ``Environment`` is built (the ygg image, async loader job, flows).
+SERVERLESS_ENVIRONMENT_VERSION = "5"
 
 
 def _norm(name: str) -> str:
@@ -281,4 +287,35 @@ def ensure_ygg_wheel(
         workspace_dir=version_dir,
         extras=("databricks",),
         requirements=("databricks-sdk",),
+    )
+
+
+def ygg_environment(
+    client: Any,
+    *,
+    environment_key: str = "default",
+    environment_version: str = SERVERLESS_ENVIRONMENT_VERSION,
+    rebuild: bool = False,
+    workspace_dir: str = WORKSPACE_WHL_DIR,
+) -> Any:
+    """The serverless ``JobEnvironment`` for the **versioned ygg image**.
+
+    Pairs the latest serverless runtime (``environment_version``, default
+    :data:`SERVERLESS_ENVIRONMENT_VERSION` = ``"5"``) with the get-or-created
+    ygg wheel bundle (:func:`ensure_ygg_wheel` — ygg CLI + ``databricks-sdk`` +
+    transitive deps), installed by path. Drop this into any serverless job's
+    ``environments=[...]`` so its python-wheel tasks can run the ``ygg`` CLI
+    against a pinned, pre-installed image rather than resolving from an index."""
+    from databricks.sdk.service.compute import Environment
+    from databricks.sdk.service.jobs import JobEnvironment
+
+    wheels = ensure_ygg_wheel(
+        client, workspace_dir=workspace_dir, rebuild=rebuild,
+    )
+    return JobEnvironment(
+        environment_key=environment_key,
+        spec=Environment(
+            environment_version=environment_version,
+            dependencies=wheels,
+        ),
     )

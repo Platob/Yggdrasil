@@ -1145,6 +1145,62 @@ class DatabricksClient(Singleton, URLBased):
             )
         return header
 
+    # -------------------------------------------------------------------------
+    # Serverless ygg image — versioned wheel bundle + environment
+    # -------------------------------------------------------------------------
+
+    def ensure_ygg_wheel(
+        self,
+        *,
+        rebuild: bool = False,
+        workspace_dir: Optional[str] = None,
+    ) -> list[str]:
+        """Get-or-create the **versioned ygg wheel bundle** in this workspace.
+
+        A pinned, per-version image of the ``ygg`` CLI + ``databricks-sdk`` +
+        all transitive dependencies, deployed under
+        ``/Workspace/Shared/.ygg/whl/<version>/`` and installed by path (no
+        index). The first call for a version builds + uploads it; later calls
+        find and reuse it. Pass ``rebuild=True`` to force a fresh build (e.g.
+        after a dev edit that doesn't bump the version). Returns the workspace
+        wheel paths a serverless job installs.
+        """
+        from yggdrasil.databricks.job.wheel import ensure_ygg_wheel, WORKSPACE_WHL_DIR
+
+        return ensure_ygg_wheel(
+            self,
+            workspace_dir=workspace_dir or WORKSPACE_WHL_DIR,
+            rebuild=rebuild,
+        )
+
+    def ygg_environment(
+        self,
+        *,
+        environment_key: str = "default",
+        environment_version: Optional[str] = None,
+        rebuild: bool = False,
+    ) -> Any:
+        """The serverless ``JobEnvironment`` for the versioned ygg image.
+
+        Pairs the latest serverless runtime (default
+        :data:`~yggdrasil.databricks.job.wheel.SERVERLESS_ENVIRONMENT_VERSION`
+        = ``"5"``) with the get-or-created :meth:`ensure_ygg_wheel` bundle.
+        Drop it straight into a serverless job's ``environments=[...]`` so its
+        python-wheel tasks run the ``ygg`` CLI against a pinned, pre-installed
+        image.
+        """
+        from yggdrasil.databricks.job.wheel import (
+            ygg_environment,
+            SERVERLESS_ENVIRONMENT_VERSION,
+        )
+
+        return ygg_environment(
+            self,
+            environment_key=environment_key,
+            environment_version=environment_version or SERVERLESS_ENVIRONMENT_VERSION,
+            rebuild=rebuild,
+        )
+
     def get_workspace_id(self) -> int:
         if self.workspace_id:
             return self.workspace_id
