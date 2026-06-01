@@ -211,6 +211,45 @@ class TestDatabricksTableInsert:
             op.data_path(client="CL")
         dp.assert_called_once_with("dbfs+volume:/x.parquet", client="CL")
 
+    def test_table_url_round_trips_and_is_a_table_source(self):
+        # The Spark dispatch records a ``dbfs+table://`` URL; the op-log keeps
+        # it byte-for-byte and the loader recognises it as a table source.
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+        url = "dbfs+table://host/cat/staging/_ygg_stg_x"
+        op = DatabricksTableInsert(target="cat.sch.t", mode="overwrite", data=url)
+        assert op.data_url == url                      # serialized verbatim
+        assert op.is_table_source is True
+        parsed = DatabricksTableInsert.from_json(json.loads(op.to_json()))
+        assert parsed.data == url                      # rebuilt without mangling
+        assert parsed.is_table_source is True
+
+    def test_file_url_is_not_a_table_source(self):
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+        op = DatabricksTableInsert(target="c.s.t", mode="append", data="dbfs+volume:/x.parquet")
+        assert op.is_table_source is False
+
+    def test_staged_source_rebuilds_table_from_url(self):
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+        op = DatabricksTableInsert(
+            target="c.s.t", mode="overwrite",
+            data="dbfs+table://host/cat/staging/tmp",
+        )
+        with patch("yggdrasil.databricks.table.table.Table.from_url") as furl:
+            op.staged_source(client="CL")
+        furl.assert_called_once_with("dbfs+table://host/cat/staging/tmp", client="CL")
+
+    def test_cleanup_drops_a_staged_table(self):
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+        op = DatabricksTableInsert(
+            target="c.s.t", mode="overwrite",
+            data="dbfs+table://host/cat/staging/tmp",
+        )
+        with patch.object(DatabricksTableInsert, "staged_source") as ss:
+            tbl = MagicMock()
+            ss.return_value = tbl
+            op.cleanup_staged_data(client="CL")
+            tbl.delete.assert_called_once()
+
 
 # --------------------------------------------------------------------------- #
 # make_sql_select / make_sql_insert — the centralized generator
@@ -224,6 +263,20 @@ class TestMakeSqlSelect:
         with patch("yggdrasil.databricks.path.DatabricksPath.from_", return_value=path):
             sql = make_sql_select(op, client="CL")
         assert sql == "SELECT * FROM parquet.`/Volumes/c/s/t/x.parquet`"
+
+    def test_table_source_selects_from_the_table(self):
+        # A Spark-staged table source reads straight from the table, not via
+        # ``parquet.`<path>```.
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert, make_sql_select
+        op = DatabricksTableInsert(
+            target="c.s.t", mode="overwrite",
+            data="dbfs+table://host/cat/staging/tmp",
+        )
+        table = MagicMock()
+        table.full_name.return_value = "`cat`.`staging`.`tmp`"
+        with patch.object(DatabricksTableInsert, "staged_source", return_value=table):
+            sql = make_sql_select(op, client="CL")
+        assert sql == "SELECT * FROM `cat`.`staging`.`tmp`"
 
     def test_explicit_source_projects_schema_columns(self):
         from yggdrasil.databricks.table.insert import DatabricksTableInsert, make_sql_select

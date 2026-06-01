@@ -372,18 +372,77 @@ class DatabricksTableInsert:
         """The target a batch aggregates over — one load per target."""
         return self.target_name
 
+    @property
+    def is_table_source(self) -> bool:
+        """``True`` when the staged ``data`` is a Delta **table** (the Spark
+        dispatch), rather than a staged file.
+
+        Recognises both a live :class:`Table` ``data`` and the
+        ``dbfs+table://`` URL the op-log round-trips to — so the loader reads
+        the right shape whether it holds the producer's object or rebuilt it
+        from a log.
+        """
+        from yggdrasil.databricks.table.table import Table
+
+        data = self.data
+        if isinstance(data, Table):
+            return True
+        if isinstance(data, str):
+            from yggdrasil.url import URL
+
+            try:
+                return URL.from_(data).scheme == Table.scheme.value
+            except Exception:
+                return False
+        return False
+
+    def staged_source(self, client: Any = None) -> "Tabular":
+        """Rebuild the staged ``data`` into the concrete :class:`Tabular` the
+        loader reads / cleans up.
+
+        A live Tabular (the producer's source) is returned unchanged. A
+        serialized URL is rebuilt through the bound (or supplied) client:
+        ``dbfs+table://`` → the :class:`Table` it names; any other path URL →
+        the matching :class:`Path` (see :meth:`data_path`). The on-disk URL
+        is kept verbatim on :attr:`data` — rebuilding only happens here, at
+        consume time — so the op-log round-trips byte-for-byte.
+        """
+        if not isinstance(self.data, str):
+            return self.data
+        if self.is_table_source:
+            from yggdrasil.databricks.table.table import Table
+
+            return Table.from_url(self.data, client=client or self.client)
+        return self.data_path(client)
+
     def data_path(self, client: Any = None) -> "Path":
-        """Resolve the staged data to a concrete :class:`Path`.
+        """Resolve a staged **file** ``data`` to a concrete :class:`Path`.
 
         Already a :class:`Path` → returned as-is; a uniform-URL string →
         reconstructed through the bound (or supplied) client so the loader can
-        read / clean it up wherever it landed.
+        read / clean it up wherever it landed. Use :meth:`staged_source` when
+        the data may be a table (the Spark dispatch) instead of a file.
         """
         if isinstance(self.data, Path):
             return self.data
         from yggdrasil.databricks.path import DatabricksPath
 
         return DatabricksPath.from_(self.data, client=client or self.client)
+
+    def cleanup_staged_data(self, client: Any = None) -> None:
+        """Best-effort removal of the staged data after a load — drop a staged
+        Delta table (the Spark dispatch), else unlink the staged file."""
+        if self.is_table_source:
+            table = self.staged_source(client)
+            try:
+                table.delete(wait=True, missing_ok=True, delete_staging=False)
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                logger.debug(
+                    "async cleanup: failed to drop staged table %s",
+                    table, exc_info=True,
+                )
+            return
+        _best_effort_unlink(self.data_path(client))
 
     def select_sql(self, client: Any = None) -> str:
         """Back-compat alias for :func:`make_sql_select` over this op."""
@@ -497,6 +556,10 @@ def make_sql_select(
       is substituted for the external-data ``VolumePath`` at prepare time),
       project the op's schema columns from it: ``SELECT <projection> FROM
       <source>``.
+
+    When the staged data is a Delta **table** (the Spark dispatch records a
+    ``dbfs+table://`` URL), the default reads straight from the table —
+    ``SELECT * FROM <catalog.schema.table>`` — rather than ``parquet.`<path>```.
     """
     if source is not None:
         if op.schema is not None and op.schema.fields:
@@ -504,6 +567,10 @@ def make_sql_select(
         else:
             projection = "*"
         return f"SELECT {projection} FROM {source}"
+
+    if op.is_table_source:
+        table = op.staged_source(client)
+        return f"SELECT * FROM {table.full_name(safe=True)}"
 
     path = op.data_path(client)
     full_path = getattr(path, "full_path", None)
@@ -1264,10 +1331,11 @@ def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> in
             batch.make_sql(client), mode=mode.name.lower(),
             match_by=batch.match_by, wait=wait,
         )
-        # Clear consumed logs + data (incl. superseded ops) after a load.
+        # Clear consumed logs + data (incl. superseded ops) after a load —
+        # unlink a staged file, drop a staged table (the Spark dispatch).
         for op in batch.logs:
             _best_effort_unlink(op.log_file)
-            _best_effort_unlink(op.data_path(client))
+            op.cleanup_staged_data(client)
         processed += len(batch.logs)
     return processed
 
