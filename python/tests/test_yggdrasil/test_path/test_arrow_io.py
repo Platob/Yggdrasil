@@ -298,10 +298,12 @@ class TestWriteModes:
         leaf.write_arrow_table(pa.table({"v": [1]}), mode=Mode.AUTO)
         result = leaf.read_arrow_table()
         assert result.num_rows == 1
-        # AUTO on second write appends (no match_by set)
+        # AUTO defaults to OVERWRITE (no match_by set) — a bare write
+        # replaces the file rather than growing it.
         leaf.write_arrow_table(pa.table({"v": [2]}), mode=Mode.AUTO)
         result = leaf.read_arrow_table()
-        assert result.num_rows == 2
+        assert result.num_rows == 1
+        assert result.column("v").to_pylist() == [2]
 
 
 # ---------------------------------------------------------------------------

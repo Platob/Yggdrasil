@@ -83,7 +83,7 @@ class Volume(DatabricksPath):
     DEFAULT_INFO_TTL: ClassVar[float] = 1800.0  # 30 minutes
     NAMESPACE_PREFIX: ClassVar[str] = "/Volumes/"
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
-    _SINGLETON_TTL: ClassVar[Any] = None
+    _SINGLETON_TTL: ClassVar[Any] = 300.0
 
     @classmethod
     def _singleton_key(
@@ -162,6 +162,7 @@ class Volume(DatabricksPath):
         infos_fetched_at: float | None = None,
         infos_ttl: float | None = None,
         singleton_ttl: "int | None" = ...,
+        **kwargs
     ) -> None:
         del singleton_ttl
 
@@ -183,7 +184,7 @@ class Volume(DatabricksPath):
         super().__init__(service=service, url=URL(
             scheme=Scheme.DATABRICKS_VOLUME.value,
             path=f"{self.NAMESPACE_PREFIX}{self.catalog_name}/{self.schema_name}/{self.volume_name}"
-        ))
+        ), **kwargs)
         self._infos_ttl: float = self.DEFAULT_INFO_TTL if infos_ttl is None else float(infos_ttl)
         self._infos: Optional[VolumeInfo] = infos
         self._infos_fetched_at: Optional[float] = (

@@ -335,18 +335,17 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         Key-aware merges are powered by
         :func:`yggdrasil.arrow.ops.upsert_arrow_batches`.
         """
-        # Mode resolution. AUTO picks UPSERT when ``match_by``
-        # is set (incoming wins on key conflict) or APPEND otherwise
-        # — Parquet has no in-place append, so both end up doing the
-        # same read-modify-rewrite, but the semantics line up with
-        # what the caller was asking for. TRUNCATE collapses to
-        # OVERWRITE; APPEND / UPSERT / MERGE keep their identity for
-        # the merge branch below; IGNORE / ERROR_IF_EXISTS guard the
-        # buffer.
+        # Mode resolution. AUTO picks UPSERT when ``match_by`` is set
+        # (incoming wins on key conflict) and otherwise defaults to
+        # OVERWRITE — a bare write replaces the file, matching the JSON /
+        # Excel / Zip leaves (a single file is "replace" by default, not
+        # "grow"). TRUNCATE collapses to OVERWRITE; APPEND / UPSERT / MERGE
+        # keep their identity for the merge branch below; IGNORE /
+        # ERROR_IF_EXISTS guard the buffer.
         mode = options.mode
         _skip_existing = self.holder_is_overwrite
         if mode is Mode.AUTO:
-            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
+            action = Mode.UPSERT if options.match_by_keys else Mode.OVERWRITE
         elif mode is Mode.TRUNCATE:
             action = Mode.OVERWRITE
         elif mode in _MERGE_MODES:
@@ -378,10 +377,17 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         iterator = iter(batches)
         first = next(iterator, None)
         if first is None and action is Mode.OVERWRITE:
-            self.seek(0)
-            self.truncate(0)
-            return
-        if first is None:
+            # No incoming rows: ``to_batches()`` on a 0-row table yields an
+            # empty iterator, dropping the schema. Replay a 0-row batch
+            # carrying the bound schema through the writer below so the file
+            # is a valid empty Parquet (footer + schema) rather than a
+            # truncated 0-byte stub a reader can't parse.
+            first = self._empty_overwrite_batch(options)
+            if first is None:
+                self.seek(0)
+                self.truncate(0)
+                return
+        elif first is None:
             return
 
         if action in _MERGE_MODES and _has_existing:
@@ -459,9 +465,11 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         per-batch Python dispatch, so a 1M-row table costs one
         C-level call instead of N ``writer.write_batch`` hops.
 
-        The fast path runs when *either*:
+        The fast path runs when *any*:
 
         - The mode is explicitly ``OVERWRITE`` / ``TRUNCATE``, OR
+        - The mode is ``AUTO`` with no ``match_by`` — a bare write
+          replaces the buffer (see ``_write_arrow_batches``), OR
         - The buffer is empty (an OVERWRITE wins regardless of the
           caller's nominal mode — ``APPEND`` to empty *is* an
           ``OVERWRITE``, and ``IGNORE`` / ``ERROR_IF_EXISTS`` on
@@ -480,6 +488,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         )
         truly_overwrite = (
             mode in (Mode.OVERWRITE, Mode.TRUNCATE)
+            or (mode is Mode.AUTO and not options.match_by_keys)
             or not has_existing
         )
         if not truly_overwrite:

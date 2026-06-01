@@ -177,3 +177,50 @@ class TestSchema:
 
     def test_collect_schema_empty(self) -> None:
         assert _pf().collect_schema().to_arrow_schema().names == []
+
+
+class TestEmptyOverwriteWritesValidFile:
+    """An empty input under OVERWRITE through the generic path route must
+    pickle a valid empty, typed table — not a truncated holder."""
+
+    def test_empty_table_round_trips(self, tmp_path) -> None:
+        empty = pa.table(
+            {"id": pa.array([], type=pa.int64()),
+             "amount": pa.array([], type=pa.float64())}
+        )
+        path = LocalPath(str(tmp_path / "empty.pkl"))
+        path.write_table(empty, mode=Mode.OVERWRITE)
+
+        assert path.size > 0
+        with path.open("rb") as cur:
+            table = cur.read_arrow_table()
+        assert table.num_rows == 0
+        assert table.schema.names == ["id", "amount"]
+
+    def test_empty_batches_overwrite_uses_bound_schema(self) -> None:
+        from yggdrasil.data.options import CastOptions
+
+        schema = pa.schema([("id", pa.int64()), ("amount", pa.float64())])
+        mem = Memory()
+        leaf = _pf(mem)
+        leaf._write_arrow_batches(
+            iter([]), leaf.check_options(CastOptions(mode=Mode.OVERWRITE, target=schema)),
+        )
+        table = _pf(mem).read_arrow_table()
+        assert table.num_rows == 0
+        assert table.schema.names == ["id", "amount"]
+
+
+class TestAutoDefaultsToOverwrite:
+    """``Mode.AUTO`` (the default) replaces the pickled table for a bare
+    write — matching the JSON / Excel / Zip leaves."""
+
+    def test_auto_replaces_existing(self) -> None:
+        from yggdrasil.data.options import CastOptions
+
+        mem = Memory()
+        _pf(mem).write_arrow_table(
+            pa.table({"id": [1, 2, 3]}), CastOptions(mode=Mode.OVERWRITE),
+        )
+        _pf(mem).write_arrow_table(pa.table({"id": [9]}))  # default mode = AUTO
+        assert _pf(mem).read_arrow_table().column("id").to_pylist() == [9]

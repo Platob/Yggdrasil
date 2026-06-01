@@ -273,15 +273,14 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         streams the existing side through and only buffers the
         smaller of the two key sets needed to drive the dedup.
         """
-        # AUTO picks the most useful mode from context:
-        # ``match_by`` set → UPSERT (incoming wins on key
-        # conflict); otherwise APPEND. This keeps the historical
-        # "default = grow the file" behaviour while letting callers
-        # opt into key-aware writes purely via ``match_by``.
+        # AUTO picks the most useful mode from context: ``match_by`` set
+        # → UPSERT (incoming wins on key conflict); otherwise OVERWRITE —
+        # a bare write replaces the file, matching the JSON / Excel / Zip
+        # leaves. Callers opt into key-aware writes purely via ``match_by``.
         action = options.mode
         _skip_existing = self.holder_is_overwrite
         if action is Mode.AUTO:
-            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
+            action = Mode.UPSERT if options.match_by_keys else Mode.OVERWRITE
         elif action is Mode.TRUNCATE:
             action = Mode.OVERWRITE
 
@@ -307,12 +306,14 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         iterator = iter(batches)
         first = next(iterator, None)
         if first is None and action is Mode.OVERWRITE:
-            # Empty payload + OVERWRITE → an empty file with the
-            # caller's schema (if any) is preferable to leaving stale
-            # bytes; truncate and bail.
-            self.truncate(0)
-            return None
-        if first is None:
+            # Empty input: replay a 0-row batch carrying the bound schema
+            # through the writer so the file is a valid IPC file (schema +
+            # footer, no batches) rather than a 0-byte stub.
+            first = self._empty_overwrite_batch(options)
+            if first is None:
+                self.truncate(0)
+                return None
+        elif first is None:
             return None
 
         if action in _MERGE_MODES and has_existing:
@@ -378,10 +379,11 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         per-batch Python dispatch.
 
         The fast path runs when the effective action is "replace the
-        buffer wholesale": ``OVERWRITE`` / ``TRUNCATE``, OR any mode
-        on an empty buffer (which all reduce to a plain write). Every
-        other shape (merge against existing rows, guarded ``IGNORE``
-        / ``ERROR_IF_EXISTS`` on non-empty) falls through to
+        buffer wholesale": ``OVERWRITE`` / ``TRUNCATE``, ``AUTO`` with no
+        ``match_by`` (a bare write replaces the file), OR any mode on an
+        empty buffer (which all reduce to a plain write). Every other
+        shape (merge against existing rows, guarded ``IGNORE`` /
+        ``ERROR_IF_EXISTS`` on non-empty) falls through to
         ``_write_arrow_batches`` where the read-modify-rewrite /
         size-check + raise / skip logic already lives.
         """
@@ -392,6 +394,7 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         )
         truly_overwrite = (
             options.mode in (Mode.OVERWRITE, Mode.TRUNCATE)
+            or (options.mode is Mode.AUTO and not options.match_by_keys)
             or not has_existing
         )
         if not truly_overwrite:

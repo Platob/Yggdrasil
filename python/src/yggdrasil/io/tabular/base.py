@@ -1455,7 +1455,31 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             row_size=None,
             byte_size=None,
         )
+        # ``to_batches()`` on a 0-row table yields nothing, dropping the schema
+        # the leaf writer needs to persist a valid empty file. Pin the source
+        # to the table's own schema (no-op when one is already bound) so the
+        # shape survives the batch hand-off.
+        inner = inner.check_source(casted.schema)
         self._write_arrow_batches(casted.to_batches(), inner)
+
+    @staticmethod
+    def _empty_overwrite_batch(options: O) -> "pa.RecordBatch | None":
+        """A 0-row :class:`pa.RecordBatch` carrying the bound write schema.
+
+        Returns ``None`` when no schema is known. The leaf
+        ``_write_arrow_batches`` writers feed this through their normal
+        OVERWRITE path when the incoming batch stream is empty, so an
+        empty input still persists a valid, schema-bearing file (Parquet
+        footer, Arrow IPC schema, CSV header, ``[]`` JSON, an empty
+        pickled table) instead of a 0-byte — or, on a remote backend,
+        never-uploaded — stub a downstream reader can't parse. The schema
+        comes from a bound target/source, or — for data written via
+        :meth:`_write_arrow_table` — the source table's own schema.
+        """
+        field = options.merged
+        if field is None:
+            return None
+        return pa.RecordBatch.from_pylist([], schema=field.to_arrow_schema())
 
     # ==================================================================
     # Union

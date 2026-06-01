@@ -36,7 +36,7 @@ import pyarrow as pa
 from yggdrasil.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data import Field
-from yggdrasil.databricks.table.table import (
+from yggdrasil.databricks.table.insert import (
     _build_anti_join_insert,
     _build_cast_column_projection,
     _build_column_projection,
@@ -465,7 +465,7 @@ class TestBuildWherePredicates:
 
 class TestNoMergeFallbackMachinery:
     """The legacy retry / fallback funnel is gone; the simple
-    helpers (MERGE template, anti-join, _execute_dml) remain."""
+    DML builders live in ``insert`` and the executor stays in ``table``."""
 
     def test_no_drain_helper(self) -> None:
         from yggdrasil.databricks.table import table as _t
@@ -477,11 +477,13 @@ class TestNoMergeFallbackMachinery:
         assert not hasattr(_t, "_build_merge_fallback_statements")
 
     def test_helpers_present(self) -> None:
+        # The DML builders are centralized in ``insert``; the executor and
+        # the Spark fast-path stay on the table layer.
+        from yggdrasil.databricks.table import insert as _i
         from yggdrasil.databricks.table import table as _t
-        # MERGE template back, anti-join INSERT alongside, and the
-        # simplified executor instead of the fallback funnel.
-        assert hasattr(_t, "_build_merge_statement")
-        assert hasattr(_t, "_build_anti_join_insert")
+        assert hasattr(_i, "_build_merge_statement")
+        assert hasattr(_i, "_build_anti_join_insert")
+        assert hasattr(_i, "_build_dml_statements")
         assert hasattr(_t, "_execute_dml")
         assert hasattr(_t, "_spark_filter_existing_keys")
 

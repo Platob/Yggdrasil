@@ -212,10 +212,15 @@ class JSONFile(IO[bytes, JsonOptions]):
         iterator = iter(batches)
         first = next(iterator, None)
         if first is None and action is Mode.OVERWRITE:
-            self.seek(0)
-            self.truncate(0)
-            return
-        if first is None:
+            # Empty input: replay a 0-row batch carrying the bound schema
+            # so the document is a valid empty array (``[]``) rather than
+            # a 0-byte stub.
+            first = self._empty_overwrite_batch(options)
+            if first is None:
+                self.seek(0)
+                self.truncate(0)
+                return
+        elif first is None:
             return
 
         if action is Mode.APPEND and _has_existing:

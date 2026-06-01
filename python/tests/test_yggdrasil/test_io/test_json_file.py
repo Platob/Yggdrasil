@@ -152,3 +152,33 @@ class TestReadViaMemoryview:
             cur.write_arrow_table(table)
         with path.open("rb") as cur:
             assert cur.read_arrow_table().column("v").to_pylist() == [1, 2, 3]
+
+
+class TestEmptyOverwriteWritesValidFile:
+    """An empty input under OVERWRITE through the generic path route must
+    persist a valid empty JSON array (``[]``), not a 0-byte stub."""
+
+    def test_empty_table_writes_empty_array(self, tmp_path) -> None:
+        from yggdrasil.enums import Mode
+
+        empty = pa.table(
+            {"id": pa.array([], type=pa.int64()),
+             "amount": pa.array([], type=pa.float64())}
+        )
+        path = LocalPath(str(tmp_path / "empty.json"))
+        path.write_table(empty, mode=Mode.OVERWRITE)
+
+        assert path.size > 0
+        assert json.loads((tmp_path / "empty.json").read_text()) == []
+
+    def test_empty_batches_overwrite_uses_bound_schema(self) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.data.options import CastOptions
+
+        schema = pa.schema([("id", pa.int64()), ("amount", pa.float64())])
+        mem = Memory()
+        leaf = JSONFile(holder=mem, owns_holder=False)
+        leaf._write_arrow_batches(
+            iter([]), leaf.check_options(CastOptions(mode=Mode.OVERWRITE, target=schema)),
+        )
+        assert json.loads(mem.to_bytes().decode()) == []

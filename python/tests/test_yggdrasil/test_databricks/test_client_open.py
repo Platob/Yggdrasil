@@ -34,8 +34,9 @@ def client():
 class TestDatabricksClientOpen:
 
     def test_string_path_routes_through_databricks_path_from(self, client):
-        # The string lands on :meth:`DatabricksPath.from_` (bound to
-        # this client) and the returned path's ``.open`` does the work.
+        # The string lands on :meth:`DatabricksPath.from_` (bound to this
+        # client, via :meth:`path`) and the returned path's ``.open`` does
+        # the work.
         fake_path = MagicMock()
         with patch(
             "yggdrasil.databricks.path.DatabricksPath.from_",
@@ -43,7 +44,7 @@ class TestDatabricksClientOpen:
         ) as from_:
             result = client.open("/Volumes/cat/sch/vol/x", "rb")
         from_.assert_called_once_with(
-            obj="/Volumes/cat/sch/vol/x", client=client,
+            obj="/Volumes/cat/sch/vol/x", client=client, temporary=False,
         )
         fake_path.open.assert_called_once_with(mode="rb")
         assert result is fake_path.open.return_value
@@ -87,6 +88,51 @@ class TestDatabricksClientOpen:
             mode="rb",
             media_type="text/csv",
             owns_holder=False,
+        )
+
+
+class TestDatabricksClientPath:
+    """:meth:`DatabricksClient.path` — the non-opening companion to
+    :meth:`open`: builds the bound path resource without opening it."""
+
+    def test_string_path_routes_through_databricks_path_from(self, client):
+        fake_path = MagicMock()
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+            return_value=fake_path,
+        ) as from_:
+            result = client.path("/Volumes/cat/sch/vol/x")
+        from_.assert_called_once_with(
+            obj="/Volumes/cat/sch/vol/x", client=client, temporary=False,
+        )
+        # The path is returned as-is — never opened.
+        fake_path.open.assert_not_called()
+        assert result is fake_path
+
+    def test_existing_path_returned_verbatim(self, client):
+        path = MagicMock(spec=VolumePath)
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+        ) as from_:
+            result = client.path(path)
+        from_.assert_not_called()
+        path.open.assert_not_called()
+        assert result is path
+
+    def test_temporary_and_kwargs_ride_through(self, client):
+        fake_path = MagicMock()
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+            return_value=fake_path,
+        ) as from_:
+            client.path(
+                "/Volumes/cat/sch/vol/x", temporary=True, service=None,
+            )
+        from_.assert_called_once_with(
+            obj="/Volumes/cat/sch/vol/x",
+            client=client,
+            temporary=True,
+            service=None,
         )
 
 
