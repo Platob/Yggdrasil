@@ -683,31 +683,6 @@ class TestTableAsyncInsertIntegration(_TableFixture):
         # empty so row-count assertions are order-independent.
         self.table.insert(_sample_data().slice(0, 0), mode=Mode.OVERWRITE)
 
-    def test_async_drop_then_loader_appends(self) -> None:
-        from yggdrasil.databricks.table.insert import (
-            DatabricksTableInsert, load_async, logs_path, stage_async_insert,
-        )
-
-        try:
-            log_path = stage_async_insert(self.table, _sample_data(), mode=Mode.APPEND)
-        except (DatabricksError, PermissionDenied) as exc:
-            self._skip(exc, "async insert needs volume write access")
-
-        self.assertTrue(log_path.exists())
-        op = DatabricksTableInsert.from_log(log_path)
-        self.assertEqual(op.target, self.table.full_name())
-        self.assertEqual(op.mode, Mode.APPEND)
-        # the staged Parquet lives exactly where the log's uniform URL says
-        data_path = op.data_path(self.table.client)
-        self.assertTrue(data_path.exists())
-
-        # run the loader: aggregate + load, then clear the consumed log + data
-        processed = load_async(self.client.tables, logs_path(self.table), wait=True)
-        self.assertEqual(processed, 1)
-        self.assertEqual(self._count(), 3)
-        self.assertFalse(log_path.exists())
-        self.assertFalse(data_path.exists())
-
     def test_async_overwrite_replaces_rows(self) -> None:
         from yggdrasil.databricks.table.insert import (
             load_async, logs_path, stage_async_insert,
@@ -736,3 +711,48 @@ class TestTableAsyncInsertIntegration(_TableFixture):
         from yggdrasil.databricks.table.insert import stage_async_insert
         with self.assertRaises(ValueError):
             stage_async_insert(self.table, _sample_data(), mode=Mode.MERGE)
+
+
+@pytest.mark.integration
+class TestTableAsyncInsertLogPathIntegration(_TableFixture):
+    """Isolated log-path lifecycle for ``stage_async_insert`` → ``load_async``.
+
+    Carved out of :class:`TestTableAsyncInsertIntegration` onto its own
+    throw-away table (``yg_async_log``) so the full drop-log →
+    loader-consumes → log+data-cleared round-trip can be iterated on its
+    own — ``pytest ...::TestTableAsyncInsertLogPathIntegration`` boots one
+    table and runs one assertion-dense test, no sibling async cases.
+    """
+
+    table_prefix = "yg_async_log"
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Single-test class, but keep the empty-start invariant so a re-run
+        # after a partial failure (table left with rows) is order-independent.
+        self.table.insert(_sample_data().slice(0, 0), mode=Mode.OVERWRITE)
+
+    def test_async_drop_then_loader_appends(self) -> None:
+        from yggdrasil.databricks.table.insert import (
+            DatabricksTableInsert, load_async, logs_path, stage_async_insert,
+        )
+
+        try:
+            log_path = stage_async_insert(self.table, _sample_data(), mode=Mode.APPEND)
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "async insert needs volume write access")
+
+        self.assertTrue(log_path.exists())
+        op = DatabricksTableInsert.from_log(log_path)
+        self.assertEqual(op.target, self.table.full_name())
+        self.assertEqual(op.mode, Mode.APPEND)
+        # the staged Parquet lives exactly where the log's uniform URL says
+        data_path = op.data_path(self.table.client)
+        self.assertTrue(data_path.exists())
+
+        # run the loader: aggregate + load, then clear the consumed log + data
+        processed = load_async(self.client.tables, logs_path(self.table), wait=True)
+        self.assertEqual(processed, 1)
+        self.assertEqual(self._count(), 3)
+        self.assertFalse(log_path.exists())
+        self.assertFalse(data_path.exists())
