@@ -114,12 +114,12 @@ class TestAsyncInsert:
         src.read_arrow_table.assert_called_once_with()
         data_file.write_table.assert_called_once()
 
-    def test_execute_loads_synchronously_without_staging(self):
+    def test_execute_async_insert_loads_synchronously(self):
         t = MagicMock()
-        out = Table.async_insert(t, "SELECT 1", mode="append", execute=True)
+        out = Table.execute_async_insert(t, "SELECT 1", mode="append")
         t.insert_into.assert_called_once()
         assert t.insert_into.call_args.kwargs["mode"] == "append"
-        t.insert_volume_path.assert_not_called()      # no staging on execute
+        t.insert_volume_path.assert_not_called()      # no staging
         assert out is t.insert_into.return_value
 
 
@@ -264,15 +264,14 @@ class TestTablesAsyncInsertLoader:
             processed = svc.async_insert(logs, wait=False)
 
         assert processed == 2
-        # one execute=True load per (target, mode) group, with the union query
-        target.async_insert.assert_called_once()
-        union = target.async_insert.call_args.args[0]
+        # one execute_async_insert load per (target, mode) group, with the union
+        target.execute_async_insert.assert_called_once()
+        union = target.execute_async_insert.call_args.args[0]
         assert "UNION ALL" in union
         # the uniform URL is resolved to the warehouse-facing path for the query
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in union
-        assert target.async_insert.call_args.kwargs["mode"] == "append"
-        assert target.async_insert.call_args.kwargs["execute"] is True
+        assert target.execute_async_insert.call_args.kwargs["mode"] == "append"
         # consumed logs + data (reconstructed from the uniform URL) cleaned up
         log_a.unlink.assert_called_once()
         log_b.unlink.assert_called_once()
@@ -288,7 +287,7 @@ class TestTablesAsyncInsertLoader:
              patch("yggdrasil.databricks.path.DatabricksPath.from_"):
             processed = svc.async_insert(logs)
         assert processed == 2
-        modes = {c.kwargs["mode"] for c in target.async_insert.call_args_list}
+        modes = {c.kwargs["mode"] for c in target.execute_async_insert.call_args_list}
         assert modes == {"append", "overwrite"}      # one INSERT per mode
 
     def test_groups_by_target_table_from_logs(self):
@@ -309,8 +308,8 @@ class TestTablesAsyncInsertLoader:
 
         assert processed == 2
         assert set(tables) == {"c.s.t1", "c.s.t2"}
-        tables["c.s.t1"].async_insert.assert_called_once()
-        tables["c.s.t2"].async_insert.assert_called_once()
+        tables["c.s.t1"].execute_async_insert.assert_called_once()
+        tables["c.s.t2"].execute_async_insert.assert_called_once()
 
     def test_single_log_file_path_string(self):
         from yggdrasil.databricks.table.tables import Tables
@@ -324,7 +323,7 @@ class TestTablesAsyncInsertLoader:
                    side_effect=lambda p, **k: log if p == "/logs/a.json" else MagicMock()):
             processed = svc.async_insert("/logs/a.json")
         assert processed == 1
-        target.async_insert.assert_called_once()
+        target.execute_async_insert.assert_called_once()
 
 
 class TestTableJobRunDelegates:

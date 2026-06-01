@@ -3344,35 +3344,22 @@ class Table(DatabricksPath):
         mode: Mode | str | None = None,
         match_by: Optional[list[str]] = None,
         cast_options: Optional[CastOptions] = None,
-        execute: bool = False,
-        wait: WaitingConfigArg = True,
         **kwargs: Any,
-    ) -> "VolumePath | Any":
+    ) -> "VolumePath":
         """Stage *data* as Parquet + drop a JSON operation log — no warehouse.
 
         Writes the rows to the table's **default tmp staging path**
         (:meth:`insert_volume_path`) and an operation log to
         ``<staging_volume>/.sql/async/logs/<op>.json`` that records the target,
-        mode, and the data's **full path** (so the data can live anywhere —
+        mode, and the data's **uniform URL** (so the data can live anywhere —
         only the log location is fixed), then returns the log path
         so the file-arrival trigger picks it up. Returns the log path.
 
         Only ``OVERWRITE`` / ``APPEND`` with no ``match_by``; the data is staged
-        with its own schema (the aggregating ``INSERT`` casts at load time).
-
-        ``execute=True`` flips this to the **loader** side: instead of staging,
-        it loads *data* into the table now (synchronous :meth:`insert_into`).
-        The file-arrival loader (:meth:`Tables.async_insert`) calls it this way
-        with the aggregated ``UNION ALL`` query for one ``(target, mode)`` group.
-        A path/URL *string* source is read into Arrow first, so a producer can
-        hand a file path directly.
+        with its own schema (the aggregating ``INSERT`` casts at load time). A
+        path/URL *string* source is read into Arrow first, so a producer can
+        hand a file path directly. The loader side is :meth:`execute_async_insert`.
         """
-        if execute:
-            return self.insert_into(
-                data, mode=mode, match_by=match_by,
-                cast_options=cast_options, wait=wait, **kwargs,
-            )
-
         import json as _json
 
         from yggdrasil.databricks.table.async_job import ASYNC_MODES, TableJob
@@ -3418,6 +3405,27 @@ class Table(DatabricksPath):
         # deploy here — building/creating a job on every insert would be far too
         # heavy.
         return log_file
+
+    def execute_async_insert(
+        self,
+        data: Any,
+        *,
+        mode: Mode | str | None = None,
+        match_by: Optional[list[str]] = None,
+        cast_options: Optional[CastOptions] = None,
+        wait: WaitingConfigArg = True,
+        **kwargs: Any,
+    ) -> "StatementBatch | Tabular | None":
+        """Loader side of :meth:`async_insert` — load *data* into the table now.
+
+        Synchronous :meth:`insert_into`. The file-arrival loader
+        (:meth:`Tables.async_insert`) calls this per ``(target, mode)`` group
+        with the aggregated ``UNION ALL`` query over the staged Parquet.
+        """
+        return self.insert_into(
+            data, mode=mode, match_by=match_by,
+            cast_options=cast_options, wait=wait, **kwargs,
+        )
 
     def arrow_insert(
         self,

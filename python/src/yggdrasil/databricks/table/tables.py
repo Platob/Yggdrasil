@@ -272,8 +272,8 @@ class Tables(DatabricksService):
         the loader needs nothing else: it reads them, **groups by
         ``(target, mode)``**, builds one aggregated ``INSERT`` per group
         (``UNION ALL`` over the staged Parquet) and runs it via
-        :meth:`Table.async_insert` with ``execute=True``, then clears the
-        consumed logs + data. Returns the number of operations processed.
+        :meth:`Table.execute_async_insert`, then clears the consumed logs +
+        data. Returns the number of operations processed.
 
         This is the loader behind the file-arrival job and the
         ``ygg databricks table async_insert --execute`` CLI.
@@ -326,7 +326,7 @@ class Tables(DatabricksService):
             union = " UNION ALL ".join(
                 f"SELECT * FROM parquet.`{p.full_path()}`" for p in paths
             )
-            target.async_insert(union, mode=mode, execute=True, wait=wait)
+            target.execute_async_insert(union, mode=mode, wait=wait)
             # Clear consumed logs + data only after a successful load.
             for (_, log_file), path in zip(items, paths):
                 _best_effort_unlink(log_file)
