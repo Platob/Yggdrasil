@@ -421,14 +421,24 @@ class Volume(DatabricksPath):
         return self._store_infos(info)
 
     def exists(self) -> bool:
-        """``True`` if this volume is reachable via the Unity Catalog API."""
+        """``True`` if this volume is reachable via the Unity Catalog API.
+
+        Always hits the API (``refresh=True``): ``exists`` is a liveness
+        probe, and a cached :class:`VolumeInfo` (5-minute TTL) would keep
+        reporting ``True`` for minutes after the volume was dropped — e.g.
+        right after a ``delete`` / a peer's cascade teardown. On a clean
+        not-found the stale cache is dropped so a following :attr:`info`
+        doesn't resurrect the deleted volume's metadata.
+        """
         try:
-            _ = self.read_info()
+            _ = self.read_info(refresh=True)
             return True
         except NotFound:
+            self._reset_cache()
             return False
         except DatabricksError as exc:
             if _looks_like_not_found(exc):
+                self._reset_cache()
                 return False
             raise
 

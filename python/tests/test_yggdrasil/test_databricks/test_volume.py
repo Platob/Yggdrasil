@@ -184,6 +184,28 @@ class TestVolumeInfoTTL:
         _ = v.info
         workspace.volumes.read.assert_not_called()
 
+    def test_exists_ignores_fresh_cache_and_probes_live(self, workspace, client):
+        # exists() is a liveness probe — a still-fresh cached VolumeInfo
+        # must NOT shortcut it, or a volume dropped within the TTL keeps
+        # reporting True. Seed a fresh cache, then have the live read
+        # not-found: exists() must re-probe and return False.
+        from databricks.sdk.errors import NotFound as SDKNotFound
+
+        v = Volume(
+            service=Volumes(client=client),
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+            infos=_info(),
+        )
+        assert v._is_fresh()                       # cache says "exists"
+        workspace.volumes.read.side_effect = SDKNotFound(
+            "Volume 'cat.sch.vol' does not exist."
+        )
+
+        assert v.exists() is False                 # ground truth wins
+        workspace.volumes.read.assert_called_once_with("cat.sch.vol")
+        # Stale entry dropped so a later info access doesn't resurrect it.
+        assert v._infos is None
+
 
 class TestVolumeNavigation:
 
