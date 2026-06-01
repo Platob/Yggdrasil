@@ -18,6 +18,7 @@ import unittest
 from typing import Any, ClassVar
 
 import pytest
+from dotenv import load_dotenv
 
 from yggdrasil.databricks import DatabricksClient
 from yggdrasil.databricks.client import invalidate_env_defaults
@@ -30,12 +31,15 @@ __all__ = ["DatabricksIntegrationCase"]
 class DatabricksIntegrationCase(unittest.TestCase):
     """Base class for tests that need a live Databricks workspace.
 
-    The class is skipped at ``setUpClass`` time when ``DATABRICKS_HOST``
-    is unset (or empty) so a plain ``pytest`` run on a developer
-    laptop never touches the network. When the env var *is* set,
-    ``cls.client`` is built from the standard ``DATABRICKS_*`` env
-    vars (host, token / OAuth, profile, ...) — exactly what a freshly
-    constructed :class:`DatabricksClient` already reads.
+    ``setUpClass`` first loads a ``.env`` (via :func:`dotenv.load_dotenv`,
+    searched upward from the cwd) so credentials can live in a file
+    instead of the shell; real session / CI env vars still win. The
+    class is then skipped when ``DATABRICKS_HOST`` is unset (or empty)
+    so a plain ``pytest`` run on a developer laptop never touches the
+    network. When the env var *is* set, ``cls.client`` is built from the
+    standard ``DATABRICKS_*`` env vars (host, token / OAuth, profile,
+    ...) — exactly what a freshly constructed :class:`DatabricksClient`
+    already reads.
     """
 
     client: ClassVar[DatabricksClient]
@@ -45,6 +49,10 @@ class DatabricksIntegrationCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        # Load credentials from a ``.env`` (searched upward from the cwd)
+        # before the gate below. Real session/CI env vars win — ``load_dotenv``
+        # fills only the gaps, it does not override what's already set.
+        load_dotenv()
         host = os.environ.get("DATABRICKS_HOST", "").strip()
         if not host:
             raise unittest.SkipTest(
