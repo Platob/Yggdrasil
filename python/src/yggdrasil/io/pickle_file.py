@@ -208,7 +208,9 @@ class PickleFile(IO[Any, PickleOptions]):
             not self.holder_is_overwrite and self.size_known and self.size > 0
         )
         truly_overwrite = (
-            options.mode in (Mode.OVERWRITE, Mode.TRUNCATE) or not has_existing
+            options.mode in (Mode.OVERWRITE, Mode.TRUNCATE)
+            or (options.mode is Mode.AUTO and not options.match_by_keys)
+            or not has_existing
         )
         if not truly_overwrite:
             return self._write_arrow_batches(iter(table.to_batches()), options)
@@ -230,7 +232,9 @@ class PickleFile(IO[Any, PickleOptions]):
         """
         action = options.mode
         if action is Mode.AUTO:
-            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
+            # Bare AUTO defaults to OVERWRITE (replace the object), matching
+            # the JSON / Excel / Zip leaves; ``match_by`` opts into UPSERT.
+            action = Mode.UPSERT if options.match_by_keys else Mode.OVERWRITE
         elif action is Mode.TRUNCATE:
             action = Mode.OVERWRITE
 

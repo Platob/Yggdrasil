@@ -94,3 +94,22 @@ class TestEmptyOverwriteWritesValidFile:
         assert mem.size > 0
         header = mem.to_bytes().decode().strip().splitlines()[0]
         assert {c.strip('"') for c in header.split(",")} == {"id", "amount"}
+
+
+class TestAutoDefaultsToOverwrite:
+    """``Mode.AUTO`` (the default) replaces the file for a bare write —
+    matching the JSON / Excel / Zip leaves. ``match_by`` still upserts."""
+
+    def test_auto_replaces_existing(self) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.data.options import CastOptions
+
+        mem = Memory()
+        CSVFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [1, 2, 3]}), CastOptions(mode=Mode.OVERWRITE),
+        )
+        CSVFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [9]}),  # default mode = AUTO
+        )
+        out = CSVFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert out.column("id").to_pylist() == [9]

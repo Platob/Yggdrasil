@@ -58,3 +58,23 @@ class TestLocalPathRoundTrip:
         assert len(lines) == 2
         for line in lines:
             assert isinstance(json.loads(line), dict)
+
+
+class TestAutoDefaultsToOverwrite:
+    """``Mode.AUTO`` (the default) replaces the file for a bare write."""
+
+    def test_auto_replaces_existing(self) -> None:
+        from yggdrasil.enums import Mode
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.path.memory import Memory
+        from yggdrasil.io.ndjson_file import NDJSONFile
+
+        mem = Memory()
+        NDJSONFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [1, 2, 3]}), CastOptions(mode=Mode.OVERWRITE),
+        )
+        NDJSONFile(holder=mem, owns_holder=False).write_arrow_table(
+            pa.table({"id": [9]}),  # default mode = AUTO
+        )
+        out = NDJSONFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert out.column("id").to_pylist() == [9]

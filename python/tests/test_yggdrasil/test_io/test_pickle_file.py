@@ -209,3 +209,18 @@ class TestEmptyOverwriteWritesValidFile:
         table = _pf(mem).read_arrow_table()
         assert table.num_rows == 0
         assert table.schema.names == ["id", "amount"]
+
+
+class TestAutoDefaultsToOverwrite:
+    """``Mode.AUTO`` (the default) replaces the pickled table for a bare
+    write — matching the JSON / Excel / Zip leaves."""
+
+    def test_auto_replaces_existing(self) -> None:
+        from yggdrasil.data.options import CastOptions
+
+        mem = Memory()
+        _pf(mem).write_arrow_table(
+            pa.table({"id": [1, 2, 3]}), CastOptions(mode=Mode.OVERWRITE),
+        )
+        _pf(mem).write_arrow_table(pa.table({"id": [9]}))  # default mode = AUTO
+        assert _pf(mem).read_arrow_table().column("id").to_pylist() == [9]

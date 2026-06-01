@@ -192,10 +192,10 @@ class TestWriteArrowTableBypassesBatchHook:
         )
         assert calls["n"] == 0
 
-    def test_auto_on_nonempty_uses_batch_hook(self, monkeypatch) -> None:
-        """AUTO with no ``match_by`` resolves to APPEND semantics
-        on a non-empty buffer — the existing data must survive, so
-        the batch hook owns the rewrite."""
+    def test_auto_on_nonempty_takes_fast_path(self, monkeypatch) -> None:
+        """AUTO with no ``match_by`` resolves to OVERWRITE — a bare
+        write replaces the buffer, so the fast path runs (no batch
+        hook) and the existing rows are gone."""
         from yggdrasil.io.parquet_file import ParquetFile
 
         seed = pa.table({"id": [1, 2, 3]})
@@ -206,10 +206,10 @@ class TestWriteArrowTableBypassesBatchHook:
         ParquetFile(holder=mem, owns_holder=False).write_arrow_table(
             pa.table({"id": [4, 5]}),
         )  # default mode = AUTO
-        assert calls["n"] >= 1
+        assert calls["n"] == 0
 
         out = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
-        assert sorted(out.column("id").to_pylist()) == [1, 2, 3, 4, 5]
+        assert sorted(out.column("id").to_pylist()) == [4, 5]
 
     def test_ignore_on_nonempty_uses_batch_hook(self, monkeypatch) -> None:
         """IGNORE on a non-empty buffer must NOT clobber existing

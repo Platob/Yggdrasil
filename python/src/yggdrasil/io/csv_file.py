@@ -302,16 +302,15 @@ class CSVFile(IO[bytes, CsvOptions]):
         - **IGNORE** — skip when non-empty.
         - **ERROR_IF_EXISTS** — raise when non-empty.
         """
-        # Mode resolution. AUTO picks UPSERT when ``match_by``
-        # is set or APPEND otherwise — APPEND keeps the byte-level
-        # fast path on uncompressed buffers, UPSERT triggers a
-        # read-modify-rewrite. TRUNCATE collapses to OVERWRITE;
-        # APPEND / UPSERT / MERGE keep their identity for the merge
-        # branch; IGNORE / ERROR_IF_EXISTS guard the buffer.
+        # Mode resolution. AUTO picks UPSERT when ``match_by`` is set and
+        # otherwise defaults to OVERWRITE — a bare write replaces the file,
+        # matching the JSON / Excel / Zip leaves. TRUNCATE collapses to
+        # OVERWRITE; APPEND / UPSERT / MERGE keep their identity for the
+        # merge branch; IGNORE / ERROR_IF_EXISTS guard the buffer.
         mode = options.mode
         _skip_existing = self.holder_is_overwrite
         if mode is Mode.AUTO:
-            action = Mode.UPSERT if options.match_by_keys else Mode.APPEND
+            action = Mode.UPSERT if options.match_by_keys else Mode.OVERWRITE
         elif mode is Mode.TRUNCATE:
             action = Mode.OVERWRITE
         elif mode in _MERGE_MODES or mode in (
