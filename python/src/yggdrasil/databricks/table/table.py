@@ -2974,7 +2974,6 @@ class Table(DatabricksPath):
             predicate=cast_options.predicate,
             match_by=match_by,
             update_column_names=update_column_names,
-            cast_options=cast_options,
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,

@@ -51,7 +51,6 @@ from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from yggdrasil.path import Path
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from yggdrasil.data.options import CastOptions
     from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.fs.volume_path import VolumePath
     from yggdrasil.databricks.table.table import Table
@@ -112,13 +111,13 @@ class DatabricksTableInsert:
     Carries the ``target`` table, the save ``mode``, the staged ``data``
     location (a uniform URL on disk, a :class:`Path` once read back), and the
     keyed-write surface (``schema``, ``predicate``, ``match_by``,
-    ``update_column_names``, ``cast_options``, ``schema_mode``, ``zorder_by``,
+    ``update_column_names``, ``schema_mode``, ``zorder_by``,
     ``optimize_after_merge``, ``vacuum_hours``, ``safe_merge``).
 
     It is also the typed content of an async op-log: :meth:`from_log` parses a
     dropped log and :meth:`to_json` serializes one. Only the JSON-friendly
-    fields round-trip through the log — runtime-only carriers (``client``,
-    ``cast_options``, and the live ``predicate`` tree) stay local to the
+    fields round-trip through the log — runtime-only carriers (``client`` and
+    the live ``predicate`` tree) stay local to the
     producing process; ``predicate`` is also recorded as its Databricks SQL
     string for human inspection but isn't reconstructed (there's no SQL→AST
     parser, and the async drop path never carries one anyway).
@@ -144,8 +143,6 @@ class DatabricksTableInsert:
     predicate: "Predicate | None" = None
     match_by: "list[str] | None" = None
     update_column_names: "list[str] | None" = None
-    #: runtime-only — not persisted in the op-log.
-    cast_options: "CastOptions | None" = None
     schema_mode: "Mode | str | None" = None
     zorder_by: "list[str] | None" = None
     optimize_after_merge: bool = False
@@ -157,12 +154,11 @@ class DatabricksTableInsert:
         # The drop pipeline only knows how to aggregate OVERWRITE / APPEND;
         # the keyed modes have no UNION-ALL story. The synchronous path
         # (``Table.arrow_insert``) builds a richer op directly — carrying a
-        # ``schema`` / ``cast_options`` / ``match_by`` — and supports every
-        # mode, so the OVERWRITE-only guard only fires for the bare op shape
-        # that is the content of an async op-log.
+        # ``schema`` / ``match_by`` — and supports every mode, so the
+        # OVERWRITE-only guard only fires for the bare op shape that is the
+        # content of an async op-log.
         if (
             self.mode not in ASYNC_MODES
-            and self.cast_options is None
             and self.schema is None
             and not self.match_by
         ):
