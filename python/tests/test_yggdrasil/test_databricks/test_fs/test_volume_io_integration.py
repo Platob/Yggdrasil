@@ -83,7 +83,13 @@ class _VolumeIOFixture(DatabricksIntegrationCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         cls.catalog_name = _resolve_catalog()
-        cls.schema_name = f"yg_volio"
+        # Unique per *class* (setUpClass runs once per class) so the several
+        # fixture subclasses in this module never share — and cascade-delete
+        # out from under — the same schema / volume. A fixed name passed
+        # class-by-class but hung / 404'd when the whole file ran, as one
+        # class's tearDownClass dropped the volume another class was mid-write
+        # against (UC volume deletes propagate to the Files API lazily).
+        cls.schema_name = f"yg_volio_{secrets.token_hex(4)}"
         cls.volume_name = f"yg_vol"
         try:
             cls.schema = cls.client.schemas(
