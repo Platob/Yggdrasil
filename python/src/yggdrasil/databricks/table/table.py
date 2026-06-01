@@ -2677,20 +2677,24 @@ class Table(DatabricksPath):
         staged Parquet + a JSON operation log are written under the table's
         ``.sql/async`` area and a file-arrival job (:meth:`async_job`)
         aggregates and loads them later — no warehouse statement runs here.
-        Only ``OVERWRITE`` / ``APPEND`` with no ``match_by`` qualify; anything
-        else (or a query / Spark source) falls through to the normal
-        synchronous path.
+        ``OVERWRITE`` / ``APPEND`` (no keys) and ``MERGE`` / ``UPSERT`` (with
+        ``match_by`` keys) qualify; anything else (or a query / Spark source)
+        falls through to the normal synchronous path.
         """
         from yggdrasil.databricks.table.insert import ASYNC_MODES, stage_async_insert
 
+        mode_enum = Mode.from_(mode, default=Mode.APPEND)
+        keyed = mode_enum in (Mode.MERGE, Mode.UPSERT)
+        async_supported = (mode_enum in ASYNC_MODES and not match_by) or (
+            keyed and match_by
+        )
         if (
             wait is False
-            and not match_by
-            and Mode.from_(mode, default=Mode.APPEND) in ASYNC_MODES
+            and async_supported
             and not isinstance(data, (PreparedStatement, StatementResult))
             and not PreparedStatement.looks_like_query(data)
         ):
-            return stage_async_insert(self, data, mode=mode, **kwargs)
+            return stage_async_insert(self, data, mode=mode, match_by=match_by, **kwargs)
         return self.insert_into(
             data,
             mode=mode,

@@ -313,6 +313,65 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
                 continue
         return out
 
+    def task_output(self, key: str) -> Any | None:
+        """SDK ``RunOutput`` for the task *key* (or ``None``)."""
+        t = self.task(key)
+        return t.output() if t is not None else None
+
+    def logs(self, task_key: str | None = None) -> Any:
+        """Captured console output. With *task_key*, that task's log text; without
+        it, a ``{task_key: log text}`` map across all tasks (``None`` entries for
+        tasks with no fetchable output)."""
+        if task_key is not None:
+            t = self.task(task_key)
+            return t.logs if t is not None else None
+        return {t.task_key: t.logs for t in self.tasks}
+
+    @property
+    def stdout(self) -> str:
+        """Every task's captured stdout, each section prefixed by its task key —
+        a single string ready to print when debugging."""
+        parts: list[str] = []
+        for t in self.tasks:
+            log = t.logs
+            if log:
+                parts.append(f"===== [{t.task_key}] stdout =====\n{log.rstrip()}")
+        return "\n".join(parts)
+
+    @property
+    def stderr(self) -> str:
+        """Every failed task's error trace, each prefixed by its task key."""
+        parts: list[str] = []
+        for t in self.tasks:
+            err = t.stderr
+            if err:
+                parts.append(f"===== [{t.task_key}] stderr =====\n{err.rstrip()}")
+        return "\n".join(parts)
+
+    def debug(self) -> str:
+        """A human-readable dump — run state, the task DAG, and each task's
+        state + stdout + stderr — for eyeballing or pasting into a bug report.
+
+        One ``get_run_output`` call per task, so call it on a terminal run."""
+        lines = [f"JobRun {self.run_id} — {self.state.name}"]
+        if self.state_message:
+            lines.append(f"  {self.state_message}")
+        lines += ["", self.dag().render(), ""]
+        for t in self.tasks:
+            lines.append(f"----- [{t.task_key}] {t.state.name} -----")
+            out = t.output()
+            log = getattr(out, "logs", None) if out is not None else None
+            if log:
+                lines.append(log.rstrip())
+            err = (
+                (getattr(out, "error_trace", None) or getattr(out, "error", None))
+                if out is not None else None
+            )
+            if err:
+                lines.append("-- stderr --")
+                lines.append(err.rstrip())
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------ #
     # Awaitable contract
     # ------------------------------------------------------------------ #
@@ -465,6 +524,47 @@ class JobTask(Awaitable):
     @property
     def cluster_instance(self):
         return self._raw.cluster_instance
+
+    # ------------------------------------------------------------------ #
+    # Output / logs — for debugging a run
+    # ------------------------------------------------------------------ #
+
+    def output(self) -> Any | None:
+        """SDK ``RunOutput`` for this task's run (logs / error / notebook
+        result), or ``None`` when there's no parent run or run id yet, or the
+        task type produces no fetchable output."""
+        if self._run is None or self._raw.run_id is None:
+            return None
+        sdk = self._run.client.workspace_client().jobs
+        try:
+            return sdk.get_run_output(run_id=self._raw.run_id)
+        except Exception:  # noqa: BLE001 - output fetch is best-effort
+            return None
+
+    @property
+    def logs(self) -> str | None:
+        """Captured console output (Databricks merges stdout + stderr into one
+        ``logs`` stream). ``None`` when unavailable."""
+        out = self.output()
+        return getattr(out, "logs", None) if out is not None else None
+
+    #: Alias — Databricks captures the task's console *stdout* in ``logs``.
+    stdout = logs
+
+    @property
+    def stderr(self) -> str | None:
+        """The failure detail — the error traceback, falling back to the error
+        message. ``None`` for a task that didn't error."""
+        out = self.output()
+        if out is None:
+            return None
+        return getattr(out, "error_trace", None) or getattr(out, "error", None)
+
+    @property
+    def error_message(self) -> str | None:
+        """Short error message for a failed task (no traceback)."""
+        out = self.output()
+        return getattr(out, "error", None) if out is not None else None
 
     # ------------------------------------------------------------------ #
     # Awaitable contract — poll the parent run for this task's state

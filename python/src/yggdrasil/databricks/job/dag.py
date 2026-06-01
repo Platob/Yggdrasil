@@ -43,21 +43,22 @@ class JobDag:
         *,
         state_of: Optional[Callable[[Any], Optional[State]]] = None,
     ) -> "JobDag":
-        nodes: list[JobDagNode] = []
+        # A node is identified by its task key. A run can list the same key more
+        # than once (a retried task is a second attempt) — collapse to one node,
+        # keeping the latest attempt's state, so the graph stays a true DAG.
+        by_key: dict[str, JobDagNode] = {}
         for t in tasks or ():
             deps = tuple(
                 d.task_key
                 for d in (getattr(t, "depends_on", None) or ())
                 if getattr(d, "task_key", None)
             )
-            nodes.append(
-                JobDagNode(
-                    key=t.task_key,
-                    depends_on=deps,
-                    state=state_of(t) if state_of is not None else None,
-                )
+            by_key[t.task_key] = JobDagNode(
+                key=t.task_key,
+                depends_on=deps,
+                state=state_of(t) if state_of is not None else None,
             )
-        return cls(nodes)
+        return cls(list(by_key.values()))
 
     def __bool__(self) -> bool:
         return bool(self.nodes)

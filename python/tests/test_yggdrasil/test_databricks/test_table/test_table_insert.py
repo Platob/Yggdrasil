@@ -2,7 +2,8 @@
 
 Covers:
 * ``Table.insert(wait=False)`` routing → ``stage_async_insert`` (OVERWRITE /
-  APPEND, no match_by), and the sync path otherwise;
+  APPEND with no keys, or MERGE / UPSERT with match_by), and the sync path
+  otherwise;
 * :class:`DatabricksTableInsert` parsing / serialization / validation and the
   per-op + per-batch SQL generators (``make_sql_select`` / ``make_sql_insert``,
   including the keyed-batch MERGE dedup);
@@ -66,12 +67,27 @@ class TestInsertRouting:
         t.insert_into.assert_called_once()
         stage.assert_not_called()
 
-    def test_merge_mode_stays_sync(self):
+    def test_merge_mode_without_keys_stays_sync(self):
+        # MERGE needs keys to qualify for the async drop; without them it falls
+        # through to the synchronous path.
         t = MagicMock()
         with patch("yggdrasil.databricks.table.insert.stage_async_insert") as stage:
             Table.insert(t, {"a": [1]}, mode="merge", wait=False)
         t.insert_into.assert_called_once()
         stage.assert_not_called()
+
+    def test_merge_with_keys_routes_to_async(self):
+        # MERGE/UPSERT + match_by qualifies for the async drop, forwarding keys.
+        t = MagicMock()
+        with patch("yggdrasil.databricks.table.insert.stage_async_insert") as stage:
+            out = Table.insert(
+                t, {"a": [1]}, mode="merge", wait=False, match_by=["id"],
+            )
+        stage.assert_called_once()
+        assert stage.call_args.kwargs["mode"] == "merge"
+        assert stage.call_args.kwargs["match_by"] == ["id"]
+        assert out is stage.return_value
+        t.insert_into.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -358,17 +374,37 @@ class TestDatabricksInsertBatch:
 # stage_async_insert (producer)
 # --------------------------------------------------------------------------- #
 class TestStageAsyncInsert:
-    def test_rejects_non_overwrite_append(self):
+    def test_rejects_unsupported_mode(self):
         from yggdrasil.databricks.table.insert import stage_async_insert
         t = _table_mock()
-        with pytest.raises(ValueError, match="OVERWRITE / APPEND"):
+        with pytest.raises(ValueError, match="OVERWRITE / APPEND / MERGE / UPSERT"):
+            stage_async_insert(t, object(), mode="truncate")
+
+    def test_merge_requires_keys(self):
+        from yggdrasil.databricks.table.insert import stage_async_insert
+        t = _table_mock()
+        with pytest.raises(ValueError, match="requires match_by"):
             stage_async_insert(t, object(), mode="merge")
 
-    def test_rejects_match_by(self):
+    def test_merge_with_keys_stages_with_match_by(self):
         from yggdrasil.databricks.table.insert import stage_async_insert
         t = _table_mock()
-        with pytest.raises(ValueError, match="match_by"):
-            stage_async_insert(t, object(), mode="append", match_by=["id"])
+        data_file = MagicMock()
+        data_file.to_url.return_value.to_string.return_value = "dbfs+volume:/x.parquet"
+        t.insert_volume_path.return_value = data_file
+        logs_dir, log_file = MagicMock(), MagicMock()
+        logs_dir.__truediv__.return_value = log_file
+        with patch("yggdrasil.databricks.table.insert.logs_path", lambda tbl: logs_dir):
+            stage_async_insert(t, {"a": [1]}, mode="merge", match_by=["id"])
+        payload = json.loads(log_file.write_bytes.call_args[0][0])
+        assert payload["mode"] == "merge"
+        assert payload["match_by"] == ["id"]
+
+    def test_string_match_by_is_rejected(self):
+        from yggdrasil.databricks.table.insert import stage_async_insert
+        t = _table_mock()
+        with pytest.raises(ValueError, match="list of key columns"):
+            stage_async_insert(t, object(), mode="merge", match_by="id")
 
     def test_writes_parquet_to_staging_and_logs_its_uniform_url(self):
         from yggdrasil.databricks.table.insert import stage_async_insert

@@ -1023,16 +1023,27 @@ def stage_async_insert(
     the table's default tmp staging path and drop a JSON op-log under
     :func:`logs_path` recording the staged data's uniform URL (so it can live
     anywhere). A path/URL *string* source is read into Arrow first. Returns the
-    op-log path; only ``OVERWRITE`` / ``APPEND`` with no ``match_by``.
+    op-log path.
+
+    Supports ``APPEND`` / ``OVERWRITE`` (no keys) and ``MERGE`` / ``UPSERT``
+    (which require ``match_by`` key columns) — the loader aggregates the staged
+    ops into one ``INSERT`` / ``INSERT OVERWRITE`` / ``MERGE INTO`` per target.
     """
     mode_enum = Mode.from_(mode, default=Mode.APPEND)
-    if mode_enum not in ASYNC_MODES:
+    keyed = mode_enum in (Mode.MERGE, Mode.UPSERT)
+    if keyed and not match_by:
         raise ValueError(
-            f"async insert (wait=False) supports only OVERWRITE / APPEND, "
+            f"async {mode_enum.name.lower()} requires match_by key columns"
+        )
+    if not keyed and mode_enum not in ASYNC_MODES:
+        raise ValueError(
+            f"async insert supports OVERWRITE / APPEND / MERGE / UPSERT, "
             f"got {mode_enum.name}"
         )
-    if match_by:
-        raise ValueError("async insert (wait=False) does not support match_by")
+    if isinstance(match_by, str):
+        raise ValueError(
+            "async match_by must be an explicit list of key columns, not a string"
+        )
 
     if isinstance(data, str):
         from yggdrasil.io.holder import IO
@@ -1048,6 +1059,7 @@ def stage_async_insert(
         mode=mode_enum,
         data=data_file,
         client=table.client,
+        match_by=list(match_by) if match_by else None,
     )
     log_file = logs_path(table) / f"{op.op_id}.json"
     log_file.write_bytes(op.to_json())

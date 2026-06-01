@@ -44,6 +44,7 @@ class TestJobsOrchestrationIntegration(DatabricksIntegrationCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         cls.notebook = f"{_SMOKE_DIR}/nb_{secrets.token_hex(4)}"
+        cls.failing_notebook = f"{_SMOKE_DIR}/nb_fail_{secrets.token_hex(4)}"
         w = cls.client.workspace_client()
         try:
             w.workspace.mkdirs(path=_SMOKE_DIR)
@@ -52,6 +53,13 @@ class TestJobsOrchestrationIntegration(DatabricksIntegrationCase):
                 format=ImportFormat.SOURCE,
                 language=Language.PYTHON,
                 content=base64.b64encode(b'print("ygg jobs smoke ok")\n').decode(),
+                overwrite=True,
+            )
+            w.workspace.import_(
+                path=cls.failing_notebook,
+                format=ImportFormat.SOURCE,
+                language=Language.PYTHON,
+                content=base64.b64encode(b'raise Exception("boom-xyz")\n').decode(),
                 overwrite=True,
             )
         except (DatabricksError, PermissionDenied) as exc:
@@ -156,3 +164,33 @@ class TestJobsOrchestrationIntegration(DatabricksIntegrationCase):
         self.assertTrue(run.is_succeeded, f"run failed: {run.state_message}")
         self.assertEqual(run.job_id, job.job_id)
         self.assertEqual(sorted(run.dag().keys), ["a", "b"])
+
+    def test_failed_task_exposes_stderr_for_debugging(self):
+        # A failing task surfaces its error through the debug accessors so a
+        # caller can diagnose a run without reaching into the SDK.
+        try:
+            run = self.client.jobs.submit(
+                run_name=f"ygg-fail-{secrets.token_hex(3)}",
+                tasks=[
+                    SubmitTask(
+                        task_key="boom",
+                        notebook_task=NotebookTask(notebook_path=self.failing_notebook),
+                    )
+                ],
+            )
+        except (DatabricksError, PermissionDenied) as exc:
+            self.skipTest(f"submit needs job/serverless access: {exc}")
+
+        # wait without raising so we can inspect the terminal failed state
+        run.wait(wait=_WAIT_SECONDS, raise_error=False)
+        self.assertTrue(run.is_failed, f"expected failure, got {run.state}")
+
+        task = run.task("boom")
+        self.assertTrue(task.is_failed)
+        self.assertIn("boom-xyz", task.error_message or "")
+        self.assertIn("boom-xyz", task.stderr or "")
+        # Run-level aggregates + the debug dump carry the error too.
+        self.assertIn("boom-xyz", run.stderr)
+        dump = run.debug()
+        self.assertIn("boom", dump)            # task key
+        self.assertIn("boom-xyz", dump)        # error detail
