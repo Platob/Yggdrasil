@@ -54,6 +54,21 @@ class TestCoerceExternalDataForSpark(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
+    # S3Path → text-substitute as parquet.`s3://<bucket>/<key>`
+    # ------------------------------------------------------------------
+
+    def test_s3_path_substitutes_as_parquet_path(self) -> None:
+        from yggdrasil.aws.fs.path import S3Path
+
+        sp = S3Path(url=URL(scheme=Scheme.S3, host="bucket", path="/data.parquet"))
+        out = _coerce_external_data_for_spark({"alias": sp})
+        self.assertIsNotNone(out)
+        entry = out["alias"]
+        self.assertEqual(entry.text_key, "alias")
+        self.assertIsNone(entry.tabular)
+        self.assertEqual(entry.text_value, "parquet.`s3://bucket/data.parquet`")
+
+    # ------------------------------------------------------------------
     # ExternalStatementData → pass-through (key normalization on mismatch)
     # ------------------------------------------------------------------
 

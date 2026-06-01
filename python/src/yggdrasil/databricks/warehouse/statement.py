@@ -69,6 +69,7 @@ from yggdrasil.databricks.sql.exceptions import SQLError
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.io.tabular import Tabular
 from ..fs import VolumePath, DatabricksPath
+from yggdrasil.aws.fs.path import S3Path
 from ..sql.types import parse_databricks_field
 
 if TYPE_CHECKING:
@@ -260,7 +261,8 @@ class WarehousePreparedStatement(PreparedStatement):
         Each entry maps a query-text alias (used as ``{alias}`` in the
         statement text) to one of:
 
-        - an existing :class:`VolumePath` — passed through.
+        - an existing :class:`VolumePath` or :class:`S3Path` — passed
+          through (read in place as ``parquet.`<full_path>```).
         - tabular data (Arrow / polars / pandas / list / dict) — staged as
           Parquet onto a fresh :meth:`Table.insert_volume_path` under the
           supplied ``catalog_name`` / ``schema_name`` (alias becomes the
@@ -295,18 +297,22 @@ class WarehousePreparedStatement(PreparedStatement):
                     continue
                 value = value.tabular
 
-            if isinstance(value, VolumePath):
+            if isinstance(value, (VolumePath, S3Path)):
+                # A volume path or an S3 path is referenced in place — the
+                # warehouse reads it directly as ``parquet.`<full_path>```; no
+                # staging needed.
                 out[alias] = value
                 continue
             if isinstance(value, DatabricksPath):
                 raise TypeError(
-                    f"external_data[{alias!r}]: only VolumePath is supported, "
-                    f"got {type(value).__name__}; stage to a Volume first"
+                    f"external_data[{alias!r}]: among paths only VolumePath "
+                    f"(or an S3Path) is supported, got {type(value).__name__}; "
+                    f"stage to a Volume first"
                 )
             if value is None:
                 raise ValueError(
                     f"external_data[{alias!r}]: value is None; "
-                    f"pass a VolumePath or tabular data"
+                    f"pass a VolumePath / S3Path or tabular data"
                 )
 
             out[alias] = cls._stage_external_value(
@@ -322,12 +328,15 @@ class WarehousePreparedStatement(PreparedStatement):
         return out
 
     @staticmethod
-    def volume_path_text_value(path: VolumePath) -> str:
+    def volume_path_text_value(path: "VolumePath | S3Path") -> str:
         """Build the SQL fragment that references *path* in a query.
 
         Single source of truth for the ``parquet.\\`<full>\\``` form used
         by :meth:`WarehouseStatementBatch._coerce`; reusing this helper
         keeps text-substitution and cleanup pointing at the same string.
+        Works for any external path that renders a warehouse-readable URL —
+        a :class:`VolumePath` (``/Volumes/...``) or an :class:`S3Path`
+        (``s3://...``).
         """
         return f"parquet.`{path.full_path()}`"
 

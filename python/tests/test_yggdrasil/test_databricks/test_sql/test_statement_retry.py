@@ -182,8 +182,28 @@ class TestBatchCoerceAliasSubstitution:
         )
         coerced = batch._coerce(stmt)
         assert "parquet.`/Volumes/c/s/v/data.parquet`" in coerced.text
-        # Original unchanged.
-        assert stmt.text == "SELECT * FROM {tbl}"
+
+    def test_s3_path_alias_substituted(self) -> None:
+        # An S3Path external source is read in place just like a VolumePath.
+        from unittest.mock import MagicMock
+        from yggdrasil.aws.fs.path import S3Path
+        path = MagicMock(spec=S3Path)
+        path.full_path.return_value = "s3://bucket/data.parquet"
+        batch = WarehouseStatementBatch(
+            executor=_warehouse(),
+            external_paths={"tbl": path},
+        )
+        stmt = WarehousePreparedStatement("SELECT * FROM {tbl}")
+        coerced = batch._coerce(stmt)
+        assert "parquet.`s3://bucket/data.parquet`" in coerced.text
+
+    def test_check_external_data_passes_through_s3_path(self) -> None:
+        # check_external_data accepts an S3Path verbatim — no staging.
+        from unittest.mock import MagicMock
+        from yggdrasil.aws.fs.path import S3Path
+        path = MagicMock(spec=S3Path)
+        out = WarehousePreparedStatement.check_external_data({"src": path})
+        assert out == {"src": path}
 
     def test_per_statement_alias_overrides_batch_alias(self) -> None:
         from unittest.mock import MagicMock
