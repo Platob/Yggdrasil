@@ -417,21 +417,13 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     #: :attr:`scheme`.
     mime_type: "ClassVar[MimeType | None]" = None
 
-    #: Lifetime of a seeded :attr:`_stat_cached` entry. ``None`` (the
-    #: default) means "trust a seeded snapshot until it is explicitly
-    #: invalidated" — right for in-memory and local-filesystem holders,
-    #: where re-probing is free or the cache is only ever seeded from a
-    #: just-performed op. Remote backends override with a finite TTL so
-    #: a snapshot can't outlive the backend's own mutation window.
-    STAT_CACHE_TTL: ClassVar["float | None"] = None
-    #: Stat-cache slots are per-instance, backend-derived state — never
-    #: pickle them. A holder serialized on one node and rehydrated on
-    #: another must re-probe rather than trust a snapshot of *this*
-    #: node's view. Subclasses that filter ``__getstate__`` by this set
-    #: (e.g. :class:`DatabricksPath`) rely on the slots being listed here.
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset(
-        {"_stat_cached", "_stat_cached_at"}
-    )
+    # The stat-cache machinery (``STAT_CACHE_TTL`` / ``_stat_cached`` /
+    # ``_stat_cached_at`` + ``_stat_cached_fresh`` / ``_persist_stat_cache``
+    # + the ``_TRANSIENT_STATE_ATTRS`` pickle filter) lives on the
+    # :class:`~yggdrasil.io.tabular.base.Tabular` base so the cached
+    # :class:`IOStats` — which also carries the schema in its ``field``
+    # — is shared by every tabular, byte-backed or not. :meth:`_touch_stat`
+    # (below) still owns the write-side mutation of that snapshot.
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Auto-register concrete subclasses keyed on :attr:`mime_type`.
@@ -468,18 +460,11 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         "_xxh3_64_cached",
         "_xxh3_64_size",
         "_xxh3_64_mtime",
-        # Optional cached :class:`IOStats` snapshot — the canonical
-        # "stat view" of this holder (``kind`` + ``size`` + ``mtime`` +
-        # ``media_type``). In-memory holders leave it ``None`` and read
-        # straight off their authoritative ``_size`` / ``_mtime`` slots;
-        # backend-bound holders (:class:`yggdrasil.path.Path`) seed it
-        # from a listing / probe and read filesystem predicates
-        # (``exists`` / ``is_file`` / ``size`` / ``mtime``) off it,
-        # honouring :attr:`STAT_CACHE_TTL`. :meth:`_touch_stat` mutates
-        # this snapshot in place on every write so a seeded entry never
-        # drifts from the bytes just committed.
-        "_stat_cached",
-        "_stat_cached_at",
+        # ``_stat_cached`` / ``_stat_cached_at`` are NOT slots here — they
+        # live in ``__dict__`` and are set by ``Tabular.__init__`` (the
+        # base that owns the cached :class:`IOStats`). ``Tabular`` has no
+        # ``__slots__``, so every holder instance carries a ``__dict__``
+        # for them regardless.
         # Cursor + mode state — pulled up from the former :class:`IO`
         # subclass after the Holder ↔ IO merge so every Holder gains
         # an opt-in seekable cursor. Read/write primitives advance
@@ -962,15 +947,12 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             self._media_type = stat.media_type
         else:
             self._media_type = ...
-        # Cached stat snapshot — cold by default. ``_stat_cached_at``
-        # being ``0.0`` marks "never seeded": :meth:`_stat_cached_fresh`
-        # returns ``None`` until a listing / probe / write fills it in.
-        # The caller-supplied ``stat`` has already seeded the scalar
-        # ``_size`` / ``_mtime`` / ``_media_type`` slots above; the stat
-        # cache stays cold so backend-bound holders still re-probe kind
-        # on first access (matching the pre-unification contract).
-        self._stat_cached: "IOStats | None" = None
-        self._stat_cached_at: float = 0.0
+        # ``_stat_cached`` / ``_stat_cached_at`` are initialised by
+        # ``Tabular.__init__`` (run via ``super().__init__`` above) — the
+        # cached :class:`IOStats` is shared at the Tabular level. The
+        # caller-supplied ``stat`` seeds the scalar ``_size`` / ``_mtime``
+        # / ``_media_type`` slots only; the stat cache stays cold so
+        # backend-bound holders still re-probe kind on first access.
         self.temporary: bool = bool(temporary)
 
         for prio in (binary, path, data):
@@ -1802,43 +1784,9 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     # returned ``IOStats`` no longer round-trips, since each call
     # produces a fresh instance.
 
-    def _stat_cached_fresh(self) -> "IOStats | None":
-        """Return the cached :class:`IOStats` when still inside its TTL.
-
-        ``None`` when the slot is cold (never seeded) *or* the entry has
-        expired past :attr:`STAT_CACHE_TTL`. ``TTL is None`` trusts a
-        seeded snapshot until it is explicitly invalidated; ``TTL <= 0``
-        always re-probes (test scaffolding / always-fresh backends).
-        In-memory holders never seed the slot, so this stays ``None``
-        for them and their authoritative ``_size`` / ``_mtime`` slots
-        answer instead.
-        """
-        cached = self._stat_cached
-        if cached is None:
-            return None
-        ttl = self.STAT_CACHE_TTL
-        if ttl is None:
-            return cached
-        if ttl <= 0:
-            return None
-        if (time.monotonic() - self._stat_cached_at) <= ttl:
-            return cached
-        return None
-
-    def _persist_stat_cache(self, stats: IOStats) -> None:
-        """Seed :attr:`_stat_cached` with a known :class:`IOStats`.
-
-        Useful for backends that learn metadata as a side-effect of a
-        listing (S3 ``ListObjectsV2`` returns size + mtime per object,
-        Databricks ``Files.list_directory_contents`` returns
-        ``is_directory`` + ``file_size``, ``os.scandir`` exposes
-        ``is_dir`` / ``is_file`` cheaply) or a read / write where the
-        response body's length IS the new size. The next filesystem
-        predicate (:attr:`size` / :meth:`exists` / :meth:`is_file` /
-        :meth:`is_dir` / :attr:`mtime`) collapses to a local hit.
-        """
-        self._stat_cached = stats
-        self._stat_cached_at = time.monotonic()
+    # ``_stat_cached_fresh`` / ``_persist_stat_cache`` live on the
+    # :class:`~yggdrasil.io.tabular.base.Tabular` base — the cached
+    # :class:`IOStats` (stat + schema ``field``) is shared there.
 
     def stat(self) -> IOStats:
         """Snapshot the holder's metadata into a fresh :class:`IOStats`.

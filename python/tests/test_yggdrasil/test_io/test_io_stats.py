@@ -117,3 +117,44 @@ class TestIOStatsIteration:
         assert (size, mtime, kind, mode, media_type) == (
             10, 2.5, IOKind.FILE, 0o600, None,
         )
+
+    def test_field_is_not_part_of_the_stat_tuple(self):
+        # ``field`` is the schema extension — it must stay out of the
+        # ``os.stat_result``-style positional iteration / __getitem__.
+        from yggdrasil.data.schema import Schema
+
+        s = IOStats(size=1, field=Schema.empty())
+        assert len(list(s)) == 5
+        assert s[6] == 1  # positional size slot unaffected
+
+
+class TestIOStatsField:
+    """IOStats carries an optional cached schema in ``field``."""
+
+    def _schema(self):
+        from yggdrasil.data.schema import Schema
+        import pyarrow as pa
+
+        return Schema.from_arrow(pa.schema([("a", pa.int64())]))
+
+    def test_default_field_is_none(self):
+        assert IOStats().field is None
+
+    def test_copy_carries_field(self):
+        sch = self._schema()
+        s = IOStats(size=3, field=sch)
+        assert s.copy(size=9).field is sch
+
+    def test_copy_can_override_field(self):
+        s = IOStats(field=self._schema())
+        assert s.copy(field=None).field is None
+
+    def test_with_inplace_sets_field(self):
+        sch = self._schema()
+        s = IOStats()
+        assert s.with_(field=sch, inplace=True) is s
+        assert s.field is sch
+
+    def test_repr_shows_field_only_when_set(self):
+        assert "field=" not in repr(IOStats(size=1))
+        assert "field=" in repr(IOStats(size=1, field=self._schema()))

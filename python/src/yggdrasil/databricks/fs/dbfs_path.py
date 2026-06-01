@@ -470,10 +470,14 @@ class DBFSPath(DatabricksPath):
                 if isinstance(exc, InvalidParameterValue):
                     msg = str(exc)
                     if "Found directory on path: " in msg:
-                        self._stat_cached = IOStats(
+                        # Stamp via the helper so the entry is marked
+                        # fresh (``_stat_cached_at``) — a raw assignment
+                        # leaves it cold and ``_stat_cached_fresh`` would
+                        # ignore it under TTL gating.
+                        self._persist_stat_cache(IOStats(
                             kind=IOKind.DIRECTORY,
                             media_type=MediaTypes.DIRECTORY,
-                        )
+                        ))
 
                 if _looks_like_not_found(exc):
                     raise FileNotFoundError(self.full_path()) from exc
