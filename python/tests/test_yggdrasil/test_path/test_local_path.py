@@ -76,6 +76,62 @@ class TestFileIO:
             assert p.size == 5
             assert p.read_bytes() == b"abcde"
 
+    def test_truncate0_missing_file_is_a_noop(self, tmp_path: pathlib.Path) -> None:
+        # ``truncate(0)`` on a not-yet-created path must not force the
+        # file into existence — the overwrite-prelude's following write
+        # materialises it.
+        target = tmp_path / "fresh.bin"
+        p = LocalPath(str(target), singleton_ttl=False)
+        assert p.truncate(0) == 0
+        assert not target.exists()
+
+    def test_truncate0_skips_write_when_already_empty(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        from unittest import mock
+        from yggdrasil.path import local_path
+
+        # Existing empty file: ``truncate(0)`` is a no-op — no
+        # open(O_CREAT), no ftruncate syscall.
+        target = tmp_path / "empty.bin"
+        target.write_bytes(b"")
+        p = LocalPath(str(target), singleton_ttl=False)
+        with mock.patch.object(local_path, "_open_with_mkdir_retry") as mopen, \
+                mock.patch("os.ftruncate") as mftrunc:
+            assert p.truncate(0) == 0
+            assert mopen.call_count == 0
+            assert mftrunc.call_count == 0
+
+    def test_truncate0_acquired_already_empty_skips_ftruncate(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        from unittest import mock
+
+        p = LocalPath(str(tmp_path / "acq.bin"), singleton_ttl=False)
+        with p:
+            p.write_bytes(b"")  # exists, 0 bytes
+            with mock.patch("os.ftruncate") as mftrunc:
+                assert p.truncate(0) == 0
+                assert mftrunc.call_count == 0
+
+    def test_truncate0_zeroes_existing_nonempty(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        target = tmp_path / "data.bin"
+        target.write_bytes(b"abcdefghij")
+        p = LocalPath(str(target), singleton_ttl=False)
+        assert p.truncate(0) == 0
+        assert target.stat().st_size == 0
+
+    def test_truncate_positive_creates_missing(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        # ``truncate(n>0)`` still honours the post-condition (n-byte file).
+        target = tmp_path / "grow.bin"
+        p = LocalPath(str(target), singleton_ttl=False)
+        assert p.truncate(4) == 4
+        assert target.stat().st_size == 4
+
     def test_reserve_negative_raises(self, tmp_path: pathlib.Path) -> None:
         p = LocalPath(str(tmp_path / "res.bin"), singleton_ttl=False)
         with p:

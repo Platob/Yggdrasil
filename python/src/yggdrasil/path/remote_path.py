@@ -751,6 +751,11 @@ class RemotePath(Path):
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
         if n == 0 and self._page_size is not None:
+            # Already known-empty (a prior truncate / empty write stamped
+            # the buffered tip to 0): nothing to discard or re-stamp.
+            # Uses only the locally-cached size — never a backend probe.
+            if self._buffered_size == 0:
+                return 0
             if self._pages is not None:
                 self._discard_pages_past(0)
             self._stamp_buffered_size(0)
