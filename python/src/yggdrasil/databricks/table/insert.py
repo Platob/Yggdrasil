@@ -124,14 +124,17 @@ class _InsertExecution(Awaitable):
     SQL or drive a warehouse batch externally. :meth:`execute` (and the
     :class:`Awaitable` ``start`` / ``wait`` / ``await``) drive an inner
     :class:`StatementBatch`: :meth:`_submit` (overridden per subclass) renders
-    the source and hands it to ``Table.sql_insert``, whose warehouse path runs
-    the statements via ``execute_many``. The Awaitable mirrors that inner
-    batch's state, so ``op.start(wait=False)`` fires the load and ``await op``
-    / ``op.wait()`` block on it.
+    the statement list and runs it through the target's SQL engine via
+    ``execute_many``. The Awaitable mirrors that inner batch's state, so
+    ``op.start(wait=False)`` fires the load and ``await op`` / ``op.wait()``
+    block on it.
     """
 
     #: The inner :class:`StatementBatch` (or backend result) the load drives.
     _inner: Any = None
+    #: Per-run knobs stashed by :meth:`execute` for :meth:`_submit` to read.
+    _engine: Any = None
+    _retry: Any = None
 
     def _submit(self, *, wait: bool, raise_error: bool) -> Any:
         """Render this op/batch's DML and submit it — return the inner batch."""
@@ -143,15 +146,67 @@ class _InsertExecution(Awaitable):
         target: Any = None,
         wait: WaitingConfigArg = True,
         raise_error: bool = True,
+        engine: Any = None,
+        retry: WaitingConfigArg | None = None,
     ) -> "_InsertExecution":
         """Build and run this insert. ``target`` rebinds the destination
-        :class:`Table` (the async loader resolves a name → Table here). With
-        ``wait`` (default) blocks until the statements finish; ``wait=False``
-        fires them and returns immediately (poll via :meth:`wait` / ``await``).
+        :class:`Table` (the async loader resolves a name → Table here);
+        ``engine`` forces the ``"api"`` / ``"spark"`` backend, ``retry`` a
+        per-statement retry policy. With ``wait`` (default) blocks until the
+        statements finish; ``wait=False`` fires them and returns immediately
+        (poll via :meth:`wait` / ``await``).
         """
         if target is not None:
             self.target = target
+        self._engine = engine
+        self._retry = retry
         return self.start(wait=wait, raise_error=raise_error)
+
+    def _run_dml(
+        self,
+        target: Any,
+        texts: "list[str]",
+        *,
+        staging: Any = None,
+        source_ref: "str | None" = None,
+        wait: bool,
+        raise_error: bool,
+    ) -> Any:
+        """Prepare *texts* as warehouse statements and run them via
+        ``execute_many``.
+
+        When a Volume *staging* file backs the source, it is registered on
+        the source-reading statement (matched by *source_ref* in the text)
+        so its temporary scratch is reclaimed after the load — the same
+        cleanup binding the old inline ``arrow_insert`` did.
+        """
+        from yggdrasil.databricks.warehouse import WarehousePreparedStatement
+
+        prepared = []
+        for sql in texts:
+            external = (
+                {ALIAS_TMPSRC: staging}
+                if (staging is not None and source_ref and source_ref in sql)
+                else None
+            )
+            prepared.append(
+                WarehousePreparedStatement.prepare(
+                    sql,
+                    client=target.client,
+                    external_volume_paths=external,
+                    catalog_name=target.catalog_name,
+                    schema_name=target.schema_name,
+                )
+            )
+        if not prepared:
+            return None
+        return target.sql.execute_many(
+            statements=prepared,
+            wait=wait,
+            raise_error=raise_error,
+            engine=self._engine,
+            retry=self._retry,
+        )
 
     @property
     def result(self) -> Any:
@@ -538,23 +593,40 @@ class DatabricksTableInsert(_InsertExecution):
         return make_sql_select(self, client=client)
 
     def _submit(self, *, wait: bool, raise_error: bool) -> Any:
-        """Render this op's source ``SELECT`` and load it through the target's
-        ``sql_insert`` — which builds the INSERT / MERGE DML and runs it via
-        ``execute_many``. The target must be a :class:`Table` (pass it to
-        :meth:`execute` when the op only carries the name)."""
+        """Render this op's INSERT / MERGE statement list and run it via
+        ``execute_many`` — the specialized table load, fully self-contained.
+
+        A staged Volume file is referenced as ``parquet.`<path>``` and
+        registered for post-load cleanup; a Spark-staged Delta table reads
+        straight from the table. The target must be a :class:`Table` (pass it
+        to :meth:`execute` when the op only carries the name)."""
+        from yggdrasil.databricks.warehouse import WarehousePreparedStatement
+
         target = self._target_table()
-        return target.sql_insert(
-            self.select_sql(client=self.client),
-            mode=self.mode.name.lower(),
-            match_by=self.match_by,
-            update_column_names=self.update_column_names,
-            zorder_by=self.zorder_by,
-            optimize_after_merge=self.optimize_after_merge,
-            vacuum_hours=self.vacuum_hours,
-            safe_merge=self.safe_merge,
-            predicate=self.predicate,
-            wait=wait,
-            raise_error=raise_error,
+        schema = self.schema if (self.schema and self.schema.fields) else target.collect_schema()
+        columns = [f.name for f in schema.fields] if schema and schema.fields else None
+
+        staging = None
+        source_ref = None
+        source_sql = None
+        if not self.is_table_source:
+            staged = self.staged_source(self.client)
+            if getattr(staged, "full_path", None) is not None:
+                staging = staged
+                source_ref = WarehousePreparedStatement.volume_path_text_value(staged)
+                source_sql = make_sql_select(self, source=source_ref)
+
+        texts = make_sql_insert(
+            self,
+            target_location=target.full_name(safe=True),
+            source_sql=source_sql,
+            columns=columns,
+            client=self.client,
+        )
+        return self._run_dml(
+            target, texts,
+            staging=staging, source_ref=source_ref,
+            wait=wait, raise_error=raise_error,
         )
 
 
@@ -571,7 +643,8 @@ class DatabricksInsertBatch(_InsertExecution):
 
     Like a single op it is :class:`Awaitable` and self-executing —
     :meth:`execute` (or ``start`` / ``await``) renders the aggregated
-    ``UNION ALL`` body and runs it through the target's ``sql_insert``.
+    INSERT / MERGE over the ``UNION ALL`` body and runs it via
+    ``execute_many``.
     """
 
     target: "Table"
@@ -585,16 +658,24 @@ class DatabricksInsertBatch(_InsertExecution):
         return self
 
     def _submit(self, *, wait: bool, raise_error: bool) -> Any:
-        """Render the aggregated source body and load it through the target's
-        ``sql_insert`` (which builds the DML + runs ``execute_many``)."""
-        client = getattr(self.target, "client", None)
-        return self.target.sql_insert(
-            self.make_sql(client),
-            mode=self.mode.name.lower(),
-            match_by=self.match_by,
-            wait=wait,
-            raise_error=raise_error,
+        """Render the aggregated INSERT / MERGE statement list (over the
+        deduplicated ``UNION ALL`` source) and run it via ``execute_many``.
+
+        Async ops carry no schema, so the target's columns are collected
+        here; the per-op staged files are read in place as
+        ``parquet.`<path>``` (cleanup runs separately via
+        :meth:`DatabricksTableInsert.cleanup_staged_data`)."""
+        target = self.target
+        client = getattr(target, "client", None)
+        schema = target.collect_schema()
+        columns = [f.name for f in schema.fields] if schema and schema.fields else None
+        texts = make_sql_insert(
+            self,
+            target_location=target.full_name(safe=True),
+            columns=columns,
+            client=client,
         )
+        return self._run_dml(target, texts, wait=wait, raise_error=raise_error)
 
     @property
     def mode(self) -> Mode:
@@ -728,7 +809,7 @@ def make_sql_insert(
     """
     if isinstance(target, DatabricksInsertBatch):
         return _make_batch_insert(
-            target, target_location=target_location, client=client,
+            target, target_location=target_location, columns=columns, client=client,
         )
     return _make_op_insert(
         target,
@@ -817,16 +898,20 @@ def _make_batch_insert(
     batch: "DatabricksInsertBatch",
     *,
     target_location: "str | None",
+    columns: "list[str] | None" = None,
     client: Any,
 ) -> list[str]:
     location = _resolve_target_location(batch.target, target_location)
     source_sql = _batch_source_sql(batch, client=client)
     head = batch.active[0] if batch.active else None
-    columns = (
-        [f.name for f in head.schema.fields]
-        if head is not None and head.schema is not None and head.schema.fields
-        else []
-    )
+    if columns is None:
+        # Async ops carry no schema — caller (batch._submit) passes the
+        # target's columns; fall back to the head op's schema otherwise.
+        columns = (
+            [f.name for f in head.schema.fields]
+            if head is not None and head.schema is not None and head.schema.fields
+            else []
+        )
     prune_predicates = _build_where_predicates(
         head.predicate if head is not None else None, target_alias="T",
     )
