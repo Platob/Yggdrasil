@@ -37,6 +37,7 @@ from .service import (
 
 if TYPE_CHECKING:
     from ..cluster import Cluster
+    from .dag import JobDag
     from .run import JobRun
 
 __all__ = ["Job"]
@@ -167,6 +168,13 @@ class Job(Singleton, DatabricksResource):
     def tags(self) -> dict[str, str]:
         s = self.settings
         return s.tags or {} if s else {}
+
+    def dag(self) -> "JobDag":
+        """The job's static task graph (no run state) — see
+        :class:`~yggdrasil.databricks.job.dag.JobDag`."""
+        from .dag import JobDag
+
+        return JobDag.from_tasks(self.tasks)
 
     def refresh(self) -> "Job":
         sdk = self.client.workspace_client().jobs
