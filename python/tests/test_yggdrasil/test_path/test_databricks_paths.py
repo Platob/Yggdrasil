@@ -357,29 +357,47 @@ class TestWorkspacePathMockReadWrite:
 
 
 class TestDatabricksPathSingleton:
+    """Leaf file paths are NOT singleton-cached: same URL → distinct
+    instances (so each carries its own stat cache and a delete/mutation
+    seen through one is never masked by a sibling's snapshot), but they
+    remain value-equal because they share the same singleton key."""
 
-    def test_same_url_same_instance(self):
+    def test_same_url_distinct_instances_but_equal(self):
         svc = _volumes_service()
         a = VolumePath("/Volumes/cat/sch/vol/file.txt", service=svc)
         b = VolumePath("/Volumes/cat/sch/vol/file.txt", service=svc)
-        assert a is b
+        assert a is not b
+        assert a == b
 
     def test_different_url_different_instance(self):
         svc = _volumes_service()
         a = VolumePath("/Volumes/cat/sch/vol/file_a.txt", service=svc)
         b = VolumePath("/Volumes/cat/sch/vol/file_b.txt", service=svc)
         assert a is not b
+        assert a != b
 
-    def test_dbfs_singleton(self):
+    def test_dbfs_not_singleton(self):
         svc = _dbfs_service()
         a = DBFSPath("/dbfs/test/same.bin", service=svc)
         b = DBFSPath("/dbfs/test/same.bin", service=svc)
-        assert a is b
+        assert a is not b
+        assert a == b
 
-    def test_workspace_singleton(self):
+    def test_workspace_not_singleton(self):
         svc = _workspaces_service()
         a = WorkspacePath("/Workspace/test/same.py", service=svc)
         b = WorkspacePath("/Workspace/test/same.py", service=svc)
+        assert a is not b
+        assert a == b
+
+    def test_explicit_singleton_ttl_opts_back_in(self):
+        # The mechanism is still available for callers that explicitly
+        # want a leaf path interned (e.g. handing one to a long-running
+        # worker): pass ``singleton_ttl`` and same-key constructions
+        # collapse onto one instance again.
+        svc = _dbfs_service()
+        a = DBFSPath("/dbfs/test/pin.bin", service=svc, singleton_ttl=300)
+        b = DBFSPath("/dbfs/test/pin.bin", service=svc, singleton_ttl=300)
         assert a is b
 
 

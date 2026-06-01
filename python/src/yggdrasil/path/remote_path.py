@@ -30,12 +30,15 @@ __all__ = ["RemotePath"]
 
 #: Default freshness window for a seeded :class:`IOStats` entry.
 #: Beyond this, :meth:`RemotePath._stat` discards the cached entry
-#: and re-issues the backend probe. Five minutes matches the
-#: lifetime of a typical Databricks / S3 credential refresh cycle —
-#: long enough to collapse the dozen probes a Delta replay makes
-#: against the same key, short enough that a stale entry doesn't
-#: outlive a meaningful change to the underlying object.
-_STAT_CACHE_TTL: float = 300.0
+#: and re-issues the backend probe. One minute is short enough that a
+#: stale ``exists`` / ``is_file`` / ``size`` read can't outlive a
+#: mutation made through another path instance, node, or external tool
+#: (Databricks UI, ``aws s3 rm`` …) by more than a tick — while still
+#: collapsing the burst of probes a single Delta replay or directory
+#: walk makes against the same key. Mutating ops (write, remove) drop
+#: the entry immediately via :meth:`invalidate_singleton`; this TTL only
+#: governs how long a *read*-populated snapshot is trusted.
+_STAT_CACHE_TTL: float = 60.0
 
 #: Default page size for the inner read/write buffer. A 4 MiB grain
 #: matches Parquet row-group / Arrow IPC chunk sizes — one page covers
@@ -115,20 +118,30 @@ class RemotePath(Path):
     else (predicate pins, stat caching, singleton identity caching)
     is inherited from this base.
 
-    ``RemotePath`` activates the :class:`Singleton` machinery that
-    :class:`Holder` ships deactivated by default: two callers asking
-    for the same URL (and client, where the subclass keys on it)
-    inside the 5-minute window share the live instance — same stat
-    cache, same lazily-bound transport. ``iterdir``-style hot loops
-    pass ``singleton_ttl=False`` to keep the bounded cache from
-    filling with short-lived children; long-lived consumers that
-    want stronger sharing pass ``singleton_ttl=None``.
+    ``RemotePath`` leaves the :class:`Singleton` machinery
+    **deactivated** (``_SINGLETON_TTL = ...``), the same as
+    :class:`Holder`: a leaf object/file path is a cheap redirector
+    onto a long-lived backend resource (the :class:`S3Bucket`, the
+    :class:`DatabricksService` / client), so there's nothing
+    expensive to share — and *not* interning instances means two
+    callers asking for the same URL get independent stat caches, so a
+    delete or external mutation observed through one path is never
+    masked by a sibling's cached snapshot. Only the heavyweight
+    *container* resources that genuinely benefit from a shared,
+    rarely-changing identity — :class:`S3Bucket`, UC
+    :class:`~yggdrasil.databricks.catalog.UCCatalog` /
+    :class:`~yggdrasil.databricks.schema.UCSchema` /
+    :class:`~yggdrasil.databricks.volume.Volume` — opt back in by
+    setting their own ``_SINGLETON_TTL``. ``iterdir``-style hot loops
+    still pass ``singleton_ttl=False`` explicitly; a caller that wants
+    a specific leaf path interned can pass ``singleton_ttl=None`` or a
+    seconds count.
     """
 
     # Bound the freshness window for both probe-populated and
     # listing-seeded entries. ``Path`` ships the slot at ``None``
     # (live forever) since LocalPath / Memory don't need a TTL;
-    # remote backends pay 5-minute round trips and want a window
+    # remote backends pay round-trip stat probes and want a window
     # that beats credential / consistency drift.
     STAT_CACHE_TTL: ClassVar["float | None"] = _STAT_CACHE_TTL
 
@@ -165,24 +178,25 @@ class RemotePath(Path):
     # and keep the in-memory commit. Defaults False; :class:`VolumePath` opts in.
     SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = False
 
-    # Activate the :class:`Singleton` cache: 5-minute default TTL,
-    # bounded at 10 000 entries as defence-in-depth against
-    # accidental cardinality explosions.
+    # Singleton instance-caching stays OFF for leaf object/file paths
+    # (``...`` = the :class:`Singleton` base default, "don't cache").
+    # A leaf path holds no expensive state of its own — the client,
+    # connection pool, and listing cache all live on the container
+    # resource it redirects to (:class:`S3Bucket`, the Databricks
+    # client) — so interning leaf instances bought nothing but a way
+    # for one caller's stale stat snapshot to leak into another's view
+    # of a freshly mutated object. Container resources that DO benefit
+    # from shared identity (:class:`S3Bucket`, ``UCCatalog`` /
+    # ``UCSchema`` / ``Volume``) override this with their own TTL.
     #
-    # Concrete subclasses (:class:`S3Path`, :class:`DatabricksPath`,
-    # :class:`HTTPPath`, …) override ``_INSTANCES`` with their OWN
-    # per-class dict so a hot ``__new__`` race on S3 doesn't
-    # serialize against a hot Databricks Volume construction.
-    # Sharing one cache across implementations was a pure
-    # contention-amplifier — the default ``_singleton_key`` already
-    # includes ``cls`` so collisions are impossible, partitioning by
-    # class only buys parallelism. The base-class instance below
-    # stays as a fallback for any caller that constructs
-    # :class:`RemotePath` directly or for a brand-new subclass that
-    # hasn't declared its own yet. No companion lock anywhere —
-    # :class:`ExpiringDict.get_or_set` (used by
-    # :class:`Singleton.__new__`) is GIL-atomic and cannot deadlock.
-    _SINGLETON_TTL: ClassVar[Any] = _STAT_CACHE_TTL
+    # ``_INSTANCES`` is still a per-class dict so that an explicit
+    # ``singleton_ttl=`` (or :meth:`to_singleton`) on a subclass
+    # partitions away from a hot ``__new__`` on a sibling class; the
+    # ``_singleton_key`` already includes ``cls`` so collisions are
+    # impossible, partitioning by class only buys parallelism. No
+    # companion lock anywhere — :class:`ExpiringDict.get_or_set` (used
+    # by :class:`Singleton.__new__`) is GIL-atomic and cannot deadlock.
+    _SINGLETON_TTL: ClassVar[Any] = ...
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
         default_ttl=_STAT_CACHE_TTL,
         max_size=10_000,
@@ -274,7 +288,7 @@ class RemotePath(Path):
     def _ensure_pages(self) -> "ExpiringDict[int, Memory]":
         if self._pages is None:
             # Pages share the stat cache's TTL: a backend object that's
-            # been quiet for 5 minutes is the same horizon at which a
+            # been quiet for a minute is the same horizon at which a
             # cached size / mtime is no longer trusted. No ``max_size``
             # — dirty pages must not be evicted under the caller's feet;
             # callers manage memory via explicit :meth:`flush` /

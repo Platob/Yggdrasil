@@ -124,6 +124,45 @@ class TestWheel:
         bw.assert_called_once_with("yggdrasil", extras=["databricks"], requirements=())
         assert dests == ["/ws/job/ygg-1.0-py3-none-any.whl", "/ws/job/pyarrow-1-py3-none-any.whl"]
 
+    def test_import_packages_for_inverts_distribution_for(self):
+        # ``ygg`` (pip/dist name) → its top-level import package ``yggdrasil``.
+        assert wheel.import_packages_for("ygg") == ["yggdrasil"]
+        assert wheel.distribution_for("yggdrasil") == "ygg"
+        assert wheel.import_packages_for("no-such-dist-xyz") == []
+
+    def test_synthesize_accepts_distribution_name(self, tmp_path):
+        # ``"ygg"`` isn't importable (the import package is ``yggdrasil``);
+        # synthesize_project must resolve it to the import package and build.
+        module = MagicMock()
+        module.__file__ = str(tmp_path / "yggdrasil" / "__init__.py")
+        (tmp_path / "yggdrasil").mkdir()
+        (tmp_path / "yggdrasil" / "__init__.py").write_text("# pkg\n")
+        out = tmp_path / "synth"
+
+        def _import(name):
+            if name == "ygg":
+                raise ModuleNotFoundError("No module named 'ygg'")
+            return module
+
+        with patch("yggdrasil.databricks.job.wheel.importlib.import_module", side_effect=_import), \
+             patch("yggdrasil.databricks.job.wheel.import_packages_for", return_value=["yggdrasil"]):
+            project = wheel.synthesize_project("ygg", dest_dir=out)
+        assert (project / "yggdrasil" / "__init__.py").exists()
+        py = (project / "pyproject.toml").read_text()
+        assert 'name = "ygg"' in py and 'include = ["yggdrasil*"]' in py
+
+    def test_ensure_ygg_wheel_builds_the_ygg_distribution(self):
+        client = MagicMock()
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=["/ws/x.whl"]) as ew:
+            out = wheel.ensure_ygg_wheel(client, workspace_dir="/ws/job")
+        ew.assert_called_once_with(
+            client, "ygg",
+            workspace_dir="/ws/job",
+            extras=("databricks",),
+            requirements=("databricks-sdk",),
+        )
+        assert out == ["/ws/x.whl"]
+
     def test_build_wheel_produces_a_real_wheel(self, tmp_path, monkeypatch):
         """Isolated, offline end-to-end: a synthesized dep-free project is really
         ``pip wheel``-ed into a wheel carrying the entry point."""

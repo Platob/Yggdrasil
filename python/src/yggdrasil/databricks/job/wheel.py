@@ -50,6 +50,17 @@ def distribution_for(package: str) -> str:
     return dists[0] if dists else package
 
 
+def import_packages_for(dist: str) -> list[str]:
+    """The top-level import packages a distribution provides — the inverse of
+    :func:`distribution_for` (``ygg`` → ``["yggdrasil"]``). Empty when *dist*
+    is not an installed distribution or ships no ``top_level.txt``."""
+    try:
+        top = ilmd.distribution(dist).read_text("top_level.txt")
+    except ilmd.PackageNotFoundError:
+        return []
+    return [line.strip() for line in (top or "").splitlines() if line.strip()]
+
+
 def _project_dependencies(dist: str, extras: "set[str]") -> list[str]:
     """Base requirements + those gated by the requested *extras* (flattened),
     dropping other-extra-only deps."""
@@ -76,18 +87,32 @@ def _console_scripts(dist: str) -> dict[str, str]:
 
 
 def synthesize_project(
-    package: str,
+    name: str,
     *,
     extras: "tuple[str, ...] | list[str]" = (),
     dest_dir: "str | Path | None" = None,
 ) -> Path:
-    """Create a buildable project from the **installed** *package* — copy its
+    """Create a buildable project from the **installed** package — copy its
     on-disk files and write a ``pyproject.toml`` reconstructed from the
     distribution metadata (version, console scripts, dependencies incl. the
-    requested *extras*). Returns the project dir."""
-    module = importlib.import_module(package)
+    requested *extras*). Returns the project dir.
+
+    *name* may be the import package (``yggdrasil``) or the distribution /
+    pip name (``ygg``) — both resolve to the same project. An import name
+    is used directly; a distribution name is resolved to its top-level
+    import package via :func:`import_packages_for`."""
+    try:
+        module = importlib.import_module(name)
+        package, dist = name, distribution_for(name)
+    except ModuleNotFoundError:
+        # ``name`` is a distribution (pip) name, not an importable package —
+        # resolve the import package it ships and build that.
+        packages = import_packages_for(name)
+        if not packages:
+            raise
+        package, dist = packages[0], name
+        module = importlib.import_module(package)
     pkg_dir = Path(module.__file__).resolve().parent
-    dist = distribution_for(package)
     meta = ilmd.metadata(dist)
 
     out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-synth-"))
@@ -180,7 +205,7 @@ def ensure_ygg_wheel(client: Any, *, workspace_dir: str = WORKSPACE_WHL_DIR) -> 
     paths. The bundle a serverless job installs by path (no index) to run the
     ``ygg`` CLI on the cluster."""
     return ensure_wheel(
-        client, "yggdrasil",
+        client, "ygg",
         workspace_dir=workspace_dir,
         extras=("databricks",),
         requirements=("databricks-sdk",),

@@ -380,6 +380,13 @@ class Path(IO, os.PathLike, ABC):
         don't accidentally recursive-delete via ``unlink``. Use
         :meth:`remove` for the directory case.
         """
+        # A delete must look at the object's *current* state, not a
+        # snapshot a prior read left in the stat cache: an entry cached
+        # MISSING (so unlink silently no-ops) or cached the wrong kind
+        # (file vs directory) is exactly how a deletion appears not to
+        # work. Drop the cached stat so the probe below hits the backend.
+        self._stat_cached = None
+        self._stat_cached_at = 0.0
         kind = self._stat().kind
         if kind == IOKind.DIRECTORY:
             raise IsADirectoryError(
@@ -396,6 +403,13 @@ class Path(IO, os.PathLike, ABC):
         fresher_than: Optional[TimeLike] = None,
         older_than: Optional[TimeLike] = None,
     ) -> "Path":
+        # Decide what to delete from the backend's *current* state — a
+        # stale cached stat (MISSING after an external create, or the
+        # wrong kind) would make the remove no-op or take the wrong
+        # branch. ``unlink`` already cleared the cache; do it here too so
+        # a direct ``remove()`` call is equally fresh.
+        self._stat_cached = None
+        self._stat_cached_at = 0.0
         stat = self._stat()
         kind = stat.kind
         wait = WaitingConfig.from_(wait)
@@ -430,6 +444,15 @@ class Path(IO, os.PathLike, ABC):
                 self._remove_file(missing_ok=missing_ok, wait=wait)
             elif kind == IOKind.DIRECTORY:
                 self._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait)
+
+        # The object is gone: drop the cached FILE/DIRECTORY snapshot the
+        # probe above left behind so a follow-up ``exists`` / ``is_file``
+        # re-probes the backend instead of reporting the deleted path as
+        # still present. Backends already invalidate inside their
+        # ``_remove_*`` hooks; doing it here too makes the contract hold
+        # for any backend regardless of that discipline.
+        if kind != IOKind.MISSING:
+            self.invalidate_singleton()
 
         return self
 
