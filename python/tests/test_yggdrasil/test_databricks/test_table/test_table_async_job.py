@@ -57,6 +57,34 @@ class TestInsertRouting:
 
 
 # --------------------------------------------------------------------------- #
+# AsyncInsert dataclass — parsing / serialization / validation
+# --------------------------------------------------------------------------- #
+class TestAsyncInsertRecord:
+    def test_round_trips_through_the_log(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsert
+        op = AsyncInsert(target="c.s.t", mode="append", data="dbfs+volume:/x.parquet")
+        log = MagicMock()
+        log.read_bytes.return_value = op.to_json()
+        parsed = AsyncInsert.from_log(log)
+        assert (parsed.target, parsed.mode, parsed.data) == ("c.s.t", "append", "dbfs+volume:/x.parquet")
+        assert parsed.op_id == op.op_id and parsed.ts == op.ts
+        assert parsed.log_file is log            # keeps the file for cleanup
+        assert parsed.group_key == ("c.s.t", "append")
+
+    def test_rejects_bad_mode(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsert
+        with pytest.raises(ValueError, match="OVERWRITE / APPEND"):
+            AsyncInsert(target="c.s.t", mode="merge", data="dbfs+volume:/x.parquet")
+
+    def test_data_path_reconstructs_from_uniform_url(self):
+        from yggdrasil.databricks.table.async_job import AsyncInsert
+        op = AsyncInsert(target="c.s.t", mode="append", data="dbfs+volume:/x.parquet")
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_") as dp:
+            op.data_path(client="CL")
+        dp.assert_called_once_with("dbfs+volume:/x.parquet", client="CL")
+
+
+# --------------------------------------------------------------------------- #
 # Table.async_insert
 # --------------------------------------------------------------------------- #
 class TestAsyncInsert:
@@ -339,13 +367,16 @@ class TestTablesAsyncInsertLoader:
         log_b.unlink.assert_called_once()
 
     def test_dispatch_async_groups_preparsed_ops(self):
-        # dispatch_async takes already-parsed ops directly.
+        # dispatch_async takes already-parsed AsyncInsert ops directly.
         from yggdrasil.databricks.table.tables import Tables
+        from yggdrasil.databricks.table.async_job import AsyncInsert
         svc = _service()
         log_a, log_b = MagicMock(), MagicMock()
         ops = [
-            ("c.s.t", "append", "dbfs+volume:/c/s/t/.sql/tmp/a.parquet", log_a),
-            ("c.s.t", "append", "dbfs+volume:/c/s/t/.sql/tmp/b.parquet", log_b),
+            AsyncInsert(target="c.s.t", mode="append",
+                        data="dbfs+volume:/c/s/t/.sql/tmp/a.parquet", log_file=log_a),
+            AsyncInsert(target="c.s.t", mode="append",
+                        data="dbfs+volume:/c/s/t/.sql/tmp/b.parquet", log_file=log_b),
         ]
         target = MagicMock()
         from_fn, _ = _fake_databricks_from()

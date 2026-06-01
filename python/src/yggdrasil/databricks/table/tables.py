@@ -274,18 +274,18 @@ class Tables(DatabricksService):
         (e.g. the exact files a file-arrival trigger reported).
 
         Each log carries the full metadata — target table, mode, and the
-        staged data's uniform URL — so the loader needs nothing else: it reads
-        them and hands the parsed operations to :meth:`dispatch_async`, which
-        **groups by ``(target, mode)``**, runs one aggregated ``INSERT`` per
-        group via :meth:`Table.execute_async_insert`, then clears the consumed
-        logs + data. Returns the number of operations processed.
+        staged data's uniform URL — so the loader needs nothing else: it parses
+        each into an :class:`~yggdrasil.databricks.table.async_job.AsyncInsert`
+        and hands them to :meth:`dispatch_async`, which **groups by
+        ``(target, mode)``**, runs one aggregated ``INSERT`` per group via
+        :meth:`Table.execute_async_insert`, then clears the consumed logs +
+        data. Returns the number of operations processed.
 
         The loader behind the file-arrival job and the
         ``ygg databricks table execute_async_insert`` CLI.
         """
-        import json
-
         from yggdrasil.databricks.path import DatabricksPath
+        from yggdrasil.databricks.table.async_job import AsyncInsert
 
         if log_files is not None:
             files = [
@@ -305,35 +305,26 @@ class Tables(DatabricksService):
                 if logs_path.is_dir() else [logs_path]
             )
 
-        ops: list[tuple[str, str, str, Any]] = []
+        ops: list[AsyncInsert] = []
         for log_file in files:
             try:
-                record = json.loads(bytes(log_file.read_bytes()))
+                ops.append(AsyncInsert.from_log(log_file))
             except Exception:
                 logger.warning("skipping unreadable async log %s", log_file)
                 continue
-            ops.append((record["target"], record["mode"], record["data"], log_file))
             if limit is not None and len(ops) >= limit:
                 break
 
         return self.dispatch_async(ops, wait=wait)
 
-    def dispatch_async(
-        self,
-        ops: "Iterable[tuple[str, str, str, Any]]",
-        *,
-        wait: Any = True,
-    ) -> int:
-        """Group parsed async ops ``(target, mode, data-url, log-file)`` by
-        ``(target, mode)`` and load each group through
-        :meth:`Table.execute_async_insert` (one aggregated ``UNION ALL`` per
-        group), clearing the consumed logs + data afterward. Returns the number
-        of operations processed."""
-        from yggdrasil.databricks.path import DatabricksPath
-
-        groups: dict[tuple[str, str], list[tuple[str, Any]]] = {}
-        for target, mode, data, log_file in ops:
-            groups.setdefault((target, mode), []).append((data, log_file))
+    def dispatch_async(self, ops: "Iterable[Any]", *, wait: Any = True) -> int:
+        """Group parsed :class:`AsyncInsert` ops by ``(target, mode)`` and load
+        each group through :meth:`Table.execute_async_insert` (one aggregated
+        ``UNION ALL`` per group), clearing the consumed logs + data afterward.
+        Returns the number of operations processed."""
+        groups: dict[tuple[str, str], list[Any]] = {}
+        for op in ops:
+            groups.setdefault(op.group_key, []).append(op)
         if not groups:
             logger.info("async loader: no pending operation logs")
             return 0
@@ -343,16 +334,15 @@ class Tables(DatabricksService):
         for (target_name, mode), items in groups.items():
             target = self[target_name]
             logger.info("loading %d file(s) into %s (%s)", len(items), target_name, mode)
-            # Each ``data`` is the uniform URL — reconstruct the Path once, then
-            # read the warehouse-facing path off it for the query.
-            paths = [DatabricksPath.from_(data, client=self.client) for data, _ in items]
+            # Each op's uniform URL → the warehouse-facing path for the query.
+            paths = [op.data_path(self.client) for op in items]
             union = " UNION ALL ".join(
                 f"SELECT * FROM parquet.`{p.full_path()}`" for p in paths
             )
             target.execute_async_insert(union, mode=mode, wait=wait)
             # Clear consumed logs + data only after a successful load.
-            for (_, log_file), path in zip(items, paths):
-                _best_effort_unlink(log_file)
+            for op, path in zip(items, paths):
+                _best_effort_unlink(op.log_file)
                 _best_effort_unlink(path)
             processed += len(items)
         return processed

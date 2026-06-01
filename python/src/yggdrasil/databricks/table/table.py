@@ -3347,63 +3347,19 @@ class Table(DatabricksPath):
     ) -> "VolumePath":
         """Stage *data* as Parquet + drop a JSON operation log — no warehouse.
 
-        Writes the rows to the table's **default tmp staging path**
-        (:meth:`insert_volume_path`) and an operation log to
-        ``<staging_volume>/.sql/async/logs/<op>.json`` that records the target,
-        mode, and the data's **uniform URL** (so the data can live anywhere —
-        only the log location is fixed), then returns the log path
-        so the file-arrival trigger picks it up. Returns the log path.
-
-        Only ``OVERWRITE`` / ``APPEND`` with no ``match_by``; the data is staged
-        with its own schema (the aggregating ``INSERT`` casts at load time). A
-        path/URL *string* source is read into Arrow first, so a producer can
-        hand a file path directly. The loader side is :meth:`execute_async_insert`.
+        Thin wrapper over
+        :func:`~yggdrasil.databricks.table.async_job.stage_async_insert`: the
+        rows land at the table's default tmp staging path and an op-log under
+        ``.sql/async/logs/`` records the staged data's uniform URL, so the
+        file-arrival job can pick it up. Returns the log path. Only
+        ``OVERWRITE`` / ``APPEND`` with no ``match_by``; a path/URL string
+        source is read first. The loader side is :meth:`execute_async_insert`.
         """
-        import json as _json
+        from yggdrasil.databricks.table.async_job import stage_async_insert
 
-        from yggdrasil.databricks.table.async_job import ASYNC_MODES, logs_path
-
-        mode_enum = Mode.from_(mode, default=Mode.APPEND)
-        if mode_enum not in ASYNC_MODES:
-            raise ValueError(
-                f"async insert (wait=False) supports only OVERWRITE / APPEND, "
-                f"got {mode_enum.name}"
-            )
-        if match_by:
-            raise ValueError("async insert (wait=False) does not support match_by")
-
-        if isinstance(data, str):
-            # A path/URL source — read it (format inferred) so the caller can
-            # stage a file without reading it themselves.
-            from yggdrasil.io.holder import IO
-            data = IO.from_(data).read_arrow_table()
-
-        op_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
-        # Data goes to the default tmp staging path; the log carries its full
-        # path so the loader reads it wherever it landed. ``temporary=False``
-        # keeps it around until the async job consumes it.
-        data_file = self.insert_volume_path(self, temporary=False)
-        data_file.write_table(data, cast_options, mode=Mode.OVERWRITE)
-
-        log_file = logs_path(self) / f"{op_id}.json"
-        log_file.write_bytes(
-            _json.dumps(
-                {
-                    "op_id": op_id,
-                    "target": self.full_name(),
-                    "mode": mode_enum.name.lower(),
-                    # The project's uniform URL — round-trips through
-                    # ``Path.from_`` on the loader side, wherever the data lives.
-                    "data": data_file.to_url().to_string(),
-                    "ts": time.time(),
-                }
-            ).encode()
+        return stage_async_insert(
+            self, data, mode=mode, match_by=match_by, cast_options=cast_options,
         )
-        # The staged data + log are durable; the file-arrival job (deploy it
-        # once via ``table.async_job().ensure()``) picks the drop up. We don't
-        # deploy here — building/creating a job on every insert would be far too
-        # heavy.
-        return log_file
 
     def execute_async_insert(
         self,

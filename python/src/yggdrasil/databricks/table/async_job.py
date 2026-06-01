@@ -20,7 +20,11 @@ it via :meth:`yggdrasil.databricks.table.table.Table.async_job`.
 """
 from __future__ import annotations
 
+import json
 import logging
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from yggdrasil.enums.mode import Mode
@@ -34,6 +38,8 @@ __all__ = [
     "LOGS_SUBDIR",
     "ASYNC_MODES",
     "BUFFER_SECONDS",
+    "AsyncInsert",
+    "stage_async_insert",
     "job_name",
     "logs_path",
     "ensure_async_job",
@@ -60,6 +66,70 @@ BUFFER_SECONDS = 120
 _NAME_PREFIX = "[YGG][ASYNC]"
 
 
+def _new_op_id() -> str:
+    return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
+
+@dataclass
+class AsyncInsert:
+    """One async-insert operation — the typed content of an op-log.
+
+    Carries everything the loader needs: the ``target`` table (full name), the
+    ``mode``, and the staged ``data``'s **uniform URL**. Owns the op-log
+    schema — :meth:`from_log` parses a dropped log and :meth:`to_json`
+    serializes one — so the producer and loader share one safe type instead of
+    ad-hoc dicts / positional tuples.
+    """
+
+    target: str
+    mode: str
+    data: str
+    op_id: str = field(default_factory=_new_op_id)
+    ts: float = field(default_factory=time.time)
+    #: the on-disk op-log (set when read back) — cleaned up after a load.
+    log_file: Any = None
+
+    def __post_init__(self) -> None:
+        if Mode.from_(self.mode, default=Mode.APPEND) not in ASYNC_MODES:
+            raise ValueError(
+                f"async insert supports only OVERWRITE / APPEND, got {self.mode!r}"
+            )
+
+    @classmethod
+    def from_log(cls, log_file: Any) -> "AsyncInsert":
+        """Parse an op-log file into an :class:`AsyncInsert` (keeps *log_file*)."""
+        r = json.loads(bytes(log_file.read_bytes()))
+        return cls(
+            target=r["target"],
+            mode=r["mode"],
+            data=r["data"],
+            op_id=r.get("op_id") or _new_op_id(),
+            ts=r.get("ts") or time.time(),
+            log_file=log_file,
+        )
+
+    def to_json(self) -> bytes:
+        """Serialize to the JSON op-log payload."""
+        return json.dumps({
+            "op_id": self.op_id,
+            "target": self.target,
+            "mode": self.mode,
+            "data": self.data,
+            "ts": self.ts,
+        }).encode()
+
+    @property
+    def group_key(self) -> "tuple[str, str]":
+        """``(target, mode)`` — the loader aggregates one ``INSERT`` per group."""
+        return (self.target, self.mode)
+
+    def data_path(self, client: Any) -> Any:
+        """Reconstruct the staged-data :class:`Path` from its uniform URL."""
+        from yggdrasil.databricks.path import DatabricksPath
+
+        return DatabricksPath.from_(self.data, client=client)
+
+
 def job_name(table: "Table") -> str:
     """The deployed loader job's name for *table*."""
     return f"{_NAME_PREFIX} {table.catalog_name}.{table.schema_name}.{table.table_name}"
@@ -75,6 +145,50 @@ def _trigger_url(table: "Table") -> str:
     # Databricks requires the file-arrival URL to end with '/'.
     url = logs_path(table).full_path()
     return url if url.endswith("/") else url + "/"
+
+
+def stage_async_insert(
+    table: "Table",
+    data: Any,
+    *,
+    mode: Any = None,
+    match_by: "list[str] | None" = None,
+    cast_options: Any = None,
+) -> "VolumePath":
+    """Stage *data* as Parquet + drop an :class:`AsyncInsert` op-log — no warehouse.
+
+    The producer behind :meth:`Table.async_insert`: write the rows to the
+    table's default tmp staging path and drop a JSON op-log under
+    :func:`logs_path` recording the staged data's uniform URL (so it can live
+    anywhere). A path/URL *string* source is read into Arrow first. Returns the
+    op-log path; only ``OVERWRITE`` / ``APPEND`` with no ``match_by``.
+    """
+    mode_enum = Mode.from_(mode, default=Mode.APPEND)
+    if mode_enum not in ASYNC_MODES:
+        raise ValueError(
+            f"async insert (wait=False) supports only OVERWRITE / APPEND, "
+            f"got {mode_enum.name}"
+        )
+    if match_by:
+        raise ValueError("async insert (wait=False) does not support match_by")
+
+    if isinstance(data, str):
+        from yggdrasil.io.holder import IO
+        data = IO.from_(data).read_arrow_table()
+
+    # Data goes to the default tmp staging path (kept until consumed); the log
+    # records its uniform URL so the loader reads it wherever it landed.
+    data_file = table.insert_volume_path(table, temporary=False)
+    data_file.write_table(data, cast_options, mode=Mode.OVERWRITE)
+
+    op = AsyncInsert(
+        target=table.full_name(),
+        mode=mode_enum.name.lower(),
+        data=data_file.to_url().to_string(),
+    )
+    log_file = logs_path(table) / f"{op.op_id}.json"
+    log_file.write_bytes(op.to_json())
+    return log_file
 
 
 def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
