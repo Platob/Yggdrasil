@@ -2959,9 +2959,10 @@ class Table(DatabricksPath):
         # cast to the target schema in :meth:`CastOptions.cast_arrow_tabular`
         # before the write, and the warehouse INSERT applies the
         # column-boundary coercion on top.  No per-column CAST needed.
-        # The staged Parquet is referenced through the ``{__tmpsrc__}``
-        # placeholder, substituted for the external-data Volume path at
-        # prepare time.
+        # The staged Parquet path is rendered straight into the SQL text as
+        # ``parquet.`<path>``` — no ``{alias}`` placeholder; the temporary
+        # staging is registered (cleanup-only) on the source-reading
+        # statements below so it's unlinked after the load.
         op = DatabricksTableInsert(
             target=target,
             mode=mode_enum,
@@ -2977,7 +2978,8 @@ class Table(DatabricksPath):
             vacuum_hours=vacuum_hours,
             safe_merge=safe_merge,
         )
-        source_sql = make_sql_select(op, source=f"{{{_ALIAS_TMPSRC}}}")
+        source_ref = WarehousePreparedStatement.volume_path_text_value(staging)
+        source_sql = make_sql_select(op, source=source_ref)
         sql_texts = make_sql_insert(
             op,
             target_location=target_location,
@@ -2990,15 +2992,15 @@ class Table(DatabricksPath):
         def _prepare_batch(texts: list[str]) -> list[WarehousePreparedStatement]:
             out: list[WarehousePreparedStatement] = []
             for sql in texts:
-                external_data = (
-                    {_ALIAS_TMPSRC: staging}
-                    if (f"{{{_ALIAS_TMPSRC}}}" in sql)
-                    else None
+                # The path is already in the text; register the staging purely
+                # so its temporary scratch is reclaimed after the statement.
+                external_volume_paths = (
+                    {_ALIAS_TMPSRC: staging} if source_ref in sql else None
                 )
                 stmt = WarehousePreparedStatement.prepare(
                     sql,
                     client=self.client,
-                    external_data=external_data,
+                    external_volume_paths=external_volume_paths,
                     catalog_name=target.catalog_name,
                     schema_name=target.schema_name,
                 )
