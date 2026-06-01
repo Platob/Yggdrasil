@@ -43,6 +43,22 @@ class TablesCommand:
         )
         ai.set_defaults(handler=cls._async_insert)
 
+        ex = sub.add_parser(
+            "execute_async_insert",
+            help="Run the async loader over pending op-logs (group by table, "
+                 "aggregate, load).",
+        )
+        ex.add_argument(
+            "--logs",
+            help="A log file or a logs directory to scan for pending op-logs.",
+        )
+        ex.add_argument(
+            "--log-file", dest="log_files", action="append", metavar="PATH",
+            help="An explicit op-log file to consume (repeatable); skips the "
+                 "directory scan.",
+        )
+        ex.set_defaults(handler=cls._execute_async_insert)
+
         parser.set_defaults(handler=lambda args, bc: parser.print_help() or 1)
 
     @classmethod
@@ -66,4 +82,14 @@ class TablesCommand:
                 "run with `--execute` to load now, or `--ensure-job` to let "
                 "the file-arrival job pick the drop up.\n"
             )
+        return 0
+
+    @classmethod
+    def _execute_async_insert(cls, args: Any, build_client: Any) -> int:
+        client = build_client(args)
+        # Loader: the logs carry full metadata, so it only needs their path(s).
+        n = client.tables.async_insert(
+            logs=args.logs, log_files=args.log_files or None, wait=True,
+        )
+        sys.stdout.write(f"executed {n} pending operation(s)\n")
         return 0

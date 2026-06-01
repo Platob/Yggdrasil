@@ -325,6 +325,40 @@ class TestTablesAsyncInsertLoader:
         assert processed == 1
         target.execute_async_insert.assert_called_once()
 
+    def test_log_files_arg_skips_the_directory_scan(self):
+        # Pre-gathered log files are consumed directly — no scan of a dir.
+        from yggdrasil.databricks.table.tables import Tables
+        svc = _service()
+        log_a, log_b = _log("a"), _log("b")
+        target = MagicMock()
+        from_fn, _ = _fake_databricks_from()
+        with patch.object(Tables, "__getitem__", return_value=target), \
+             patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
+            processed = svc.async_insert(log_files=[log_a, log_b], wait=False)
+        assert processed == 2
+        target.execute_async_insert.assert_called_once()   # one (target, mode) group
+        log_a.unlink.assert_called_once()
+        log_b.unlink.assert_called_once()
+
+    def test_dispatch_async_groups_preparsed_ops(self):
+        # dispatch_async takes already-parsed ops directly.
+        from yggdrasil.databricks.table.tables import Tables
+        svc = _service()
+        log_a, log_b = MagicMock(), MagicMock()
+        ops = [
+            ("c.s.t", "append", "dbfs+volume:/c/s/t/.sql/tmp/a.parquet", log_a),
+            ("c.s.t", "append", "dbfs+volume:/c/s/t/.sql/tmp/b.parquet", log_b),
+        ]
+        target = MagicMock()
+        from_fn, _ = _fake_databricks_from()
+        with patch.object(Tables, "__getitem__", return_value=target), \
+             patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
+            processed = svc.dispatch_async(ops)
+        assert processed == 2
+        target.execute_async_insert.assert_called_once()
+        union = target.execute_async_insert.call_args.args[0]
+        assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
+
 
 class TestTableJobRunDelegates:
     def test_run_delegates_to_service_loader(self):

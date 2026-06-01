@@ -83,3 +83,37 @@ class TestTableAsyncInsertDispatch(unittest.TestCase):
         self.assertEqual(rc, 0)
         table.async_job.return_value.ensure.assert_called_once_with()
         client.tables.async_insert.assert_not_called()
+
+
+class TestTableExecuteAsyncInsert(unittest.TestCase):
+    def test_help_exits_zero(self):
+        with self.assertRaises(SystemExit) as ctx:
+            main(["table", "execute_async_insert", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_runs_loader_over_logs_dir(self):
+        client = MagicMock()
+        client.tables.async_insert.return_value = 5
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client):
+            rc = main([
+                "table", "execute_async_insert",
+                "--logs", "/Volumes/c/s/t/.sql/async/logs",
+            ])
+        self.assertEqual(rc, 0)
+        client.tables.async_insert.assert_called_once_with(
+            logs="/Volumes/c/s/t/.sql/async/logs", log_files=None, wait=True,
+        )
+
+    def test_runs_loader_over_explicit_log_files(self):
+        client = MagicMock()
+        client.tables.async_insert.return_value = 2
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client):
+            rc = main([
+                "table", "execute_async_insert",
+                "--log-file", "/logs/a.json",
+                "--log-file", "/logs/b.json",
+            ])
+        self.assertEqual(rc, 0)
+        client.tables.async_insert.assert_called_once_with(
+            logs=None, log_files=["/logs/a.json", "/logs/b.json"], wait=True,
+        )

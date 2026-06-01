@@ -259,41 +259,51 @@ class Tables(DatabricksService):
 
     def async_insert(
         self,
-        logs: Any,
+        logs: Any = None,
         *,
+        log_files: "Iterable[Any] | None" = None,
         wait: Any = True,
         limit: int | None = None,
     ) -> int:
-        """Execute the pending async inserts described by *logs*.
+        """Execute the pending async inserts described by the op-logs.
 
-        *logs* is a path to a JSON operation-log file or a directory of them
-        (a :class:`Path` or a path string). Each log carries the full
-        metadata — target table, mode, and the staged data's full path — so
-        the loader needs nothing else: it reads them, **groups by
-        ``(target, mode)``**, builds one aggregated ``INSERT`` per group
-        (``UNION ALL`` over the staged Parquet) and runs it via
-        :meth:`Table.execute_async_insert`, then clears the consumed logs +
-        data. Returns the number of operations processed.
+        Pass **either** *logs* — a path to a JSON operation-log file or a
+        directory of them (a :class:`Path` or a path string), scanned for
+        ``*.json`` — **or** *log_files*, an explicit, pre-gathered iterable of
+        log files (paths or strings) to consume directly, skipping the scan
+        (e.g. the exact files a file-arrival trigger reported).
 
-        This is the loader behind the file-arrival job and the
-        ``ygg databricks table async_insert --execute`` CLI.
+        Each log carries the full metadata — target table, mode, and the
+        staged data's uniform URL — so the loader needs nothing else: it reads
+        them and hands the parsed operations to :meth:`dispatch_async`, which
+        **groups by ``(target, mode)``**, runs one aggregated ``INSERT`` per
+        group via :meth:`Table.execute_async_insert`, then clears the consumed
+        logs + data. Returns the number of operations processed.
+
+        The loader behind the file-arrival job and the
+        ``ygg databricks table execute_async_insert`` CLI.
         """
         import json
 
         from yggdrasil.databricks.path import DatabricksPath
 
-        logs_path = (
-            DatabricksPath.from_(logs, client=self.client)
-            if isinstance(logs, str) else logs
-        )
-        if not logs_path.exists():
-            logger.info("async loader: %s does not exist — nothing to do", logs_path)
-            return 0
-
-        files = (
-            [f for f in logs_path.iterdir() if str(f.name).endswith(".json")]
-            if logs_path.is_dir() else [logs_path]
-        )
+        if log_files is not None:
+            files = [
+                DatabricksPath.from_(f, client=self.client) if isinstance(f, str) else f
+                for f in log_files
+            ]
+        else:
+            logs_path = (
+                DatabricksPath.from_(logs, client=self.client)
+                if isinstance(logs, str) else logs
+            )
+            if logs_path is None or not logs_path.exists():
+                logger.info("async loader: %s does not exist — nothing to do", logs_path)
+                return 0
+            files = (
+                [f for f in logs_path.iterdir() if str(f.name).endswith(".json")]
+                if logs_path.is_dir() else [logs_path]
+            )
 
         ops: list[tuple[str, str, str, Any]] = []
         for log_file in files:
@@ -305,16 +315,29 @@ class Tables(DatabricksService):
             ops.append((record["target"], record["mode"], record["data"], log_file))
             if limit is not None and len(ops) >= limit:
                 break
-        if not ops:
-            logger.info("async loader: no pending operation logs")
-            return 0
+
+        return self.dispatch_async(ops, wait=wait)
+
+    def dispatch_async(
+        self,
+        ops: "Iterable[tuple[str, str, str, Any]]",
+        *,
+        wait: Any = True,
+    ) -> int:
+        """Group parsed async ops ``(target, mode, data-url, log-file)`` by
+        ``(target, mode)`` and load each group through
+        :meth:`Table.execute_async_insert` (one aggregated ``UNION ALL`` per
+        group), clearing the consumed logs + data afterward. Returns the number
+        of operations processed."""
+        from yggdrasil.databricks.path import DatabricksPath
 
         groups: dict[tuple[str, str], list[tuple[str, Any]]] = {}
         for target, mode, data, log_file in ops:
             groups.setdefault((target, mode), []).append((data, log_file))
-        logger.info(
-            "async loader: %d operation(s) in %d group(s)", len(ops), len(groups)
-        )
+        if not groups:
+            logger.info("async loader: no pending operation logs")
+            return 0
+        logger.info("async loader: %d group(s)", len(groups))
 
         processed = 0
         for (target_name, mode), items in groups.items():
