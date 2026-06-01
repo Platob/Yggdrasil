@@ -64,9 +64,6 @@ class TableJob(Flow):
     """
 
     task_key: ClassVar[str] = "async-load"
-    #: When building a wheel, pull ygg's ``[databricks]`` extra so the loader's
-    #: runtime deps (databricks-sdk, pyarrow, …) ship too.
-    wheel_extras: "tuple[str, ...]" = ("databricks",)
     _NAME_PREFIX: ClassVar[str] = "[YGG][ASYNC]"
 
     #: File-arrival buffering window (seconds): wait this long after the last

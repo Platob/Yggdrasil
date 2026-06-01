@@ -18,7 +18,6 @@ import pytest
 from yggdrasil.databricks.table import async_job as aj
 from yggdrasil.databricks.table.async_job import LOGS_SUBDIR, TableJob
 from yggdrasil.databricks.table.table import Table
-from yggdrasil.version import __version__
 
 
 def _table_mock(full_name="c.s.t"):
@@ -110,7 +109,10 @@ class TestEnsure:
         t.staging_volume.path.return_value.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
 
         tj = TableJob(t)
-        assert tj.ensure() is tj
+        wheels = ["/Workspace/Shared/.ygg/whl/YGG_ASYNC_c.s.t/ygg-9.9-py3-none-any.whl",
+                  "/Workspace/Shared/.ygg/whl/YGG_ASYNC_c.s.t/databricks_sdk-1.2-py3-none-any.whl"]
+        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheels):
+            assert tj.ensure() is tj
         assert tj.job is created
         # the watched logs dir is created so the trigger URL is valid
         t.staging_volume.path.return_value.mkdir.assert_called_with(
@@ -128,10 +130,10 @@ class TestEnsure:
         assert task.python_wheel_task.package_name == "ygg"
         assert task.python_wheel_task.entry_point == "ygg-job"
         assert task.python_wheel_task.parameters == ["table-async-load", "c.s.t"]
-        # serverless v5; published ygg from the index + latest databricks-sdk
+        # serverless v5; by default ygg + databricks-sdk are bundled as wheels
         env = kwargs["environments"][0]
         assert env.spec.environment_version == "5"
-        assert env.spec.dependencies == [f"ygg[databricks]=={__version__}", "databricks-sdk"]
+        assert env.spec.dependencies == wheels
         assert task.environment_key == env.environment_key
 
     def test_ensure_is_noop_when_already_deployed(self):

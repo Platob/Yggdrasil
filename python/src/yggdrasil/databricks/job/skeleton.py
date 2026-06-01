@@ -222,13 +222,16 @@ class Flow(_Runnable):
 
     #: Project extras to include when building the wheel with its dependencies
     #: (e.g. ``("databricks",)`` to pull the project's ``[databricks]`` extra).
-    wheel_extras: "tuple[str, ...]" = ()
+    #: Default pulls ``[databricks]`` so the bundled ``ygg`` wheel carries the
+    #: databricks deps it runs against (a no-op for projects without that extra).
+    wheel_extras: "tuple[str, ...]" = ("databricks",)
 
     #: Build the project wheel **with its dependencies** on :meth:`deploy` and
-    #: ship them all instead of installing the published ``ygg`` from an index.
-    #: Default ``False`` — ``ygg`` is published, so the serverless env just
-    #: pip-installs it; set ``True`` for an air-gapped workspace.
-    build_wheel: bool = False
+    #: ship them all (``ygg`` + ``databricks-sdk`` latest + transitive deps) as
+    #: workspace wheels — installed by path, no index access. Default ``True`` so
+    #: the cluster runs exactly this code; set ``False`` to instead pip-install
+    #: the published ``ygg`` (pinned to the running version) from an index.
+    build_wheel: bool = True
 
     def __init__(
         self,
