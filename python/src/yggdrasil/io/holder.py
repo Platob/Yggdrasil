@@ -3506,6 +3506,24 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             if n > 0:
                 self.write_bytes(view, cursor=True)
 
+        # A tabular leaf knows the content type it just wrote (its
+        # ``mime_type``). Keep the backing holder's cached stat in step so
+        # a follow-up ``stat()`` / format re-dispatch (``for_holder``)
+        # reports the format that's actually on the holder rather than a
+        # stale or never-set media type. Only an *existing* cached stat is
+        # refreshed — without one the type resolves fresh on the next
+        # probe, so there's nothing to keep coherent.
+        if n > 0:
+            holder = self._parent if self._parent is not None else self
+            holder_stat = getattr(holder, "_stat_cached", None)
+            cls_mime = type(self).mime_type
+            if holder_stat is not None and cls_mime is not None:
+                resolved = self.media_type
+                codec = getattr(resolved, "codec", None)
+                mt = MediaType(mime_type=cls_mime, codec=codec)
+                if holder_stat.media_type != mt:
+                    holder_stat.media_type = mt
+
         if restore_pos is not None:
             self._pos = min(restore_pos, self.size)
         return n
