@@ -162,6 +162,62 @@ class TestAsyncInsertModes(_AsyncFixture):
         with self.assertRaises(ValueError):
             stage_async_insert(tbl, _data([(1, "a", 1.0)]), mode=Mode.MERGE)
 
+    def test_merge_on_partitioned_table_is_correct(self):
+        # A keyed merge on a partitioned target auto-derives the partition cols
+        # and inlines a literal IN filter on the MERGE ON (pruning the scan) —
+        # the result must still be correct: matched rows update, new rows insert.
+        from yggdrasil.databricks.table.insert import (
+            load_async, logs_path, stage_async_insert,
+        )
+
+        name = f"{self.catalog_name}.{self.schema_name}.yg_part_{secrets.token_hex(4)}"
+        self._tables.append(name)
+        sql = self.client.sql(
+            catalog_name=self.catalog_name, schema_name=self.schema_name,
+        )
+
+        def _pdata(rows):
+            return pa.table({
+                "id": pa.array([r[0] for r in rows], pa.int64()),
+                "d": pa.array([r[1] for r in rows], pa.string()),
+                "v": pa.array([r[2] for r in rows], pa.float64()),
+            })
+
+        try:
+            sql.execute(
+                f"CREATE TABLE {name} (id BIGINT, d STRING, v DOUBLE) PARTITIONED BY (d)"
+            )
+            sql.execute(
+                f"INSERT INTO {name} VALUES (1,'2024-01-01',1.0),(2,'2024-01-02',2.0)"
+            )
+        except (DatabricksError, PermissionDenied) as exc:
+            self.skipTest(f"cannot create partitioned table: {exc}")
+
+        tbl = self.client.tables.table(name)
+        # the partition filter is literal (no subquery — invalid in a MERGE ON)
+        self.assertEqual(
+            tbl._merge_partition_filters("SELECT 'x' AS d", ["d"]),
+            ["T.`d` IN ('x')"],
+        )
+
+        stage_async_insert(
+            tbl, _pdata([(2, "2024-01-02", 22.0), (3, "2024-01-03", 33.0)]),
+            mode=Mode.MERGE, match_by=["id"],
+        )
+        load_async(self.client.tables, logs_path(tbl), wait=True)
+
+        rows = {
+            x["id"]: (x["d"], x["v"])
+            for x in sql.execute(
+                f"SELECT id, d, v FROM {name} ORDER BY id"
+            ).to_arrow_table().to_pylist()
+        }
+        self.assertEqual(rows, {
+            1: ("2024-01-01", 1.0),     # untouched
+            2: ("2024-01-02", 22.0),    # matched → updated
+            3: ("2024-01-03", 33.0),    # new → inserted
+        })
+
     def test_several_merge_file_arrivals_aggregate_latest_wins(self):
         # Several independent async merge drops (each its own "file arrival" /
         # op-log) targeting one table are aggregated by the loader into a single

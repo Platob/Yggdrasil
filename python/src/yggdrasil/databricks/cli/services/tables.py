@@ -57,6 +57,11 @@ class TablesCommand:
             help="An explicit op-log file to consume (repeatable); skips the "
                  "directory scan.",
         )
+        ex.add_argument(
+            "--debug", action="store_true",
+            help="Print each target's file count, mode, keys, and the generated "
+                 "SQL to stdout (captured in the job run's output).",
+        )
         ex.set_defaults(handler=cls._execute_async_insert)
 
         parser.set_defaults(handler=lambda args, bc: parser.print_help() or 1)
@@ -95,7 +100,8 @@ class TablesCommand:
         client = build_client(args)
         # Loader: the logs carry full metadata, so it only needs their path(s).
         n = load_async(
-            client.tables, logs=args.logs, log_files=args.log_files or None, wait=True,
+            client.tables, logs=args.logs, log_files=args.log_files or None,
+            wait=True, debug=getattr(args, "debug", False),
         )
         sys.stdout.write(f"executed {n} pending operation(s)\n")
         return 0

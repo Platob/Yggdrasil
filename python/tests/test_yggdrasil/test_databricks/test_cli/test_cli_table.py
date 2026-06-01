@@ -110,7 +110,8 @@ class TestTableExecuteAsyncInsert(unittest.TestCase):
             ])
         self.assertEqual(rc, 0)
         load.assert_called_once_with(
-            client.tables, logs="/Volumes/c/s/t/.sql/async/logs", log_files=None, wait=True,
+            client.tables, logs="/Volumes/c/s/t/.sql/async/logs", log_files=None,
+            wait=True, debug=False,
         )
 
     def test_runs_loader_over_explicit_log_files(self):
@@ -124,5 +125,6 @@ class TestTableExecuteAsyncInsert(unittest.TestCase):
             ])
         self.assertEqual(rc, 0)
         load.assert_called_once_with(
-            client.tables, logs=None, log_files=["/logs/a.json", "/logs/b.json"], wait=True,
+            client.tables, logs=None, log_files=["/logs/a.json", "/logs/b.json"],
+            wait=True, debug=False,
         )

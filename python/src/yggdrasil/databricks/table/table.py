@@ -400,6 +400,30 @@ YGG_SCHEMA_FIELD_PREFIX = "ygg.schema["
 YGG_SCHEMA_FIELD_SUFFIX = "]"
 
 
+def _sql_literal(value: Any) -> "str | None":
+    """Render *value* as a SQL literal for an ``IN`` list, or ``None`` when it
+    can't be safely rendered (``NULL`` — which ``IN`` wouldn't match anyway — or
+    an unsupported type). Used to inline partition values into a MERGE filter."""
+    import datetime
+    import decimal
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return "'" + value.isoformat() + "'"
+    return None
+
+
 def _ygg_schema_key(name: str) -> str:
     """Build the ``ygg.schema[<name>]`` TBLPROPERTIES key for a field."""
     return f"{YGG_SCHEMA_FIELD_PREFIX}{name}{YGG_SCHEMA_FIELD_SUFFIX}"
@@ -3364,6 +3388,7 @@ class Table(DatabricksPath):
         existing_schema = self.collect_schema()
         fields = list(existing_schema.fields)
         columns = [f.name for f in fields]
+        partition_columns = [f.name for f in fields if getattr(f, "partition_by", False)]
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
@@ -3380,6 +3405,22 @@ class Table(DatabricksPath):
         prune_predicates = _build_where_predicates(
             cast_options.predicate, target_alias="T",
         )
+        # Partition pruning for a native MERGE: resolve the source's distinct
+        # partition values now and inline them as a literal ``IN`` on the ON, so
+        # Delta scans only the touched partitions. A MERGE search condition
+        # can't hold a subquery, so this must be literal — and the source has to
+        # be directly queryable (the staged-Parquet async path; the sync arrow
+        # path still carries a ``{__tmpsrc__}`` placeholder, so skip it there).
+        partition_filters: list[str] = []
+        if (
+            partition_columns
+            and match_by
+            and mode_enum in (Mode.MERGE, Mode.UPSERT, Mode.APPEND, Mode.AUTO)
+            and "{" not in source_sql
+        ):
+            partition_filters = self._merge_partition_filters(
+                source_sql, partition_columns,
+            )
         sql_texts = _build_dml_statements(
             target_location=target_location,
             source_sql=source_sql,
@@ -3391,6 +3432,7 @@ class Table(DatabricksPath):
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
+            partition_filters=partition_filters,
         )
 
         retry_active = retry is not None
@@ -3427,6 +3469,51 @@ class Table(DatabricksPath):
             raise_error=raise_error,
             engine=engine,
         )
+
+    def _merge_partition_filters(
+        self, source_sql: str, partition_columns: list[str],
+    ) -> list[str]:
+        """Literal ``T.<part> IN (...)`` predicates (one per partition column)
+        for a MERGE's ``ON``, resolved from the source's distinct partition
+        values.
+
+        Runs one bounded ``GROUP BY`` over the source to collect the distinct
+        partition values, then renders them as SQL literals so Delta can prune
+        the target scan to the touched partitions. A column is skipped (no
+        pruning, never a wrong filter) when the source has a NULL partition
+        value there or any value can't be safely rendered. Returns ``[]`` on an
+        empty source.
+
+        Note: like any partition-pruned MERGE this assumes a key doesn't move
+        partitions between target and source — if it did, the pruned-away target
+        row wouldn't match and the source row would insert as a duplicate.
+        """
+        cols = ", ".join(quote_ident(c) for c in partition_columns)
+        try:
+            rows = self.sql.execute(
+                f"SELECT {cols} FROM (\n{source_sql}\n) AS __ygg_src__ GROUP BY {cols}"
+            ).to_arrow_table()
+        except Exception:  # noqa: BLE001 - pruning is best-effort
+            logger.debug("partition-filter probe failed; merging unpruned", exc_info=True)
+            return []
+        if rows.num_rows == 0:
+            return []
+
+        filters: list[str] = []
+        for c in partition_columns:
+            values = rows.column(c).to_pylist()
+            literals: list[str] = []
+            usable = True
+            for v in values:
+                lit = _sql_literal(v)
+                if lit is None:        # NULL or unrenderable → skip this column
+                    usable = False
+                    break
+                literals.append(lit)
+            if usable and literals:
+                uniq = sorted(set(literals))
+                filters.append(f"T.{quote_ident(c)} IN ({', '.join(uniq)})")
+        return filters
 
     # =========================================================================
     # Storage & credentials

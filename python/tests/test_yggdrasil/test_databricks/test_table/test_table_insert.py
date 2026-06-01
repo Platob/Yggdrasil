@@ -332,6 +332,21 @@ class TestDatabricksInsertBatch:
         # … but the superseded 'a' is still tracked so its data gets cleaned up
         assert len(batch.logs) == 3
 
+    def test_keyed_overwrite_does_not_supersede_earlier_appends(self):
+        # A keyed overwrite (match_by set) only replaces matching rows, so it
+        # must NOT discard appends staged before it — they stay in the load.
+        from yggdrasil.databricks.table.insert import DatabricksInsertBatch
+        from yggdrasil.enums.mode import Mode
+        schema = _schema(("id", pa.int64()), ("v", pa.float64()))
+        [batch] = DatabricksInsertBatch.group([
+            self._op("a", mode="append", ts=1.0),
+            self._op("b", mode="overwrite", match_by=["id"], schema=schema, ts=2.0),
+        ])
+        # no keyless overwrite → not a full-table overwrite; both ops feed the load
+        assert batch.mode is not Mode.OVERWRITE
+        assert len(batch.active) == 2
+        assert "parquet.`a`" in batch.make_sql() and "parquet.`b`" in batch.make_sql()
+
     def test_keyed_merge_batch_deduplicates_union(self):
         # A keyed MERGE batch can carry duplicate keys across staged files;
         # the union is wrapped in a ROW_NUMBER()=1 dedup so Delta's MERGE
@@ -461,6 +476,86 @@ class TestBatchedMergeDML:
         assert "WHEN MATCHED THEN UPDATE" not in sql
         assert "WHEN NOT MATCHED THEN INSERT" in sql
         assert "ROW_NUMBER()" not in sql            # insert-only doesn't dedup
+
+    def test_partition_filters_added_to_merge_on_as_literals(self):
+        # A partitioned target prunes the MERGE scan to the partitions the source
+        # touches — literal IN predicates on the ON (no subquery: MERGE search
+        # conditions can't contain one).
+        from yggdrasil.databricks.table.insert import _build_dml_statements
+        from yggdrasil.enums.mode import Mode
+        stmts = _build_dml_statements(
+            target_location="c.s.t", source_sql="SELECT * FROM src",
+            columns=["id", "d", "v"], mode=Mode.MERGE, match_by=["id"],
+            update_column_names=None, prune_predicates=[],
+            partition_filters=["T.`d` IN ('2024-01-01', '2024-01-02')"],
+        )
+        sql = _normalize_ws(stmts[0])
+        assert sql.startswith("MERGE INTO c.s.t AS T")
+        assert "T.`id` <=> S.`id` AND T.`d` IN ('2024-01-01', '2024-01-02')" in sql
+        assert "SELECT" in sql.split("WHEN")[0]      # sanity: still a MERGE
+        assert "__ygg_part__" not in sql              # never a subquery in ON
+
+    def test_multiple_partition_filters_all_anded_on(self):
+        from yggdrasil.databricks.table.insert import _build_dml_statements
+        from yggdrasil.enums.mode import Mode
+        stmts = _build_dml_statements(
+            target_location="c.s.t", source_sql="SELECT * FROM src",
+            columns=["id", "y", "m", "v"], mode=Mode.MERGE, match_by=["id"],
+            update_column_names=None, prune_predicates=[],
+            partition_filters=["T.`y` IN (2024)", "T.`m` IN (1, 2)"],
+        )
+        sql = _normalize_ws(stmts[0])
+        assert "T.`y` IN (2024)" in sql and "T.`m` IN (1, 2)" in sql
+
+    def test_no_partition_filters_leaves_on_clause_clean(self):
+        from yggdrasil.databricks.table.insert import _build_dml_statements
+        from yggdrasil.enums.mode import Mode
+        stmts = _build_dml_statements(
+            target_location="c.s.t", source_sql="SELECT * FROM src",
+            columns=["id", "v"], mode=Mode.MERGE, match_by=["id"],
+            update_column_names=None, prune_predicates=[], partition_filters=[],
+        )
+        sql = _normalize_ws(stmts[0])
+        assert "ON T.`id` <=> S.`id` WHEN" in sql
+
+
+class TestMergePartitionFilters:
+    def test_sql_literal_renders_common_types(self):
+        import datetime
+        from yggdrasil.databricks.table.table import _sql_literal
+        assert _sql_literal("a'b") == "'a''b'"          # quote-escaped string
+        assert _sql_literal(5) == "5"
+        assert _sql_literal(True) == "TRUE"
+        assert _sql_literal(None) is None               # NULL → skip
+        assert _sql_literal(datetime.date(2024, 1, 2)) == "'2024-01-02'"
+        assert _sql_literal(object()) is None           # unsupported → skip
+
+    def test_partition_filters_from_distinct_source_values(self):
+        from yggdrasil.databricks.table.table import Table
+        mock = MagicMock()
+        mock.sql.execute.return_value.to_arrow_table.return_value = pa.table(
+            {"d": ["2024-01-02", "2024-01-01", "2024-01-02"]}
+        )
+        out = Table._merge_partition_filters(mock, "SELECT * FROM src", ["d"])
+        assert out == ["T.`d` IN ('2024-01-01', '2024-01-02')"]   # distinct + sorted
+
+    def test_null_partition_value_skips_pruning_for_that_column(self):
+        from yggdrasil.databricks.table.table import Table
+        mock = MagicMock()
+        mock.sql.execute.return_value.to_arrow_table.return_value = pa.table(
+            {"d": ["a", None]}
+        )
+        # NULL wouldn't be matched by IN — drop the filter rather than risk a
+        # wrong prune.
+        assert Table._merge_partition_filters(mock, "src", ["d"]) == []
+
+    def test_empty_source_yields_no_filters(self):
+        from yggdrasil.databricks.table.table import Table
+        mock = MagicMock()
+        mock.sql.execute.return_value.to_arrow_table.return_value = pa.table(
+            {"d": pa.array([], pa.string())}
+        )
+        assert Table._merge_partition_filters(mock, "src", ["d"]) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -596,7 +691,7 @@ class TestEnsureAsyncJob:
         assert task.python_wheel_task.entry_point == "ygg"
         assert task.python_wheel_task.parameters == [
             "databricks", "table", "execute_async_insert",
-            "--logs", "/Volumes/c/s/t/.sql/async/logs",
+            "--logs", "/Volumes/c/s/t/.sql/async/logs", "--debug",
         ]
         # serverless v5 image shipped as the env, wired to the task
         env = kwargs["environments"][0]
@@ -756,6 +851,21 @@ class TestLoadAsync:
         log_b.unlink.assert_called_once()
         data_paths["dbfs+volume:/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
         data_paths["dbfs+volume:/c/s/t/.sql/tmp/b.parquet"].unlink.assert_called_once()
+
+    def test_debug_prints_batch_and_sql_to_stdout(self, capsys):
+        from yggdrasil.databricks.table.insert import load_async
+        svc = _tables_service()
+        logs = _logs_dir(_log("a"))
+        target = MagicMock()
+        svc.__getitem__.return_value = target
+        from_fn, _ = _fake_databricks_from()
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
+            load_async(svc, logs, wait=False, debug=True)
+        out = capsys.readouterr().out
+        # the loader announces the target + emits the generated SQL to stdout
+        assert "[async-load] c.s.t" in out
+        assert "source SQL" in out
+        assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in out
 
     def test_overwrite_supersedes_earlier_append_for_same_target(self):
         from yggdrasil.databricks.table.insert import load_async

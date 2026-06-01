@@ -199,21 +199,30 @@ class Job(Singleton, DatabricksResource):
         wait: WaitingConfigArg = False,
         raise_error: bool = True,
     ) -> "JobRun":
-        """Trigger a new run of this job.
+        """Trigger a new run of this job, passing run-time parameters.
 
-        Parameters
-        ----------
-        parameters:
-            Job-level parameters (``job_parameters`` in the SDK).
-        notebook_params:
-            Notebook-specific parameter overrides.
-        python_params / jar_params:
-            Task-type-specific parameter overrides.
-        wait:
-            ``False`` (default) = fire-and-forget; ``True`` = block until
-            terminal; a number = timeout in seconds.
-        raise_error:
-            Raise on terminal failure when waiting.
+        How each kind reaches the running task:
+
+        - ``parameters`` → **job parameters** (``run_now(job_parameters=…)``):
+          values for the job's declared parameters, referenced anywhere in the
+          job as ``{{job.parameters.<name>}}`` (and read by a notebook via
+          ``dbutils.widgets.get`` / by a Python task off its argv).
+        - ``notebook_params`` → per-run **notebook widget** values: a notebook
+          task reads them with ``dbutils.widgets.get("<name>")`` and can return
+          a result with ``dbutils.notebook.exit(value)`` (surfaced as the task's
+          notebook output).
+        - ``python_params`` → **argv** appended to a ``spark_python_task`` /
+          ``python_wheel_task`` (read via ``sys.argv`` / ``argparse``).
+        - ``jar_params`` → argv for a JAR task's ``main``.
+
+        Example::
+
+            run = job.run(notebook_params={"date": "2024-01-01"}, wait=True)
+            result = run.task_output("ingest").notebook_output.result
+
+        ``wait``: ``False`` (default) = fire-and-forget; ``True`` = block until
+        terminal; a number = timeout in seconds. ``raise_error`` raises on
+        terminal failure when waiting. Returns an awaitable :class:`JobRun`.
         """
         from .run import JobRun
 
@@ -350,11 +359,18 @@ class Job(Singleton, DatabricksResource):
         new_settings.update(settings_kwargs)
         new_settings.pop("name", None)
 
+        desired = JobSettings(name=self.name, **new_settings)
+
+        # Skip the reset when the desired settings already match what the API
+        # holds — the diff/update is a no-op, so there's nothing to send.
+        if self.settings_match(desired):
+            LOGGER.info("Job %r already current — skipping update", self.name)
+            if permissions:
+                self.update_permissions(permissions)
+            return self
+
         LOGGER.debug("Updating job %r (id=%s)", self.name, self.job_id)
-        sdk.reset(
-            job_id=self.job_id,
-            new_settings=JobSettings(name=self.name, **new_settings),
-        )
+        sdk.reset(job_id=self.job_id, new_settings=desired)
         self._details = None
         LOGGER.info("Updated job %r", self.name)
 
@@ -362,6 +378,39 @@ class Job(Singleton, DatabricksResource):
             self.update_permissions(permissions)
 
         return self
+
+    # ------------------------------------------------------------------ #
+    # Settings comparison — skip no-op updates
+    # ------------------------------------------------------------------ #
+
+    def settings_diff(self, desired: JobSettings) -> dict[str, Any]:
+        """Per-field ``{field: {"current": …, "desired": …}}`` for every field
+        where *desired* differs from the job's **current** (API-returned)
+        settings. Empty dict ⇒ the two are equivalent (a reset would be a no-op).
+
+        Both sides go through the SDK's ``as_dict`` so enums and nested task /
+        environment specs compare structurally — letting a caller verify whether
+        the config it built reproduces exactly what the API returns."""
+        current = self.settings
+        cur = current.as_dict() if current is not None else {}
+        des = desired.as_dict()
+        out: dict[str, Any] = {}
+        for key in set(cur) | set(des):
+            if cur.get(key) != des.get(key):
+                out[key] = {"current": cur.get(key), "desired": des.get(key)}
+        return out
+
+    def settings_match(self, desired: JobSettings) -> bool:
+        """True when *desired* serializes identically to the current settings —
+        a reset would change nothing, so it can be skipped. Conservative: any
+        difference (including a field the server normalises that we can't
+        reproduce) returns ``False`` so a real change is never skipped."""
+        if self.settings is None:
+            return False
+        try:
+            return not self.settings_diff(desired)
+        except Exception:  # noqa: BLE001 - never block an update on a compare error
+            return False
 
     def update_permissions(
         self,

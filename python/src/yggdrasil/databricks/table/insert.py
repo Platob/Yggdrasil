@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -285,10 +286,19 @@ class DatabricksInsertBatch:
         self.logs.append(op)
         return self
 
+    @staticmethod
+    def _supersedes(op: "DatabricksTableInsert") -> bool:
+        """True for a **keyless** ``OVERWRITE`` — the only op that replaces the
+        whole table and so makes everything staged before it irrelevant. A
+        *keyed* overwrite / merge only touches matching rows, so it must NOT
+        discard earlier appends."""
+        return op.mode is Mode.OVERWRITE and not op.match_by
+
     @property
     def mode(self) -> Mode:
-        """``OVERWRITE`` if any op overwrites, else the first active op's mode."""
-        if any(op.mode is Mode.OVERWRITE for op in self.logs):
+        """``OVERWRITE`` if a keyless overwrite is staged, else the first active
+        op's mode."""
+        if any(self._supersedes(op) for op in self.logs):
             return Mode.OVERWRITE
         active = self.active
         return active[0].mode if active else Mode.APPEND
@@ -297,13 +307,15 @@ class DatabricksInsertBatch:
     def active(self) -> "list[DatabricksTableInsert]":
         """The ops that actually feed the load, in timestamp order.
 
-        Everything from the latest OVERWRITE onward — earlier ops are
-        superseded by it (but still tracked on :attr:`logs` for cleanup).
+        Everything from the latest **keyless** ``OVERWRITE`` onward — earlier
+        ops are superseded by it (but still tracked on :attr:`logs` for
+        cleanup). A keyed overwrite / merge does not supersede, so prior appends
+        staged before it are kept and unioned in.
         """
         ordered = sorted(self.logs, key=lambda op: op.ts)
         cut = 0
         for i, op in enumerate(ordered):
-            if op.mode is Mode.OVERWRITE:
+            if self._supersedes(op):
                 cut = i
         return ordered[cut:]
 
@@ -762,6 +774,7 @@ def _build_merge_statement(
     update_column_names: Optional[list[str]],
     prune_predicates: list[str],
     insert_only: bool = False,
+    partition_filters: Optional[list[str]] = None,
 ) -> str:
     """Render a single ``MERGE INTO ...`` statement.
 
@@ -773,11 +786,19 @@ def _build_merge_statement(
     ``insert_only=True`` emits a MERGE with only the ``WHEN NOT MATCHED THEN
     INSERT`` clause — the keyed-APPEND shape. Without it, the full
     update-and-insert MERGE runs.
+
+    ``partition_filters`` are target-side literal predicates (e.g.
+    ``T.`d` IN ('2024-01-01', '2024-01-02')``) added to the ``ON`` so Delta
+    prunes the target scan to the partitions the source touches. They must be
+    *literal* — a MERGE search condition can't contain a subquery — so the
+    caller resolves the source's distinct partition values first (see
+    :meth:`Table._merge_partition_filters`).
     """
     cols_quoted = ", ".join(quote_ident(c) for c in columns)
+    extra = list(prune_predicates) + list(partition_filters or ())
     on_condition = _build_match_condition(
         match_by, left_alias="T", right_alias="S",
-        null_safe=True, extra_predicates=prune_predicates,
+        null_safe=True, extra_predicates=extra,
     )
     insert_clause = (
         f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
@@ -888,8 +909,13 @@ def _build_dml_statements(
     optimize_after_merge: bool = False,
     vacuum_hours: Optional[int] = None,
     safe_merge: bool = False,
+    partition_filters: Optional[list[str]] = None,
 ) -> list[str]:
     """Generate INSERT / MERGE / DELETE / OPTIMIZE / VACUUM SQL.
+
+    ``partition_filters`` are literal target-side predicates added to a native
+    ``MERGE``'s ``ON`` so Delta restricts the target scan to the partitions the
+    source actually touches (see :func:`_build_merge_statement`).
 
     Mode dispatch when ``match_by`` is set:
 
@@ -952,6 +978,7 @@ def _build_dml_statements(
             update_column_names=update_column_names,
             prune_predicates=prune_predicates,
             insert_only=mode in (Mode.APPEND, Mode.AUTO),
+            partition_filters=partition_filters,
         ))
 
     elif match_by and mode in (Mode.UPSERT, Mode.MERGE):
@@ -1077,6 +1104,7 @@ def load_async(
     log_files: "Iterable[Any] | None" = None,
     wait: Any = True,
     limit: "int | None" = None,
+    debug: bool = False,
 ) -> int:
     """Run the async loader over pending op-logs — group, aggregate, load, clean.
 
@@ -1126,13 +1154,27 @@ def load_async(
         if limit is not None and len(ops) >= limit:
             break
 
-    return dispatch_async(tables, ops, wait=wait)
+    return dispatch_async(tables, ops, wait=wait, debug=debug)
 
 
-def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> int:
+def _emit(message: str) -> None:
+    """Write a loader progress line to stdout (and the log) so it's visible in a
+    job run's captured output for debugging."""
+    sys.stdout.write(message + "\n")
+    sys.stdout.flush()
+    logger.info(message)
+
+
+def dispatch_async(
+    tables: Any, ops: "Iterable[Any]", *, wait: Any = True, debug: bool = False,
+) -> int:
     """Group parsed ops by target into a :class:`DatabricksInsertBatch` and load
     each through the target's ``insert_into`` (one aggregated body per target),
-    clearing the consumed logs + data afterward. Returns the op count."""
+    clearing the consumed logs + data afterward. Returns the op count.
+
+    ``debug=True`` prints, per target, the file count, mode, keys, and the
+    generated SQL to **stdout** — so a deployed loader job's run captures it (see
+    ``JobRun.stdout`` / ``JobRun.debug``) and you can see exactly what ran."""
     client = tables.client
     batches = DatabricksInsertBatch.group(ops)
     if not batches:
@@ -1145,15 +1187,23 @@ def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> in
         target_name = batch.logs[0].target_name
         target = tables[target_name]
         mode = batch.mode
+        sql = batch.make_sql(client)
         logger.info(
             "loading %d file(s) into %s (%s)",
             len(batch.active), target_name, mode.name.lower(),
         )
+        if debug:
+            _emit(
+                f"[async-load] {target_name}: {len(batch.active)} file(s), "
+                f"mode={mode.name.lower()}, match_by={batch.match_by}"
+            )
+            _emit(f"[async-load] {target_name} source SQL:\n{sql}")
         # The batch is the single place the load source is generated.
         target.insert_into(
-            batch.make_sql(client), mode=mode.name.lower(),
-            match_by=batch.match_by, wait=wait,
+            sql, mode=mode.name.lower(), match_by=batch.match_by, wait=wait,
         )
+        if debug:
+            _emit(f"[async-load] {target_name}: loaded {len(batch.active)} file(s)")
         # Clear consumed logs + data (incl. superseded ops) after a load.
         for op in batch.logs:
             _best_effort_unlink(op.log_file)
@@ -1238,7 +1288,7 @@ def ensure_async_job(
                     entry_point="ygg",
                     parameters=[
                         "databricks", "table", "execute_async_insert",
-                        "--logs", logs.full_path(),
+                        "--logs", logs.full_path(), "--debug",
                     ],
                 ),
             )

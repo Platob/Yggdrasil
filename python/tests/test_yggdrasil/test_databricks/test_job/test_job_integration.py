@@ -45,6 +45,13 @@ class TestJobsOrchestrationIntegration(DatabricksIntegrationCase):
         super().setUpClass()
         cls.notebook = f"{_SMOKE_DIR}/nb_{secrets.token_hex(4)}"
         cls.failing_notebook = f"{_SMOKE_DIR}/nb_fail_{secrets.token_hex(4)}"
+        cls.param_notebook = f"{_SMOKE_DIR}/nb_param_{secrets.token_hex(4)}"
+        # Reads a run parameter via a widget and returns it as the task output —
+        # the standard "parameters in, result out" notebook contract.
+        param_src = (
+            'dbutils.widgets.text("msg", "default")\n'
+            'dbutils.notebook.exit(dbutils.widgets.get("msg"))\n'
+        )
         w = cls.client.workspace_client()
         try:
             w.workspace.mkdirs(path=_SMOKE_DIR)
@@ -60,6 +67,13 @@ class TestJobsOrchestrationIntegration(DatabricksIntegrationCase):
                 format=ImportFormat.SOURCE,
                 language=Language.PYTHON,
                 content=base64.b64encode(b'raise Exception("boom-xyz")\n').decode(),
+                overwrite=True,
+            )
+            w.workspace.import_(
+                path=cls.param_notebook,
+                format=ImportFormat.SOURCE,
+                language=Language.PYTHON,
+                content=base64.b64encode(param_src.encode()).decode(),
                 overwrite=True,
             )
         except (DatabricksError, PermissionDenied) as exc:
@@ -164,6 +178,34 @@ class TestJobsOrchestrationIntegration(DatabricksIntegrationCase):
         self.assertTrue(run.is_succeeded, f"run failed: {run.state_message}")
         self.assertEqual(run.job_id, job.job_id)
         self.assertEqual(sorted(run.dag().keys), ["a", "b"])
+
+    def test_run_passes_parameters_and_task_receives_them(self):
+        # How to pass parameters when starting a run and have the job receive
+        # them: Job.run(notebook_params={...}) overrides the notebook's widgets;
+        # the task reads them with dbutils.widgets.get and returns via
+        # dbutils.notebook.exit, which surfaces as the task's notebook output.
+        name = f"[YGG][SMOKE] params {secrets.token_hex(4)}"
+        try:
+            job = self.client.jobs.create_or_update(
+                name=name,
+                tasks=[
+                    Task(
+                        task_key="echo",
+                        notebook_task=NotebookTask(notebook_path=self.param_notebook),
+                    )
+                ],
+            )
+        except (DatabricksError, PermissionDenied) as exc:
+            self.skipTest(f"job create needs access: {exc}")
+        self._jobs_to_delete.append(job.job_id)
+
+        run = job.run(notebook_params={"msg": "hello-xyz"}, wait=_WAIT_SECONDS)
+        self.assertTrue(run.is_succeeded, f"run failed:\n{run.debug()}")
+
+        # The parameter made it into the task and came back as its output.
+        out = run.task_output("echo")
+        self.assertIsNotNone(out)
+        self.assertEqual(out.notebook_output.result, "hello-xyz")
 
     def test_failed_task_exposes_stderr_for_debugging(self):
         # A failing task surfaces its error through the debug accessors so a
