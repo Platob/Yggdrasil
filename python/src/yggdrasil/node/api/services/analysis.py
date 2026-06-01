@@ -27,6 +27,8 @@ from ...exceptions import ForbiddenError, NotFoundError
 from ..schemas.analysis import (
     AggregateRequest,
     AggregateResult,
+    CorrelationRequest,
+    CorrelationResult,
     DescribeResult,
     ExportRequest,
     FilterSpec,
@@ -40,6 +42,10 @@ from ..schemas.analysis import (
     OhlcResult,
     SeriesRequest,
     SeriesResult,
+    TechnicalRequest,
+    TechnicalResult,
+    TechnicalSeries,
+    TechnicalSignal,
     Transform,
 )
 from .fs import FsService
@@ -90,6 +96,12 @@ class AnalysisService:
 
     async def forecast(self, req: "ForecastRequest") -> "ForecastResult":
         return await run_in_threadpool(partial(self._forecast, req))
+
+    async def technical(self, req: "TechnicalRequest") -> "TechnicalResult":
+        return await run_in_threadpool(partial(self._technical, req))
+
+    async def correlation(self, req: "CorrelationRequest") -> "CorrelationResult":
+        return await run_in_threadpool(partial(self._correlation, req))
 
     def _forecast(self, req: "ForecastRequest") -> "ForecastResult":
         """Forecast a value column over time (optionally per group key).
@@ -173,6 +185,228 @@ class AnalysisService:
             model_used=used[0], horizon=req.horizon, period=req.period,
             series=out, source_rows=source_rows,
             sampled=any(len(s.history_x) < source_rows for s in out),
+        )
+
+    # -- technical indicators -----------------------------------------------
+
+    def _technical(self, req: "TechnicalRequest") -> "TechnicalResult":
+        """Compute RSI, MACD, Bollinger Bands (+ ATR if high/low available)."""
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        cols = set(lf.collect_schema().names())
+        if req.column not in cols:
+            raise BadRequestError(f"column {req.column!r} not found")
+
+        keep = [req.column]
+        if req.x and req.x in cols:
+            keep = [req.x] + keep
+        for extra in (req.high, req.low, req.volume):
+            if extra and extra in cols:
+                keep.append(extra)
+        keep = list(dict.fromkeys(keep))
+
+        cap = min(req.limit, self.settings.analysis_max_rows)
+        df = lf.select(keep).tail(cap).collect(engine="streaming")
+        source_rows = lf.select(pl.len()).collect(engine="streaming").item()
+        truncated = source_rows > cap
+
+        prices = df[req.column].cast(pl.Float64, strict=False).to_list()
+        n = len(prices)
+        index: list = df[req.x].to_list() if (req.x and req.x in df.columns) else list(range(n))
+
+        def _ema_list(vals: list[float | None], period: int) -> list[float | None]:
+            k = 2.0 / (period + 1)
+            out: list[float | None] = [None] * len(vals)
+            warm = 0
+            prev: float | None = None
+            for i, v in enumerate(vals):
+                if v is None:
+                    continue
+                if prev is None:
+                    prev = v
+                    warm = 1
+                else:
+                    warm += 1
+                    prev = v * k + prev * (1 - k)
+                if warm >= period:
+                    out[i] = prev
+            return out
+
+        def _sma_list(vals: list[float | None], period: int) -> list[float | None]:
+            out: list[float | None] = [None] * len(vals)
+            buf: list[float] = []
+            for i, v in enumerate(vals):
+                if v is not None:
+                    buf.append(v)
+                if len(buf) >= period:
+                    out[i] = sum(buf[-period:]) / period
+            return out
+
+        # RSI
+        rsi: list[float | None] = [None] * n
+        gains, losses = [], []
+        prev_p: float | None = None
+        for i, p in enumerate(prices):
+            if p is None:
+                continue
+            if prev_p is not None:
+                d = p - prev_p
+                gains.append(max(d, 0.0))
+                losses.append(max(-d, 0.0))
+                if len(gains) >= req.rsi_period:
+                    ag = sum(gains[-req.rsi_period:]) / req.rsi_period
+                    al = sum(losses[-req.rsi_period:]) / req.rsi_period
+                    rsi[i] = 100.0 - 100.0 / (1.0 + ag / al) if al != 0 else 100.0
+            prev_p = p
+
+        # MACD
+        ema_fast = _ema_list(prices, req.macd_fast)
+        ema_slow = _ema_list(prices, req.macd_slow)
+        macd_line = [
+            (f - s) if (f is not None and s is not None) else None
+            for f, s in zip(ema_fast, ema_slow)
+        ]
+        macd_signal_line = _ema_list(macd_line, req.macd_signal)
+        macd_hist = [
+            (m - s) if (m is not None and s is not None) else None
+            for m, s in zip(macd_line, macd_signal_line)
+        ]
+
+        # Bollinger Bands
+        sma = _sma_list(prices, req.bb_period)
+        bb_std_list: list[float | None] = [None] * n
+        for i, p in enumerate(prices):
+            if p is None or sma[i] is None:
+                continue
+            start = max(0, i - req.bb_period + 1)
+            window_vals = [prices[j] for j in range(start, i + 1) if prices[j] is not None]
+            if len(window_vals) >= req.bb_period:
+                mean = sum(window_vals) / len(window_vals)
+                variance = sum((v - mean) ** 2 for v in window_vals) / len(window_vals)
+                bb_std_list[i] = variance ** 0.5
+
+        bb_upper = [
+            (sma[i] + req.bb_std * bb_std_list[i])
+            if (sma[i] is not None and bb_std_list[i] is not None) else None
+            for i in range(n)
+        ]
+        bb_lower = [
+            (sma[i] - req.bb_std * bb_std_list[i])
+            if (sma[i] is not None and bb_std_list[i] is not None) else None
+            for i in range(n)
+        ]
+
+        # ATR (optional — needs high + low)
+        atr: list[float | None] = [None] * n
+        has_hl = req.high and req.high in df.columns and req.low and req.low in df.columns
+        if has_hl:
+            highs = df[req.high].cast(pl.Float64, strict=False).to_list()
+            lows = df[req.low].cast(pl.Float64, strict=False).to_list()
+            tr_list: list[float | None] = [None] * n
+            for i in range(1, n):
+                h, l, cp = highs[i], lows[i], prices[i - 1]
+                if h is None or l is None or cp is None:
+                    continue
+                tr_list[i] = max(h - l, abs(h - cp), abs(l - cp))
+            atr_raw = _sma_list(tr_list, req.atr_period)
+            atr = atr_raw
+
+        # Signal detection
+        signals: list[TechnicalSignal] = []
+        for i in range(1, n):
+            xv = index[i]
+            # RSI oversold/overbought
+            if rsi[i] is not None:
+                if rsi[i] < 30 and (rsi[i - 1] is None or rsi[i - 1] >= 30):
+                    signals.append(TechnicalSignal(idx=i, x_val=xv, kind="rsi_oversold", value=round(rsi[i], 2)))
+                elif rsi[i] > 70 and (rsi[i - 1] is None or rsi[i - 1] <= 70):
+                    signals.append(TechnicalSignal(idx=i, x_val=xv, kind="rsi_overbought", value=round(rsi[i], 2)))
+            # MACD crossover
+            if (macd_line[i] is not None and macd_signal_line[i] is not None and
+                    macd_line[i - 1] is not None and macd_signal_line[i - 1] is not None):
+                was_below = macd_line[i - 1] < macd_signal_line[i - 1]
+                now_above = macd_line[i] >= macd_signal_line[i]
+                if was_below and now_above:
+                    signals.append(TechnicalSignal(idx=i, x_val=xv, kind="macd_cross_up",
+                                                   value=round(macd_line[i], 4)))
+                elif not was_below and not now_above:
+                    signals.append(TechnicalSignal(idx=i, x_val=xv, kind="macd_cross_down",
+                                                   value=round(macd_line[i], 4)))
+            # Bollinger breakout
+            p = prices[i]
+            if p is not None:
+                if bb_upper[i] is not None and p > bb_upper[i]:
+                    signals.append(TechnicalSignal(idx=i, x_val=xv, kind="bb_breakout_up",
+                                                   value=round(p, 4)))
+                elif bb_lower[i] is not None and p < bb_lower[i]:
+                    signals.append(TechnicalSignal(idx=i, x_val=xv, kind="bb_breakout_down",
+                                                   value=round(p, 4)))
+
+        indicators = [
+            TechnicalSeries(name="rsi", values=[_safe(v) for v in rsi]),
+            TechnicalSeries(name="macd", values=[_safe(v) for v in macd_line]),
+            TechnicalSeries(name="macd_signal", values=[_safe(v) for v in macd_signal_line]),
+            TechnicalSeries(name="macd_hist", values=[_safe(v) for v in macd_hist]),
+            TechnicalSeries(name="bb_upper", values=[_safe(v) for v in bb_upper]),
+            TechnicalSeries(name="bb_middle", values=[_safe(v) for v in sma]),
+            TechnicalSeries(name="bb_lower", values=[_safe(v) for v in bb_lower]),
+        ]
+        if has_hl:
+            indicators.append(TechnicalSeries(name="atr", values=[_safe(v) for v in atr]))
+
+        return TechnicalResult(
+            node_id=self.settings.node_id,
+            path=req.path, column=req.column,
+            index=[_safe(v) for v in index],
+            price=[_safe(v) for v in prices],
+            indicators=indicators,
+            signals=signals,
+            truncated=truncated,
+        )
+
+    def _correlation(self, req: "CorrelationRequest") -> "CorrelationResult":
+        """Compute a pairwise correlation matrix across numeric columns."""
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        schema = lf.collect_schema()
+        all_num = [
+            n for n, t in schema.items()
+            if t in (pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                     pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)
+        ]
+        cols = [c for c in req.columns if c in all_num] if req.columns else all_num[:20]
+        if not cols:
+            raise BadRequestError("No numeric columns found for correlation")
+
+        cap = min(req.limit, self.settings.analysis_max_rows)
+        df = lf.select(cols).tail(cap).collect(engine="streaming")
+        source_rows = lf.select(pl.len()).collect(engine="streaming").item()
+
+        method = req.method if req.method in ("pearson", "spearman") else "pearson"
+        try:
+            mat: list[list[float | None]] = []
+            for c1 in cols:
+                row: list[float | None] = []
+                for c2 in cols:
+                    try:
+                        if method == "spearman":
+                            s1 = df[c1].cast(pl.Float64, strict=False).rank()
+                            s2 = df[c2].cast(pl.Float64, strict=False).rank()
+                        else:
+                            s1 = df[c1].cast(pl.Float64, strict=False)
+                            s2 = df[c2].cast(pl.Float64, strict=False)
+                        corr = s1.pearson_corr(s2)
+                        row.append(_safe(corr))
+                    except Exception:
+                        row.append(None)
+                mat.append(row)
+        except Exception as exc:
+            raise BadRequestError(f"Correlation failed: {exc}")
+
+        return CorrelationResult(
+            node_id=self.settings.node_id,
+            path=req.path,
+            columns=cols,
+            matrix=mat,
+            source_rows=source_rows,
         )
 
     # -- lazy scan ----------------------------------------------------------

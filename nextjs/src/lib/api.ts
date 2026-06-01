@@ -732,6 +732,77 @@ export function registerForecastWorkflow(
   return jsonFetch(url, { method: "POST", body: JSON.stringify(input) });
 }
 
+// ── Technical indicators + correlation ────────────────────────────────────
+
+export interface TechnicalSeries {
+  name: string;
+  values: (number | null)[];
+}
+
+export interface TechnicalSignal {
+  idx: number;
+  x_val: unknown;
+  kind: string;
+  value: number | null;
+}
+
+export interface TechnicalResult {
+  node_id: string;
+  path: string;
+  column: string;
+  index: unknown[];
+  price: (number | null)[];
+  indicators: TechnicalSeries[];
+  signals: TechnicalSignal[];
+  truncated: boolean;
+}
+
+export interface CorrelationResult {
+  node_id: string;
+  path: string;
+  columns: string[];
+  matrix: (number | null)[][];
+  source_rows: number;
+}
+
+// POST /analysis/technical — RSI, MACD, Bollinger Bands (+ ATR when high/low
+// present) over a price series, with crossover/oversold/breakout signals.
+// Cached client-side so flipping tabs doesn't recompute.
+export function technical(
+  path: string,
+  column: string,
+  opts: {
+    x?: string;
+    high?: string;
+    low?: string;
+    volume?: string;
+    rsi_period?: number;
+    macd_fast?: number;
+    macd_slow?: number;
+    bb_period?: number;
+    bb_std?: number;
+    limit?: number;
+    node?: string;
+  } = {},
+): Promise<TechnicalResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/technical${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
+// POST /analysis/correlation — pairwise correlation matrix (pearson|spearman)
+// across numeric columns. Cached client-side.
+export function correlation(
+  path: string,
+  opts: { columns?: string[]; method?: string; limit?: number; node?: string } = {},
+): Promise<CorrelationResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/correlation${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
 // ── Saga catalog ─────────────────────────────────────────────────────────
 
 export interface ColumnSpec { name: string; dtype: string; nullable: boolean; comment: string; }

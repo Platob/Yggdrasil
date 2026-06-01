@@ -7,6 +7,8 @@ from ..deps import get_analysis_service, get_network_service
 from ..schemas.analysis import (
     AggregateRequest,
     AggregateResult,
+    CorrelationRequest,
+    CorrelationResult,
     DescribeResult,
     ExportRequest,
     FinanceRequest,
@@ -17,6 +19,8 @@ from ..schemas.analysis import (
     OhlcResult,
     SeriesRequest,
     SeriesResult,
+    TechnicalRequest,
+    TechnicalResult,
 )
 from ..services.analysis import AnalysisService
 from ..services.network import NetworkService
@@ -97,6 +101,33 @@ async def forecast(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/forecast", json_body=req.model_dump())
     return await service.forecast(req)
+
+
+@router.post("/technical", response_model=TechnicalResult)
+async def technical(
+    req: TechnicalRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> TechnicalResult:
+    """Compute RSI, MACD, Bollinger Bands (+ ATR when high/low present) over a
+    price series and flag crossover/oversold/breakout signals."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/technical", json_body=req.model_dump())
+    return await service.technical(req)
+
+
+@router.post("/correlation", response_model=CorrelationResult)
+async def correlation(
+    req: CorrelationRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> CorrelationResult:
+    """Pairwise correlation matrix (pearson|spearman) across numeric columns."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/correlation", json_body=req.model_dump())
+    return await service.correlation(req)
 
 
 @router.post("/ohlc", response_model=OhlcResult)

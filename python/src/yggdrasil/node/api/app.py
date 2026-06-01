@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import FastAPI, Request
@@ -135,10 +136,12 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         """Aggregate cluster-wide statistics in one call."""
         state = request.app.state
         snap = state.backend_service.snapshot()
-        envs = await state.pyenv_service.list()
-        funcs = await state.pyfunc_service.list()
-        dags = await state.dag_service.list()
-        peers = await state.network_service.get_peers()
+        envs, funcs, dags, peers = await asyncio.gather(
+            state.pyenv_service.list(),
+            state.pyfunc_service.list(),
+            state.dag_service.list(),
+            state.network_service.get_peers(),
+        )
         mem_pct = (
             round(snap.memory_used_mb / snap.memory_total_mb * 100, 1)
             if snap.memory_total_mb else 0
@@ -162,8 +165,10 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     async def get_metrics(request: Request):
         """Detailed metrics: top functions by runs, top by duration, recent activity."""
         state = request.app.state
-        funcs = await state.pyfunc_service.list()
-        runs = await state.pyfuncrun_service.list()
+        funcs, runs = await asyncio.gather(
+            state.pyfunc_service.list(),
+            state.pyfuncrun_service.list(),
+        )
 
         top_by_runs = sorted(funcs.funcs, key=lambda f: f.run_count, reverse=True)[:5]
         top_by_duration = sorted(

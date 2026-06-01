@@ -190,3 +190,64 @@ class ForecastResult(StrictModel):
     series: list[ForecastSeries]
     source_rows: int
     sampled: bool = False
+
+
+# -- technical indicators ---------------------------------------------------
+
+class TechnicalRequest(StrictModel):
+    path: str
+    column: str                 # price column (close)
+    x: str | None = None        # time/index column
+    volume: str | None = None   # volume column (optional, for OBV, VWAP)
+    rsi_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    bb_period: int = 20
+    bb_std: float = 2.0
+    atr_period: int = 14        # needs high/low/close; skipped if cols missing
+    high: str | None = None     # high price column (for ATR)
+    low: str | None = None      # low price column (for ATR)
+    limit: int = 2000
+    filters: list[FilterSpec] = []
+
+
+class TechnicalSeries(StrictModel):
+    """One named indicator series, aligned to the main index."""
+    name: str
+    values: list[float | None]
+
+
+class TechnicalSignal(StrictModel):
+    """A detected signal event."""
+    idx: int                   # position in index
+    x_val: Any                 # x axis value (time or row number)
+    kind: str                  # e.g. "rsi_oversold", "macd_cross_up"
+    value: float | None = None # indicator value at signal
+
+
+class TechnicalResult(StrictModel):
+    node_id: str
+    path: str
+    column: str
+    index: list[Any]
+    price: list[float | None]
+    indicators: list[TechnicalSeries]
+    signals: list[TechnicalSignal]
+    truncated: bool
+
+
+class CorrelationRequest(StrictModel):
+    path: str
+    columns: list[str] = []     # empty = all numeric columns
+    method: str = "pearson"     # pearson | spearman
+    limit: int = 10000
+    filters: list[FilterSpec] = []
+
+
+class CorrelationResult(StrictModel):
+    node_id: str
+    path: str
+    columns: list[str]
+    matrix: list[list[float | None]]  # NxN correlation matrix
+    source_rows: int
