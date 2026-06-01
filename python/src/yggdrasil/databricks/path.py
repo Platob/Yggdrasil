@@ -995,7 +995,7 @@ class DatabricksPath(RemotePath, DatabricksResource):
     def __getstate__(self) -> dict[str, Any]:
         # Bypass :class:`DatabricksResource`'s non-filtering version so
         # ``_stat_cached`` / ``_stat_cached_at`` (declared in
-        # ``Path._TRANSIENT_STATE_ATTRS``) actually stay out of the
+        # ``Holder._TRANSIENT_STATE_ATTRS``) actually stay out of the
         # payload — same convention :class:`Singleton` enforces.
         return {
             k: v
