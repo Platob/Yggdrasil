@@ -842,3 +842,34 @@ class TestFastPathEquivalence:
         slow_table = _pq.read_table(pa.BufferReader(slow))
         assert fast_table.equals(slow_table)
         assert fast_table.equals(table)
+
+
+class TestThriftFooterLimits:
+    """Parquet footers with large metadata exceed pyarrow's default thrift
+    deserialization limits ("Couldn't deserialize thrift: Exceeded size
+    limit"). Reads must pass generous limits so such files open."""
+
+    def test_read_passes_thrift_limits_to_parquet_open(self) -> None:
+        from unittest.mock import patch
+        import pyarrow as pa
+        from yggdrasil.io import parquet_file as pf_mod
+
+        table = pa.table({"a": [1, 2, 3]})
+        mem = Memory()
+        ParquetFile(parent=mem).write_arrow_table(table)
+
+        real = pf_mod.pq.ParquetFile
+        seen = {}
+
+        def _spy(source, *args, **kwargs):
+            seen.update(kwargs)
+            return real(source, *args, **kwargs)
+
+        with patch.object(pf_mod.pq, "ParquetFile", side_effect=_spy):
+            out = ParquetFile(parent=mem).read_arrow_table()
+
+        assert out.num_rows == 3
+        assert seen.get("thrift_string_size_limit") == pf_mod._THRIFT_LIMITS["thrift_string_size_limit"]
+        assert seen.get("thrift_container_size_limit") == pf_mod._THRIFT_LIMITS["thrift_container_size_limit"]
+        # generous enough to clear the 100 MB string default
+        assert pf_mod._THRIFT_LIMITS["thrift_string_size_limit"] > 100_000_000

@@ -53,6 +53,16 @@ if TYPE_CHECKING:
 #: we map these back to ``None`` so the round-trip matches the source.
 _INDEX_PLACEHOLDER_PREFIX: str = "__index_level_"
 
+#: Parquet footers with large metadata (many row groups / columns, big column
+#: statistics) blow past pyarrow's default thrift deserialization limits and
+#: fail to even open — "Couldn't deserialize thrift: TProtocolException:
+#: Exceeded size limit". Open with generous limits so wide / heavily
+#: row-grouped files read instead of erroring on the footer.
+_THRIFT_LIMITS = {
+    "thrift_string_size_limit": 1 << 30,      # 1 GiB strings (stats / schema)
+    "thrift_container_size_limit": 1 << 28,   # 256M elements (row groups × cols)
+}
+
 
 __all__ = ["ParquetFile", "ParquetOptions"]
 
@@ -190,7 +200,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
             return Schema.empty()
         try:
             with self.arrow_input_stream() as v:
-                schema = Schema.from_arrow(pq.ParquetFile(v).schema_arrow)
+                schema = Schema.from_arrow(pq.ParquetFile(v, **_THRIFT_LIMITS).schema_arrow)
                 self._persist_schema(schema)
                 return schema
         except (FileNotFoundError, pa.ArrowInvalid):
@@ -239,7 +249,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
             return
         try:
             try:
-                pf = pq.ParquetFile(stream, pre_buffer=ranged)
+                pf = pq.ParquetFile(stream, pre_buffer=ranged, **_THRIFT_LIMITS)
             except pa.ArrowInvalid:
                 # Empty or truncated payload — same end state as the
                 # ``size == 0`` short-circuit on the in-memory path.
@@ -280,7 +290,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         try:
             ctx = holder.arrow_random_access_file() if ranged else self.arrow_input_stream()
             with ctx as v:
-                with pq.ParquetFile(v, pre_buffer=ranged) as pf:
+                with pq.ParquetFile(v, pre_buffer=ranged, **_THRIFT_LIMITS) as pf:
                     columns = self._projection_columns(options, pf.schema_arrow.names)
                     table = pf.read(
                         columns=columns,
@@ -637,7 +647,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                 pa.table({}),
             )
         with self.arrow_input_stream() as v:
-            table = pq.read_table(v)
+            table = pq.read_table(v, **_THRIFT_LIMITS)
         return pds.dataset(table)
 
     def _scan_polars_frame(self, options: ParquetOptions) -> "pl.LazyFrame":
@@ -683,7 +693,7 @@ class ParquetFile(IO[bytes, ParquetOptions]):
             # parquet metadata read is the same cheap call ``collect_schema``
             # makes and dominates nothing in the read path.
             with self.arrow_input_stream() as v:
-                schema_names = pq.ParquetFile(v).schema_arrow.names
+                schema_names = pq.ParquetFile(v, **_THRIFT_LIMITS).schema_arrow.names
             columns = self._projection_columns(options, schema_names)
         if path is not None:
             df = pl.read_parquet(path, columns=columns, use_pyarrow=False)
