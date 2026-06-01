@@ -1380,25 +1380,31 @@ class VolumePath(DatabricksPath):
                     parent,
                 )
                 os.makedirs(parent, exist_ok=True)
-            if hasattr(content, "seek"):
-                try:
-                    pos = content.tell()
-                    if size == -1:
-                        content.seek(0, io.SEEK_END)
-                        size = content.tell()
-                    content.seek(pos, io.SEEK_SET)
-                except Exception:
-                    pos = 0
+            if hasattr(content, "read"):
+                # Whole-object upload — rewind to byte 0 and stream the
+                # entire source, exactly like the off-cluster PUT below.
+                # Reading from ``content.tell()`` instead would truncate
+                # the file to empty when the caller hands a stream already
+                # parked at EOF (a just-written buffer), corrupting the
+                # object on-cluster while the off-cluster path stayed
+                # correct. A non-seekable stream just reads from where it
+                # is — best-effort, same as off-cluster.
+                if hasattr(content, "seek"):
+                    try:
+                        content.seek(0)
+                    except Exception:
+                        pass
                 bytes_written = 0
                 with open(api_path, "wb") as fh:
                     while True:
                         chunk = content.read(1024 * 1024)
                         if not chunk:
                             break
+                        if isinstance(chunk, str):
+                            chunk = chunk.encode()
                         fh.write(chunk)
                         bytes_written += len(chunk)
-                if size == -1:
-                    size = bytes_written
+                size = bytes_written
             else:
                 payload = bytes(content)
                 size = len(payload)
