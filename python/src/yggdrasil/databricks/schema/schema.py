@@ -683,8 +683,12 @@ class UCSchema(DatabricksPath):
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
     ) -> "UCSchema":
-        """Create this schema if it does not already exist, then return ``self``."""
+        """Create this schema (and its parent catalog) if missing, then return
+        ``self``. Ensuring the catalog first means a single ``ensure_created``
+        materialises the whole catalog → schema chain, so the volume
+        auto-create recovery only needs to ensure its schema."""
         if not self.exists():
+            self.catalog.ensure_created()
             self.create(
                 comment=comment,
                 properties=properties,

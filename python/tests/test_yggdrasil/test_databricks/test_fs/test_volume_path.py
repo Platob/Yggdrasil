@@ -1085,11 +1085,11 @@ class TestVolumeAutoCreate:
         self, workspace, client, service
     ) -> None:
         # Common case: catalog + schema already exist, only the volume
-        # is missing. The upload's ``NotFound("Volume … does not exist")``
-        # message names the volume directly, so the recovery path skips
-        # its cheap ``files.create_directory`` probe and goes straight
-        # to ``volumes.create``. ``files.create_directory`` is only
-        # called once afterwards, to materialise the sub-directory.
+        # is missing. Recovery routes through the idempotent
+        # :meth:`Volume.create`, whose own ``volumes.read`` reports the
+        # volume missing, so a single ``volumes.create`` lands. No parent
+        # ensure (the read names the volume, not the schema); the
+        # post-volume-create ``create_directory`` materialises the sub-dir.
         uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
 
         def upload(**_kwargs):
@@ -1099,6 +1099,10 @@ class TestVolumeAutoCreate:
             return r
 
         workspace.files.upload.side_effect = upload
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
+        )
+        workspace.volumes.create.return_value = _volume_info()
 
         p = VolumePath(
             "/Volumes/cat/sch/vol/sub/file.bin",
@@ -1106,13 +1110,9 @@ class TestVolumeAutoCreate:
         )
         p.write_bytes(b"payload")
 
-        workspace.catalogs.get.assert_not_called()
-        workspace.schemas.get.assert_not_called()
-        workspace.volumes.read.assert_not_called()
-
-        # Volume created first; catalog/schema untouched because volume
-        # create succeeded. The cheap-path probe was skipped — only the
-        # post-volume-create ``create_directory`` call should land.
+        # Volume created; parents untouched (the parent schema ensure is
+        # not triggered, since the read named the volume).
+        client.schemas.schema.return_value.ensure_created.assert_not_called()
         workspace.catalogs.create.assert_not_called()
         workspace.schemas.create.assert_not_called()
         workspace.files.create_directory.assert_called_once_with(
@@ -1154,6 +1154,12 @@ class TestVolumeAutoCreate:
 
         workspace.files.upload.side_effect = upload
         workspace.files.create_directory.side_effect = create_directory
+        # Volume genuinely missing, so ``Volume.create``'s read NotFounds
+        # and it proceeds to ``volumes.create``.
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
+        )
+        workspace.volumes.create.return_value = _volume_info()
 
         p = VolumePath(
             "/Volumes/cat/sch/vol/sub/file.bin",
@@ -1166,17 +1172,17 @@ class TestVolumeAutoCreate:
         assert workspace.files.create_directory.call_count == 2
         workspace.volumes.create.assert_called_once()
 
-    def test_schema_missing_creates_schema_then_volume(
+    def test_schema_missing_ensures_schema_then_volume(
         self,
         workspace,
         client,
         service,
     ) -> None:
-        # Schema is also missing — first ``volumes.create`` fails
-        # NotFound, then ``schemas.create`` succeeds, then volume create
-        # is retried. Catalog should not be touched.
-        uploads = [NotFound("Volume does not exist"), None]
-        volume_creates = [NotFound("Schema does not exist"), None]
+        # The volume read reports the schema missing, so ``Volume.create``
+        # ensures the parent schema (which cascades to the catalog — see
+        # the schema tests) through the high-level ``client.schemas``
+        # service, then creates the volume.
+        uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
 
         def upload(**_kwargs):
             r = uploads.pop(0)
@@ -1184,14 +1190,9 @@ class TestVolumeAutoCreate:
                 raise r
             return r
 
-        def volumes_create(**_kwargs):
-            r = volume_creates.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
         workspace.files.upload.side_effect = upload
-        workspace.volumes.create.side_effect = volumes_create
+        workspace.volumes.read.side_effect = NotFound("Schema does not exist")
+        workspace.volumes.create.return_value = _volume_info()
 
         p = VolumePath(
             "/Volumes/cat/sch/vol/sub/file.bin",
@@ -1199,22 +1200,18 @@ class TestVolumeAutoCreate:
         )
         p.write_bytes(b"payload")
 
-        workspace.catalogs.create.assert_not_called()
-        workspace.schemas.create.assert_called_once_with(
-            name="sch",
-            catalog_name="cat",
-        )
-        assert workspace.volumes.create.call_count == 2
+        client.schemas.schema.return_value.ensure_created.assert_called_once()
+        workspace.volumes.create.assert_called_once()
 
-    def test_catalog_missing_creates_full_chain(
+    def test_volume_create_failure_falls_back_to_schema_ensure(
         self, workspace, client, service
     ) -> None:
-        # Both schema and catalog are missing — volume.create then
-        # schema.create both fail NotFound, falling through to catalog
-        # → schema → volume creation.
-        uploads = [NotFound("Volume does not exist"), None]
-        volume_creates = [NotFound("Schema does not exist"), None]
-        schema_creates = [NotFound("Catalog does not exist"), None]
+        # ``Volume.create``'s own ``volumes.create`` NotFounds because the
+        # schema is missing → recovery ensures the parent schema (cascading
+        # to the catalog) through ``client.schemas`` and retries the volume
+        # create, which then lands.
+        uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
+        volume_creates = [NotFound("Schema does not exist"), _volume_info()]
 
         def upload(**_kwargs):
             r = uploads.pop(0)
@@ -1228,15 +1225,11 @@ class TestVolumeAutoCreate:
                 raise r
             return r
 
-        def schemas_create(**_kwargs):
-            r = schema_creates.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
         workspace.files.upload.side_effect = upload
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
+        )
         workspace.volumes.create.side_effect = volumes_create
-        workspace.schemas.create.side_effect = schemas_create
 
         p = VolumePath(
             "/Volumes/cat/sch/vol/sub/file.bin",
@@ -1244,8 +1237,7 @@ class TestVolumeAutoCreate:
         )
         p.write_bytes(b"payload")
 
-        workspace.catalogs.create.assert_called_once_with(name="cat")
-        assert workspace.schemas.create.call_count == 2
+        client.schemas.schema.return_value.ensure_created.assert_called_once()
         assert workspace.volumes.create.call_count == 2
 
     def test_already_exists_swallowed(self, workspace, client, service) -> None:
@@ -1687,63 +1679,34 @@ class TestCredentialsRefresherSingleton:
 
 class TestVolumeInfoNotFoundRecovery:
 
-    def test_creates_volume_on_not_found_then_re_reads(
+    def test_volume_info_does_not_auto_create_on_not_found(
         self, workspace, client, service
     ) -> None:
-        # First ``volumes.read`` raises NotFound; the recovery path
-        first_call = {"done": False}
-
-        def read(full_name):
-            if not first_call["done"]:
-                first_call["done"] = True
-                raise NotFound("Volume cat.sch.vol does not exist")
-            return _volume_info()
-
-        workspace.volumes.read.side_effect = read
-        workspace.volumes.create.return_value = SimpleNamespace(
-            volume_id="volume-uuid-0001",
+        # Reads never mutate: a missing volume surfaces as NotFound — the
+        # read does NOT auto-create it. Only ``create`` (and write
+        # recovery) creates.
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
         )
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
-        info = p.volume_info()
-        assert info.volume_id == "volume-uuid-0001"
-        assert workspace.volumes.read.call_count == 2
-        # The create call should have run with the volume coordinates
-        # parsed from the path.
-        create_kwargs = workspace.volumes.create.call_args.kwargs
-        assert create_kwargs["catalog_name"] == "cat"
-        assert create_kwargs["schema_name"] == "sch"
-        assert create_kwargs["name"] == "vol"
+        with pytest.raises(Exception):
+            p.volume_info()
+        workspace.volumes.create.assert_not_called()
+        assert workspace.volumes.read.call_count == 1
 
-    def test_recovery_also_creates_missing_schema(
+    def test_volume_info_does_not_create_even_when_schema_missing(
         self, workspace, client, service
     ) -> None:
-        read_outcomes = [NotFound("missing"), _volume_info(volume_id="vid")]
-
-        def read(full_name):
-            outcome = read_outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-
-        create_outcomes = [
-            NotFound("schema does not exist"),
-            SimpleNamespace(volume_id="vid"),
-        ]
-
-        def create(**kwargs):
-            outcome = create_outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-
-        workspace.volumes.read.side_effect = read
-        workspace.volumes.create.side_effect = create
+        # Even a "schema does not exist" read error stays a read failure —
+        # no schema ensure, no volume create.
+        workspace.volumes.read.side_effect = NotFound("schema does not exist")
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
-        info = p.volume_info()
-        assert info.volume_id == "vid"
-        workspace.schemas.create.assert_called_once()
+        with pytest.raises(Exception):
+            p.volume_info()
+        client.schemas.schema.return_value.ensure_created.assert_not_called()
+        workspace.volumes.create.assert_not_called()
 
     def test_propagates_other_errors_unchanged(
         self, workspace, client, service
@@ -1756,28 +1719,15 @@ class TestVolumeInfoNotFoundRecovery:
             p.volume_info()
         workspace.volumes.create.assert_not_called()
 
-    def test_temporary_credentials_inherits_create_on_not_found(
+    def test_temporary_credentials_reads_without_creating(
         self,
         workspace,
         client,
         service,
     ) -> None:
-        # ``temporary_credentials`` calls ``volume_info`` first, so
-        # the create-on-NotFound flow surfaces transparently — the
-        # caller gets back the AWS creds without ever seeing a
-        # NotFound.
-        read_calls = {"n": 0}
-
-        def read(full_name):
-            read_calls["n"] += 1
-            if read_calls["n"] == 1:
-                raise NotFound("missing")
-            return _volume_info(volume_id="vid-after-create")
-
-        workspace.volumes.read.side_effect = read
-        workspace.volumes.create.return_value = SimpleNamespace(
-            volume_id="vid-after-create",
-        )
+        # ``temporary_credentials`` reads ``volume_info`` first; for an
+        # existing volume it vends creds without ever creating anything.
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid")
         gen = (
             workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         )
@@ -1786,9 +1736,24 @@ class TestVolumeInfoNotFoundRecovery:
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         resp = p.temporary_credentials(mode="read")
         assert resp.aws_temp_credentials.access_key_id == "AKIA-test"
-        workspace.volumes.create.assert_called_once()
+        workspace.volumes.create.assert_not_called()
         gen.assert_called_once()
-        assert gen.call_args.kwargs["volume_id"] == "vid-after-create"
+        assert gen.call_args.kwargs["volume_id"] == "vid"
+
+    def test_temporary_credentials_does_not_auto_create_on_not_found(
+        self,
+        workspace,
+        client,
+        service,
+    ) -> None:
+        # A missing volume surfaces as NotFound through the read — no
+        # auto-create.
+        workspace.volumes.read.side_effect = NotFound("missing")
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
+        with pytest.raises(Exception):
+            p.temporary_credentials(mode="read")
+        workspace.volumes.create.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

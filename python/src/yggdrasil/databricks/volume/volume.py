@@ -215,8 +215,13 @@ class Volume(DatabricksPath):
         # catalog (1) → schema (2) → volume (3) → :class:`VolumePath`
         # (4+).
         # Drop empty components (trailing / duplicate slashes) so the
-        # depth count reflects real segments however the URL was built.
+        # depth count reflects real segments however the URL was built,
+        # and a leading ``Volumes`` namespace token (this volume's own URL
+        # carries the ``/Volumes/`` prefix) so the depth model lines up
+        # whether or not the joined URL kept the namespace.
         parts = [p for p in url.parts if p]
+        if parts and parts[0] == "Volumes":
+            parts = parts[1:]
         n = len(parts)
 
         if n <= 1:

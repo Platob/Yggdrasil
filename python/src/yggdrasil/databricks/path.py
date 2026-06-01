@@ -188,7 +188,14 @@ def _coerce_explore_url(u: "URL") -> "Optional[URL]":
         # exact VolumePath, falling back to the bare volume coordinates.
         deep = u.query_dict.get("volumePath")
         if deep and _looks_like_posix(deep[0]):
-            scheme, sub = _parse_posix(deep[0])
+            # A file deep-link splits the selection across ``volumePath``
+            # (the parent dir) and ``filePreviewPath`` (the leaf) — rejoin
+            # them so the full file path round-trips.
+            base = deep[0]
+            preview = u.query_dict.get("filePreviewPath")
+            if preview and preview[0]:
+                base = base.rstrip("/") + "/" + preview[0].lstrip("/")
+            scheme, sub = _parse_posix(base)
             return URL(scheme=scheme, path=sub)
         coords = segs[1:]  # cat / sch / vol
         return URL(
