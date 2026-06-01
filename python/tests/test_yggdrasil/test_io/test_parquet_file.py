@@ -333,6 +333,56 @@ class TestWriteArrowTableBypassesBatchHook:
         assert reread.num_rows == 0
         assert reread.schema.field("id").type == pa.int64()
 
+    def test_empty_table_batch_route_writes_valid_parquet(
+        self, tmp_path,
+    ) -> None:
+        """An empty pa.Table written through the *generic* path route
+        (``Path.write_table`` → base ``_write_arrow_table`` →
+        ``to_batches()`` → ``_write_arrow_batches``) must still produce a
+        valid, schema-bearing 0-row parquet — not a truncated 0-byte file.
+
+        This is the route every non-leaf path (``VolumePath``, ``S3Path``,
+        ``LocalPath``) takes: it doesn't inherit ``ParquetFile``'s
+        fast-path ``_write_arrow_table`` override, so the schema would be
+        lost at ``to_batches()`` on a 0-row table. A staged 0-byte file
+        breaks a downstream ``INSERT … SELECT FROM parquet.`<path>``` with
+        a path-not-found / unreadable-footer error.
+        """
+        from yggdrasil.enums import Mode
+
+        empty = pa.table(
+            {"id": pa.array([], type=pa.int64()),
+             "amount": pa.array([], type=pa.float64())}
+        )
+        path = LocalPath(str(tmp_path / "empty.parquet"))
+        path.write_table(empty, mode=Mode.OVERWRITE)
+
+        assert path.exists()
+        assert path.size > 0
+        with path.open("rb") as cursor:
+            reread = cursor.read_arrow_table()
+        assert reread.num_rows == 0
+        assert reread.schema.names == ["id", "amount"]
+
+    def test_empty_batches_overwrite_uses_bound_schema(self) -> None:
+        """``_write_arrow_batches`` with no incoming batches under
+        OVERWRITE writes a valid 0-row parquet from the schema bound on
+        the options (target/source), instead of truncating to 0 bytes."""
+        from yggdrasil.enums import Mode
+        from yggdrasil.data.options import CastOptions
+
+        schema = pa.schema([("id", pa.int64()), ("amount", pa.float64())])
+        mem = Memory()
+        leaf = ParquetFile(holder=mem, owns_holder=False)
+        options = leaf.check_options(
+            CastOptions(mode=Mode.OVERWRITE, target=schema)
+        )
+        leaf._write_arrow_batches(iter([]), options)
+
+        reread = ParquetFile(holder=mem, owns_holder=False).read_arrow_table()
+        assert reread.num_rows == 0
+        assert reread.schema.names == ["id", "amount"]
+
     def test_cursor_opened_in_overwrite_mode_takes_fast_path(
         self, monkeypatch, tmp_path,
     ) -> None:

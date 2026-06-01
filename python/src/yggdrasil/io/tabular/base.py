@@ -1455,6 +1455,11 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             row_size=None,
             byte_size=None,
         )
+        # ``to_batches()`` on a 0-row table yields nothing, dropping the schema
+        # the leaf writer needs to persist a valid empty file. Pin the source
+        # to the table's own schema (no-op when one is already bound) so the
+        # shape survives the batch hand-off.
+        inner = inner.check_source(casted.schema)
         self._write_arrow_batches(casted.to_batches(), inner)
 
     # ==================================================================
