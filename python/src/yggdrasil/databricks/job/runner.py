@@ -6,7 +6,7 @@ task runs as ``ygg-job <command> <args...>`` on the Databricks cluster. Today::
     ygg-job table-async-load <catalog.schema.table>
 
 reconstructs the table from the runtime client and drives the async loader
-(:class:`~yggdrasil.databricks.table.async_job.TableJob`). Add subcommands here
+(:meth:`Tables.async_insert` over the table's logs dir). Add subcommands here
 as more job kinds appear.
 """
 from __future__ import annotations
@@ -24,11 +24,11 @@ __all__ = ["main", "build_parser", "table_async_load"]
 def table_async_load(full_name: str, *, wait: bool = True) -> int:
     """Aggregate + load a table's pending async-insert drops. Returns the count."""
     from yggdrasil.databricks.client import DatabricksClient
-    from yggdrasil.databricks.table.async_job import TableJob
+    from yggdrasil.databricks.table.async_job import logs_path
 
     client = DatabricksClient()              # runtime auth on the cluster
     table = client.tables[full_name]
-    processed = TableJob(table).run(wait=wait)
+    processed = table.service.async_insert(logs_path(table), wait=wait)
     logger.info("table-async-load %s: %s ops", full_name, processed)
     return int(processed or 0)
 

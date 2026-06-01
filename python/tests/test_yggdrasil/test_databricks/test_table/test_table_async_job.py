@@ -4,8 +4,8 @@ Covers:
 * ``Table.insert(wait=False)`` routing → ``async_insert`` (OVERWRITE/APPEND,
   no match_by), and the sync path otherwise;
 * ``async_insert`` staging a Parquet + dropping a JSON operation log;
-* ``TableJob.ensure`` get-or-create with a file-arrival trigger;
-* ``TableJob.run`` aggregating logs into one INSERT per (target, mode),
+* ``ensure_async_job`` get-or-create with a file-arrival trigger;
+* ``Tables.async_insert`` aggregating logs into one INSERT per (target, mode),
   then cleaning up consumed logs + data.
 """
 from __future__ import annotations
@@ -15,8 +15,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from yggdrasil.databricks.table import async_job as aj
-from yggdrasil.databricks.table.async_job import LOGS_SUBDIR, TableJob
 from yggdrasil.databricks.table.table import Table
 
 
@@ -85,7 +83,7 @@ class TestAsyncInsert:
         logs_dir, log_file = MagicMock(), MagicMock()
         logs_dir.__truediv__.return_value = log_file
 
-        with patch.object(TableJob, "logs_path", staticmethod(lambda tbl: logs_dir)):
+        with patch("yggdrasil.databricks.table.async_job.logs_path", lambda tbl: logs_dir):
             result = Table.async_insert(t, {"a": [1]}, mode="append")
 
         assert result is log_file
@@ -107,7 +105,7 @@ class TestAsyncInsert:
         logs_dir.__truediv__.return_value = log_file
         src = MagicMock()
         src.read_arrow_table.return_value = {"a": [1]}
-        with patch.object(TableJob, "logs_path", staticmethod(lambda tbl: logs_dir)), \
+        with patch("yggdrasil.databricks.table.async_job.logs_path", lambda tbl: logs_dir), \
              patch("yggdrasil.io.holder.IO.from_", return_value=src) as io_from:
             Table.async_insert(t, "s3://b/data.parquet", mode="append")
         io_from.assert_called_once_with("s3://b/data.parquet")
@@ -124,29 +122,32 @@ class TestAsyncInsert:
 
 
 # --------------------------------------------------------------------------- #
-# TableJob.ensure (get-or-create with a file-arrival trigger)
+# ensure_async_job (get-or-create the file-arrival loader job)
 # --------------------------------------------------------------------------- #
-class TestEnsure:
+class TestEnsureAsyncJob:
     def test_creates_job_with_file_arrival_trigger(self):
+        from yggdrasil.databricks.table.async_job import ensure_async_job
+
         t = _table_mock()
         jobs = MagicMock()
         t.client.jobs = jobs
         created = MagicMock()
         created.job_id = 42
-        created._details = None
         jobs.create_or_update.return_value = created
-        t.staging_volume.path.return_value.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
+        logs = t.staging_volume.path.return_value
+        logs.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
+        jobs.list.return_value = []
 
-        tj = TableJob(t)
-        wheels = ["/Workspace/Shared/.ygg/whl/YGG_ASYNC_c.s.t/ygg-9.9-py3-none-any.whl",
-                  "/Workspace/Shared/.ygg/whl/YGG_ASYNC_c.s.t/databricks_sdk-1.2-py3-none-any.whl"]
-        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheels):
-            assert tj.ensure() is tj
-        assert tj.job is created
+        wheels = ["/Workspace/Shared/.ygg/whl/ygg-9.9-py3-none-any.whl",
+                  "/Workspace/Shared/.ygg/whl/databricks_sdk-1.2-py3-none-any.whl"]
+        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel", return_value=wheels) as ew:
+            job = ensure_async_job(t)
+
+        assert job is created
+        # the full ygg wheel is built + shipped as the env dependencies
+        assert ew.call_count == 1
         # the watched logs dir is created so the trigger URL is valid
-        t.staging_volume.path.return_value.mkdir.assert_called_with(
-            parents=True, exist_ok=True
-        )
+        logs.mkdir.assert_called_with(parents=True, exist_ok=True)
 
         kwargs = jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "[YGG][ASYNC] c.s.t"
@@ -159,21 +160,15 @@ class TestEnsure:
         assert task.python_wheel_task.package_name == "ygg"
         assert task.python_wheel_task.entry_point == "ygg-job"
         assert task.python_wheel_task.parameters == ["table-async-load", "c.s.t"]
-        # serverless v5; by default ygg + databricks-sdk are bundled as wheels
+        # serverless v5; the built ygg wheel is shipped as the dependencies
         env = kwargs["environments"][0]
         assert env.spec.environment_version == "5"
         assert env.spec.dependencies == wheels
         assert task.environment_key == env.environment_key
 
-    def test_ensure_is_noop_when_already_deployed(self):
-        t = _table_mock()
-        t.client.jobs = MagicMock()
-        tj = TableJob(t)
-        tj._job = MagicMock()                # already deployed
-        assert tj.ensure() is tj
-        t.client.jobs.create_or_update.assert_not_called()
+    def test_prunes_stale_jobs_on_same_trigger(self):
+        from yggdrasil.databricks.table.async_job import ensure_async_job
 
-    def test_deploy_prunes_stale_jobs_on_same_trigger(self):
         t = _table_mock()
         jobs = MagicMock()
         t.client.jobs = jobs
@@ -194,8 +189,8 @@ class TestEnsure:
         other = _job(8, "/Volumes/other/.sql/async/logs/")  # unrelated job
         jobs.list.return_value = [keep, stale, other]
 
-        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=["w.whl"]):
-            TableJob(t).deploy(t.client)
+        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel", return_value=["w.whl"]):
+            ensure_async_job(t)
 
         stale.delete.assert_called_once()      # orphan on the shared trigger removed
         keep.delete.assert_not_called()
@@ -358,17 +353,3 @@ class TestTablesAsyncInsertLoader:
         target.execute_async_insert.assert_called_once()
         union = target.execute_async_insert.call_args.args[0]
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
-
-
-class TestTableJobRunDelegates:
-    def test_run_delegates_to_service_loader(self):
-        t = _table_mock()
-        logs = MagicMock()
-        # logs_path(table) → staging_volume.path(LOGS_SUBDIR)
-        t.staging_volume.path.return_value = logs
-        t.service.async_insert.return_value = 7
-
-        out = TableJob(t).run(wait=False, limit=3)
-
-        t.service.async_insert.assert_called_once_with(logs, wait=False, limit=3)
-        assert out == 7

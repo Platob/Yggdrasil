@@ -32,6 +32,7 @@ __all__ = [
     "build_wheel",
     "upload_wheel",
     "ensure_wheel",
+    "ensure_ygg_wheel",
 ]
 
 #: Root for workspace wheels — one subfolder per job to keep each self-contained.
@@ -170,3 +171,17 @@ def ensure_wheel(
     fresh each call so the deployed job ships current code."""
     wheels = build_wheel(package, extras=extras, requirements=requirements)
     return [upload_wheel(client, w, workspace_dir=workspace_dir) for w in wheels]
+
+
+def ensure_ygg_wheel(client: Any, *, workspace_dir: str = WORKSPACE_WHL_DIR) -> list[str]:
+    """Build the **full ygg wheel** — the live ``yggdrasil`` package with its
+    ``[databricks]`` dependencies **plus the latest ``databricks-sdk``** — and
+    upload every produced wheel to *workspace_dir*; return their workspace
+    paths. The bundle a serverless job installs by path (no index) to run any
+    ``ygg-job`` task on the cluster."""
+    return ensure_wheel(
+        client, "yggdrasil",
+        workspace_dir=workspace_dir,
+        extras=("databricks",),
+        requirements=("databricks-sdk",),
+    )

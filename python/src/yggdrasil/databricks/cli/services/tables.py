@@ -75,8 +75,8 @@ class TablesCommand:
             n = client.tables.async_insert(log_file.full_path(), wait=True)
             sys.stdout.write(f"executed {n} pending operation(s)\n")
         elif args.ensure_job:
-            table.async_job().ensure()
-            sys.stdout.write("loader job ready.\n")
+            job = table.async_job()
+            sys.stdout.write(f"loader job ready: {getattr(job, 'job_id', job)}\n")
         else:
             sys.stdout.write(
                 "run with `--execute` to load now, or `--ensure-job` to let "

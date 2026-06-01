@@ -81,7 +81,7 @@ class TestTableAsyncInsertDispatch(unittest.TestCase):
                 "--ensure-job",
             ])
         self.assertEqual(rc, 0)
-        table.async_job.return_value.ensure.assert_called_once_with()
+        table.async_job.assert_called_once_with()      # get-or-create the loader job
         client.tables.async_insert.assert_not_called()
 
 

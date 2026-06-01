@@ -52,13 +52,14 @@ class TestRunner:
         client = MagicMock()
         table = MagicMock()
         client.tables.__getitem__.return_value = table
+        table.service.async_insert.return_value = 3
+        logs = MagicMock()
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
-             patch("yggdrasil.databricks.table.async_job.TableJob") as TJ:
-            TJ.return_value.run.return_value = 3
+             patch("yggdrasil.databricks.table.async_job.logs_path", return_value=logs):
             n = runner.table_async_load("c.s.t")
         client.tables.__getitem__.assert_called_once_with("c.s.t")
-        TJ.assert_called_once_with(table)
-        TJ.return_value.run.assert_called_once_with(wait=True)
+        # the runner drives the service loader over the table's logs dir
+        table.service.async_insert.assert_called_once_with(logs, wait=True)
         assert n == 3
 
     def test_main_dispatches_subcommand(self):

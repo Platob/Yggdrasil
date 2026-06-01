@@ -75,7 +75,6 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession, DataFrame as SparkDataFrame
     from yggdrasil.databricks.sql.engine import SQLEngine
     from yggdrasil.databricks.table.tables import Tables
-    from yggdrasil.databricks.table.async_job import TableJob
     from yggdrasil.databricks.catalog.catalog import UCCatalog
     from yggdrasil.databricks.column.columns import Columns
     from yggdrasil.databricks.schema.schema import UCSchema
@@ -3325,17 +3324,17 @@ class Table(DatabricksPath):
     # async insert — drop Parquet + an operation log; a file-arrival job loads
     # =========================================================================
 
-    def async_job(self) -> "TableJob":
-        """The file-arrival :class:`TableJob` handle for this table.
+    def async_job(self) -> Any:
+        """Get-or-create the file-arrival loader job for this table; return it.
 
-        A cheap handle — call :meth:`TableJob.ensure` / :meth:`TableJob.deploy`
-        to create the Databricks job (watches ``.sql/async/logs`` and aggregates
-        the operation logs :meth:`async_insert` drops into one ``INSERT`` per
-        ``(target, mode)`` group), or :meth:`TableJob.run` to drive the loader
-        directly."""
-        from yggdrasil.databricks.table.async_job import TableJob
+        Builds + uploads the full ygg wheel and upserts a serverless job that
+        watches ``.sql/async/logs`` and aggregates the operation logs
+        :meth:`async_insert` drops into one ``INSERT`` per ``(target, mode)``
+        group. See :func:`~yggdrasil.databricks.table.async_job.ensure_async_job`.
+        """
+        from yggdrasil.databricks.table.async_job import ensure_async_job
 
-        return TableJob(self)
+        return ensure_async_job(self)
 
     def async_insert(
         self,
@@ -3362,7 +3361,7 @@ class Table(DatabricksPath):
         """
         import json as _json
 
-        from yggdrasil.databricks.table.async_job import ASYNC_MODES, TableJob
+        from yggdrasil.databricks.table.async_job import ASYNC_MODES, logs_path
 
         mode_enum = Mode.from_(mode, default=Mode.APPEND)
         if mode_enum not in ASYNC_MODES:
@@ -3386,7 +3385,7 @@ class Table(DatabricksPath):
         data_file = self.insert_volume_path(self, temporary=False)
         data_file.write_table(data, cast_options, mode=Mode.OVERWRITE)
 
-        log_file = TableJob.logs_path(self) / f"{op_id}.json"
+        log_file = logs_path(self) / f"{op_id}.json"
         log_file.write_bytes(
             _json.dumps(
                 {
