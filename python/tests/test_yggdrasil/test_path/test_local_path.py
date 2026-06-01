@@ -478,3 +478,56 @@ class TestStaticValues:
         assert sv.get("year") == "2024"
         assert sv.get("month") == "01"
         assert "$filepath" in sv
+
+
+class TestParquetOpenRoundTrip:
+    """``with path.open(media_type="parquet")`` round-trips an Arrow table on
+    the local filesystem — the same surface the volume integration exercises,
+    so the format-leaf open + the parquet read path are covered off-cluster."""
+
+    def test_open_parquet_write_read_round_trip(self, tmp_path: pathlib.Path) -> None:
+        import pyarrow as pa
+        from yggdrasil.enums import Mode
+
+        p = LocalPath(str(tmp_path / "data.parquet"), singleton_ttl=False)
+        # A few thousand rows / wide-ish strings so the footer + row groups
+        # are non-trivial (exercises the read path, not just a 1-row file).
+        table = pa.table({
+            "id": pa.array(range(5000), pa.int64()),
+            "label": pa.array([f"row-{i}" for i in range(5000)], pa.string()),
+            "amount": pa.array([i * 1.5 for i in range(5000)], pa.float64()),
+        })
+        with p.open("wb", media_type="parquet") as pf:
+            pf.write_arrow_table(table, mode=Mode.OVERWRITE)
+
+        assert p.exists() and p.size > 0
+        with p.open("rb", media_type="parquet") as pf:
+            out = pf.read_arrow_table()
+        assert out.num_rows == 5000
+        assert out.column("id").to_pylist() == list(range(5000))
+        assert out.column("label")[0].as_py() == "row-0"
+
+    def test_open_parquet_column_projection(self, tmp_path: pathlib.Path) -> None:
+        # A bound target projects columns on read — only the requested ones
+        # come back, in target order.
+        import pyarrow as pa
+        from yggdrasil.data.options import CastOptions
+        from yggdrasil.data.schema import Schema
+        from yggdrasil.enums import Mode
+
+        p = LocalPath(str(tmp_path / "proj.parquet"), singleton_ttl=False)
+        table = pa.table({
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "label": pa.array(["a", "b", "c"], pa.string()),
+            "amount": pa.array([1.0, 2.0, 3.0], pa.float64()),
+        })
+        with p.open("wb", media_type="parquet") as pf:
+            pf.write_arrow_table(table, mode=Mode.OVERWRITE)
+        with p.open("rb", media_type="parquet") as pf:
+            out = pf.read_arrow_table(
+                CastOptions(target=Schema.from_arrow(
+                    pa.schema([pa.field("id", pa.int64()), pa.field("amount", pa.float64())])
+                ))
+            )
+        assert out.column_names == ["id", "amount"]
+        assert out.column("id").to_pylist() == [1, 2, 3]

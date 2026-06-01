@@ -730,7 +730,13 @@ class DatabricksPath(RemotePath, DatabricksResource):
         self._initialized = True
 
     def __repr__(self):
-        exp = getattr(self, "explore_url", None)
+        # ``explore_url`` can raise (e.g. a VolumePath that doesn't yet
+        # address a full ``/Volumes/<cat>/<sch>/<vol>/...`` path) — repr must
+        # never raise (it breaks logging / debuggers), so fall back quietly.
+        try:
+            exp = self.explore_url
+        except Exception:
+            exp = None
         if exp is not None:
             return f"{self.__class__.__name__}({exp!r})"
         return super().__repr__()

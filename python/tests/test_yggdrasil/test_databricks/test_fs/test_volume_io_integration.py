@@ -53,6 +53,7 @@ from tests.test_yggdrasil.test_databricks import DatabricksIntegrationCase
 __all__ = [
     "TestVolumeBytesRoundTrip",
     "TestVolumePandasRoundTrip",
+    "TestVolumeParquetOpenRoundTrip",
     "TestVolumeNavigation",
 ]
 
@@ -223,9 +224,39 @@ class TestVolumePandasRoundTrip(_VolumeIOFixture, PandasTestCase):
     
     def test_storage_path(self):
         v = self.volume / "external"
-        
+
         assert v.client is self.volume.client
-    
+
+
+@pytest.mark.integration
+class TestVolumeParquetOpenRoundTrip(_VolumeIOFixture):
+    """``with path.open(media_type="parquet")`` round-trips an Arrow table
+    through the Files API — the ygg-native parquet surface (write_arrow_table /
+    read_arrow_table), exercising the upload + the footer-aware read end to end
+    against a live volume."""
+
+    def test_open_parquet_arrow_round_trip(self) -> None:
+        import pyarrow as pa
+        from yggdrasil.enums import Mode
+
+        path = self._scratch(f"frame-{secrets.token_hex(4)}.parquet")
+        table = pa.table({
+            "id": pa.array(range(5000), pa.int64()),
+            "label": pa.array([f"row-{i}" for i in range(5000)], pa.string()),
+            "amount": pa.array([i * 1.5 for i in range(5000)], pa.float64()),
+        })
+        try:
+            with path.open("wb", media_type="parquet") as pf:
+                pf.write_arrow_table(table, mode=Mode.OVERWRITE)
+            self.assertTrue(path.exists())
+            with path.open("rb", media_type="parquet") as pf:
+                out = pf.read_arrow_table()
+            self.assertEqual(out.num_rows, 5000)
+            self.assertEqual(out.column("id").to_pylist(), list(range(5000)))
+            self.assertEqual(out.column("label")[0].as_py(), "row-0")
+        finally:
+            path.unlink(missing_ok=True)
+
 
 @pytest.mark.integration
 class TestVolumeNavigation(_VolumeIOFixture):

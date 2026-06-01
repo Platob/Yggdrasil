@@ -344,7 +344,9 @@ class TestOSErrorFallback:
         real_stat = os.stat
 
         def bad_stat(path, *a, **kw):
-            if "/dbfs/tmp/explode" in str(path):
+            # Match the mount path regardless of OS separator (Windows joins
+            # the fake root with ``\``).
+            if "/dbfs/tmp/explode" in str(path).replace("\\", "/"):
                 raise PermissionError("simulated")
             return real_stat(path, *a, **kw)
 
