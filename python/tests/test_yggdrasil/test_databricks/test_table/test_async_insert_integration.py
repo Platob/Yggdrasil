@@ -197,15 +197,15 @@ class TestAsyncInsertDeployedJob(_AsyncFixture):
         self.assertEqual(run.dag().keys, ["async-load"])
 
         if run.is_failed:
-            # The bundled ygg image ships dependency wheels built on the *local*
-            # host; a serverless runtime on a different platform/python can't
-            # install them. That's an environment compatibility limitation, not
-            # an async-insert defect (the loader logic is covered by the
-            # loader-driven mode tests). The debug() dump surfaced the cause —
-            # skip rather than fail the suite on it.
+            # The ygg image ships the pure-python ygg wheel by path and resolves
+            # its deps from the workspace index, so a serverless install should
+            # succeed. If a workspace nonetheless can't resolve the image (no
+            # index access for a dep, etc.) that's an environment limitation,
+            # not an async-insert defect — skip with the cause debug() surfaced
+            # rather than failing the suite.
             haystack = f"{run.stderr}\n{run.state_message}\n{dump}".lower()
             if "installation" in haystack or "wheel" in haystack:
-                self.skipTest(f"serverless image install incompatible:\n{dump}")
+                self.skipTest(f"serverless image install unavailable:\n{dump}")
             self.fail(f"loader run failed:\n{dump}")
 
         # On success: the staged insert was loaded by the job, and the loader

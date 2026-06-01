@@ -35,6 +35,7 @@ __all__ = [
     "ensure_wheel",
     "deployed_wheels",
     "ensure_ygg_wheel",
+    "ygg_runtime_dependencies",
     "ygg_environment",
 ]
 
@@ -168,17 +169,29 @@ def build_wheel(
     extras: "tuple[str, ...] | list[str]" = (),
     requirements: "tuple[str, ...] | list[str]" = (),
     dest_dir: "str | Path | None" = None,
+    no_deps: bool = False,
 ) -> list[Path]:
-    """Build the live *package* (synthesized project) **with its dependencies**
-    via an isolated ``pip wheel`` — returns every produced ``.whl`` (the project
-    plus all transitive deps + any extra *requirements*)."""
+    """Build the live *package* (synthesized project) via an isolated
+    ``pip wheel`` — returns the produced ``.whl`` files.
+
+    By default builds the project **with its dependencies** (every transitive
+    dep wheel + any extra *requirements*). With ``no_deps=True`` builds **only
+    the project wheel** (``pip wheel --no-deps``): a pure-python ``py3-none-any``
+    wheel with no platform-specific dependency wheels — what you want when the
+    install target's platform / python differs from the build host (e.g. a
+    Databricks serverless runtime), so dependencies resolve there from the
+    index instead."""
     project = synthesize_project(package, extras=extras)
     out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-wheel-"))
-    logger.info("building wheel (+ dependencies) for %s into %s", package, out)
-    subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", str(project), *requirements, "--wheel-dir", str(out)],
-        check=True,
+    logger.info(
+        "building wheel%s for %s into %s",
+        "" if no_deps else " (+ dependencies)", package, out,
     )
+    cmd = [sys.executable, "-m", "pip", "wheel", str(project), *requirements,
+           "--wheel-dir", str(out)]
+    if no_deps:
+        cmd.append("--no-deps")
+    subprocess.run(cmd, check=True)
     wheels = sorted(out.glob("*.whl"))
     if not wheels:
         raise FileNotFoundError(f"no wheels produced in {out}")
@@ -205,11 +218,15 @@ def ensure_wheel(
     workspace_dir: str = WORKSPACE_WHL_DIR,
     extras: "tuple[str, ...] | list[str]" = (),
     requirements: "tuple[str, ...] | list[str]" = (),
+    no_deps: bool = False,
 ) -> list[str]:
-    """Build the live *package* with its dependencies (:func:`build_wheel`) and
-    upload every wheel to *workspace_dir*; return their workspace paths. Built
-    fresh each call so the deployed job ships current code."""
-    wheels = build_wheel(package, extras=extras, requirements=requirements)
+    """Build the live *package* (:func:`build_wheel`) and upload every produced
+    wheel to *workspace_dir*; return their workspace paths. ``no_deps=True``
+    builds only the pure-python project wheel (deps resolve at install time on
+    the target). Built fresh each call so the deployed job ships current code."""
+    wheels = build_wheel(
+        package, extras=extras, requirements=requirements, no_deps=no_deps,
+    )
     return [upload_wheel(client, w, workspace_dir=workspace_dir) for w in wheels]
 
 
@@ -219,15 +236,17 @@ def deployed_wheels(
     version: str,
     *,
     workspace_dir: str,
+    dist_only: bool = False,
 ) -> list[str]:
-    """Workspace paths of a wheel bundle already deployed for *dist* *version*
-    under *workspace_dir*, or ``[]`` when none is present.
+    """Workspace paths of wheels already deployed for *dist* *version* under
+    *workspace_dir*, or ``[]`` when *dist*'s own wheel for *version* is absent.
 
-    The bundle counts as present only when *dist*'s own wheel for *version* is
-    there — a directory holding just the dependency wheels (a never-built or
-    half-finished upload) is treated as absent so the caller rebuilds. Every
-    ``.whl`` in the directory is returned, since :func:`build_wheel` drops the
-    distribution wheel and its transitive deps side by side."""
+    The deploy counts as present only when *dist*'s wheel for *version* is there
+    — a directory holding just dependency wheels (a never-built or half-finished
+    upload) is treated as absent so the caller rebuilds. With ``dist_only=True``
+    only *dist*'s own wheel(s) are returned (the current pure-python image is a
+    single wheel; deps resolve from the index at install). Otherwise every
+    ``.whl`` in the directory is returned (legacy full bundles)."""
     from yggdrasil.databricks.path import DatabricksPath
 
     folder = DatabricksPath.from_(workspace_dir, client=client)
@@ -235,21 +254,24 @@ def deployed_wheels(
         return []
 
     paths: list[str] = []
-    has_dist = False
+    dist_paths: list[str] = []
     want_dist, want_version = _norm(dist), _norm_version(version)
     for child in folder.iterdir():
         name = str(child.name)
         if not name.endswith(".whl"):
             continue
-        paths.append(child.full_path())
+        full = child.full_path()
+        paths.append(full)
         parts = name[:-4].split("-")  # drop ".whl"; <dist>-<version>-<tags...>
         if (
             len(parts) >= 2
             and _norm(parts[0]) == want_dist
             and _norm_version(parts[1]) == want_version
         ):
-            has_dist = True
-    return paths if has_dist else []
+            dist_paths.append(full)
+    if not dist_paths:
+        return []
+    return dist_paths if dist_only else paths
 
 
 def ensure_ygg_wheel(
@@ -258,36 +280,50 @@ def ensure_ygg_wheel(
     workspace_dir: str = WORKSPACE_WHL_DIR,
     rebuild: bool = False,
 ) -> list[str]:
-    """Get-or-build the **full ygg wheel** bundle for the current version.
+    """Get-or-build the **pure-python ygg wheel** for the current version.
 
-    The live ``yggdrasil`` package with its ``[databricks]`` dependencies
-    **plus the latest ``databricks-sdk``**, deployed under a version-scoped
-    subfolder of *workspace_dir* (``.../whl/<version>/``). On the first call for
-    a version the bundle is built (:func:`build_wheel`) and uploaded; later
-    calls find that deployed bundle (:func:`deployed_wheels`) and reuse it
-    rather than rebuilding. Pass ``rebuild=True`` to force a fresh build (e.g.
-    after a dev edit that doesn't bump the version). Returns the workspace
-    wheel paths a serverless job installs by path (no index) to run the ``ygg``
-    CLI on the cluster."""
+    Builds *only* the live ``yggdrasil`` package as a ``py3-none-any`` wheel
+    (``pip wheel --no-deps``) — no platform-specific dependency wheels — deployed
+    under a version-scoped subfolder of *workspace_dir* (``.../whl/<version>/``).
+    On the first call for a version the wheel is built and uploaded; later calls
+    find and reuse it (:func:`deployed_wheels`). Pass ``rebuild=True`` to force
+    a fresh build.
+
+    Returns the workspace path of the ygg wheel — a serverless job installs it
+    **by path** while resolving the runtime dependencies (see
+    :func:`ygg_environment`) from the workspace index, so they land as
+    platform-correct builds rather than wheels bundled from the deploying host
+    (which a different serverless platform / python can't install)."""
     version = ilmd.version("ygg")
     version_dir = f"{workspace_dir.rstrip('/')}/{version}"
 
     if not rebuild:
-        existing = deployed_wheels(client, "ygg", version, workspace_dir=version_dir)
+        existing = deployed_wheels(
+            client, "ygg", version, workspace_dir=version_dir, dist_only=True,
+        )
         if existing:
-            logger.info(
-                "reusing deployed ygg %s wheel bundle at %s (%d wheels)",
-                version, version_dir, len(existing),
-            )
+            logger.info("reusing deployed ygg %s wheel at %s", version, version_dir)
             return existing
-        logger.info("no ygg %s wheel bundle at %s — building", version, version_dir)
+        logger.info("no ygg %s wheel at %s — building", version, version_dir)
 
     return ensure_wheel(
         client, "ygg",
         workspace_dir=version_dir,
         extras=("databricks",),
-        requirements=("databricks-sdk",),
+        no_deps=True,
     )
+
+
+def ygg_runtime_dependencies() -> list[str]:
+    """The ygg image's runtime dependency **requirements** (names + version
+    pins), for a serverless env to resolve from the workspace index.
+
+    The live ``yggdrasil`` package's declared dependencies plus its
+    ``[databricks]`` extra (which pins the latest ``databricks-sdk``). Shipped
+    as names — not wheels — so the serverless runtime installs platform-correct
+    builds. ``pyarrow`` / ``numpy`` and other binary deps therefore resolve on
+    the cluster instead of being bundled from the build host."""
+    return _project_dependencies("ygg", {"databricks"})
 
 
 def ygg_environment(
@@ -301,21 +337,27 @@ def ygg_environment(
     """The serverless ``JobEnvironment`` for the **versioned ygg image**.
 
     Pairs the latest serverless runtime (``environment_version``, default
-    :data:`SERVERLESS_ENVIRONMENT_VERSION` = ``"5"``) with the get-or-created
-    ygg wheel bundle (:func:`ensure_ygg_wheel` — ygg CLI + ``databricks-sdk`` +
-    transitive deps), installed by path. Drop this into any serverless job's
-    ``environments=[...]`` so its python-wheel tasks can run the ``ygg`` CLI
-    against a pinned, pre-installed image rather than resolving from an index."""
+    :data:`SERVERLESS_ENVIRONMENT_VERSION` = ``"5"``) with:
+
+    - the get-or-created pure-python ygg wheel (:func:`ensure_ygg_wheel`),
+      installed **by path**; and
+    - its runtime dependencies (:func:`ygg_runtime_dependencies`) as **index
+      requirements**, so ``pyarrow`` / ``polars`` / ``databricks-sdk`` / … land
+      as platform-correct builds the serverless runtime can actually install.
+
+    Drop this into any serverless job's ``environments=[...]`` so its
+    python-wheel tasks run the ``ygg`` CLI against a pinned image."""
     from databricks.sdk.service.compute import Environment
     from databricks.sdk.service.jobs import JobEnvironment
 
     wheels = ensure_ygg_wheel(
         client, workspace_dir=workspace_dir, rebuild=rebuild,
     )
+    dependencies = list(wheels) + ygg_runtime_dependencies()
     return JobEnvironment(
         environment_key=environment_key,
         spec=Environment(
             environment_version=environment_version,
-            dependencies=wheels,
+            dependencies=dependencies,
         ),
     )

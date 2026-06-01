@@ -1155,15 +1155,16 @@ class DatabricksClient(Singleton, URLBased):
         rebuild: bool = False,
         workspace_dir: Optional[str] = None,
     ) -> list[str]:
-        """Get-or-create the **versioned ygg wheel bundle** in this workspace.
+        """Get-or-create the **versioned pure-python ygg wheel** in this workspace.
 
-        A pinned, per-version image of the ``ygg`` CLI + ``databricks-sdk`` +
-        all transitive dependencies, deployed under
-        ``/Workspace/Shared/.ygg/whl/<version>/`` and installed by path (no
-        index). The first call for a version builds + uploads it; later calls
-        find and reuse it. Pass ``rebuild=True`` to force a fresh build (e.g.
-        after a dev edit that doesn't bump the version). Returns the workspace
-        wheel paths a serverless job installs.
+        A pinned, per-version image of the ``ygg`` package (CLI included), built
+        ``--no-deps`` as a ``py3-none-any`` wheel and deployed under
+        ``/Workspace/Shared/.ygg/whl/<version>/``. The first call for a version
+        builds + uploads it; later calls find and reuse it. Pass ``rebuild=True``
+        to force a fresh build. Returns the wheel's workspace path — a serverless
+        job installs it by path while resolving the runtime dependencies from
+        the index (see :meth:`ygg_environment`), so they land as platform-correct
+        builds rather than wheels bundled from this host.
         """
         from yggdrasil.databricks.job.wheel import ensure_ygg_wheel, WORKSPACE_WHL_DIR
 
