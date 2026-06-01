@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 import pytest
 
 from yggdrasil.databricks import DatabricksClient
+from yggdrasil.databricks.client import invalidate_env_defaults
 
 
 __all__ = ["DatabricksIntegrationCase"]
@@ -52,6 +53,12 @@ class DatabricksIntegrationCase(unittest.TestCase):
                 "credentials, e.g. DATABRICKS_TOKEN or a config profile) "
                 "to run them."
             )
+        # Reload from the current environment. The client snapshots the
+        # ``DATABRICKS_*`` env defaults once per process, so a client built
+        # earlier in the same pytest run (e.g. by a unit test) would pin a
+        # stale snapshot taken before these vars were set. Drop it so the
+        # build below resolves host / token / profile from the live env.
+        invalidate_env_defaults()
         cls.client = DatabricksClient()
         cls.workspace = cls.client.workspace_client()
 
