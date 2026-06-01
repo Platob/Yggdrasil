@@ -2933,9 +2933,11 @@ class Table(DatabricksPath):
             )
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
-        if mode_enum == Mode.OVERWRITE and not match_by:
-            schema_mode = Mode.OVERWRITE
-
+        # Data-level OVERWRITE replaces rows (the write below), not the schema:
+        # keep the target's columns so a narrower source still lands with the
+        # missing columns filled as NULL. Schema evolution stays opt-in through
+        # ``schema_mode`` / ``overwrite_schema`` — don't force a CREATE OR
+        # REPLACE that would shrink the table to the source's shape.
         target = self.create(
             data,
             mode=schema_mode,
@@ -3080,9 +3082,11 @@ class Table(DatabricksPath):
         from yggdrasil.spark.statement import SparkPreparedStatement
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
-        if mode_enum == Mode.OVERWRITE and not match_by:
-            schema_mode = Mode.OVERWRITE
-
+        # Data-level OVERWRITE replaces rows (the write below), not the schema:
+        # keep the target's columns so a narrower source still lands with the
+        # missing columns filled as NULL. Schema evolution stays opt-in through
+        # ``schema_mode`` / ``overwrite_schema`` — don't force a CREATE OR
+        # REPLACE that would shrink the table to the source's shape.
         target = self.create(
             data,
             mode=schema_mode,
