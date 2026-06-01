@@ -1449,8 +1449,38 @@ class Table(DatabricksPath):
         execution result; the public :meth:`delete` returns the table itself.
         """
         if predicate is None:
-            # Whole-table removal — UC API, no SQL warehouse.
-            self.delete(wait=wait, missing_ok=missing_ok, delete_staging=delete_staging)
+            # Whole-table removal — drop the asset through the UC tables
+            # API, no SQL warehouse. Implemented inline (not via
+            # ``self.delete``): the public ``delete`` dispatches back here,
+            # so delegating would recurse infinitely.
+            #
+            # ``delete_staging=False`` keeps the staging volume around for
+            # internal drop-and-recreate flows (OVERWRITE) where the very
+            # next step uploads a fresh parquet to the same volume — the
+            # background ``VolumesAPI.delete`` would otherwise race the
+            # upload and surface as PATH_NOT_FOUND on the warehouse INSERT.
+            uc = self.client.workspace_client().tables
+            logger.debug(
+                "Deleting table %r (wait=%s, delete_staging=%s)",
+                self, bool(wait), delete_staging,
+            )
+            if wait:
+                try:
+                    uc.delete(full_name=self.full_name())
+                    if delete_staging and self._staging_volume:
+                        self._staging_volume.delete(wait=False)
+                except DatabricksError:
+                    if not missing_ok:
+                        raise
+            else:
+                Job.make(
+                    self._delete,
+                    wait=True,
+                    missing_ok=missing_ok,
+                    delete_staging=delete_staging,
+                ).fire_and_forget()
+            self.invalidate_singleton(remove_global=True)
+            logger.info("Deleted table %r", self)
             return 0
         where = predicate if isinstance(predicate, str) else expr_to_sql(
             predicate, dialect=Dialect.DATABRICKS,
