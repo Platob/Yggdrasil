@@ -530,32 +530,49 @@ class TestMergePartitionFilters:
         assert _sql_literal(datetime.date(2024, 1, 2)) == "'2024-01-02'"
         assert _sql_literal(object()) is None           # unsupported → skip
 
+    @staticmethod
+    def _mock_table(part_cols=("d",), distinct=None):
+        from types import SimpleNamespace
+        mock = MagicMock()
+        mock.collect_schema.return_value.fields = [
+            SimpleNamespace(name=c, partition_by=True) for c in part_cols
+        ] + [SimpleNamespace(name="v", partition_by=False)]
+        if distinct is not None:
+            mock.sql.execute.return_value.to_arrow_table.return_value = distinct
+        return mock
+
     def test_partition_filters_from_distinct_source_values(self):
         from yggdrasil.databricks.table.table import Table
-        mock = MagicMock()
-        mock.sql.execute.return_value.to_arrow_table.return_value = pa.table(
-            {"d": ["2024-01-02", "2024-01-01", "2024-01-02"]}
+        mock = self._mock_table(
+            distinct=pa.table({"d": ["2024-01-02", "2024-01-01", "2024-01-02"]})
         )
-        out = Table._merge_partition_filters(mock, "SELECT * FROM src", ["d"])
+        out = Table.merge_partition_filters(mock, "SELECT * FROM src")
         assert out == ["T.`d` IN ('2024-01-01', '2024-01-02')"]   # distinct + sorted
+
+    def test_unpartitioned_table_returns_no_filters(self):
+        from yggdrasil.databricks.table.table import Table
+        mock = self._mock_table(part_cols=())     # no partition columns
+        assert Table.merge_partition_filters(mock, "SELECT * FROM src") == []
+        mock.sql.execute.assert_not_called()      # no distinct query either
+
+    def test_placeholder_source_is_skipped(self):
+        from yggdrasil.databricks.table.table import Table
+        mock = self._mock_table()
+        # the sync arrow path carries a {__tmpsrc__} placeholder — not queryable
+        assert Table.merge_partition_filters(mock, "SELECT * FROM {__tmpsrc__}") == []
+        mock.collect_schema.assert_not_called()
 
     def test_null_partition_value_skips_pruning_for_that_column(self):
         from yggdrasil.databricks.table.table import Table
-        mock = MagicMock()
-        mock.sql.execute.return_value.to_arrow_table.return_value = pa.table(
-            {"d": ["a", None]}
-        )
+        mock = self._mock_table(distinct=pa.table({"d": ["a", None]}))
         # NULL wouldn't be matched by IN — drop the filter rather than risk a
         # wrong prune.
-        assert Table._merge_partition_filters(mock, "src", ["d"]) == []
+        assert Table.merge_partition_filters(mock, "src") == []
 
     def test_empty_source_yields_no_filters(self):
         from yggdrasil.databricks.table.table import Table
-        mock = MagicMock()
-        mock.sql.execute.return_value.to_arrow_table.return_value = pa.table(
-            {"d": pa.array([], pa.string())}
-        )
-        assert Table._merge_partition_filters(mock, "src", ["d"]) == []
+        mock = self._mock_table(distinct=pa.table({"d": pa.array([], pa.string())}))
+        assert Table.merge_partition_filters(mock, "src") == []
 
 
 # --------------------------------------------------------------------------- #
@@ -691,7 +708,7 @@ class TestEnsureAsyncJob:
         assert task.python_wheel_task.entry_point == "ygg"
         assert task.python_wheel_task.parameters == [
             "databricks", "table", "execute_async_insert",
-            "--logs", "/Volumes/c/s/t/.sql/async/logs", "--debug",
+            "--logs", "/Volumes/c/s/t/.sql/async/logs", "--debug", "--prune-partitions",
         ]
         # serverless v5 image shipped as the env, wired to the task
         env = kwargs["environments"][0]
@@ -838,14 +855,14 @@ class TestLoadAsync:
             processed = load_async(svc, logs, wait=False)
 
         assert processed == 2
-        # one insert_into load per (target, mode) group, with the union
-        target.insert_into.assert_called_once()
-        union = target.insert_into.call_args.args[0]
+        # one sql_insert load per (target, mode) group, with the union
+        target.sql_insert.assert_called_once()
+        union = target.sql_insert.call_args.args[0]
         assert "UNION ALL" in union
         # the uniform URL is resolved to the warehouse-facing path for the query
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in union
-        assert target.insert_into.call_args.kwargs["mode"] == "append"
+        assert target.sql_insert.call_args.kwargs["mode"] == "append"
         # consumed logs + data (reconstructed from the uniform URL) cleaned up
         log_a.unlink.assert_called_once()
         log_b.unlink.assert_called_once()
@@ -879,9 +896,9 @@ class TestLoadAsync:
         with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
             processed = load_async(svc, logs, wait=False)
         assert processed == 2
-        target.insert_into.assert_called_once()
-        sql = target.insert_into.call_args.args[0]
-        assert target.insert_into.call_args.kwargs["mode"] == "overwrite"
+        target.sql_insert.assert_called_once()
+        sql = target.sql_insert.call_args.args[0]
+        assert target.sql_insert.call_args.kwargs["mode"] == "overwrite"
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in sql
         assert "a.parquet" not in sql            # superseded — not in the load
         data_paths["dbfs+volume:/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
@@ -901,8 +918,8 @@ class TestLoadAsync:
 
         assert processed == 2
         assert set(tables) == {"c.s.t1", "c.s.t2"}
-        tables["c.s.t1"].insert_into.assert_called_once()
-        tables["c.s.t2"].insert_into.assert_called_once()
+        tables["c.s.t1"].sql_insert.assert_called_once()
+        tables["c.s.t2"].sql_insert.assert_called_once()
 
     def test_single_log_file_path_string(self):
         from yggdrasil.databricks.table.insert import load_async
@@ -916,7 +933,7 @@ class TestLoadAsync:
                    side_effect=lambda p, **k: log if p == "/logs/a.json" else MagicMock()):
             processed = load_async(svc, "/logs/a.json")
         assert processed == 1
-        target.insert_into.assert_called_once()
+        target.sql_insert.assert_called_once()
 
     def test_log_files_arg_skips_the_directory_scan(self):
         from yggdrasil.databricks.table.insert import load_async
@@ -928,7 +945,7 @@ class TestLoadAsync:
         with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
             processed = load_async(svc, log_files=[log_a, log_b], wait=False)
         assert processed == 2
-        target.insert_into.assert_called_once()   # one (target, mode) group
+        target.sql_insert.assert_called_once()   # one (target, mode) group
         log_a.unlink.assert_called_once()
         log_b.unlink.assert_called_once()
 
@@ -948,6 +965,6 @@ class TestLoadAsync:
         with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
             processed = dispatch_async(svc, ops)
         assert processed == 2
-        target.insert_into.assert_called_once()
-        union = target.insert_into.call_args.args[0]
+        target.sql_insert.assert_called_once()
+        union = target.sql_insert.call_args.args[0]
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union

@@ -3276,6 +3276,7 @@ class Table(DatabricksPath):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
+        partition_filters: Optional[list[str]] = None,
     ) -> "StatementBatch | Tabular | None":
         """Insert into this table from a SQL source query.
 
@@ -3331,7 +3332,8 @@ class Table(DatabricksPath):
             )
 
         batch = self._sql_insert_warehouse_fallback(
-            statement, schema_mode=schema_mode, cast_options=cast_options, **common,
+            statement, schema_mode=schema_mode, cast_options=cast_options,
+            partition_filters=partition_filters, **common,
         )
         if return_data and isinstance(statement, StatementResult):
             return statement
@@ -3353,8 +3355,15 @@ class Table(DatabricksPath):
         optimize_after_merge: bool,
         vacuum_hours: int | None,
         retry: Optional[WaitingConfigArg] = None,
+        partition_filters: Optional[list[str]] = None,
     ) -> "StatementBatch | None":
-        """Warehouse fallback for :meth:`sql_insert`."""
+        """Warehouse fallback for :meth:`sql_insert`.
+
+        ``partition_filters`` are literal ``T.<part> IN (...)`` predicates the
+        caller resolved up front; they're spliced into a native MERGE's ``ON``
+        to prune the target scan. The live/synchronous path passes none (no
+        extra distinct-values query); the async loader job computes and passes
+        them (see :meth:`merge_partition_filters` / ``dispatch_async``)."""
         from yggdrasil.databricks.warehouse import WarehousePreparedStatement
 
         base = statement.statement if isinstance(statement, StatementResult) else statement
@@ -3388,7 +3397,6 @@ class Table(DatabricksPath):
         existing_schema = self.collect_schema()
         fields = list(existing_schema.fields)
         columns = [f.name for f in fields]
-        partition_columns = [f.name for f in fields if getattr(f, "partition_by", False)]
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
@@ -3405,22 +3413,6 @@ class Table(DatabricksPath):
         prune_predicates = _build_where_predicates(
             cast_options.predicate, target_alias="T",
         )
-        # Partition pruning for a native MERGE: resolve the source's distinct
-        # partition values now and inline them as a literal ``IN`` on the ON, so
-        # Delta scans only the touched partitions. A MERGE search condition
-        # can't hold a subquery, so this must be literal — and the source has to
-        # be directly queryable (the staged-Parquet async path; the sync arrow
-        # path still carries a ``{__tmpsrc__}`` placeholder, so skip it there).
-        partition_filters: list[str] = []
-        if (
-            partition_columns
-            and match_by
-            and mode_enum in (Mode.MERGE, Mode.UPSERT, Mode.APPEND, Mode.AUTO)
-            and "{" not in source_sql
-        ):
-            partition_filters = self._merge_partition_filters(
-                source_sql, partition_columns,
-            )
         sql_texts = _build_dml_statements(
             target_location=target_location,
             source_sql=source_sql,
@@ -3470,24 +3462,36 @@ class Table(DatabricksPath):
             engine=engine,
         )
 
-    def _merge_partition_filters(
-        self, source_sql: str, partition_columns: list[str],
-    ) -> list[str]:
+    def merge_partition_filters(self, source_sql: str) -> list[str]:
         """Literal ``T.<part> IN (...)`` predicates (one per partition column)
-        for a MERGE's ``ON``, resolved from the source's distinct partition
-        values.
+        for a MERGE's ``ON``, resolved by **listing the source's distinct
+        partition values**.
 
-        Runs one bounded ``GROUP BY`` over the source to collect the distinct
-        partition values, then renders them as SQL literals so Delta can prune
-        the target scan to the touched partitions. A column is skipped (no
-        pruning, never a wrong filter) when the source has a NULL partition
-        value there or any value can't be safely rendered. Returns ``[]`` on an
-        empty source.
+        Derives the target's partition columns, runs one bounded ``GROUP BY``
+        over *source_sql* to collect their distinct values, and renders them as
+        SQL literals so Delta prunes the target scan to the touched partitions.
+        A MERGE search condition can't hold a subquery, so the values must be
+        listed explicitly like this.
+
+        Returns ``[]`` when the table isn't partitioned, the source isn't
+        directly queryable (a ``{…}`` placeholder, e.g. the sync arrow path), or
+        a partition value is NULL / unrenderable (no pruning, never a wrong
+        filter). **Intended for the async loader job** — the live/synchronous
+        insert path doesn't call it, so interactive merges pay no extra query.
 
         Note: like any partition-pruned MERGE this assumes a key doesn't move
         partitions between target and source — if it did, the pruned-away target
         row wouldn't match and the source row would insert as a duplicate.
         """
+        if "{" in source_sql:
+            return []
+        partition_columns = [
+            f.name for f in self.collect_schema().fields
+            if getattr(f, "partition_by", False)
+        ]
+        if not partition_columns:
+            return []
+
         cols = ", ".join(quote_ident(c) for c in partition_columns)
         try:
             rows = self.sql.execute(

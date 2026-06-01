@@ -62,6 +62,12 @@ class TablesCommand:
             help="Print each target's file count, mode, keys, and the generated "
                  "SQL to stdout (captured in the job run's output).",
         )
+        ex.add_argument(
+            "--prune-partitions", dest="prune_partitions", action="store_true",
+            help="For a keyed MERGE into a partitioned target, list the source's "
+                 "distinct partition values and add them as a literal IN filter "
+                 "on the MERGE ON (prunes the target scan). Costs one extra query.",
+        )
         ex.set_defaults(handler=cls._execute_async_insert)
 
         parser.set_defaults(handler=lambda args, bc: parser.print_help() or 1)
@@ -102,6 +108,7 @@ class TablesCommand:
         n = load_async(
             client.tables, logs=args.logs, log_files=args.log_files or None,
             wait=True, debug=getattr(args, "debug", False),
+            prune_partitions=getattr(args, "prune_partitions", False),
         )
         sys.stdout.write(f"executed {n} pending operation(s)\n")
         return 0

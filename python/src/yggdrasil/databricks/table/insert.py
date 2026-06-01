@@ -1105,6 +1105,7 @@ def load_async(
     wait: Any = True,
     limit: "int | None" = None,
     debug: bool = False,
+    prune_partitions: bool = False,
 ) -> int:
     """Run the async loader over pending op-logs — group, aggregate, load, clean.
 
@@ -1154,7 +1155,9 @@ def load_async(
         if limit is not None and len(ops) >= limit:
             break
 
-    return dispatch_async(tables, ops, wait=wait, debug=debug)
+    return dispatch_async(
+        tables, ops, wait=wait, debug=debug, prune_partitions=prune_partitions,
+    )
 
 
 def _emit(message: str) -> None:
@@ -1166,15 +1169,27 @@ def _emit(message: str) -> None:
 
 
 def dispatch_async(
-    tables: Any, ops: "Iterable[Any]", *, wait: Any = True, debug: bool = False,
+    tables: Any,
+    ops: "Iterable[Any]",
+    *,
+    wait: Any = True,
+    debug: bool = False,
+    prune_partitions: bool = False,
 ) -> int:
     """Group parsed ops by target into a :class:`DatabricksInsertBatch` and load
-    each through the target's ``insert_into`` (one aggregated body per target),
+    each through the target's ``sql_insert`` (one aggregated body per target),
     clearing the consumed logs + data afterward. Returns the op count.
 
-    ``debug=True`` prints, per target, the file count, mode, keys, and the
-    generated SQL to **stdout** — so a deployed loader job's run captures it (see
-    ``JobRun.stdout`` / ``JobRun.debug``) and you can see exactly what ran."""
+    ``prune_partitions=True`` — for a keyed MERGE into a partitioned target,
+    list the source's distinct partition values and add them as a literal ``IN``
+    filter on the MERGE ``ON`` (``Table.merge_partition_filters``) so the scan is
+    pruned. Off by default: this costs one extra distinct-values query, so only
+    the **deployed loader job** turns it on — the live / synchronous execute
+    path merges without it.
+
+    ``debug=True`` prints, per target, the file count, mode, keys, partition
+    filters, and the generated SQL to **stdout** — so a deployed loader job's run
+    captures it (see ``JobRun.stdout`` / ``JobRun.debug``)."""
     client = tables.client
     batches = DatabricksInsertBatch.group(ops)
     if not batches:
@@ -1188,6 +1203,13 @@ def dispatch_async(
         target = tables[target_name]
         mode = batch.mode
         sql = batch.make_sql(client)
+
+        # On the job only: list the source's distinct partition values and build
+        # explicit literal MERGE filters. Skipped on the live/execute path.
+        partition_filters: list[str] = []
+        if prune_partitions and batch.match_by:
+            partition_filters = target.merge_partition_filters(sql)
+
         logger.info(
             "loading %d file(s) into %s (%s)",
             len(batch.active), target_name, mode.name.lower(),
@@ -1195,12 +1217,14 @@ def dispatch_async(
         if debug:
             _emit(
                 f"[async-load] {target_name}: {len(batch.active)} file(s), "
-                f"mode={mode.name.lower()}, match_by={batch.match_by}"
+                f"mode={mode.name.lower()}, match_by={batch.match_by}, "
+                f"partition_filters={partition_filters or None}"
             )
             _emit(f"[async-load] {target_name} source SQL:\n{sql}")
         # The batch is the single place the load source is generated.
-        target.insert_into(
+        target.sql_insert(
             sql, mode=mode.name.lower(), match_by=batch.match_by, wait=wait,
+            partition_filters=partition_filters or None,
         )
         if debug:
             _emit(f"[async-load] {target_name}: loaded {len(batch.active)} file(s)")
@@ -1288,7 +1312,7 @@ def ensure_async_job(
                     entry_point="ygg",
                     parameters=[
                         "databricks", "table", "execute_async_insert",
-                        "--logs", logs.full_path(), "--debug",
+                        "--logs", logs.full_path(), "--debug", "--prune-partitions",
                     ],
                 ),
             )

@@ -194,9 +194,10 @@ class TestAsyncInsertModes(_AsyncFixture):
             self.skipTest(f"cannot create partitioned table: {exc}")
 
         tbl = self.client.tables.table(name)
-        # the partition filter is literal (no subquery — invalid in a MERGE ON)
+        # the partition filter is literal (no subquery — invalid in a MERGE ON),
+        # derived by listing the source's distinct partition values
         self.assertEqual(
-            tbl._merge_partition_filters("SELECT 'x' AS d", ["d"]),
+            tbl.merge_partition_filters("SELECT 'x' AS d"),
             ["T.`d` IN ('x')"],
         )
 
@@ -204,7 +205,9 @@ class TestAsyncInsertModes(_AsyncFixture):
             tbl, _pdata([(2, "2024-01-02", 22.0), (3, "2024-01-03", 33.0)]),
             mode=Mode.MERGE, match_by=["id"],
         )
-        load_async(self.client.tables, logs_path(tbl), wait=True)
+        # prune_partitions=True → the loader lists distinct values + filters the
+        # MERGE (as the deployed job does); the live path would skip it.
+        load_async(self.client.tables, logs_path(tbl), wait=True, prune_partitions=True)
 
         rows = {
             x["id"]: (x["d"], x["v"])
