@@ -143,6 +143,15 @@ def _coerce_to_url_str(value: Any) -> Any:
     """
     if not isinstance(value, str):
         return value
+    # Unity Catalog paths use forward slashes only. A path built on Windows
+    # (``os.path.join`` / ``pathlib`` under ``os.sep == '\\'``) can carry
+    # backslash separators — normalize them so the write, the read, and the
+    # metadata HEAD all key the same object instead of diverging into a
+    # literal-backslash key (a classic "uploaded file is corrupt / unreadable"
+    # cause). Only rewrite when the result is a recognized Databricks path, so
+    # genuine Windows *local* paths are left for their own backend.
+    if "\\" in value and _looks_like_posix(value.replace("\\", "/")):
+        value = value.replace("\\", "/")
     if _looks_like_posix(value):
         scheme, path = _parse_posix(value)
         return f"{scheme}://{path}"

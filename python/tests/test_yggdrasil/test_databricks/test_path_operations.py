@@ -174,6 +174,19 @@ class TestPosixCoercion:
         assert _coerce_to_url_str("https://example.com/x") == "https://example.com/x"
         assert _coerce_to_url_str(42) == 42
 
+    def test_coerce_normalizes_windows_backslashes_in_uc_path(self):
+        # A path built on Windows (os.sep == '\\') must collapse to forward
+        # slashes so write / read / metadata all key the same object.
+        assert (
+            _coerce_to_url_str("/Volumes/cat/sch/vol/a\\b\\c.parquet")
+            == f"{Scheme.DATABRICKS_VOLUME.value}:///cat/sch/vol/a/b/c.parquet"
+        )
+
+    def test_coerce_leaves_non_databricks_backslash_paths_alone(self):
+        # A genuine Windows *local* path isn't a UC path — leave it for its
+        # own backend rather than rewriting its separators.
+        assert _coerce_to_url_str("C:\\Users\\me\\x.parquet") == "C:\\Users\\me\\x.parquet"
+
 
 # ===========================================================================
 # dbfs:// family prefix expansion
