@@ -77,6 +77,71 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+#: Placeholder column-name prefix pyarrow uses for pandas index levels
+#: that had no ``name`` on the source DataFrame (``__index_level_0__``
+#: for an unnamed top level, ``__index_level_1__`` for the second level
+#: of a partially-named MultiIndex, …). On read we map these back to
+#: ``None`` so the round-trip matches the source.
+_INDEX_PLACEHOLDER_PREFIX: str = "__index_level_"
+
+
+def _is_default_range_index(frame: "pandas.DataFrame") -> bool:
+    """Is this the freebie ``RangeIndex(0, len(df), 1, name=None)``?
+
+    Default pandas indexes carry no information the read side has to
+    recover — ``to_pandas()`` synthesises the same range from scratch.
+    Skipping preservation for this case avoids writing a synthetic
+    ``__index_level_0__`` column that would just hold ``0, 1, …, n-1``.
+    Every *other* index (named, non-zero start / non-unit step, or an
+    arbitrary label set like ``[5, 3, 1]``) carries information and
+    MUST be persisted so it round-trips on read.
+    """
+    idx = frame.index
+    return (
+        type(idx).__name__ == "RangeIndex"
+        and idx.name is None
+        and getattr(idx, "start", 0) == 0
+        and getattr(idx, "step", 1) == 1
+        and getattr(idx, "stop", 0) == len(frame)
+    )
+
+
+def _collect_index_levels(schema: pa.Schema) -> "list[tuple[int, str]]":
+    """Extract pandas index levels from yggdrasil tags or ``b"pandas"`` metadata.
+
+    Returns ``(level_position, column_name)`` pairs. Prefers the
+    ``index_key`` / ``index_key_level`` per-field tags written by
+    :func:`_tag_index_columns`; falls back to pyarrow's ``b"pandas"``
+    JSON blob's ``index_columns`` when those are absent — so files
+    produced by ``pandas.to_parquet`` / ``pandas.to_feather``, Spark,
+    or other tools still restore their index on read.
+    """
+    import yggdrasil.pickle.json as ygg_json
+
+    levels: "list[tuple[int, str]]" = []
+    for f in schema:
+        meta = f.metadata
+        if not meta or not meta.get(_Field._TAG_KEY_INDEX_KEY):
+            continue
+        raw_level = meta.get(_Field._TAG_KEY_INDEX_KEY_LEVEL)
+        try:
+            pos = int(raw_level) if raw_level is not None else 0
+        except (TypeError, ValueError):
+            pos = 0
+        levels.append((pos, f.name))
+    if levels:
+        return levels
+
+    raw = (schema.metadata or {}).get(b"pandas")
+    if not raw:
+        return levels
+    pmeta = ygg_json.loads(raw)
+    for pos, entry in enumerate(pmeta.get("index_columns", ())):
+        if isinstance(entry, str):
+            levels.append((pos, entry))
+    return levels
+
+
 def _tag_index_columns(table: pa.Table) -> pa.Table:
     """Stamp ``index_key`` + ``index_key_level`` on pandas index columns."""
     raw = (table.schema.metadata or {}).get(b"pandas")
@@ -1606,28 +1671,31 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         )
 
     def _read_pandas_frame(self, options: O) -> "pandas.DataFrame":
+        """Read the table and restore the pandas index it was written with.
+
+        Index levels are recovered from yggdrasil's ``index_key`` /
+        ``index_key_level`` per-field tags (written by
+        :meth:`_write_pandas_frame`), falling back to pyarrow's
+        ``b"pandas"`` ``index_columns`` blob for files produced by other
+        tools — see :func:`_collect_index_levels`. Tagged columns are
+        promoted into the index in level order; ``__index_level_N__``
+        placeholders map back to the unnamed levels they came from.
+        """
         table = self._read_arrow_table(options)
         df = table.to_pandas()
-        levels: list[tuple[int, str]] = []
-        for f in table.schema:
-            meta = f.metadata
-            if not meta or not meta.get(_Field._TAG_KEY_INDEX_KEY):
-                continue
-            raw_level = meta.get(_Field._TAG_KEY_INDEX_KEY_LEVEL)
-            try:
-                pos = int(raw_level) if raw_level is not None else 0
-            except (TypeError, ValueError):
-                pos = 0
-            levels.append((pos, f.name))
-        if levels:
-            levels.sort()
-            names = [name for _, name in levels]
-            df = df.set_index(names)
-            df.index.names = [
-                None if isinstance(n, str) and n.startswith("__index_level_")
-                else n
-                for n in df.index.names
-            ]
+        levels = _collect_index_levels(table.schema)
+        if not levels:
+            return df
+        levels.sort()
+        present = [name for _, name in levels if name in df.columns]
+        if not present:
+            return df
+        df = df.set_index(present)
+        df.index.names = [
+            None if isinstance(n, str) and n.startswith(_INDEX_PLACEHOLDER_PREFIX)
+            else n
+            for n in df.index.names
+        ]
         return df
 
     def write_pandas_frame(
@@ -1639,7 +1707,16 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         self._write_pandas_frame(frame, self.check_options(options, overrides=locals()))
 
     def _write_pandas_frame(self, frame: "pandas.DataFrame", options: O) -> None:
-        include_index = any(n is not None for n in frame.index.names)
+        # Persist every index that carries information so it round-trips
+        # on read — named, non-trivial RangeIndex, or an arbitrary label
+        # set (``[5, 3, 1]``). Only the freebie ``RangeIndex(0, n, 1)``
+        # is dropped: ``to_pandas`` regenerates it for free. ``any(name
+        # is not None)`` used to gate this, which silently lost every
+        # fully-unnamed non-default index (e.g. a sliced / reordered
+        # frame) — ``preserve_index`` then materialises the levels as
+        # ``__index_level_N__`` columns that :func:`_tag_index_columns`
+        # marks and :meth:`_read_pandas_frame` restores.
+        include_index = not _is_default_range_index(frame)
 
         fast_casted: "pa.Table | None" = None
         target = getattr(options, "target", None)
