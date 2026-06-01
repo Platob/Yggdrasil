@@ -61,3 +61,38 @@ def test_catalog_create_is_idempotent_and_has_no_parent():
     with patch.object(UCCatalog, "read_infos", return_value=object()):
         assert c.create() is c
     uc.create.assert_not_called()
+
+
+def test_catalog_schema_volume_intern_per_coords():
+    # Each resource is a Singleton keyed by (client, coords) so the cached
+    # info / parent-create state is shared — repeated lookups hand back the
+    # same instance instead of flooding the API.
+    from yggdrasil.databricks.volume.volume import Volume
+
+    for cls in (UCCatalog, UCSchema, Volume):
+        cls._INSTANCES.clear()
+    svc = MagicMock()
+    svc.client.base_url.host = "example.cloud.databricks.com"
+
+    assert UCCatalog(service=svc, catalog_name="c") is UCCatalog(
+        service=svc, catalog_name="c"
+    )
+    assert UCSchema(service=svc, catalog_name="c", schema_name="s") is UCSchema(
+        service=svc, catalog_name="c", schema_name="s"
+    )
+    assert Volume(
+        service=svc, catalog_name="c", schema_name="s", volume_name="v"
+    ) is Volume(service=svc, catalog_name="c", schema_name="s", volume_name="v")
+
+
+def test_schema_create_then_create_again_does_not_reflood():
+    # After a successful create caches the info, a second create on the same
+    # singleton short-circuits (no second ``schemas.create``).
+    UCSchema._INSTANCES.clear()
+    s = _schema()
+    uc = s.client.workspace_client().schemas
+    uc.create.return_value = object()
+    with patch.object(UCSchema, "read_infos", side_effect=[None, object()]):
+        s.create()
+        s.create()
+    uc.create.assert_called_once()

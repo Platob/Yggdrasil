@@ -1251,6 +1251,26 @@ class TestVolumeAutoCreate:
             p.write_bytes(b"x")
         workspace.volumes.create.assert_not_called()
 
+    def test_recovery_reuses_singleton_cache_no_reflood(
+        self, workspace, client, service
+    ) -> None:
+        # Recovery routes through the idempotent ``Volume.create``. Once the
+        # first pass creates the volume, the ``Volume`` singleton caches its
+        # info, so a second recovery pass short-circuits on the cached read
+        # and does NOT re-hit ``volumes.create`` — no API flood.
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
+        )
+        workspace.volumes.create.return_value = _volume_info()
+
+        p = VolumePath("/Volumes/cat/sch/vol/sub/file.bin", service=service)
+        p._ensure_volume()
+        p._ensure_volume()
+
+        workspace.volumes.create.assert_called_once()
+        # second pass never even re-read — the cached info answered it
+        assert workspace.volumes.read.call_count == 1
+
 
 class TestTransportResilience:
     """Reads / writes now flow over yggdrasil's :class:`HTTPSession`, which
