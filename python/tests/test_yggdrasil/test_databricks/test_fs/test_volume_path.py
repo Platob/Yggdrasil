@@ -17,6 +17,7 @@ a stubbed socket layer.
 from __future__ import annotations
 
 import io
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -2185,3 +2186,78 @@ class TestUploadVolumeRecovery:
         with pytest.raises(ValueError):
             p._upload_call_ensuring_volume(do_upload)
         assert state["ensure"] == 0
+
+    def test_retries_over_volume_visibility_window(self, service, monkeypatch):
+        # ``ensure_created`` returns but the Files edge keeps 404-ing
+        # "Volume ... does not exist" for a few attempts (eventual
+        # consistency). The recovery must keep retrying — not give up after
+        # one — until the just-created volume becomes visible.
+        from yggdrasil.databricks.volume.volume import Volume
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        monkeypatch.setattr(Volume, "ensure_created", lambda self, **_kw: self)
+
+        state = {"attempts": 0}
+
+        def do_upload():
+            state["attempts"] += 1
+            # Pre-ensure transport drop, then not-yet-visible 404s, then OK.
+            if state["attempts"] == 1:
+                raise OSError("EOF occurred in violation of protocol")
+            if state["attempts"] <= 4:
+                raise FileNotFoundError("Volume 'c.s.v' does not exist.")
+
+        p = VolumePath("/Volumes/c/s/v/z.bin", service=service)
+        p._upload_call_ensuring_volume(do_upload)
+
+        # One transport drop + several invisible-volume 404s before success —
+        # the old single-shot retry would have raised on attempt 2.
+        assert state["attempts"] == 5
+
+    def test_retry_until_visible_backs_off_then_succeeds(self, service, monkeypatch):
+        # Pin the helper's backoff sequence directly: capped exponential
+        # sleeps between not-found retries, no sleep after the success.
+        sleeps: list[float] = []
+        monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+        state = {"calls": 0}
+
+        def op():
+            state["calls"] += 1
+            if state["calls"] <= 3:
+                raise FileNotFoundError("Volume 'c.s.v' does not exist.")
+
+        p = VolumePath("/Volumes/c/s/v/z.bin", service=service)
+        p._retry_until_volume_visible(op)
+
+        assert state["calls"] == 4
+        assert sleeps == [0.5, 1.0, 2.0]      # capped exponential backoff
+
+    def test_visibility_window_exhausts_and_reraises(self, service, monkeypatch):
+        # If the volume never becomes visible the last not-found surfaces
+        # rather than looping forever.
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        monkeypatch.setattr(VolumePath, "VOLUME_VISIBILITY_RETRIES", 3)
+
+        def op():
+            raise FileNotFoundError("Volume 'c.s.v' does not exist.")
+
+        p = VolumePath("/Volumes/c/s/v/z.bin", service=service)
+        with pytest.raises(FileNotFoundError):
+            p._retry_until_volume_visible(op)
+
+    def test_visibility_retry_surfaces_non_not_found_immediately(
+        self, service, monkeypatch
+    ):
+        # A non-not-found error is deterministic — surface it at once, no
+        # sleeping, no looping.
+        sleeps: list[float] = []
+        monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+        def op():
+            raise ValueError("permission or logic error")
+
+        p = VolumePath("/Volumes/c/s/v/z.bin", service=service)
+        with pytest.raises(ValueError):
+            p._retry_until_volume_visible(op)
+        assert sleeps == []

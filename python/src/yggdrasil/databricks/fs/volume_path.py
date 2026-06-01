@@ -198,6 +198,18 @@ class VolumePath(DatabricksPath):
     # write never materialises whole in memory.
     SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = True
 
+    # Volume visibility window. Creating a UC volume is *not* immediately
+    # consistent with the Files API: ``volumes.create`` returns, but the
+    # next ``PUT /files`` / ``create_directory`` can still 404 with
+    # "Volume ... does not exist" for a second or two while the edge
+    # catches up. After an :meth:`Volume.ensure_created` recovery we retry
+    # the write up to ``VOLUME_VISIBILITY_RETRIES`` times with capped
+    # exponential backoff so a single ``write_bytes`` no longer races the
+    # propagation the way the old single-shot retry did.
+    VOLUME_VISIBILITY_RETRIES: ClassVar[int] = 6
+    VOLUME_VISIBILITY_BASE_SLEEP: ClassVar[float] = 0.5
+    VOLUME_VISIBILITY_MAX_SLEEP: ClassVar[float] = 4.0
+
     # ``_SERVICE_CLASS`` is bound below the class body to avoid the
     # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
     # import cycle.
@@ -966,16 +978,51 @@ class VolumePath(DatabricksPath):
                 # mkdir NotFounded — the volume itself is missing; fall through.
 
         # Second: create the volume (and any missing catalog / schema), then
-        # retry the directory create.
+        # retry the directory create — looping over the visibility window so a
+        # just-created volume that the Files edge hasn't caught up to yet
+        # doesn't fail the recovery on the first immediate retry.
         self.volume.ensure_created()
 
         if has_subdir:
-            try:
-                self._create_directory(parent.api_path)
-            except Exception as inner:
-                if not _looks_like_already_exists(inner):
-                    raise
+            def _mkdir() -> None:
+                try:
+                    self._create_directory(parent.api_path)
+                except Exception as inner:
+                    if not _looks_like_already_exists(inner):
+                        raise
+
+            self._retry_until_volume_visible(_mkdir)
         return True
+
+    def _retry_until_volume_visible(self, op) -> None:
+        """Run *op*, absorbing the post-create volume-visibility window.
+
+        :meth:`Volume.ensure_created` returns as soon as Unity Catalog has the
+        volume, but the Files API edge can keep 404-ing "Volume ... does not
+        exist" for a second or two afterwards (eventual consistency). Retry
+        *op* up to :attr:`VOLUME_VISIBILITY_RETRIES` times with capped
+        exponential backoff while the failure still looks like that
+        not-yet-visible volume; surface any other error immediately, and
+        re-raise the last not-found once the window is exhausted.
+        """
+        sleep = self.VOLUME_VISIBILITY_BASE_SLEEP
+        for attempt in range(self.VOLUME_VISIBILITY_RETRIES):
+            try:
+                op()
+                return
+            except Exception as exc:
+                if not _looks_like_not_found(exc):
+                    raise
+                if attempt == self.VOLUME_VISIBILITY_RETRIES - 1:
+                    raise
+                logger.warning(
+                    "Volume %r not visible to the Files API yet (attempt "
+                    "%d/%d) — sleeping %.1fs before retrying: %s",
+                    self, attempt + 1, self.VOLUME_VISIBILITY_RETRIES,
+                    sleep, exc,
+                )
+                time.sleep(sleep)
+                sleep = min(sleep * 2, self.VOLUME_VISIBILITY_MAX_SLEEP)
 
     # ==================================================================
     # Mutators
@@ -1287,7 +1334,9 @@ class VolumePath(DatabricksPath):
         instead of returning a clean 404 when the target volume doesn't exist —
         and that transport error never trips the NotFound recovery. So on an
         ``HTTPError`` / ``OSError`` from the upload, ensure the volume exists
-        (idempotent :meth:`Volume.ensure_created`) and retry exactly once.
+        (idempotent :meth:`Volume.ensure_created`) and retry over the volume
+        visibility window — a freshly-created volume isn't immediately visible
+        to the Files edge, so a single immediate retry races the propagation.
         """
         try:
             self._call_ensuring_parents(do_upload)
@@ -1296,10 +1345,12 @@ class VolumePath(DatabricksPath):
                 raise  # not a volume path — nothing to ensure
             logger.warning(
                 "Upload of %r failed at the transport layer (%s) — ensuring the "
-                "volume exists and retrying once.", self, exc,
+                "volume exists and retrying.", self, exc,
             )
             self.volume.ensure_created()
-            self._call_ensuring_parents(do_upload)
+            self._retry_until_volume_visible(
+                lambda: self._call_ensuring_parents(do_upload)
+            )
 
     def _upload(self, content: Any) -> int:
         """Upload *content* via ``PUT /api/2.0/fs/files`` (overwrite).
