@@ -1254,18 +1254,18 @@ class TestVolumeAutoCreate:
     def test_recovery_reuses_singleton_cache_no_reflood(
         self, workspace, client, service
     ) -> None:
-        # Recovery routes through the idempotent ``Volume.create``. Once the
-        # first pass creates the volume, the ``Volume`` singleton caches its
-        # info, so a second recovery pass short-circuits on the cached read
-        # and does NOT re-hit ``volumes.create`` — no API flood.
+        # Recovery routes through the idempotent ``Volume.ensure_created``.
+        # Once the first pass creates the volume, the ``Volume`` singleton
+        # caches its info, so a second recovery pass short-circuits on the
+        # cached read and does NOT re-hit ``volumes.create`` — no API flood.
         workspace.volumes.read.side_effect = NotFound(
             "Volume 'cat.sch.vol' does not exist"
         )
         workspace.volumes.create.return_value = _volume_info()
 
         p = VolumePath("/Volumes/cat/sch/vol/sub/file.bin", service=service)
-        p._ensure_volume()
-        p._ensure_volume()
+        p.volume.ensure_created()
+        p.volume.ensure_created()
 
         workspace.volumes.create.assert_called_once()
         # second pass never even re-read — the cached info answered it
@@ -2133,6 +2133,7 @@ class TestUploadVolumeRecovery:
 
     def test_transport_error_ensures_volume_then_retries(self, service, monkeypatch):
         from yggdrasil.http_.exceptions import MaxRetryError
+        from yggdrasil.databricks.volume.volume import Volume
 
         state = {"attempts": 0, "ensure": 0}
 
@@ -2145,8 +2146,8 @@ class TestUploadVolumeRecovery:
                 )
 
         monkeypatch.setattr(
-            VolumePath, "_ensure_volume",
-            lambda self: state.__setitem__("ensure", state["ensure"] + 1) or True,
+            Volume, "ensure_created",
+            lambda self, **_kw: state.__setitem__("ensure", state["ensure"] + 1) or self,
         )
         p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
         p._upload_call_ensuring_volume(do_upload)
@@ -2156,10 +2157,12 @@ class TestUploadVolumeRecovery:
 
     def test_non_transport_error_does_not_create_volume(self, service, monkeypatch):
         # A logic / permission error is not a missing volume — don't create it.
+        from yggdrasil.databricks.volume.volume import Volume
+
         state = {"ensure": 0}
         monkeypatch.setattr(
-            VolumePath, "_ensure_volume",
-            lambda self: state.__setitem__("ensure", state["ensure"] + 1),
+            Volume, "ensure_created",
+            lambda self, **_kw: state.__setitem__("ensure", state["ensure"] + 1) or self,
         )
 
         def do_upload():

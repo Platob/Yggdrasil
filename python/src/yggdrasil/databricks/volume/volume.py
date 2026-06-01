@@ -739,15 +739,15 @@ class Volume(DatabricksPath):
         storage_location: str | None = None,
         volume_type: Any = None,
     ) -> "Volume":
-        """Create this volume if it does not already exist, then return ``self``."""
-        if not self.exists():
-            self.create(
-                comment=comment,
-                storage_location=storage_location,
-                volume_type=volume_type,
-                missing_ok=True,
-            )
-        return self
+        """Create this volume (and any missing parents) if it doesn't exist,
+        then return ``self``. :meth:`create` is itself idempotent and ensures
+        the parents on a not-found, so this is just a named alias."""
+        return self.create(
+            comment=comment,
+            storage_location=storage_location,
+            volume_type=volume_type,
+            missing_ok=True,
+        )
 
     def delete(
         self,

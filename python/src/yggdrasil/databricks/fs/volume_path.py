@@ -939,9 +939,10 @@ class VolumePath(DatabricksPath):
         ``files.create_directory`` on the parent fixes the common
         case (only a sub-directory was missing). If that also
         NotFounds — or if *exc* already named the volume as
-        missing — fall back to :meth:`_ensure_volume` and retry
-        the parent ``mkdir``. Blind creates swallow ``AlreadyExists``
-        so the idempotent path costs at most three SDK calls.
+        missing — fall back to the idempotent :meth:`Volume.ensure_created`
+        (which creates the volume and any missing catalog / schema, then
+        retries once) and retry the parent ``mkdir``. Blind creates swallow
+        ``AlreadyExists`` so the idempotent path costs at most three SDK calls.
         """
         triple = self._split_volume()
         if triple is None:
@@ -964,7 +965,7 @@ class VolumePath(DatabricksPath):
                 # Parent missing because volume itself is missing —
                 # fall through to volume creation.
 
-        self._ensure_volume()
+        self.volume.ensure_created()
 
         if has_subdir:
             try:
@@ -972,20 +973,6 @@ class VolumePath(DatabricksPath):
             except Exception as inner:
                 if not _looks_like_already_exists(inner):
                     raise
-        return True
-
-    def _ensure_volume(self) -> bool:
-        """Create the missing volume (and any missing catalog / schema).
-
-        Routes through the idempotent :meth:`Volume.create`, which reads
-        first, applies the managed-volume-type default, swallows a
-        concurrent ``AlreadyExists`` (``missing_ok=True``), and — if the
-        create NotFounds because the schema (or, through it, the catalog)
-        is missing — creates the parents and retries once.
-        """
-        if self._split_volume() is None:
-            return False
-        self.volume.create(missing_ok=True)
         return True
 
     # ==================================================================
@@ -1298,16 +1285,18 @@ class VolumePath(DatabricksPath):
         instead of returning a clean 404 when the target volume doesn't exist —
         and that transport error never trips the NotFound recovery. So on an
         ``HTTPError`` / ``OSError`` from the upload, ensure the volume exists
-        (idempotent :meth:`Volume.create`) and retry exactly once.
+        (idempotent :meth:`Volume.ensure_created`) and retry exactly once.
         """
         try:
             self._call_ensuring_parents(do_upload)
         except (HTTPError, OSError) as exc:
+            if self._split_volume() is None:
+                raise  # not a volume path — nothing to ensure
             logger.warning(
                 "Upload of %r failed at the transport layer (%s) — ensuring the "
                 "volume exists and retrying once.", self, exc,
             )
-            self._ensure_volume()
+            self.volume.ensure_created()
             self._call_ensuring_parents(do_upload)
 
     def _upload(self, content: Any) -> int:
