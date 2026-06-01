@@ -611,6 +611,24 @@ class TestStageAsyncInsert:
         with pytest.raises(ValueError, match="list of key columns"):
             stage_async_insert(t, object(), mode="merge", match_by="id")
 
+    def test_log_does_not_persist_schema_or_partition_columns(self):
+        # Partition columns (and the schema) are NEVER baked into the op-log —
+        # the loader refetches the live partition layout in the job. The log
+        # carries only the keys + staged data location.
+        from yggdrasil.databricks.table.insert import stage_async_insert
+        t = _table_mock()
+        data_file = MagicMock()
+        data_file.to_url.return_value.to_string.return_value = "dbfs+volume:/x.parquet"
+        t.insert_volume_path.return_value = data_file
+        logs_dir, log_file = MagicMock(), MagicMock()
+        logs_dir.__truediv__.return_value = log_file
+        with patch("yggdrasil.databricks.table.insert.logs_path", lambda tbl: logs_dir):
+            stage_async_insert(t, {"a": [1]}, mode="merge", match_by=["id"])
+        payload = json.loads(log_file.write_bytes.call_args[0][0])
+        assert "schema" not in payload
+        assert "partition" not in json.dumps(payload).lower()
+        assert payload["match_by"] == ["id"]      # keys are carried, partitions aren't
+
     def test_writes_parquet_to_staging_and_logs_its_uniform_url(self):
         from yggdrasil.databricks.table.insert import stage_async_insert
         t = _table_mock()

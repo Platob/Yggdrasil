@@ -3485,6 +3485,12 @@ class Table(DatabricksPath):
         """
         if "{" in source_sql:
             return []
+        # Refetch the live partition layout from the table — the partition
+        # columns are NEVER persisted in the op-log or any other metadata
+        # (the async drop carries no schema), so the loader reads them fresh
+        # from the table in the job. Drop the cached infos first so an altered
+        # partitioning is picked up even on a long-lived table handle.
+        self.invalidate_singleton()
         partition_columns = [
             f.name for f in self.collect_schema().fields
             if getattr(f, "partition_by", False)
