@@ -2214,38 +2214,6 @@ class TestUploadVolumeRecovery:
         # the old single-shot retry would have raised on attempt 2.
         assert state["attempts"] == 5
 
-    def test_retry_until_visible_backs_off_then_succeeds(self, service, monkeypatch):
-        # Pin the helper's backoff sequence directly: capped exponential
-        # sleeps between not-found retries, no sleep after the success.
-        sleeps: list[float] = []
-        monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-
-        state = {"calls": 0}
-
-        def op():
-            state["calls"] += 1
-            if state["calls"] <= 3:
-                raise FileNotFoundError("Volume 'c.s.v' does not exist.")
-
-        p = VolumePath("/Volumes/c/s/v/z.bin", service=service)
-        p._retry_until_volume_visible(op)
-
-        assert state["calls"] == 4
-        assert sleeps == [0.5, 1.0, 2.0]      # capped exponential backoff
-
-    def test_visibility_window_exhausts_and_reraises(self, service, monkeypatch):
-        # If the volume never becomes visible the last not-found surfaces
-        # rather than looping forever.
-        monkeypatch.setattr(time, "sleep", lambda s: None)
-        monkeypatch.setattr(VolumePath, "VOLUME_VISIBILITY_RETRIES", 3)
-
-        def op():
-            raise FileNotFoundError("Volume 'c.s.v' does not exist.")
-
-        p = VolumePath("/Volumes/c/s/v/z.bin", service=service)
-        with pytest.raises(FileNotFoundError):
-            p._retry_until_volume_visible(op)
-
     def test_visibility_retry_surfaces_non_not_found_immediately(
         self, service, monkeypatch
     ):

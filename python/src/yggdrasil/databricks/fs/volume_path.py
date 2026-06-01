@@ -1013,16 +1013,22 @@ class VolumePath(DatabricksPath):
             except Exception as exc:
                 if not _looks_like_not_found(exc):
                     raise
-                if attempt == self.VOLUME_VISIBILITY_RETRIES - 1:
+
+                message = str(exc)
+
+                if "olume" in message and "not exist" in message:
+                    self.volume.create(refresh=True)
+                elif attempt == self.VOLUME_VISIBILITY_RETRIES - 1:
                     raise
-                logger.warning(
-                    "Volume %r not visible to the Files API yet (attempt "
-                    "%d/%d) — sleeping %.1fs before retrying: %s",
-                    self, attempt + 1, self.VOLUME_VISIBILITY_RETRIES,
-                    sleep, exc,
-                )
-                time.sleep(sleep)
-                sleep = min(sleep * 2, self.VOLUME_VISIBILITY_MAX_SLEEP)
+                else:
+                    logger.warning(
+                        "Volume %r not visible to the Files API yet (attempt "
+                        "%d/%d) — sleeping %.1fs before retrying: %s",
+                        self, attempt + 1, self.VOLUME_VISIBILITY_RETRIES,
+                        sleep, exc,
+                    )
+                    time.sleep(sleep)
+                    sleep = min(sleep * 2, self.VOLUME_VISIBILITY_MAX_SLEEP)
 
     # ==================================================================
     # Mutators
