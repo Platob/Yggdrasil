@@ -34,8 +34,9 @@ def client():
 class TestDatabricksClientOpen:
 
     def test_string_path_routes_through_databricks_path_from(self, client):
-        # The string lands on :meth:`DatabricksPath.from_` (bound to
-        # this client) and the returned path's ``.open`` does the work.
+        # The string lands on :meth:`DatabricksPath.from_` (bound to this
+        # client, via :meth:`path`) and the returned path's ``.open`` does
+        # the work.
         fake_path = MagicMock()
         with patch(
             "yggdrasil.databricks.path.DatabricksPath.from_",
@@ -43,7 +44,7 @@ class TestDatabricksClientOpen:
         ) as from_:
             result = client.open("/Volumes/cat/sch/vol/x", "rb")
         from_.assert_called_once_with(
-            obj="/Volumes/cat/sch/vol/x", client=client,
+            obj="/Volumes/cat/sch/vol/x", client=client, temporary=False,
         )
         fake_path.open.assert_called_once_with(mode="rb")
         assert result is fake_path.open.return_value

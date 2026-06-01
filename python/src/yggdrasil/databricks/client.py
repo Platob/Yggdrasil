@@ -1383,15 +1383,7 @@ class DatabricksClient(Singleton, URLBased):
         ``mode`` and ``**kwargs`` ride straight through to
         :meth:`Path.open` (which forwards to :meth:`IO.open`).
         """
-        from yggdrasil.path import Path
-        from .path import DatabricksPath
-
-        target = (
-            path
-            if isinstance(path, Path)
-            else DatabricksPath.from_(obj=path, client=self)
-        )
-        return target.open(mode=mode, **kwargs)
+        return self.path(path).open(mode=mode, **kwargs)
 
     def path(
         self,

@@ -378,10 +378,10 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     Also subclasses :class:`typing.BinaryIO` so external libraries
     that type-check against the stdlib file-like interface (pandas,
     pyarrow, zipfile, …) accept Yggdrasil byte buffers without a
-    separate facade. :attr:`mode` returns the POSIX string
-    (``"rb"`` / ``"wb+"`` / …) so pandas/zipfile's
-    ``"b" in handle.mode`` sniffs work; the typed value lives on
-    :attr:`_mode`.
+    separate facade. :attr:`mode` returns the typed :class:`Mode`
+    enum; pandas/zipfile's ``"b" in handle.mode`` sniffs still work
+    because :class:`Mode` delegates ``__contains__`` to its
+    :attr:`~Mode.os_mode` string.
 
     Storage subclasses implement five primitives:
 
@@ -3464,16 +3464,17 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     # ---- mode predicates / stdlib BinaryIO surface ---------------------
 
     @property
-    def mode(self) -> str:
-        """POSIX mode string — stdlib :class:`typing.BinaryIO` parity.
+    def mode(self) -> Mode:
+        """The typed :class:`Mode` enum this buffer was opened with.
 
-        pandas / pyarrow / zipfile inspect ``.mode`` for substrings
-        like ``"b"`` to dispatch binary vs text reads, so this
-        surface returns the os-mode form (``"rb+"`` / ``"wb+"`` /
-        ``"ab+"`` / ``"xb+"``) rather than the typed :class:`Mode`
-        enum. The typed value is available via ``self._mode``.
+        pandas / pyarrow / zipfile inspect ``.mode`` for substrings like
+        ``"b"`` to dispatch binary vs text reads; those sniffs still work
+        because :class:`Mode` implements ``__contains__`` against its
+        :attr:`~Mode.os_mode` form (``"b" in handle.mode`` → ``True``).
+        Reach for ``self.mode.os_mode`` when an actual POSIX string is
+        required.
         """
-        return self._mode.os_mode
+        return self._mode
 
     def readable(self) -> bool:
         return self._mode.readable
