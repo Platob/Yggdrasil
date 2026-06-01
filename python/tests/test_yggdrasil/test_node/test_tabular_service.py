@@ -75,6 +75,36 @@ class TestInspect(unittest.TestCase):
             self.assertFalse(info.is_tabular)
             self.assertFalse(info.editable)
 
+    def test_pure_binary_is_not_tabular(self):
+        # Pure binary inspects cleanly as non-tabular (no schema_error, no crash).
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / "blob.bin").write_bytes(bytes(range(256)) * 8)
+            info = asyncio.run(_service(home).inspect("blob.bin"))
+            self.assertFalse(info.is_tabular)
+            self.assertEqual(info.column_count, 0)
+            self.assertIsNone(info.schema_error)
+
+    def test_gzipped_csv_inspects_as_tabular(self):
+        # ``data.csv.gz`` — the codec wrapper is stripped, the inner csv decides
+        # tabularness, and the IO layer decompresses on read.
+        import csv
+        import gzip
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            with gzip.open(home / "trades.csv.gz", "wt", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["sym", "px", "qty"])
+                w.writerows([["AAPL", 201.1, 100], ["MSFT", 410.2, 50]])
+            svc = _service(home)
+            info = asyncio.run(svc.inspect("trades.csv.gz"))
+            self.assertTrue(info.is_tabular)
+            self.assertEqual(info.media_type, "text/csv")
+            self.assertEqual(info.column_count, 3)
+            self.assertEqual(info.row_count, 2)
+            prev = asyncio.run(svc.preview("trades.csv.gz", limit=10))
+            self.assertEqual(prev.rows[0][0], "AAPL")
+
 
 class TestPreview(unittest.TestCase):
     def test_bounded_and_truncated(self):

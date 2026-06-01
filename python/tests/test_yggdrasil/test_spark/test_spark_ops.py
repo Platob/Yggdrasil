@@ -10,56 +10,12 @@ is missing or the JVM mode is unreachable.
 from __future__ import annotations
 
 import datetime as dt
-import os
-import unittest
+
+from yggdrasil.spark.tests import SparkTestCase
 
 
-def _local_spark():
-    try:
-        from pyspark.sql import SparkSession
-    except ImportError:
-        raise unittest.SkipTest("pyspark not installed")
-
-    os.environ.pop("DATABRICKS_HOST", None)
-    jvm_opens = (
-        "--add-opens=java.base/java.lang=ALL-UNNAMED "
-        "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED "
-        "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED "
-        "--add-opens=java.base/java.io=ALL-UNNAMED "
-        "--add-opens=java.base/java.net=ALL-UNNAMED "
-        "--add-opens=java.base/java.nio=ALL-UNNAMED "
-        "--add-opens=java.base/java.util=ALL-UNNAMED "
-        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
-        "--add-opens=java.base/sun.misc=ALL-UNNAMED"
-    )
-    try:
-        return (
-            SparkSession.builder
-            .master("local[2]")
-            .appName("ygg-test-spark-ops")
-            .config("spark.sql.shuffle.partitions", "2")
-            .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-            .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true")
-            .config("spark.driver.extraJavaOptions", jvm_opens)
-            .config("spark.executor.extraJavaOptions", jvm_opens)
-            .getOrCreate()
-        )
-    except RuntimeError as exc:
-        raise unittest.SkipTest(f"local SparkSession unavailable: {exc}")
-
-
-class TestSparkOps(unittest.TestCase):
-    """Dedup / resample / fill on a real local SparkSession."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.spark = _local_spark()
-        cls.spark.sparkContext.setLogLevel("ERROR")
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        # Don't stop — other test modules share the JVM.
-        pass
+class TestSparkOps(SparkTestCase):
+    """Dedup / resample / fill on the shared SparkTestCase session."""
 
     def _ts_frame(self, rows):
         import pyspark.sql.types as T

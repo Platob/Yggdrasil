@@ -2,6 +2,31 @@
 
 Distributed node framework — Python backend, Next.js frontend, Nordic dark UI.
 
+## ⚠️ Cross-language parity (IMPORTANT — global rule)
+
+Yggdrasil is replicated across languages so the same concepts run on the
+backend and client-side. The reference implementation is **Python**
+(`python/src/yggdrasil/`); the **JS/TS** port lives in
+`packages/yggdrasil/` (mirrors the Python package layout — `enums/`,
+…). More languages may follow.
+
+**These ports are ONE contract, not independent code.** When you touch a
+concept that exists in more than one language, you MUST keep them
+synchronized — same names, same structure, same behavior:
+
+- Changing a Python concept (e.g. a value in `enums/mime_type.py`, a new
+  field, a renamed method) → mirror it in the JS/TS port (`enums/mimeType.ts`)
+  in the same commit, and vice-versa.
+- Keep the **structure** parallel: file-for-file, class-for-class,
+  method-for-method (Python `MimeType.from_` ↔ TS `MimeType.fromName`/`from`).
+- Each port's module header points at its counterpart; update both when the
+  mapping changes. See `packages/yggdrasil/README.md` for the file map.
+- If you can only do one side now, leave an explicit `// PARITY:` /
+  `# PARITY:` note at both sites describing the gap — never let the two
+  drift silently.
+
+Treat a cross-language divergence as a bug.
+
 ## Coding Style
 
 1. **Inline over micro-functions** — prefer inlining logic directly where it's used. Don't extract one-liner helpers, don't create utility functions called from a single site, don't wrap stdlib calls in project-specific wrappers. A 15-line method is better than 5 three-line functions calling each other. Extract only when the same logic appears 3+ times or the extracted function has genuine standalone semantics (e.g. `make_id`, `serialize_result`).

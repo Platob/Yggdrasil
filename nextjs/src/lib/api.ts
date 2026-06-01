@@ -26,6 +26,8 @@ import type {
   UserCard,
 } from "./types";
 import { cachedGet, cachedPost, invalidate, TTL } from "./cache";
+import { downloadBlob } from "./format";
+import { MimeType, MimeTypes, State } from "@platob/yggdrasil";
 
 // ── Low-level fetch helper ─────────────────────────────────────────────────
 
@@ -210,7 +212,7 @@ export async function runFuncByName(
     `/api/v2/pyfuncrun/${triggered.run.id}/wait?timeout=60`,
   );
   invalidate("pyfuncrun", "pyfunc", "stats", "metrics");
-  if (final.run.status === "failed" || final.run.error) {
+  if (State.from(final.run.status).isFailed || final.run.error) {
     throw new Error(final.run.error || `Run #${final.run.id} failed`);
   }
   // Prefer the structured result; fall back to stdout for fire-and-forget funcs.
@@ -472,10 +474,11 @@ export interface TabularPreview {
   truncated: boolean;
 }
 
-const TABULAR_EXTS = new Set(["csv", "parquet", "pq", "json", "ndjson", "arrow", "feather", "xlsx", "xls"]);
+// File-type predicates resolve through the shared yggdrasil MIME registry
+// (mirrors the backend), honoring a trailing codec wrapper so `data.csv.gz`
+// resolves to its inner `csv`.
 export function isTabularName(name: string): boolean {
-  const idx = name.lastIndexOf(".");
-  return idx >= 0 && TABULAR_EXTS.has(name.slice(idx + 1).toLowerCase());
+  return MimeType.fromName(name).mime?.isTabular ?? false;
 }
 
 export function getTabularInspect(path: string, node?: string): Promise<TabularInspect> {
@@ -504,8 +507,7 @@ export function tabularPreviewArrowUrl(path: string, limit = 200, offset = 0, no
 }
 
 export function isWorkbookName(name: string): boolean {
-  const idx = name.lastIndexOf(".");
-  return idx >= 0 && ["xlsx", "xls"].includes(name.slice(idx + 1).toLowerCase());
+  return MimeType.fromName(name).mime === MimeTypes.XLSX;
 }
 
 export interface WorkbookSheet { name: string; rows: number; cols: number; visible: boolean; }
@@ -537,36 +539,38 @@ export async function editWorkbook(
 // ── Analysis (pivot / describe / finance) ───────────────────────────────────
 export type AggFunc = "sum" | "mean" | "min" | "max" | "count" | "median" | "std" | "var";
 
-export interface AggregateResult {
+export interface PivotMeasure { column: string; agg: AggFunc }
+
+export interface PivotResult {
+  row_fields: string[];
+  column_fields: string[];
+  measures: string[];
   columns: string[];
   rows: TabularCell[][];
-  group_count: number;
+  row_count: number;
+  col_count: number;
+  total_columns: number;   // trailing per-measure "Total" columns
+  has_total_row: boolean;  // last row is the grand total
   source_rows: number;
   truncated: boolean;
 }
 
-export function aggregate(
+export function pivot(
   path: string,
-  group_by: string[],
-  measures: { column: string; agg: AggFunc }[],
+  rows: string[],
+  columns: string[],
+  measures: PivotMeasure[],
   node?: string,
-  limit = 500,
-  filters: { column: string; op: string; value?: unknown }[] = [],
-): Promise<AggregateResult> {
-  const url = `/api/v2/analysis/aggregate${node ? `?node=${encodeURIComponent(node)}` : ""}`;
-  const payload = { path, group_by, measures, limit, filters };
+  opts: { row_limit?: number; col_limit?: number; totals?: boolean; filters?: { column: string; op: string; value?: unknown }[] } = {},
+): Promise<PivotResult> {
+  const url = `/api/v2/analysis/pivot${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = {
+    path, rows, columns, measures,
+    row_limit: opts.row_limit ?? 1000, col_limit: opts.col_limit ?? 50,
+    totals: opts.totals ?? true,
+    filters: opts.filters ?? [],
+  };
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
-}
-
-export interface DescribeResult {
-  statistics: string[];
-  columns: string[];
-  rows: TabularCell[][];
-  truncated: boolean;
-}
-
-export function describe(path: string, node?: string): Promise<DescribeResult> {
-  return jsonFetch(`/api/v2/analysis/describe?path=${encodeURIComponent(path)}${nodeParam(node)}`);
 }
 
 export interface FinanceMetrics {
@@ -637,11 +641,7 @@ export async function downloadExport(path: string, fmt: string, transform: Trans
   if (!res.ok) throw new Error(`export failed: HTTP ${res.status}`);
   const blob = await res.blob();
   const base = path.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "export";
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `${base}.${fmt}`;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  downloadBlob(blob, `${base}.${fmt}`);
 }
 
 export interface OhlcResult {
@@ -896,11 +896,7 @@ export async function downloadSqlExport(body: { sql: string; fmt: string; dialec
   }
   const blob = await res.blob();
   const name = res.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1] ?? `result.${body.fmt}`;
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  downloadBlob(blob, name);
 }
 
 export interface OpLogEntry {

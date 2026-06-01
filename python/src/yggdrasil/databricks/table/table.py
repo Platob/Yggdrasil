@@ -1426,6 +1426,69 @@ class Table(DatabricksPath):
             safe_merge=options.safe_merge,
         )
 
+    def _delete(
+        self,
+        predicate: "Any" = None,
+        *,
+        wait: "Any" = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: "Any",
+    ) -> int:
+        """Row-level delete that avoids rewriting the (potentially huge) table.
+
+        * **No predicate** → drop the table through the Unity Catalog tables
+          API (:meth:`delete`). Emptying the whole table needs no row
+          filtering, so there's no reason to spin up a SQL warehouse.
+        * **With a predicate** → issue a server-side ``DELETE FROM <t> WHERE …``
+          so the warehouse does the work in place, instead of streaming every
+          batch back to the client to filter and rewrite (the generic
+          :meth:`~yggdrasil.io.tabular.base.Tabular._delete_rewrite` path).
+
+        Returns ``0`` — the affected-row count isn't surfaced by the
+        execution result; the public :meth:`delete` returns the table itself.
+        """
+        if predicate is None:
+            # Whole-table removal — drop the asset through the UC tables
+            # API, no SQL warehouse. Implemented inline (not via
+            # ``self.delete``): the public ``delete`` dispatches back here,
+            # so delegating would recurse infinitely.
+            #
+            # ``delete_staging=False`` keeps the staging volume around for
+            # internal drop-and-recreate flows (OVERWRITE) where the very
+            # next step uploads a fresh parquet to the same volume — the
+            # background ``VolumesAPI.delete`` would otherwise race the
+            # upload and surface as PATH_NOT_FOUND on the warehouse INSERT.
+            uc = self.client.workspace_client().tables
+            logger.debug(
+                "Deleting table %r (wait=%s, delete_staging=%s)",
+                self, bool(wait), delete_staging,
+            )
+            if wait:
+                try:
+                    uc.delete(full_name=self.full_name())
+                    if delete_staging and self._staging_volume:
+                        self._staging_volume.delete(wait=False)
+                except DatabricksError:
+                    if not missing_ok:
+                        raise
+            else:
+                Job.make(
+                    self._delete,
+                    wait=True,
+                    missing_ok=missing_ok,
+                    delete_staging=delete_staging,
+                ).fire_and_forget()
+            self.invalidate_singleton(remove_global=True)
+            logger.info("Deleted table %r", self)
+            return 0
+        where = predicate if isinstance(predicate, str) else expr_to_sql(
+            predicate, dialect=Dialect.DATABRICKS,
+        )
+        self.sql.execute(f"DELETE FROM {self.full_name(safe=True)} WHERE {where}", wait=wait)
+        self.invalidate_singleton(remove_global=True)
+        return 0
+
     def _read_spark_frame(self, options: O) -> "SparkDataFrame":
         options = options.with_source(source=self.collect_schema(options))
         query = self._options_to_sql(options)
@@ -2750,16 +2813,7 @@ class Table(DatabricksPath):
             self.sql.execute(statement, wait=wait)
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
-                logger.debug(
-                    "Parent schema missing for view %r — auto-creating %s.%s",
-                    self, self.catalog_name, self.schema_name,
-                )
-                self.sql.execute(
-                    f"CREATE SCHEMA IF NOT EXISTS "
-                    f"{quote_ident(self.catalog_name)}.{quote_ident(self.schema_name)}",
-                    wait=True,
-                )
-                self.sql.execute(statement, wait=wait)
+                self.schema.ensure_created()
             else:
                 raise
 
@@ -2857,40 +2911,6 @@ class Table(DatabricksPath):
             )
 
         return "\nUNION ALL\n".join(select_blocks)
-
-    def delete(
-        self,
-        *,
-        wait: WaitingConfigArg = True,
-        missing_ok: bool = False,
-        delete_staging: bool = True,
-    ) -> "Table":
-        # ``delete_staging=False`` keeps the staging volume around for
-        # internal drop-and-recreate flows (OVERWRITE) where the very
-        # next step uploads a fresh parquet to the same volume — the
-        # background ``VolumesAPI.delete`` would otherwise race the
-        # upload and surface as PATH_NOT_FOUND on the warehouse INSERT.
-        uc = self.client.workspace_client().tables
-        logger.debug(
-            "Deleting table %r (wait=%s, delete_staging=%s)",
-            self, bool(wait), delete_staging,
-        )
-
-        if wait:
-            try:
-                uc.delete(full_name=self.full_name())
-
-                if delete_staging and self._staging_volume:
-                    self._staging_volume.delete(wait=False)
-            except DatabricksError:
-                if not missing_ok:
-                    raise
-        else:
-            Job.make(self.delete, delete_staging=delete_staging).fire_and_forget()
-
-        self.invalidate_singleton(remove_global=True)
-        logger.info("Deleted table %r", self)
-        return self
 
     # =========================================================================
     # Rename
@@ -3143,7 +3163,26 @@ class Table(DatabricksPath):
         return_data: bool = False,
         **kwargs
     ) -> "Tabular | None":
-        """Insert *data* into this table — thin wrapper over :meth:`insert_into`."""
+        """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
+
+        ``wait=False`` switches to the **async drop** path
+        (:meth:`async_insert`): the staged Parquet + a JSON operation log are
+        written under the table's ``.sql/async`` area and a file-arrival job
+        (:meth:`async_job`) aggregates and loads them later — no warehouse
+        statement runs here. Only ``OVERWRITE`` / ``APPEND`` with no
+        ``match_by`` qualify; anything else (or a query / Spark source) falls
+        through to the normal synchronous path.
+        """
+        from yggdrasil.databricks.table.async_job import ASYNC_MODES
+
+        if (
+            wait is False
+            and not match_by
+            and Mode.from_(mode, default=Mode.APPEND) in ASYNC_MODES
+            and not isinstance(data, (PreparedStatement, StatementResult))
+            and not PreparedStatement.looks_like_query(data)
+        ):
+            return self.async_insert(data, mode=mode, **kwargs)
         return self.insert_into(
             data,
             mode=mode,
@@ -3269,6 +3308,13 @@ class Table(DatabricksPath):
             )
         return self._staging_volume
 
+    @staging_volume.setter
+    def staging_volume(self, value):
+        self._staging_volume = self.client.volumes(
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        ).volume(value)
+
     def staging_folder(
         self,
         temporary: bool = False,
@@ -3280,6 +3326,7 @@ class Table(DatabricksPath):
         self,
         target: "Table | None" = None,
         *,
+        staging_volume: "Volume | None" = None,
         temporary: bool = True,
     ) -> VolumePath:
         """Mint a fresh Parquet staging path under the target table's
@@ -3296,9 +3343,73 @@ class Table(DatabricksPath):
         target = target if target is not None else self
         seed = uuid.uuid4().hex[:8]
         leaf = f"tmp-{int(time.time() * 1000)}-{seed}.parquet"
-        return target.staging_volume.path(
+        staging_volume = target.staging_volume if staging_volume is None else staging_volume
+
+        return staging_volume.path(
             f".sql/tmp/{leaf}",
             temporary=temporary,
+        )
+
+    # =========================================================================
+    # async insert — drop Parquet + an operation log; a file-arrival job loads
+    # =========================================================================
+
+    def async_job(self) -> Any:
+        """Get-or-create the file-arrival loader job for this table; return it.
+
+        Builds + uploads the full ygg wheel and upserts a serverless job that
+        watches ``.sql/async/logs`` and aggregates the operation logs
+        :meth:`async_insert` drops into one ``INSERT`` per ``(target, mode)``
+        group. See :func:`~yggdrasil.databricks.table.async_job.ensure_async_job`.
+        """
+        from yggdrasil.databricks.table.async_job import ensure_async_job
+
+        return ensure_async_job(self)
+
+    def async_insert(
+        self,
+        data: Any,
+        *,
+        mode: Mode | str | None = None,
+        match_by: Optional[list[str]] = None,
+        cast_options: Optional[CastOptions] = None,
+        **kwargs: Any,
+    ) -> "VolumePath":
+        """Stage *data* as Parquet + drop a JSON operation log — no warehouse.
+
+        Thin wrapper over
+        :func:`~yggdrasil.databricks.table.async_job.stage_async_insert`: the
+        rows land at the table's default tmp staging path and an op-log under
+        ``.sql/async/logs/`` records the staged data's uniform URL, so the
+        file-arrival job can pick it up. Returns the log path. Only
+        ``OVERWRITE`` / ``APPEND`` with no ``match_by``; a path/URL string
+        source is read first. The loader side is :meth:`execute_async_insert`.
+        """
+        from yggdrasil.databricks.table.async_job import stage_async_insert
+
+        return stage_async_insert(
+            self, data, mode=mode, match_by=match_by, cast_options=cast_options,
+        )
+
+    def execute_async_insert(
+        self,
+        data: Any,
+        *,
+        mode: Mode | str | None = None,
+        match_by: Optional[list[str]] = None,
+        cast_options: Optional[CastOptions] = None,
+        wait: WaitingConfigArg = True,
+        **kwargs: Any,
+    ) -> "StatementBatch | Tabular | None":
+        """Loader side of :meth:`async_insert` — load *data* into the table now.
+
+        Synchronous :meth:`insert_into`. The file-arrival loader
+        (:meth:`Tables.async_insert`) calls this per ``(target, mode)`` group
+        with the aggregated ``UNION ALL`` query over the staged Parquet.
+        """
+        return self.insert_into(
+            data, mode=mode, match_by=match_by,
+            cast_options=cast_options, wait=wait, **kwargs,
         )
 
     def arrow_insert(
@@ -3321,6 +3432,7 @@ class Table(DatabricksPath):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
+        staging_volume: "Volume | None" = None
     ) -> "StatementBatch | Tabular | None":
         """Insert through the warehouse SQL path with staged Parquet.
 
@@ -3373,7 +3485,7 @@ class Table(DatabricksPath):
             match_by = [f.name for f in existing_schema.primary_fields] or None
 
         wait = WaitingConfig.from_(wait)
-        staging = self.insert_volume_path(target, temporary=bool(wait))
+        staging = self.insert_volume_path(target, temporary=bool(wait), staging_volume=staging_volume)
         output_data: "Tabular | None" = None
         staging.write_table(data, cast_options, mode=Mode.OVERWRITE)
         if return_data:

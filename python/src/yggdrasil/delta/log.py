@@ -1,8 +1,8 @@
-"""Back-compat shim — :class:`DeltaLog` lives at :mod:`yggdrasil.io.nested.delta.log`."""
+"""Back-compat shim — :class:`DeltaLog` lives at :mod:`yggdrasil.io.delta.log`."""
 
 from __future__ import annotations
 
-from yggdrasil.io.nested.delta._names import (
+from yggdrasil.io.delta._names import (
     LAST_CHECKPOINT_NAME,
     LOG_DIR_NAME,
     SIDECARS_DIR_NAME,
@@ -11,7 +11,7 @@ from yggdrasil.io.nested.delta._names import (
     format_commit_name,
     version_from_log_name,
 )
-from yggdrasil.io.nested.delta.log import DeltaLog, LogSegment
+from yggdrasil.io.delta.log import DeltaLog, LogSegment
 
 __all__ = [
     "DeltaLog",

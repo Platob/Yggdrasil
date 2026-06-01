@@ -20,6 +20,7 @@ import tempfile
 import unittest
 
 import pyarrow as pa
+import pytest
 
 from yggdrasil.enums import Mode
 from yggdrasil.delta.io import DeltaOptions
@@ -62,7 +63,7 @@ class TestPathPickle(DeltaTestCase):
         print(f"DeltaFolder path pickle size: {len(pickled)} bytes")
 
     def test_add_file_pickle_round_trip(self) -> None:
-        from yggdrasil.io.nested.delta.protocol import AddFile, DeletionVectorDescriptor
+        from yggdrasil.io.delta.protocol import AddFile, DeletionVectorDescriptor
 
         add = AddFile(
             path="region=us/part-001.parquet",
@@ -103,7 +104,7 @@ class TestPathPickle(DeltaTestCase):
     def test_executor_payload_pickle(self) -> None:
         """Verify the full (path, AddFile, partition_cols, schema) tuple pickles."""
         from yggdrasil.path import LocalPath
-        from yggdrasil.io.nested.delta.protocol import AddFile
+        from yggdrasil.io.delta.protocol import AddFile
 
         path = LocalPath(str(self.tmp_path))
         add = AddFile(path="part.parquet", size=100, modification_time=1000)
@@ -153,7 +154,7 @@ class TestDeltaSparkReadPreparation(DeltaTestCase):
         snap = d.snapshot(fresh=True)
         self.assertEqual(snap.num_active_files(), 3)  # us, eu, ap
 
-        from yggdrasil.io.nested.delta.delta_folder import _partition_prune_values
+        from yggdrasil.io.delta.delta_folder import _partition_prune_values
         from yggdrasil.execution.expr import col as expr_col
 
         prune = _partition_prune_values(
@@ -210,6 +211,7 @@ class TestDeltaSparkWritePreparation(DeltaTestCase):
 
 
 @unittest.skipUnless(_has_pyspark(), "PySpark not installed")
+@pytest.mark.spark
 class TestDeltaSparkReadWrite(DeltaTestCase):
     """End-to-end Spark read/write through DeltaFolder."""
 
@@ -343,6 +345,7 @@ class TestDeltaSparkReadWrite(DeltaTestCase):
 
 
 @unittest.skipUnless(_has_pyspark(), "PySpark not installed")
+@pytest.mark.spark
 class TestDeltaSparkBenchmark(DeltaTestCase):
     """Spark-specific benchmarks."""
 

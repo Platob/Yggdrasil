@@ -299,6 +299,18 @@ class TestUploadFastPath:
             fake_dbfs_root / "streamed"
         ).read_bytes() == b"streamed-bytes"
 
+    def test_upload_rewinds_stream_parked_at_eof(self, fake_dbfs_root, service):
+        # Same corruption guard as the VolumePath fix: a stream handed in
+        # already at EOF must still write the whole object, not truncate to
+        # empty. The mount path seek(0)s before streaming.
+        import io
+        buf = io.BytesIO(b"mount-payload")
+        buf.seek(0, io.SEEK_END)
+        p = DBFSPath("/dbfs/tmp/eof", service=service)
+        n = p._upload(buf)
+        assert n == len(b"mount-payload")
+        assert (fake_dbfs_root / "eof").read_bytes() == b"mount-payload"
+
 
 # ===========================================================================
 # Off-cluster fallback
@@ -344,7 +356,9 @@ class TestOSErrorFallback:
         real_stat = os.stat
 
         def bad_stat(path, *a, **kw):
-            if "/dbfs/tmp/explode" in str(path):
+            # Match the mount path regardless of OS separator (Windows joins
+            # the fake root with ``\``).
+            if "/dbfs/tmp/explode" in str(path).replace("\\", "/"):
                 raise PermissionError("simulated")
             return real_stat(path, *a, **kw)
 

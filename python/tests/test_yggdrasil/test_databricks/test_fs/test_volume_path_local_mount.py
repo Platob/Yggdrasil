@@ -276,6 +276,43 @@ class TestUploadFastPath:
             fake_volume_root / "deep" / "sub" / "new.bin"
         ).read_bytes() == b"deep-write"
 
+    def test_upload_stream_rewinds_to_zero(
+        self, fake_volume_root, service,
+    ):
+        # A stream parked at EOF (a just-written buffer the caller didn't
+        # rewind) must still upload the whole object — the mount path used
+        # to read from the current position and truncate it to empty, while
+        # the off-cluster PUT stayed correct. Both must write all the bytes.
+        import io as _io
+
+        buf = _io.BytesIO(b"payload-bytes")
+        buf.seek(0, _io.SEEK_END)            # caller left the cursor at EOF
+        p = VolumePath("/Volumes/cat/sch/vol/stream.bin", service=service)
+        n = p._upload(buf)
+        assert n == len(b"payload-bytes")
+        assert (fake_volume_root / "stream.bin").read_bytes() == b"payload-bytes"
+
+    def test_upload_non_seekable_readable_stream(
+        self, fake_volume_root, service,
+    ):
+        # A readable but non-seekable stream must be drained via read(),
+        # not coerced through bytes(stream) (which wouldn't read it at all).
+        class _Pipe:
+            def __init__(self, data: bytes) -> None:
+                self._data = data
+                self._read = False
+
+            def read(self, n: int = -1) -> bytes:
+                if self._read:
+                    return b""
+                self._read = True
+                return self._data
+
+        p = VolumePath("/Volumes/cat/sch/vol/pipe.bin", service=service)
+        n = p._upload(_Pipe(b"piped"))
+        assert n == 5
+        assert (fake_volume_root / "pipe.bin").read_bytes() == b"piped"
+
 
 # ===========================================================================
 # Off-cluster: the Files API is still the source of truth
@@ -421,7 +458,9 @@ class TestOSErrorFallback:
         real_open = builtins.open
 
         def bad_open(path, *a, **kw):
-            if "/Volumes/cat/sch/vol/explode" in str(path):
+            # Match the mount path regardless of OS separator (Windows joins
+            # the fake root with ``\``).
+            if "/Volumes/cat/sch/vol/explode" in str(path).replace("\\", "/"):
                 raise PermissionError("simulated")
             return real_open(path, *a, **kw)
 

@@ -158,7 +158,7 @@ class TestYggWriteDeltalakeRead(DeltaTestCase):
                 ),
             )
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d2 = DeltaFolder(path=str(d.path))
         out = d2.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), list(range(6)))
@@ -243,7 +243,7 @@ class TestDeltalakeWriteYggRead(DeltaTestCase):
         t = self.pa.table({"id": [1, 2, 3], "val": ["a", "b", "c"]})
         deltalake.write_deltalake(table_path, t)
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d = DeltaFolder(path=table_path)
         out = d.read_arrow_table()
         self.assertEqual(out.num_rows, 3)
@@ -262,7 +262,7 @@ class TestDeltalakeWriteYggRead(DeltaTestCase):
             table_path, t, partition_by=["region"],
         )
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d = DeltaFolder(path=table_path)
         out = d.read_arrow_table()
         self.assertEqual(out.num_rows, 4)
@@ -278,7 +278,7 @@ class TestDeltalakeWriteYggRead(DeltaTestCase):
         t2 = self.pa.table({"id": [3, 4]})
         deltalake.write_deltalake(table_path, t2, mode="append")
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d = DeltaFolder(path=table_path)
 
         v0 = d.read_arrow_table(options=DeltaOptions(version=0))
@@ -297,7 +297,7 @@ class TestDeltalakeWriteYggRead(DeltaTestCase):
         t2 = self.pa.table({"id": [99]})
         deltalake.write_deltalake(table_path, t2, mode="overwrite")
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d = DeltaFolder(path=table_path)
         out = d.read_arrow_table()
         self.assertEqual(out.column("id").to_pylist(), [99])
@@ -314,7 +314,7 @@ class TestDeltalakeWriteYggRead(DeltaTestCase):
         })
         deltalake.write_deltalake(table_path, t)
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d = DeltaFolder(path=table_path)
         schema = d.collect_schema()
         names = [f.name for f in schema.fields]
@@ -333,7 +333,7 @@ class TestDeltalakeWriteYggRead(DeltaTestCase):
         })
         deltalake.write_deltalake(table_path, t)
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d = DeltaFolder(path=table_path)
         out = d.read_arrow_table()
         self.assertEqual(out.num_rows, n)
@@ -369,7 +369,7 @@ class TestBidirectionalInterop(DeltaTestCase):
             table_path, self.pa.table({"id": [1, 2]}),
         )
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d = DeltaFolder(path=table_path)
         d.write_arrow_batches(
             self.pa.table({"id": [3, 4]}).to_batches(),
@@ -430,7 +430,7 @@ class TestCheckpointV2Interop(DeltaTestCase):
                 ),
             )
 
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d2 = DeltaFolder(path=str(d.path))
         out = d2.read_arrow_table()
         self.assertEqual(sorted(out.column("id").to_pylist()), list(range(11)))

@@ -83,10 +83,16 @@ _PENDING_URL_STASH: dict[int, "URL"] = {}
 #: leading directory the user types (case-insensitive); values are the
 #: scheme each subclass registers under (the ``dbfs+<surface>``
 #: convention — see :class:`Scheme`).
+#: Leading POSIX namespace segment → canonical ``dbfs+<surface>`` scheme.
+#: The segment after the namespace is the rest of the path — for
+#: ``ExternalLocations`` that's the Unity Catalog external-location *name*
+#: (``/ExternalLocations/raw_zone`` → ``dbfs+extloc:///raw_zone``), with any
+#: deeper path a child below it on the backing store.
 _POSIX_NAMESPACES: dict[str, str] = {
     "dbfs": Scheme.DATABRICKS_DBFS.value,
     "Volumes": Scheme.DATABRICKS_VOLUME.value,
     "Workspace": Scheme.DATABRICKS_WORKSPACE.value,
+    "ExternalLocations": Scheme.DATABRICKS_EXTERNAL_LOCATION.value,
 }
 
 
@@ -100,7 +106,8 @@ def _looks_like_posix(value: str) -> bool:
 
 
 def _parse_posix(value: str) -> Tuple[str, str]:
-    """``/dbfs/x`` → ``("dbfs", "/x")``, etc.
+    """``/dbfs/x`` → ``("dbfs", "/x")``, ``/ExternalLocations/raw`` →
+    ``("dbfs+extloc", "/raw")``, etc.
 
     Case-insensitive on the namespace; the rest of the path is
     preserved verbatim.
@@ -136,6 +143,15 @@ def _coerce_to_url_str(value: Any) -> Any:
     """
     if not isinstance(value, str):
         return value
+    # Unity Catalog paths use forward slashes only. A path built on Windows
+    # (``os.path.join`` / ``pathlib`` under ``os.sep == '\\'``) can carry
+    # backslash separators — normalize them so the write, the read, and the
+    # metadata HEAD all key the same object instead of diverging into a
+    # literal-backslash key (a classic "uploaded file is corrupt / unreadable"
+    # cause). Only rewrite when the result is a recognized Databricks path, so
+    # genuine Windows *local* paths are left for their own backend.
+    if "\\" in value and _looks_like_posix(value.replace("\\", "/")):
+        value = value.replace("\\", "/")
     if _looks_like_posix(value):
         scheme, path = _parse_posix(value)
         return f"{scheme}://{path}"
@@ -181,7 +197,14 @@ def _coerce_explore_url(u: "URL") -> "Optional[URL]":
         # exact VolumePath, falling back to the bare volume coordinates.
         deep = u.query_dict.get("volumePath")
         if deep and _looks_like_posix(deep[0]):
-            scheme, sub = _parse_posix(deep[0])
+            # A file deep-link splits the selection across ``volumePath``
+            # (the parent dir) and ``filePreviewPath`` (the leaf) — rejoin
+            # them so the full file path round-trips.
+            base = deep[0]
+            preview = u.query_dict.get("filePreviewPath")
+            if preview and preview[0]:
+                base = base.rstrip("/") + "/" + preview[0].lstrip("/")
+            scheme, sub = _parse_posix(base)
             return URL(scheme=scheme, path=sub)
         coords = segs[1:]  # cat / sch / vol
         return URL(
@@ -389,6 +412,10 @@ def _resolve_databricks_subclass(
         from yggdrasil.databricks.table.table import Table
 
         return Table, candidate
+    if scheme == Scheme.DATABRICKS_EXTERNAL_LOCATION.value:
+        from yggdrasil.databricks.external.location.resource import ExternalLocation
+
+        return ExternalLocation, candidate
     if scheme == Scheme.DATABRICKS_CATALOG.value:
         from yggdrasil.databricks.catalog.catalog import UCCatalog
 
@@ -566,6 +593,13 @@ class DatabricksPath(RemotePath, DatabricksResource):
             return instance
 
         target, normalized = _resolve_databricks_subclass(data=data, url=url)
+        # ``s3://`` URLs aren't a Databricks namespace — they resolve
+        # through Unity Catalog external locations (credential lookup),
+        # which needs the client. Route to ``from_url`` (it returns an
+        # ExternalLocation / inner storage path, neither a DatabricksPath,
+        # so Python skips the auto-``__init__`` pass).
+        if normalized is not None and (normalized.scheme or "").lower() in cls._S3_SCHEMES:
+            return cls.from_url(normalized, **kwargs)
         # Byte-shaped Path subclasses (DBFSPath / VolumePath /
         # WorkspacePath) accept ``url=`` straight through ``__init__``,
         # so we can hand control back to Python — their auto-fired
@@ -666,7 +700,7 @@ class DatabricksPath(RemotePath, DatabricksResource):
                 if explore is not None:
                     url = explore
                 url = _strip_dbfs_family_prefix(url)
-                target_scheme = self.scheme
+                target_scheme = (url.scheme if url else None) or self.scheme
                 if target_scheme is not None:
                     target_token = (
                         target_scheme.value
@@ -694,6 +728,18 @@ class DatabricksPath(RemotePath, DatabricksResource):
 
         self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
         self._initialized = True
+
+    def __repr__(self):
+        # ``explore_url`` can raise (e.g. a VolumePath that doesn't yet
+        # address a full ``/Volumes/<cat>/<sch>/<vol>/...`` path) — repr must
+        # never raise (it breaks logging / debuggers), so fall back quietly.
+        try:
+            exp = self.explore_url
+        except Exception:
+            exp = None
+        if exp is not None:
+            return f"{self.__class__.__name__}({exp!r})"
+        return super().__repr__()
 
     # ==================================================================
     # URLBased dispatch — ``dbfs://`` resolves here and forwards
@@ -729,6 +775,22 @@ class DatabricksPath(RemotePath, DatabricksResource):
         explore = _coerce_explore_url(u)
         if explore is not None:
             u = explore
+        # ``s3://`` URLs resolve against Unity Catalog external locations:
+        # the location whose storage URL contains ``u`` lends its
+        # credentials. The location root returns the ExternalLocation; a
+        # child returns the credential-backed inner storage path.
+        if (u.scheme or "").lower() in cls._S3_SCHEMES:
+            resolved = cls._resolve_external_location(
+                u, service=kwargs.get("service"), client=kwargs.get("client"),
+            )
+            if resolved is not None:
+                return resolved
+            # No external location covers it — an ``s3://`` URL is not a
+            # Databricks namespace, so fall back to a plain (ambient-creds)
+            # S3 path rather than mis-dispatching to a DBFS surface.
+            from yggdrasil.aws.fs.path import S3Path
+
+            return S3Path.from_(u)
         if cls is not DatabricksPath:
             return cls(url=u, **kwargs)
 
@@ -736,6 +798,54 @@ class DatabricksPath(RemotePath, DatabricksResource):
         if normalized is None:
             normalized = u
         return target.from_url(normalized, **kwargs)
+
+    #: Cloud-storage schemes resolved through external locations.
+    _S3_SCHEMES: ClassVar[Tuple[str, ...]] = ("s3", "s3a", "s3n")
+
+    @classmethod
+    def _resolve_external_location(
+        cls,
+        u: "URL",
+        *,
+        service: Any = None,
+        client: Any = None,
+    ) -> "Any | None":
+        """Resolve an ``s3://`` URL against the workspace's external locations.
+
+        Builds the :class:`ExternalLocations` service from whatever binding
+        is available (an :class:`ExternalLocations` passed as *service*, a
+        *client*, the *service*'s client, else the process-current client)
+        and asks :meth:`ExternalLocations.find_url` for the location whose
+        storage URL contains *u*. When *u* is the location root the
+        :class:`ExternalLocation` itself is returned; for a child the
+        credential-backed inner storage path is built from it. Returns
+        ``None`` when nothing (no binding, or no matching location) resolves
+        — the caller then falls back to a plain path."""
+        from yggdrasil.databricks.external.location.service import ExternalLocations
+
+        if isinstance(service, ExternalLocations):
+            locations = service
+        elif client is not None:
+            locations = ExternalLocations(client=client)
+        elif service is not None and getattr(service, "client", None) is not None:
+            locations = ExternalLocations(client=service.client)
+        else:
+            from . import client as _client_mod
+
+            current = _client_mod.CURRENT_BASE_CLIENT
+            if current is None:
+                return None
+            locations = ExternalLocations(client=current)
+
+        el = locations.find_url(u)
+        if el is None:
+            return None
+        base = (el.url or "").rstrip("/")
+        target = str(u).rstrip("/")
+        if target == base:
+            return el  # location root → the ExternalLocation itself
+        # Child → the credential-backed inner storage path (an S3Path).
+        return el.joinpath(target[len(base):].lstrip("/"))
 
     @classmethod
     def from_(cls, obj: Any, **kwargs: Any) -> "DatabricksPath":

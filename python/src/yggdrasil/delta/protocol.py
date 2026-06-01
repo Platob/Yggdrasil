@@ -1,8 +1,8 @@
-"""Back-compat shim — Delta action types live at :mod:`yggdrasil.io.nested.delta.protocol`."""
+"""Back-compat shim — Delta action types live at :mod:`yggdrasil.io.delta.protocol`."""
 
 from __future__ import annotations
 
-from yggdrasil.io.nested.delta.protocol import (
+from yggdrasil.io.delta.protocol import (
     AddFile,
     CommitInfo,
     DeletionVectorDescriptor,

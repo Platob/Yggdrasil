@@ -1,19 +1,19 @@
-"""Back-compat shim — Delta support lives at :mod:`yggdrasil.io.nested.delta`.
+"""Back-compat shim — Delta support lives at :mod:`yggdrasil.io.delta`.
 
-The whole package was relocated under ``yggdrasil.io.nested`` to sit
+The whole package was relocated under ``yggdrasil.io.delta`` to sit
 alongside the other :class:`Folder` leaves (folders, zip archives,
 ygg folders). This module keeps the old import paths
 (``yggdrasil.delta``, ``yggdrasil.delta.io``, ``yggdrasil.delta.log``,
 …) working so existing callers don't break — every name here is just
 re-exported from its new home.
 
-New code should import from :mod:`yggdrasil.io.nested.delta`
+New code should import from :mod:`yggdrasil.io.delta`
 directly; this shim exists to avoid a flag-day rename.
 """
 
 from __future__ import annotations
 
-from yggdrasil.io.nested.delta import (
+from yggdrasil.io.delta import (
     AddFile,
     CommitInfo,
     DeletionVector,

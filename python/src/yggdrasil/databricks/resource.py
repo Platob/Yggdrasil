@@ -11,6 +11,7 @@ from abc import ABC
 from typing import TYPE_CHECKING, Optional
 
 from yggdrasil.url import URL
+from yggdrasil.url.explore import ExploreUrlRepr
 
 from .client import DatabricksClient
 from .service import DatabricksService
@@ -21,7 +22,13 @@ if TYPE_CHECKING:
 __all__ = ["DatabricksResource"]
 
 
-class DatabricksResource(ABC):
+class DatabricksResource(ExploreUrlRepr, ABC):
+
+    # Resources are identity objects (singleton-cached handles), so hash/eq on
+    # identity — like the client and services they hang off of — so they stay
+    # usable as dict / set keys regardless of any value-based __eq__ a subclass
+    # (or mixin) might introduce.
+    __hash__ = object.__hash__
 
     @property
     def explore_url(self) -> Optional[URL]:
@@ -31,29 +38,12 @@ class DatabricksResource(ABC):
         :class:`Volume`, :class:`Table`, :class:`SQLWarehouse`,
         :class:`Job`, :class:`VolumePath`, …) override this to return
         the ``/explore/data/...`` / ``/sql/warehouses/...`` / ``/jobs/...``
-        URL that opens the resource in the workspace UI. The default
-        :meth:`__repr__` keys off the override — anything that returns
-        a non-``None`` URL gets a ``ClassName(<url>)``-style repr for
-        free without restating the format string on every subclass.
+        URL that opens the resource in the workspace UI. The inherited
+        :class:`ExploreUrlRepr` keys off the override — anything that returns
+        a non-``None`` URL gets a ``ClassName(<url>)`` repr (and a clickable
+        ``_repr_html_``) for free without restating it on every subclass.
         """
         return None
-
-    def __repr__(self) -> str:
-        # ``explore_url`` reaches through ``self.service.client.base_url``,
-        # which can be ``None`` on a half-constructed / mid-tear-down
-        # instance (``__del__`` during interpreter shutdown,
-        # ``Session._INSTANCES.clear()`` racing a GC pass, a pickle-
-        # restored object whose service hasn't rebound yet). Bake a
-        # try/except so the repr survives — having a degraded
-        # ``ClassName(...)`` log line is strictly better than swallowing
-        # a downstream error because its message couldn't be formatted.
-        try:
-            url = self.explore_url
-        except Exception:
-            url = None
-        if url is None:
-            return super().__repr__()
-        return f"{type(self).__name__}({url!r})"
 
     def __getstate__(self):
         # ``object.__getstate__`` only exists in Python 3.11+, but the

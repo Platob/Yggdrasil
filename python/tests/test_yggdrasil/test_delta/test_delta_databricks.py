@@ -109,7 +109,7 @@ class _DeltaSQLBase(unittest.TestCase):
         ``Path.from_(location)`` against the same URL would fail with
         ``AccessDenied`` on managed Delta tables.
         """
-        from yggdrasil.io.nested.delta import DeltaFolder
+        from yggdrasil.io.delta import DeltaFolder
         return DeltaFolder(path=table.storage_path())
 
 

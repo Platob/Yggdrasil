@@ -68,16 +68,16 @@ from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 from urllib.parse import quote
 
 from databricks.sdk.errors import PermissionDenied
-
 from yggdrasil.concurrent import Job
 from yggdrasil.data.cast import any_to_datetime, parse_http_date
+from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Mode, ModeLike, Scheme
 from yggdrasil.enums.media_type import MediaType
-from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.http_.exceptions import HTTPError
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
+
 from ..path import DatabricksPath
 
 if TYPE_CHECKING:
@@ -198,6 +198,18 @@ class VolumePath(DatabricksPath):
     # write never materialises whole in memory.
     SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = True
 
+    # Volume visibility window. Creating a UC volume is *not* immediately
+    # consistent with the Files API: ``volumes.create`` returns, but the
+    # next ``PUT /files`` / ``create_directory`` can still 404 with
+    # "Volume ... does not exist" for a second or two while the edge
+    # catches up. After an :meth:`Volume.ensure_created` recovery we retry
+    # the write up to ``VOLUME_VISIBILITY_RETRIES`` times with capped
+    # exponential backoff so a single ``write_bytes`` no longer races the
+    # propagation the way the old single-shot retry did.
+    VOLUME_VISIBILITY_RETRIES: ClassVar[int] = 6
+    VOLUME_VISIBILITY_BASE_SLEEP: ClassVar[float] = 0.5
+    VOLUME_VISIBILITY_MAX_SLEEP: ClassVar[float] = 4.0
+
     # ``_SERVICE_CLASS`` is bound below the class body to avoid the
     # ``volume.volumes`` → ``volume.volume`` → ``fs.volume_path``
     # import cycle.
@@ -241,10 +253,12 @@ class VolumePath(DatabricksPath):
 
     @property
     def explore_url(self) -> URL:
-        return self.volume.explore_url.add_param(
-            key="volumePath",
-            value=self.full_path(),
-        )
+        full = self.full_path().rstrip("/")
+        parent, _, leaf = full.rpartition("/")
+        params = {"volumePath": full}
+        if "." in leaf:  # extension heuristic: open the file preview panel
+            params = {"volumePath": parent, "filePreviewPath": leaf}
+        return self.volume.explore_url.add_params(params)
 
     # ==================================================================
     # Path rendering
@@ -317,8 +331,8 @@ class VolumePath(DatabricksPath):
 
         Maps the wire status onto the exception *shapes* the recovery /
         classification helpers key on: 404 → :class:`FileNotFoundError`
-        (carrying the server message so :func:`_looks_like_volume_not_found`
-        still fires), 401/403 → SDK :class:`PermissionDenied`, 409 →
+        (carrying the server message so the not-found classifiers still
+        fire), 401/403 → SDK :class:`PermissionDenied`, 409 →
         :class:`FileExistsError`, everything else → :class:`OSError`.
         2xx/3xx return cleanly.
         """
@@ -933,13 +947,15 @@ class VolumePath(DatabricksPath):
     def _ensure_parents(self, exc: "BaseException | None" = None) -> bool:
         """Recovery hook for :meth:`_call_ensuring_parents`.
 
-        Cheap-path first: if *self* lives below the volume root,
-        ``files.create_directory`` on the parent fixes the common
-        case (only a sub-directory was missing). If that also
-        NotFounds — or if *exc* already named the volume as
-        missing — fall back to :meth:`_ensure_volume` and retry
-        the parent ``mkdir``. Blind creates swallow ``AlreadyExists``
-        so the idempotent path costs at most three SDK calls.
+        Cheap-path first — never go straight to a volume create: if *self*
+        lives below the volume root, try ``files.create_directory`` on the
+        parent, which fixes the common case (only a sub-directory was
+        missing) without touching Unity Catalog. Only if that ``mkdir``
+        NotFounds (the volume itself is missing) fall back to the idempotent
+        :meth:`Volume.ensure_created` (which creates the volume and any
+        missing catalog / schema, retrying once) and then retry the parent
+        ``mkdir``. Blind creates swallow ``AlreadyExists`` so the idempotent
+        path costs at most three SDK calls.
         """
         triple = self._split_volume()
         if triple is None:
@@ -948,9 +964,9 @@ class VolumePath(DatabricksPath):
         parent = self.parent
         pparts = [p for p in (parent.url.path or "/").lstrip("/").split("/") if p]
         has_subdir = len(pparts) > 3  # parent strictly below ``/cat/sch/vol``
-        volume_missing = exc is not None and _looks_like_volume_not_found(exc)
 
-        if has_subdir and not volume_missing:
+        # First: just make the parent directory through the API.
+        if has_subdir:
             try:
                 self._create_directory(parent.api_path)
                 return True
@@ -959,56 +975,60 @@ class VolumePath(DatabricksPath):
                     return True
                 if not _looks_like_not_found(inner):
                     raise
-                # Parent missing because volume itself is missing —
-                # fall through to volume creation.
+                # mkdir NotFounded — the volume itself is missing; fall through.
 
-        self._ensure_volume()
+        # Second: create the volume (and any missing catalog / schema), then
+        # retry the directory create — looping over the visibility window so a
+        # just-created volume that the Files edge hasn't caught up to yet
+        # doesn't fail the recovery on the first immediate retry.
+        self.volume.ensure_created()
 
         if has_subdir:
-            try:
-                self._create_directory(parent.api_path)
-            except Exception as inner:
-                if not _looks_like_already_exists(inner):
-                    raise
+            def _mkdir() -> None:
+                try:
+                    self._create_directory(parent.api_path)
+                except Exception as inner:
+                    if not _looks_like_already_exists(inner):
+                        raise
+
+            self._retry_until_volume_visible(_mkdir)
         return True
 
-    def _ensure_volume(self) -> bool:
-        """Top-down create of the missing pieces of catalog / schema / volume.
+    def _retry_until_volume_visible(self, op) -> None:
+        """Run *op*, absorbing the post-create volume-visibility window.
 
-        Routes the volume create through :meth:`Volume.create` so the
-        managed-volume-type default (``VolumeType.MANAGED`` enum, not
-        a bare ``"MANAGED"`` string the SDK rejects) lives in one
-        place. ``AlreadyExists`` is swallowed by ``missing_ok=True``;
-        if the volume create NotFounds because schema (or catalog) is
-        missing, falls through to :func:`_ensure_parents_for` to
-        materialise the parents before a single retry.
+        :meth:`Volume.ensure_created` returns as soon as Unity Catalog has the
+        volume, but the Files API edge can keep 404-ing "Volume ... does not
+        exist" for a second or two afterwards (eventual consistency). Retry
+        *op* up to :attr:`VOLUME_VISIBILITY_RETRIES` times with capped
+        exponential backoff while the failure still looks like that
+        not-yet-visible volume; surface any other error immediately, and
+        re-raise the last not-found once the window is exhausted.
         """
-        if self._split_volume() is None:
-            return False
-        volume = self.volume
+        sleep = self.VOLUME_VISIBILITY_BASE_SLEEP
+        for attempt in range(self.VOLUME_VISIBILITY_RETRIES):
+            try:
+                op()
+                return
+            except Exception as exc:
+                if not _looks_like_not_found(exc):
+                    raise
 
-        try:
-            volume.create(missing_ok=True)
-            return True
-        except Exception as exc:
-            if _looks_like_already_exists(exc):
-                return True
-            if not _looks_like_not_found(exc):
-                raise
+                message = str(exc)
 
-        from yggdrasil.databricks.volume.volumes import _ensure_parents_for
-
-        _ensure_parents_for(
-            self.client.workspace_client(),
-            catalog_name=volume.catalog_name,
-            schema_name=volume.schema_name,
-        )
-        try:
-            volume.create(missing_ok=True)
-        except Exception as exc:
-            if not _looks_like_already_exists(exc):
-                raise
-        return True
+                if "olume" in message and "not exist" in message:
+                    self.volume.create(refresh=True)
+                elif attempt == self.VOLUME_VISIBILITY_RETRIES - 1:
+                    raise
+                else:
+                    logger.warning(
+                        "Volume %r not visible to the Files API yet (attempt "
+                        "%d/%d) — sleeping %.1fs before retrying: %s",
+                        self, attempt + 1, self.VOLUME_VISIBILITY_RETRIES,
+                        sleep, exc,
+                    )
+                    time.sleep(sleep)
+                    sleep = min(sleep * 2, self.VOLUME_VISIBILITY_MAX_SLEEP)
 
     # ==================================================================
     # Mutators
@@ -1320,17 +1340,23 @@ class VolumePath(DatabricksPath):
         instead of returning a clean 404 when the target volume doesn't exist —
         and that transport error never trips the NotFound recovery. So on an
         ``HTTPError`` / ``OSError`` from the upload, ensure the volume exists
-        (idempotent :meth:`Volume.create`) and retry exactly once.
+        (idempotent :meth:`Volume.ensure_created`) and retry over the volume
+        visibility window — a freshly-created volume isn't immediately visible
+        to the Files edge, so a single immediate retry races the propagation.
         """
         try:
             self._call_ensuring_parents(do_upload)
         except (HTTPError, OSError) as exc:
+            if self._split_volume() is None:
+                raise  # not a volume path — nothing to ensure
             logger.warning(
                 "Upload of %r failed at the transport layer (%s) — ensuring the "
-                "volume exists and retrying once.", self, exc,
+                "volume exists and retrying.", self, exc,
             )
-            self._ensure_volume()
-            self._call_ensuring_parents(do_upload)
+            self.volume.ensure_created()
+            self._retry_until_volume_visible(
+                lambda: self._call_ensuring_parents(do_upload)
+            )
 
     def _upload(self, content: Any) -> int:
         """Upload *content* via ``PUT /api/2.0/fs/files`` (overwrite).
@@ -1360,25 +1386,31 @@ class VolumePath(DatabricksPath):
                     parent,
                 )
                 os.makedirs(parent, exist_ok=True)
-            if hasattr(content, "seek"):
-                try:
-                    pos = content.tell()
-                    if size == -1:
-                        content.seek(0, io.SEEK_END)
-                        size = content.tell()
-                    content.seek(pos, io.SEEK_SET)
-                except Exception:
-                    pos = 0
+            if hasattr(content, "read"):
+                # Whole-object upload — rewind to byte 0 and stream the
+                # entire source, exactly like the off-cluster PUT below.
+                # Reading from ``content.tell()`` instead would truncate
+                # the file to empty when the caller hands a stream already
+                # parked at EOF (a just-written buffer), corrupting the
+                # object on-cluster while the off-cluster path stayed
+                # correct. A non-seekable stream just reads from where it
+                # is — best-effort, same as off-cluster.
+                if hasattr(content, "seek"):
+                    try:
+                        content.seek(0)
+                    except Exception:
+                        pass
                 bytes_written = 0
                 with open(api_path, "wb") as fh:
                     while True:
                         chunk = content.read(1024 * 1024)
                         if not chunk:
                             break
+                        if isinstance(chunk, str):
+                            chunk = chunk.encode()
                         fh.write(chunk)
                         bytes_written += len(chunk)
-                if size == -1:
-                    size = bytes_written
+                size = bytes_written
             else:
                 payload = bytes(content)
                 size = len(payload)
@@ -1546,28 +1578,6 @@ def _looks_like_not_found(exc: BaseException) -> bool:
     if isinstance(exc, FileNotFoundError):
         return True
     return "does not exist" in str(exc).lower()
-
-
-# ``\bvolume\b`` matches the bare word; ``/Volumes/`` in a directory-missing
-# path lowercases to ``/volumes/`` and ``volumes`` (with the trailing ``s``)
-# does *not* satisfy the second word boundary — so this stays clear of the
-# path-prefix false positive.
-_VOLUME_TOKEN_RE = re.compile(r"\bvolume\b", re.IGNORECASE)
-
-
-def _looks_like_volume_not_found(exc: BaseException) -> bool:
-    """True when *exc* names the Unity Catalog volume itself as missing.
-
-    Distinct from a missing sub-directory inside an existing volume:
-    Databricks' Files API surfaces the former as a NotFound carrying
-    the word ``Volume`` (e.g. ``Volume 'cat.sch.vol' does not exist``),
-    while a missing sub-path mentions ``Path``/``directory`` instead.
-    Used by :meth:`VolumePath._ensure_parents` to skip the cheap
-    ``files.create_directory`` probe and create the volume directly.
-    """
-    if not _looks_like_not_found(exc):
-        return False
-    return _VOLUME_TOKEN_RE.search(str(exc)) is not None
 
 
 def _looks_like_already_exists(exc: BaseException) -> bool:

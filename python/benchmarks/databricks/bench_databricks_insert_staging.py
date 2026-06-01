@@ -72,7 +72,7 @@ import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 
 # ---------------------------------------------------------------------------

@@ -18,9 +18,7 @@ Exercises the gnarly parts of the API against a real local
   registry knows — dict, dataclass, ``pyarrow.RecordBatch``,
   ``polars.DataFrame`` — fanned out in a single transform.
 * :meth:`Dataset.filter` that drops every row (empty output
-  partitions must not crash the typed-cast path) and predicate
-  carriers that preserve ``installed_modules`` across a chain of
-  transforms.
+  partitions must not crash the typed-cast path).
 * :meth:`Dataset.parallelize` distributing a closure that
   captures live state by reference (caught via ``yggdrasil.pickle``
   serialization).
@@ -42,6 +40,11 @@ import uuid
 import pytest
 
 pytest.importorskip("pyspark")
+
+# End-to-end Dataset/dynamic-frame coverage — the heaviest Spark surface in
+# the suite (signal-guarded full pipelines over heterogeneous objects). Gated
+# as integration: skipped unless YGGDRASIL_SPARK_INTEGRATION is set.
+pytestmark = pytest.mark.spark_integration
 
 import pyarrow as pa  # noqa: E402
 
@@ -84,16 +87,7 @@ class _Row:
 
 
 class _DatasetTestBase(SparkTestCase, ArrowTestCase):
-    """Shared SIGALRM-guarded setUp/tearDown for the integration tests.
-
-    Also stubs out :func:`yggdrasil.spark.frame._install_modules_on_executors`
-    so the per-transform ``_ensure_installed`` scan doesn't build /
-    ship real ``yggdrasil`` / ``pyarrow`` / ``polars`` archives for
-    every test that calls ``.map`` / ``.filter`` / ``.apply``. The
-    scan itself still runs and populates ``installed_modules`` — we
-    just don't pay the multi-hundred-MB archive-build cost on the
-    local Spark session.
-    """
+    """Shared SIGALRM-guarded setUp/tearDown for the integration tests."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -108,23 +102,7 @@ class _DatasetTestBase(SparkTestCase, ArrowTestCase):
             )
             signal.alarm(_TEST_TIMEOUT_SECONDS)
 
-        # Stub: pretend every requested module installed cleanly. The shim
-        # lives at module scope in ``yggdrasil.spark.frame`` and is
-        # imported lazily inside ``Dataset._ensure_installed_on_session`` —
-        # patching the module attribute is enough for the `from … import`
-        # lookup to pick up the stub.
-        from yggdrasil.spark import frame as _spark_frame
-
-        self._spark_frame = _spark_frame
-        self._orig_install = _spark_frame._install_modules_on_executors
-
-        def _stub(session, modules):
-            return set(modules)
-
-        _spark_frame._install_modules_on_executors = _stub  # type: ignore[assignment]
-
     def tearDown(self) -> None:
-        self._spark_frame._install_modules_on_executors = self._orig_install  # type: ignore[assignment]
         if _has_alarm():
             signal.alarm(0)
             signal.signal(signal.SIGALRM, self._prev_handler)
@@ -416,32 +394,11 @@ class TestApplyTabularShapes(_DatasetTestBase):
 
 
 # ---------------------------------------------------------------------------
-# Chained transforms — installed_modules + lineage preservation
+# Chained transforms — lineage preservation
 # ---------------------------------------------------------------------------
 
 
 class TestTransformLineage(_DatasetTestBase):
-
-    def test_installed_modules_propagate_through_chain(self) -> None:
-        """map → filter → cast keeps the discovered module set on every
-        intermediate frame so the executor doesn't re-ship the same
-        wheel for each transform.
-        """
-        seeded = {"ygg-test-module"}
-        frame = Dataset.from_iterable(
-            range(10), spark_session=self.spark,
-        )
-        # Seed directly so we exercise the propagation without
-        # triggering a real archive build.
-        frame.installed_modules.update(seeded)
-
-        mapped = frame.map(lambda x: x + 1)
-        filtered = mapped.filter(lambda x: x % 2 == 0)
-        out_schema = schema([field("v", Int64Type)])
-        cast = filtered.apply(lambda x: {"v": x}, out_schema)
-
-        for f in (mapped, filtered, cast):
-            self.assertTrue(seeded.issubset(f.installed_modules))
 
     def test_filter_then_map_preserves_count(self) -> None:
         frame = Dataset.from_iterable(range(100), spark_session=self.spark)

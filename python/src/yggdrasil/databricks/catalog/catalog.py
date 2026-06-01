@@ -33,6 +33,7 @@ from typing import Any, ClassVar, Iterable, Iterator, Mapping, Optional, TYPE_CH
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import CatalogInfo, SecurableType
 from yggdrasil.concurrent.threading import Job
+from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
@@ -248,11 +249,18 @@ class UCCatalog(DatabricksPath, Singleton):
 
     def _stat_uncached(self) -> IOStats:
         infos = self.read_infos(default=None)
-        kind = IOKind.MISSING if infos is None else IOKind.DIRECTORY
+
+        if infos is None:
+            kind = IOKind.MISSING
+            mtime = 0.0
+        else:
+            kind = IOKind.DIRECTORY
+            mtime = float(infos.updated_at / 1000.0) if infos.updated_at else 0.0
 
         return IOStats(
             kind=kind,
             media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_CATALOG,
+            mtime=mtime
         )
 
     def _from_url(self, url: URL) -> "DatabricksPath":
@@ -495,6 +503,10 @@ class UCCatalog(DatabricksPath, Singleton):
     def storage_root(self) -> Optional[str]:
         return self.infos.storage_root
 
+    @property
+    def storage_location(self):
+        return self.infos.storage_location
+
     # ── navigation ────────────────────────────────────────────────────────────
 
     def schema(self, name: str) -> "UCSchema":
@@ -580,28 +592,36 @@ class UCCatalog(DatabricksPath, Singleton):
             storage_root: External storage root URI (for external catalogs).
             missing_ok: Silently succeed if the catalog already exists.
         """
-        uc = self.client.workspace_client().catalogs
-        logger.debug(
-            "Creating catalog %r (storage_root=%s, missing_ok=%s)",
-            self, storage_root, missing_ok,
-        )
-        try:
-            info = uc.create(
-                name=self.catalog_name,
-                comment=comment,
-                properties=properties,
-                storage_root=storage_root,
+        # Idempotent: a successful read means it already exists — never
+        # auto-create from a read, only here.
+        if self.read_infos(default=None) is None:
+            uc = self.client.workspace_client().catalogs
+            logger.debug(
+                "Creating catalog %r (storage_root=%s, missing_ok=%s)",
+                self, storage_root, missing_ok,
             )
-            object.__setattr__(self, "_infos", info)
-            object.__setattr__(self, "_infos_fetched_at", time.time())
-        except DatabricksError as exc:
-            if missing_ok and "already exists" in str(exc).lower():
-                logger.debug(
-                    "Catalog %r already exists — soft-resetting cache", self,
+            try:
+                info = uc.create(
+                    name=self.catalog_name,
+                    comment=comment,
+                    properties=properties,
+                    storage_root=storage_root,
                 )
-                self._reset_cache()
-            else:
-                raise
+                object.__setattr__(self, "_infos", info)
+                object.__setattr__(self, "_infos_fetched_at", time.time())
+            except Exception as exc:
+                # A catalog is top-level — there are no parents to create —
+                # so the only soft outcome is a concurrent create.
+                if missing_ok and "already exists" in str(exc).lower():
+                    logger.debug(
+                        "Catalog %r already exists — soft-resetting cache", self,
+                    )
+                    self._reset_cache()
+                else:
+                    raise
+        # Keep the path stat cache in lock-step with the now-current info so a
+        # follow-up exists() / is_dir() / stat() doesn't observe a stale MISSING.
+        self._persist_stat_cache(self._stat_uncached())
         return self
 
     def ensure_created(
@@ -611,15 +631,15 @@ class UCCatalog(DatabricksPath, Singleton):
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
     ) -> "UCCatalog":
-        """Create this catalog if it does not already exist, then return ``self``."""
-        if not self.exists():
-            self.create(
-                comment=comment,
-                properties=properties,
-                storage_root=storage_root,
-                missing_ok=True,
-            )
-        return self
+        """Create this catalog if it does not already exist, then return
+        ``self``. :meth:`create` is itself idempotent, so this is just a
+        named alias."""
+        return self.create(
+            comment=comment,
+            properties=properties,
+            storage_root=storage_root,
+            missing_ok=True,
+        )
 
     def delete(
         self,

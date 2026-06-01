@@ -1,4 +1,4 @@
-"""Tests for :class:`yggdrasil.io.nested.folder_path.Folder`."""
+"""Tests for :class:`yggdrasil.io.folder_path.Folder`."""
 
 from __future__ import annotations
 

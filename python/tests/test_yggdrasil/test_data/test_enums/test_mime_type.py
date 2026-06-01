@@ -32,6 +32,69 @@ class TestRegistryConstants:
     def test_octet_stream_is_any_bytes(self) -> None:
         assert MimeTypes.OCTET_STREAM.is_any_bytes
 
+    def test_columnar_and_json_formats_are_tabular(self) -> None:
+        # The frame-producing file formats must all carry is_tabular so the
+        # registry agrees with how the IO/inspect layer treats them.
+        for fmt in (
+            MimeTypes.PARQUET, MimeTypes.PARQUET_DELTA, MimeTypes.ARROW_IPC,
+            MimeTypes.ARROW_STREAM, MimeTypes.ORC, MimeTypes.AVRO,
+            MimeTypes.ICEBERG, MimeTypes.DELTA,
+            MimeTypes.JSON, MimeTypes.NDJSON, MimeTypes.CSV, MimeTypes.TSV,
+        ):
+            assert fmt.is_tabular, f"{fmt.name} should be tabular"
+
+    def test_ndjson_identity(self) -> None:
+        assert MimeTypes.NDJSON.value == "application/ld+json"
+        assert "ndjson" in MimeTypes.NDJSON.extensions
+
+    def test_bin_is_generic_not_flatbuffers(self) -> None:
+        # ``.bin`` is generic binary — it must not be claimed by FlatBuffers.
+        assert MimeType._EXT_MAP.get("bin") is None
+        assert "bin" not in MimeTypes.FLATBUFFERS.extensions
+        assert "fbs" in MimeTypes.FLATBUFFERS.extensions
+
+    def test_no_duplicate_or_colliding_extensions(self) -> None:
+        # Every registered extension maps to exactly one MimeType, and no
+        # MimeType lists the same extension twice (case-insensitively).
+        from collections import Counter
+        owners: dict[str, set[str]] = {}
+        for mt in set(MimeType._BY_NAME.values()):
+            seen = Counter(e.lower().lstrip(".") for e in mt.extensions)
+            assert all(c == 1 for c in seen.values()), f"{mt.name} has dup exts"
+            for e in seen:
+                owners.setdefault(e, set()).add(mt.name)
+        collisions = {e: o for e, o in owners.items() if len(o) > 1}
+        assert not collisions, f"extension collisions: {collisions}"
+
+    def test_from_magic_soft_misses_on_unreadable(self) -> None:
+        # A magic sniff that can't yield bytes is a soft miss, not a crash.
+        assert MimeType.from_magic(b"", default=None) is None
+
+    def test_blob_flag_is_set_and_exclusive(self) -> None:
+        # is_blob marks opaque single-file payloads; never overlaps is_tabular,
+        # and codecs/connectors aren't blobs.
+        for m in set(MimeType._BY_NAME.values()):
+            assert not (m.is_blob and m.is_tabular), f"{m.name} is both"
+            assert not (m.is_blob and m.is_codec), f"{m.name} blob+codec"
+        for fmt in (MimeTypes.PNG, MimeTypes.PDF, MimeTypes.ZIP, MimeTypes.SVG,
+                    MimeTypes.PICKLE, MimeTypes.OCTET_STREAM, MimeTypes.MP4):
+            assert fmt.is_blob, f"{fmt.name} should be a blob"
+        assert not MimeTypes.PARQUET.is_blob   # tabular, not blob
+        assert not MimeTypes.GZIP.is_blob      # codec, not blob
+
+    def test_new_formats_resolve(self) -> None:
+        assert MimeType.from_("svg", default=None) is MimeTypes.SVG
+        assert MimeType.from_("md", default=None) is MimeTypes.MARKDOWN
+        assert MimeType.from_("7z", default=None) is MimeTypes.SEVEN_ZIP
+        assert MimeType.from_("mp4", default=None) is MimeTypes.MP4
+
+    def test_tar_magic_at_offset_257(self) -> None:
+        # tar's ``ustar`` lives mid-header; a long-enough buffer matches,
+        # a short head does not false-positive.
+        header = b"f.txt" + b"\x00" * (257 - 5) + b"ustar" + b"\x00" * 250
+        assert MimeType.from_magic(header, default=None) is MimeTypes.TAR
+        assert MimeType.from_magic(header[:64], default=None) is None
+
 
 class TestPureGet:
     """`get` is a side-effect-free dict lookup."""

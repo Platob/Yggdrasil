@@ -94,13 +94,17 @@ from yggdrasil.io.holder import IO
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.url import hive_cast_value, hive_encode, hive_split
 
-# Side-effect import: ensures every primitive leaf (parquet / csv /
-# arrow / ndjson / json / xlsx) has registered itself in the
+# Force the single-buffer format leaves (parquet / csv / arrow / ndjson
+# / json / xlsx / pickle) to register themselves in
 # :data:`yggdrasil.io.holder._HOLDER_FORMAT_REGISTRY` so
-# :meth:`IO.class_for_media_type` actually finds them. Hoisted to
-# module-top so :meth:`Folder._leaf_for` (per-child during
-# :meth:`iter_children`) doesn't pay a dict lookup on every iter.
-import yggdrasil.io.primitive  # noqa: F401
+# :meth:`IO.class_for_media_type` finds them without
+# :meth:`Folder._leaf_for` paying a cold-miss per child. Only the
+# *primitive* leaves are loaded here — the nested ones (zip / delta)
+# depend on :class:`Folder` defined below, so loading them now would
+# close an import cycle; the full bootstrap pulls them lazily later.
+from yggdrasil.io.holder import _bootstrap_primitive_format_leaves
+
+_bootstrap_primitive_format_leaves()
 
 if TYPE_CHECKING:
     from yggdrasil.execution.expr import Predicate
@@ -1678,7 +1682,15 @@ class Folder(Path):
     # Row-level delete
     # ==================================================================
 
-    def _delete(self, predicate: "Predicate", options: FolderOptions) -> int:
+    def _delete(
+        self,
+        predicate: "Predicate" = None,
+        *,
+        wait: Any = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: Any,
+    ) -> int:
         """Walk children, filter each leaf in isolation, rewrite survivors.
 
         Streams leaf-by-leaf so a single match in one part file doesn't
@@ -1686,17 +1698,19 @@ class Folder(Path):
         hold matched rows are rewritten. Sub-folders recurse. Files
         the predicate fully drains are unlinked outright; leaves with
         a mix of survivors and matches are rewritten as a fresh part
-        and the original is unlinked once the new file is on disk.
+        and the original is unlinked once the new file is on disk. A
+        ``None`` *predicate* removes every row (all leaves unlinked).
 
         Per-batch filtering goes through
         :meth:`Predicate.filter_arrow_batches`, so the row work runs
         in pyarrow's C++ kernels — no Python row iteration.
         """
-        not_pred = ~predicate
+        options = self.check_options(kwargs.pop("options", None), **kwargs)
+        not_pred = ~predicate if predicate is not None else None
         deleted = 0
         for child in self.iter_children():
             if isinstance(child, Folder):
-                deleted += child._delete(predicate, child.options_class()())
+                deleted += child._delete(predicate)  # child resolves its own options
                 continue
             deleted += self._delete_leaf(child, not_pred, options)
         return deleted
@@ -1707,7 +1721,10 @@ class Folder(Path):
         not_pred: Any,
         options: FolderOptions,
     ) -> int:
-        """Filter rows in *child*; rewrite as a fresh part or unlink it."""
+        """Filter rows in *child*; rewrite as a fresh part or unlink it.
+
+        ``not_pred`` is ``None`` for a no-filter delete — every row goes,
+        so the leaf is drained for its count and unlinked outright."""
         survivors: "list[pa.RecordBatch]" = []
         kept_rows = 0
         total_rows = 0
@@ -1719,9 +1736,13 @@ class Folder(Path):
                 yield b
 
         try:
-            for kept in not_pred.filter_arrow_batches(_counted()):
-                kept_rows += kept.num_rows
-                survivors.append(kept)
+            if not_pred is None:
+                for _ in _counted():
+                    pass
+            else:
+                for kept in not_pred.filter_arrow_batches(_counted()):
+                    kept_rows += kept.num_rows
+                    survivors.append(kept)
         except Exception:
             return 0
 

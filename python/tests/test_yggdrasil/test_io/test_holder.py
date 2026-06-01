@@ -67,14 +67,14 @@ class TestFormatDispatch:
 
     def test_bytes_io_with_parquet_path_dispatches(self, tmp_path) -> None:
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         b = IO(path=str(tmp_path / "x.parquet"))
         assert isinstance(b, ParquetFile)
 
     def test_bytes_io_with_csv_path_dispatches(self, tmp_path) -> None:
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         b = IO(path=str(tmp_path / "x.csv"))
         assert isinstance(b, CSVFile)
@@ -82,7 +82,7 @@ class TestFormatDispatch:
     def test_explicit_media_type_wins_over_extension(self, tmp_path) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         b = IO(
             path=str(tmp_path / "x.csv"),
@@ -93,7 +93,7 @@ class TestFormatDispatch:
     def test_storage_holder_media_type_drives_dispatch(self) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         mem = Memory()
         mem.media_type = MediaType(MimeTypes.PARQUET)
@@ -107,7 +107,7 @@ class TestFormatDispatch:
 
     def test_data_string_path_dispatches(self, tmp_path) -> None:
         from yggdrasil.io.base import IO
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         b = IO(data=str(tmp_path / "x.csv"))
         assert isinstance(b, CSVFile)
@@ -306,7 +306,7 @@ class TestOpenFormatDispatch:
     """``LocalPath('x.parquet').open()`` lands on :class:`ParquetFile`."""
 
     def test_local_path_parquet_opens_as_parquet_file(self, tmp_path) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         lp = LocalPath(str(tmp_path / "x.parquet"))
         cursor = lp.open(mode="rb", auto_open=False)
@@ -314,7 +314,7 @@ class TestOpenFormatDispatch:
         assert cursor.parent is lp
 
     def test_local_path_csv_opens_as_csv_file(self, tmp_path) -> None:
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         lp = LocalPath(str(tmp_path / "x.csv"))
         cursor = lp.open(mode="rb", auto_open=False)
@@ -329,7 +329,7 @@ class TestOpenFormatDispatch:
 
     def test_explicit_media_type_overrides_extension(self, tmp_path) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         lp = LocalPath(str(tmp_path / "x.csv"))
         cursor = lp.open(
@@ -352,12 +352,12 @@ class TestFormatRegistry:
             assert expected in names
 
     def test_class_for_media_type_parquet(self) -> None:
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         assert Holder.class_for_media_type("parquet") is ParquetFile
 
     def test_class_for_media_type_csv(self) -> None:
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         assert Holder.class_for_media_type("text/csv") is CSVFile
 
@@ -371,7 +371,7 @@ class TestFormatRegistry:
 
     def test_for_holder_dispatches_via_stamped_media(self) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         mem = Memory()
         mem.media_type = MediaType(MimeTypes.PARQUET)
@@ -380,7 +380,7 @@ class TestFormatRegistry:
 
     def test_for_holder_explicit_media_type(self) -> None:
         from yggdrasil.enums import MediaType, MimeTypes
-        from yggdrasil.io.primitive.csv_file import CSVFile
+        from yggdrasil.io.csv_file import CSVFile
 
         mem = Memory()
         leaf = Holder.for_holder(mem, media_type=MediaType(MimeTypes.CSV))
@@ -577,7 +577,7 @@ class TestReserveCopyOnWrite:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         table = pa.table({"x": pa.array(range(100), type=pa.int64())})
         pf = ParquetFile()
@@ -586,3 +586,63 @@ class TestReserveCopyOnWrite:
         assert got.num_rows == 100
         # Re-read still works after the holder is otherwise touched.
         assert pf.read_arrow_table().num_rows == 100
+
+
+class TestRemoteWholeReadTopUp:
+    """A whole-object read must return the complete object even when a
+    stale / eventually-consistent stat undersizes the request (or a server
+    ignores the Range) — the read tops up the tail from the freshly-learned
+    size rather than handing back a truncated buffer (e.g. a Parquet footer
+    going missing)."""
+
+    def test_full_read_tops_up_a_truncated_remote_read(self) -> None:
+        from yggdrasil.io.holder import IO
+
+        real = bytes(range(256)) * 40        # 10240 bytes
+
+        class _StaleRemote(IO):              # no __slots__ → gets a __dict__
+            def __init__(self) -> None:
+                self._parent = None
+                self._pos = 0
+                self._believed = 16          # stale-small initial size
+                self.calls: list[tuple[int, int]] = []
+
+            @property
+            def size(self) -> int:
+                return self._believed
+
+            def _read_mv(self, n: int, pos: int) -> memoryview:
+                # Serving the read reveals the object's true (larger) size.
+                self._believed = len(real)
+                self.calls.append((n, pos))
+                return memoryview(real[pos:pos + n])
+
+        s = _StaleRemote()
+        out = bytes(IO.read_mv(s, -1, 0))
+        assert out == real                   # complete, not the 16-byte prefix
+        assert len(s.calls) >= 2             # initial short read + tail top-up
+
+    def test_explicit_prefix_read_is_not_topped_up(self) -> None:
+        # A bounded read (size >= 0) keeps its contract — only reads-to-end
+        # (size < 0) top up.
+        from yggdrasil.io.holder import IO
+
+        real = bytes(range(256))             # 256 bytes
+
+        class _Remote(IO):
+            def __init__(self) -> None:
+                self._parent = None
+                self._pos = 0
+                self.calls = 0
+
+            @property
+            def size(self) -> int:
+                return len(real)
+
+            def _read_mv(self, n: int, pos: int) -> memoryview:
+                self.calls += 1
+                return memoryview(real[pos:pos + n])
+
+        s = _Remote()
+        out = bytes(IO.read_mv(s, 10, 0))
+        assert out == real[:10] and s.calls == 1

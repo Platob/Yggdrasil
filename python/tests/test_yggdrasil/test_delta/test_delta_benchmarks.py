@@ -62,7 +62,7 @@ class TestWriteBenchmark(DeltaTestCase, _BenchmarkMixin):
         def ygg_write():
             p = str(self.tmp_path / f"ygg_{time.time_ns()}")
             os.makedirs(p, exist_ok=True)
-            from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+            from yggdrasil.io.delta.delta_folder import DeltaFolder
             d = DeltaFolder(path=p)
             d.write_arrow_table(t)
 
@@ -85,7 +85,7 @@ class TestWriteBenchmark(DeltaTestCase, _BenchmarkMixin):
         def ygg_write():
             p = str(self.tmp_path / f"ygg_{time.time_ns()}")
             os.makedirs(p, exist_ok=True)
-            from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+            from yggdrasil.io.delta.delta_folder import DeltaFolder
             d = DeltaFolder(path=p)
             d.write_arrow_table(t)
 
@@ -108,7 +108,7 @@ class TestWriteBenchmark(DeltaTestCase, _BenchmarkMixin):
         def ygg_write():
             p = str(self.tmp_path / f"ygg_{time.time_ns()}")
             os.makedirs(p, exist_ok=True)
-            from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+            from yggdrasil.io.delta.delta_folder import DeltaFolder
             d = DeltaFolder(path=p)
             d.write_arrow_table(t)
 
@@ -133,7 +133,7 @@ class TestReadBenchmark(DeltaTestCase, _BenchmarkMixin):
 
         ygg_path = str(self.tmp_path / "ygg_read")
         os.makedirs(ygg_path, exist_ok=True)
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
         d = DeltaFolder(path=ygg_path)
         d.write_arrow_table(t)
 
@@ -144,7 +144,7 @@ class TestReadBenchmark(DeltaTestCase, _BenchmarkMixin):
 
     def test_read_small_table(self) -> None:
         import deltalake
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
 
         ygg_path, dl_path = self._setup_table(1000)
         print("\n--- Read 1K rows ---")
@@ -165,7 +165,7 @@ class TestReadBenchmark(DeltaTestCase, _BenchmarkMixin):
 
     def test_read_medium_table(self) -> None:
         import deltalake
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
 
         ygg_path, dl_path = self._setup_table(100_000)
         print("\n--- Read 100K rows ---")
@@ -191,7 +191,7 @@ class TestAppendBenchmark(DeltaTestCase, _BenchmarkMixin):
 
     def test_append_many_commits(self) -> None:
         import deltalake
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
 
         n_commits = 20
         batch_size = 1000
@@ -227,7 +227,7 @@ class TestCheckpointBenchmark(DeltaTestCase, _BenchmarkMixin):
     """Checkpoint write + replay benchmark."""
 
     def test_checkpoint_v1_write_and_replay(self) -> None:
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
 
         print("\n--- V1 Checkpoint (10 commits + checkpoint + replay) ---")
 
@@ -248,7 +248,7 @@ class TestCheckpointBenchmark(DeltaTestCase, _BenchmarkMixin):
         self._time(run, "v1 checkpoint cycle", repeat=3)
 
     def test_checkpoint_v2_write_and_replay(self) -> None:
-        from yggdrasil.io.nested.delta.delta_folder import DeltaFolder
+        from yggdrasil.io.delta.delta_folder import DeltaFolder
 
         print("\n--- V2 Checkpoint (10 commits + checkpoint + replay) ---")
 
@@ -273,7 +273,7 @@ class TestDeletionVectorBenchmark(DeltaTestCase, _BenchmarkMixin):
     """DV encode/decode benchmark."""
 
     def test_dv_encode_decode_small(self) -> None:
-        from yggdrasil.io.nested.delta.deletion_vector import (
+        from yggdrasil.io.delta.deletion_vector import (
             _encode_dv_payload,
             _decode_payload,
         )
@@ -292,7 +292,7 @@ class TestDeletionVectorBenchmark(DeltaTestCase, _BenchmarkMixin):
         self._time(decode, "decode", repeat=100)
 
     def test_dv_encode_decode_large(self) -> None:
-        from yggdrasil.io.nested.delta.deletion_vector import (
+        from yggdrasil.io.delta.deletion_vector import (
             _encode_dv_payload,
             _decode_payload,
         )
@@ -311,7 +311,7 @@ class TestDeletionVectorBenchmark(DeltaTestCase, _BenchmarkMixin):
         self._time(decode, "decode", repeat=10)
 
     def test_dv_mask_batch_benchmark(self) -> None:
-        from yggdrasil.io.nested.delta.deletion_vector import (
+        from yggdrasil.io.delta.deletion_vector import (
             DeletionVector,
             DeletionVectorDescriptor,
             mask_batch_with_dv,

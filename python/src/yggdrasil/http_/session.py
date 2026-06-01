@@ -88,7 +88,7 @@ from yggdrasil.http_.response_batch import HTTPResponseBatch
 from yggdrasil.io.holder import IO
 from yggdrasil.http_.headers import HTTPHeaders
 from yggdrasil.path.memory import Memory
-from yggdrasil.io.primitive import ArrowIPCFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.http_.cache_config import CacheConfig
 from yggdrasil.http_.send_config import DEFAULT_MAX_BATCH_TTL, SendConfig
 from yggdrasil.url import URL

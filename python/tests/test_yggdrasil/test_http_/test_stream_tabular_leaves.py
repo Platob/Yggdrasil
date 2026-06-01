@@ -39,10 +39,10 @@ import pytest
 from yggdrasil.http_.session import HTTPSession
 from yggdrasil.path.memory import Memory
 from yggdrasil.path.memory_stream import MemoryStream
-from yggdrasil.io.primitive.arrow_ipc_file import ArrowIPCFile
-from yggdrasil.io.primitive.csv_file import CSVFile
-from yggdrasil.io.primitive.ndjson_file import NDJSONFile
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
+from yggdrasil.io.csv_file import CSVFile
+from yggdrasil.io.ndjson_file import NDJSONFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 
 _ROWS = 200_000
@@ -157,7 +157,7 @@ def test_zip_reads_over_spilled_stream():
             zf.writestr(f"m{i}.bin", os.urandom(4096))
     data = buf.getvalue()
     assert len(data) > 64 * 1024
-    from yggdrasil.io.nested.zip_file import ZipFile
+    from yggdrasil.io.zip_file import ZipFile
 
     ms = _spilling(data)
     zf = ZipFile(holder=ms, owns_holder=False)

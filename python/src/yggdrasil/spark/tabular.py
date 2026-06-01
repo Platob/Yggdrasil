@@ -9,9 +9,11 @@ roles, both satisfied by one class:
   holder fits anywhere the IO surface expects a Tabular.
 * Rich :class:`pyspark.sql.DataFrame` wrapper — schema-aware
   ``map`` / ``apply`` / ``filter`` / ``explode`` / ``cast`` over
-  :meth:`pyspark.sql.DataFrame.mapInArrow`, executor module
-  auto-shipping (yggdrasil + user-function deps), schema inference
-  off dynamic-mode (pickled-object) frames.
+  :meth:`pyspark.sql.DataFrame.mapInArrow`, schema inference off
+  dynamic-mode (cloudpickled-object) frames. The user function and
+  row payloads travel as cloudpickle (the serializer pyspark already
+  ships), so executors need no ygg install; cluster-side libraries
+  are provisioned by the environment (e.g. ``DatabricksEnv``).
 
 The held DataFrame is mutable: writes replace it (OVERWRITE) or
 union to it (APPEND). :meth:`read_spark_frame` returns the held
@@ -115,7 +117,6 @@ class SparkDataset(Tabular[CastOptions]):
         *,
         df: Optional["SparkDataFrame"] = None,
         spark: Optional["SparkSession"] = None,
-        installed_modules: "set[str] | None" = None,
     ) -> None:
         """Wrap a Spark DataFrame, optionally with a yggdrasil schema.
 
@@ -144,15 +145,6 @@ class SparkDataset(Tabular[CastOptions]):
         # merge without a parallel slot.
         if schema is not None:
             self._persist_schema(schema)
-        # Top-level package names this frame has already declared on
-        # the cluster. Auto-populated when :meth:`apply` / :meth:`map`
-        # / :meth:`filter` scan a user function's globals and feed
-        # them through :meth:`_ensure_installed`. Persists across
-        # transforms so a chain like ``df.apply(f).map(g).filter(h)``
-        # only round-trips each module once per frame lineage.
-        self.installed_modules: set[str] = (
-            set(installed_modules) if installed_modules else set()
-        )
         if held is not None and self._spark is None:
             # Cache the session off the frame so subsequent
             # empty-frame reads / writes don't have to rediscover it.
@@ -488,6 +480,18 @@ class SparkDataset(Tabular[CastOptions]):
             return
         yield from Record.from_spark_frame(self._frame)
 
+    def _delete(
+        self,
+        predicate: Any = None,
+        *,
+        wait: Any = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: Any,
+    ) -> int:
+        """Spark delete — filter the dataset's batches and rewrite."""
+        return self._delete_rewrite(predicate, **kwargs)
+
     def _write_arrow_batches(
         self,
         batches: Iterable[pa.RecordBatch],
@@ -512,11 +516,8 @@ class SparkDataset(Tabular[CastOptions]):
     # Typed-argument projection / row-filter hooks
     #
     # Override the cross-engine defaults in :class:`Tabular` so the
-    # returned ``Dataset`` carries over per-instance state
-    # (``installed_modules``, the typed ``schema`` for filter — which
-    # preserves the row layout). The base defaults would re-build a
-    # bare ``Dataset(frame=...)`` and lose the executor-side module
-    # install record, forcing a re-install on the next transform.
+    # returned ``Dataset`` carries over per-instance state (the typed
+    # ``schema`` for filter, which preserves the row layout).
     # ------------------------------------------------------------------
 
     def _select(self, *, columns: list[str]) -> "SparkDataset":
@@ -530,7 +531,6 @@ class SparkDataset(Tabular[CastOptions]):
         return type(self)(
             frame=new_frame,
             schema=None,
-            installed_modules=self.installed_modules,
         )
 
     def _drop(self, *, columns: list[str]) -> "SparkDataset":
@@ -541,7 +541,6 @@ class SparkDataset(Tabular[CastOptions]):
         return type(self)(
             frame=new_frame,
             schema=None,
-            installed_modules=self.installed_modules,
         )
 
     def _filter(self, *, predicate: "Predicate") -> "SparkDataset":
@@ -551,7 +550,6 @@ class SparkDataset(Tabular[CastOptions]):
         return type(self)(
             frame=new_frame,
             schema=self.schema,
-            installed_modules=self.installed_modules,
         )
 
     # ==================================================================
@@ -605,7 +603,7 @@ class SparkDataset(Tabular[CastOptions]):
         from yggdrasil.environ import PyEnv
         from yggdrasil.arrow.cast import any_to_arrow_table
         from yggdrasil.data.schema import Schema as _Schema
-        from yggdrasil.pickle.ser import dumps
+        import cloudpickle
         from yggdrasil.spark.frame import DYNAMIC_SCHEMA
 
         if spark_session is None:
@@ -616,11 +614,10 @@ class SparkDataset(Tabular[CastOptions]):
             )
 
         if schema is None:
-            cls._ensure_installed_on_session(spark_session)
             # Materialize before handing to Spark — Spark Connect's
             # ``createDataFrame`` indexes ``_data[0]`` to sniff the
             # shape, which IndexErrors on an empty generator.
-            rows = [(dumps(x),) for x in items]
+            rows = [(cloudpickle.dumps(x),) for x in items]
             logger.debug(
                 "Creating dynamic Spark dataset from iterable (rows=%d)",
                 len(rows),
@@ -637,7 +634,6 @@ class SparkDataset(Tabular[CastOptions]):
             )
             return instance
 
-        cls._ensure_installed_on_session(spark_session)
         schema = _Schema.from_any(schema)
         table = any_to_arrow_table(
             items,
@@ -776,7 +772,7 @@ class SparkDataset(Tabular[CastOptions]):
         from yggdrasil.environ import PyEnv
         from yggdrasil.data.schema import Schema as _Schema
         from yggdrasil.dataclasses.safe_function import build_row_invoker
-        from yggdrasil.pickle.ser import dumps
+        import cloudpickle
         from yggdrasil.spark.frame import (
             DYNAMIC_SCHEMA,
             _dynamic_rows,
@@ -791,12 +787,8 @@ class SparkDataset(Tabular[CastOptions]):
                 import_error=True,
             )
 
-        installed_modules = cls._ensure_installed_on_session(
-            spark_session,
-            function,
-        )
-        dumped = [(dumps(x),) for x in inputs]
-        function_pickle = dumps(function)
+        dumped = [(cloudpickle.dumps(x),) for x in inputs]
+        function_pickle = cloudpickle.dumps(function)
         logger.debug(
             "Creating Spark dataset via parallelize (inputs=%d, "
             "function=%r, schema=%r)",
@@ -815,9 +807,9 @@ class SparkDataset(Tabular[CastOptions]):
             def _runner(
                 batches: "Iterator[pa.RecordBatch]",
             ) -> "Iterator[pa.RecordBatch]":
-                from yggdrasil.pickle.ser import loads
+                import cloudpickle
 
-                invoke = build_row_invoker(loads(function_pickle))
+                invoke = build_row_invoker(cloudpickle.loads(function_pickle))
                 yield from _emit_pickled(
                     (invoke(obj) for obj in _dynamic_rows(batches)),
                     byte_size=byte_size,
@@ -830,7 +822,6 @@ class SparkDataset(Tabular[CastOptions]):
             return cls(
                 frame=result_df,
                 schema=None,
-                installed_modules=installed_modules,
             )
 
         schema = _Schema.from_any(schema)
@@ -838,9 +829,9 @@ class SparkDataset(Tabular[CastOptions]):
         def _typed_runner(
             batches: "Iterator[pa.RecordBatch]",
         ) -> "Iterator[pa.RecordBatch]":
-            from yggdrasil.pickle.ser import loads
+            import cloudpickle
 
-            invoke = build_row_invoker(loads(function_pickle))
+            invoke = build_row_invoker(cloudpickle.loads(function_pickle))
 
             def _groups() -> "Iterator[list[Any]]":
                 for batch in batches:
@@ -848,7 +839,7 @@ class SparkDataset(Tabular[CastOptions]):
                     n = batch.num_rows
                     if n == 0:
                         continue
-                    yield [invoke(loads(col[i].as_py())) for i in range(n)]
+                    yield [invoke(cloudpickle.loads(col[i].as_py())) for i in range(n)]
 
             return spark_typed_cast(_groups(), schema, byte_size=byte_size)
 
@@ -859,7 +850,6 @@ class SparkDataset(Tabular[CastOptions]):
         return cls(
             frame=result_df,
             schema=schema,
-            installed_modules=installed_modules,
         )
 
     # ==================================================================
@@ -886,7 +876,7 @@ class SparkDataset(Tabular[CastOptions]):
         transform whose output schema is looser than the declared one.
         """
         from yggdrasil.data.schema import Schema as _Schema
-        from yggdrasil.pickle.ser import dumps, loads
+        import cloudpickle
         from yggdrasil.spark.frame import (
             DYNAMIC_SCHEMA,
             PICKLE_COLUMN_NAME,
@@ -905,7 +895,7 @@ class SparkDataset(Tabular[CastOptions]):
             merged: "Schema | None" = None
             if self.is_dynamic:
                 for row in df.toLocalIterator():
-                    shape = _Schema.from_(loads(row[PICKLE_COLUMN_NAME]))
+                    shape = _Schema.from_(cloudpickle.loads(row[PICKLE_COLUMN_NAME]))
                     merged = (
                         shape
                         if merged is None
@@ -930,7 +920,6 @@ class SparkDataset(Tabular[CastOptions]):
             return merged
 
         # ---- full-scan path: per-partition inference via mapInArrow ---
-        self._ensure_installed()
         is_dynamic_in = self.is_dynamic
 
         def _runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
@@ -940,7 +929,7 @@ class SparkDataset(Tabular[CastOptions]):
                 for batch in batches:
                     col = batch.column(0)
                     for i in range(batch.num_rows):
-                        shape = _Schema.from_(loads(col[i].as_py()))
+                        shape = _Schema.from_(cloudpickle.loads(col[i].as_py()))
                         partition_schema = (
                             shape
                             if partition_schema is None
@@ -958,7 +947,7 @@ class SparkDataset(Tabular[CastOptions]):
 
             if partition_schema is not None:
                 yield pa.RecordBatch.from_pylist(
-                    [{PICKLE_COLUMN_NAME: dumps(partition_schema)}],
+                    [{PICKLE_COLUMN_NAME: cloudpickle.dumps(partition_schema)}],
                     schema=_ARROW_DYNAMIC_SCHEMA,
                 )
 
@@ -969,7 +958,7 @@ class SparkDataset(Tabular[CastOptions]):
 
         merged = None
         for row in schemas_df.toLocalIterator():
-            partition_schema = loads(row[PICKLE_COLUMN_NAME])
+            partition_schema = cloudpickle.loads(row[PICKLE_COLUMN_NAME])
             merged = (
                 partition_schema
                 if merged is None
@@ -983,69 +972,6 @@ class SparkDataset(Tabular[CastOptions]):
             self._persist_schema(merged)
 
         return merged
-
-    # ==================================================================
-    # Executor dependency wiring
-    # ==================================================================
-
-    @classmethod
-    def _ensure_installed_on_session(
-        cls,
-        session: "SparkSession",
-        *functions: "Callable[..., Any]",
-    ) -> "set[str]":
-        """Auto-ship ygg (+ any function deps) to executors on first use."""
-        from yggdrasil.spark.frame import (
-            _PER_SESSION_INSTALLED_MODULES,
-            _function_top_modules,
-            _install_modules_on_executors,
-        )
-
-        cache = _PER_SESSION_INSTALLED_MODULES.setdefault(id(session), set())
-        wanted: set[str] = {"yggdrasil"}
-        for fn in functions:
-            if fn is None:
-                continue
-            wanted.update(_function_top_modules(fn))
-
-        new_modules = wanted - cache
-        if not new_modules:
-            return set(cache)
-
-        logger.debug(
-            "Installing modules on Spark executors %r (modules=%r)",
-            session,
-            sorted(new_modules),
-        )
-        try:
-            installed = _install_modules_on_executors(session, new_modules)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "%s: failed to install %s on executors: %s",
-                cls.__name__,
-                sorted(new_modules),
-                exc,
-            )
-            return set(cache)
-
-        cache.update(installed)
-        if installed:
-            logger.info(
-                "Installed modules on Spark executors %r (modules=%r)",
-                session,
-                sorted(installed),
-            )
-        return set(cache)
-
-    def _ensure_installed(self, *functions: "Callable[..., Any]") -> "set[str]":
-        """Per-frame wrapper around :meth:`_ensure_installed_on_session`."""
-        installed = self._ensure_installed_on_session(
-            self.sparkSession,
-            *functions,
-        )
-        new = installed - self.installed_modules
-        self.installed_modules.update(installed)
-        return new
 
     # ==================================================================
     # Transforms (Dataset surface)
@@ -1080,7 +1006,7 @@ class SparkDataset(Tabular[CastOptions]):
             build_batch_invoker,
             build_row_invoker,
         )
-        from yggdrasil.pickle.ser import dumps, loads
+        import cloudpickle
         from yggdrasil.spark.frame import (
             DYNAMIC_SCHEMA,
             _dynamic_rows,
@@ -1089,8 +1015,7 @@ class SparkDataset(Tabular[CastOptions]):
             _typed_rows,
         )
 
-        self._ensure_installed(function)
-        function_pickle = dumps(function)
+        function_pickle = cloudpickle.dumps(function)
         is_dynamic_in = self.is_dynamic
 
         if schema is None:
@@ -1098,7 +1023,7 @@ class SparkDataset(Tabular[CastOptions]):
             def _runner(
                 batches: "Iterator[pa.RecordBatch]",
             ) -> "Iterator[pa.RecordBatch]":
-                invoke = build_row_invoker(loads(function_pickle))
+                invoke = build_row_invoker(cloudpickle.loads(function_pickle))
                 rows = _dynamic_rows(batches) if is_dynamic_in else _typed_rows(batches)
                 yield from _emit_pickled(
                     (invoke(row) for row in rows),
@@ -1112,7 +1037,6 @@ class SparkDataset(Tabular[CastOptions]):
             return type(self)(
                 frame=result_df,
                 schema=None,
-                installed_modules=self.installed_modules,
             )
 
         schema = _Schema.from_any(schema)
@@ -1120,7 +1044,7 @@ class SparkDataset(Tabular[CastOptions]):
         def _typed_runner(
             batches: "Iterator[pa.RecordBatch]",
         ) -> "Iterator[pa.RecordBatch]":
-            func = loads(function_pickle)
+            func = cloudpickle.loads(function_pickle)
 
             def _groups() -> "Iterator[list[Any]]":
                 if is_dynamic_in:
@@ -1130,7 +1054,7 @@ class SparkDataset(Tabular[CastOptions]):
                         n = batch.num_rows
                         if n == 0:
                             continue
-                        yield [invoke_row(loads(col[i].as_py())) for i in range(n)]
+                        yield [invoke_row(cloudpickle.loads(col[i].as_py())) for i in range(n)]
                 else:
                     invoke_batch = build_batch_invoker(func)
                     for batch in batches:
@@ -1147,7 +1071,6 @@ class SparkDataset(Tabular[CastOptions]):
         return type(self)(
             frame=result_df,
             schema=schema,
-            installed_modules=self.installed_modules,
         )
 
     def apply(
@@ -1209,19 +1132,18 @@ class SparkDataset(Tabular[CastOptions]):
             build_batch_invoker,
             build_row_invoker,
         )
-        from yggdrasil.pickle.ser import dumps, loads
+        import cloudpickle
         from yggdrasil.spark.frame import spark_typed_cast
 
         if schema is None:
             return self.map(function, byte_size=byte_size)
 
-        self._ensure_installed(function)
         schema = _Schema.from_any(schema)
-        function_pickle = dumps(function)
+        function_pickle = cloudpickle.dumps(function)
         is_dynamic_in = self.is_dynamic
 
         def _runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
-            func = loads(function_pickle)
+            func = cloudpickle.loads(function_pickle)
 
             def _groups() -> "Iterator[list[Any]]":
                 if is_dynamic_in:
@@ -1234,7 +1156,7 @@ class SparkDataset(Tabular[CastOptions]):
                         n = batch.num_rows
                         if n == 0:
                             continue
-                        yield [invoke_row(loads(col[i].as_py())) for i in range(n)]
+                        yield [invoke_row(cloudpickle.loads(col[i].as_py())) for i in range(n)]
                 else:
                     # Typed mode — let the batch invoker pick the column
                     # by arg name and vectorise the cast when possible.
@@ -1253,7 +1175,6 @@ class SparkDataset(Tabular[CastOptions]):
         return type(self)(
             frame=result_df,
             schema=schema,
-            installed_modules=self.installed_modules,
         )
 
     def filter(
@@ -1305,7 +1226,7 @@ class SparkDataset(Tabular[CastOptions]):
                 return super().filter(predicate)
 
         from yggdrasil.data.schema import Schema as _Schema
-        from yggdrasil.pickle.ser import dumps, loads
+        import cloudpickle
         from yggdrasil.spark.frame import (
             DYNAMIC_SCHEMA,
             PICKLE_COLUMN_NAME,
@@ -1313,8 +1234,7 @@ class SparkDataset(Tabular[CastOptions]):
             spark_typed_cast,
         )
 
-        self._ensure_installed(predicate)
-        predicate_pickle = dumps(predicate)
+        predicate_pickle = cloudpickle.dumps(predicate)
         is_dynamic_in = self.is_dynamic
 
         if is_dynamic_in and schema is None:
@@ -1322,14 +1242,14 @@ class SparkDataset(Tabular[CastOptions]):
             def _runner(
                 batches: "Iterator[pa.RecordBatch]",
             ) -> "Iterator[pa.RecordBatch]":
-                pred = loads(predicate_pickle)
+                pred = cloudpickle.loads(predicate_pickle)
                 out: "list[dict[str, bytes]]" = []
                 out_bytes = 0
                 for batch in batches:
                     col = batch.column(0)
                     for i in range(batch.num_rows):
                         ser = col[i].as_py()
-                        if not pred(loads(ser)):
+                        if not pred(cloudpickle.loads(ser)):
                             continue
                         if out and out_bytes + len(ser) > byte_size:
                             yield pa.RecordBatch.from_pylist(
@@ -1353,7 +1273,6 @@ class SparkDataset(Tabular[CastOptions]):
             return type(self)(
                 frame=result_df,
                 schema=None,
-                installed_modules=self.installed_modules,
             )
 
         out_schema = _Schema.from_any(schema) if schema is not None else self.schema
@@ -1363,7 +1282,7 @@ class SparkDataset(Tabular[CastOptions]):
         def _typed_runner(
             batches: "Iterator[pa.RecordBatch]",
         ) -> "Iterator[pa.RecordBatch]":
-            pred = loads(predicate_pickle)
+            pred = cloudpickle.loads(predicate_pickle)
 
             def _groups() -> "Iterator[list[Any]]":
                 if is_dynamic_in:
@@ -1371,7 +1290,7 @@ class SparkDataset(Tabular[CastOptions]):
                         col = batch.column(0)
                         kept = []
                         for i in range(batch.num_rows):
-                            obj = loads(col[i].as_py())
+                            obj = cloudpickle.loads(col[i].as_py())
                             if pred(obj):
                                 kept.append(obj)
                         if kept:
@@ -1391,7 +1310,6 @@ class SparkDataset(Tabular[CastOptions]):
         return type(self)(
             frame=result_df,
             schema=out_schema,
-            installed_modules=self.installed_modules,
         )
 
     def explode(
@@ -1406,7 +1324,7 @@ class SparkDataset(Tabular[CastOptions]):
         iterables. Pass a ``schema`` to type the flattened output.
         """
         from yggdrasil.data.schema import Schema as _Schema
-        from yggdrasil.pickle.ser import loads
+        import cloudpickle
         from yggdrasil.spark.frame import (
             DYNAMIC_SCHEMA,
             _emit_pickled,
@@ -1419,7 +1337,6 @@ class SparkDataset(Tabular[CastOptions]):
                 "the inner objects must be iterable."
             )
 
-        self._ensure_installed()
 
         if schema is None:
 
@@ -1430,7 +1347,7 @@ class SparkDataset(Tabular[CastOptions]):
                     for batch in batches:
                         col = batch.column(0)
                         for i in range(batch.num_rows):
-                            yield from loads(col[i].as_py())
+                            yield from cloudpickle.loads(col[i].as_py())
 
                 yield from _emit_pickled(_items(), byte_size=byte_size)
 
@@ -1441,7 +1358,6 @@ class SparkDataset(Tabular[CastOptions]):
             return type(self)(
                 frame=result_df,
                 schema=None,
-                installed_modules=self.installed_modules,
             )
 
         schema = _Schema.from_any(schema)
@@ -1454,7 +1370,7 @@ class SparkDataset(Tabular[CastOptions]):
                     col = batch.column(0)
                     group: list[Any] = []
                     for i in range(batch.num_rows):
-                        group.extend(loads(col[i].as_py()))
+                        group.extend(cloudpickle.loads(col[i].as_py()))
                     if group:
                         yield group
 
@@ -1467,14 +1383,12 @@ class SparkDataset(Tabular[CastOptions]):
         return type(self)(
             frame=result_df,
             schema=schema,
-            installed_modules=self.installed_modules,
         )
 
     def _cast(
         self,
         options: CastOptions
     ) -> "SparkDataset":
-        self._ensure_installed()
         schema = options.target
         is_dynamic_in = self.is_dynamic
 
@@ -1502,7 +1416,6 @@ class SparkDataset(Tabular[CastOptions]):
         return type(self)(
             frame=result_df,
             schema=schema,
-            installed_modules=self.installed_modules,
         )
 
     def to_dynamic(
@@ -1523,7 +1436,6 @@ class SparkDataset(Tabular[CastOptions]):
         if self.is_dynamic:
             return self
 
-        self._ensure_installed()
 
         def _runner(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
             yield from _emit_pickled(_typed_rows(batches), byte_size=byte_size)
@@ -1535,7 +1447,6 @@ class SparkDataset(Tabular[CastOptions]):
         return type(self)(
             frame=result_df,
             schema=None,
-            installed_modules=self.installed_modules,
         )
 
     # ==================================================================
@@ -1543,24 +1454,24 @@ class SparkDataset(Tabular[CastOptions]):
     # ==================================================================
 
     def collect(self) -> "list[Any]":
-        from yggdrasil.pickle.ser import loads
+        import cloudpickle
         from yggdrasil.spark.frame import PICKLE_COLUMN_NAME
 
         if self._frame is None:
             return []
         if self.is_dynamic:
-            return [loads(row[PICKLE_COLUMN_NAME]) for row in self._frame.collect()]
+            return [cloudpickle.loads(row[PICKLE_COLUMN_NAME]) for row in self._frame.collect()]
         return [row.asDict(recursive=True) for row in self._frame.collect()]
 
     def to_local_iterator(self) -> "Iterator[Any]":
-        from yggdrasil.pickle.ser import loads
+        import cloudpickle
         from yggdrasil.spark.frame import PICKLE_COLUMN_NAME
 
         if self._frame is None:
             return
         if self.is_dynamic:
             for row in self._frame.toLocalIterator():
-                yield loads(row[PICKLE_COLUMN_NAME])
+                yield cloudpickle.loads(row[PICKLE_COLUMN_NAME])
         else:
             for row in self._frame.toLocalIterator():
                 yield row.asDict(recursive=True)
@@ -1714,11 +1625,9 @@ def _wrap(
             from yggdrasil.data.schema import Schema as _Schema
 
             out_schema = _Schema.from_any(value.schema)
-        installed = owner.installed_modules if owner is not None else None
         return SparkDataset(
             frame=value,
             schema=out_schema,
-            installed_modules=installed,
         )
     return value
 

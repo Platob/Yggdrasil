@@ -8,26 +8,16 @@ import pytest
 
 pyspark = pytest.importorskip("pyspark")
 
-from pyspark.sql import SparkSession
-
 from yggdrasil.enums import Mode
 from yggdrasil.path.local_path import LocalPath
 
 
 @pytest.fixture(scope="module")
 def spark():
-    session = (
-        SparkSession.builder
-        .master("local[1]")
-        .appName("test")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate()
-    )
-    # Register the session so read_spark_frame can resolve it via PyEnv.
-    from yggdrasil.environ import PyEnv
-    PyEnv.set_spark_session(session)
-    yield session
-    session.stop()
+    # One shared SparkTestCase session (registered via PyEnv so
+    # read_spark_frame resolves it); never stopped — other modules share it.
+    from yggdrasil.spark.tests import _get_test_spark
+    return _get_test_spark()
 
 
 # ---------------------------------------------------------------------------

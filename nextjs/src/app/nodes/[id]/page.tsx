@@ -6,6 +6,7 @@ import Link from "next/link";
 import { ResourceBar } from "@/components/ResourceBar";
 import { Sparkline } from "@/components/Sparkline";
 import { getBackend, getEnvs, getEnvPackages, getFuncs, getRuns, getNodeCard, getDags, getDagRuns, bulkDeleteFuncs, setEnvVars, deleteEnvVar, createBackendStream, cancelRun } from "@/lib/api";
+import { ByteUnit, State } from "@platob/yggdrasil";
 import type { NodeBackend, NodeCard, PyEnvEntry, PyEnvPackages, PyFuncEntry, PyFuncRunEntry, DAGEntry, DAGRunEntry } from "@/lib/types";
 
 // Rolling window of live samples for the timeseries charts (~1 min at 1s).
@@ -44,8 +45,8 @@ function formatUptime(seconds: number): string {
 }
 
 function formatBytes(mb: number): string {
-  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
-  return `${mb.toFixed(0)} MB`;
+  // shared yggdrasil byte formatting; MB -> raw bytes
+  return ByteUnit.format(mb * ByteUnit.MIB.bytes, { iec: false, precision: mb >= 1024 ? 1 : 0 });
 }
 
 // ── Run status badge ────────────────────────────────────────
@@ -796,12 +797,12 @@ export default function NodeDetailPage() {
               <polygon points="5 3 19 12 5 21 5 3" />
             </svg>
             Task Manager
-            {runs.some((r) => r.status === "running" || r.status === "pending") && (
+            {runs.some((r) => State.from(r.status).isActive) && (
               <span
                 className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded inline-flex items-center gap-1"
                 style={{ background: "rgba(251,191,36,0.1)", color: "var(--amber)" }}
               >
-                {runs.filter((r) => r.status === "running" || r.status === "pending").length} active
+                {runs.filter((r) => State.from(r.status).isActive).length} active
               </span>
             )}
             <span className="ml-auto text-foreground-dim font-mono">{runs.length}</span>
@@ -817,8 +818,9 @@ export default function NodeDetailPage() {
           <div className="space-y-0.5 max-h-72 overflow-y-auto">
             {runs.slice(0, 20).map((run) => {
               const funcName = funcs.find((f) => f.id === run.func_id)?.name ?? `func#${run.func_id}`;
-              const isRunning = run.status === "running";
-              const cancellable = run.status === "running" || run.status === "pending";
+              const st = State.from(run.status);
+              const isRunning = st === State.RUNNING;
+              const cancellable = st.isActive;
               const cancelling = cancellingRuns.has(run.id);
               const progress = run.progress != null ? run.progress : null;
               return (

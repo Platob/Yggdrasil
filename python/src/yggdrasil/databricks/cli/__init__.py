@@ -4,6 +4,8 @@ Subcommands::
 
     ygg databricks clusters list/get/create/delete
     ygg databricks warehouses list/get/create/delete
+    ygg databricks table async_insert --table-name … --data …
+    ygg databricks table execute_async_insert --logs … | --log-file …
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ from typing import Any, Optional, Sequence
 
 from .services import (
     ClustersCommand,
+    TablesCommand,
     WarehousesCommand,
 )
 
@@ -52,6 +55,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     subparsers = parser.add_subparsers(dest="command")
     ClustersCommand.register(subparsers)
+    TablesCommand.register(subparsers)
     WarehousesCommand.register(subparsers)
 
     args = parser.parse_args(argv)

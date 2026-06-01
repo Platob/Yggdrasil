@@ -165,6 +165,14 @@ class Scheme(str, Enum):
     #: knobs ride along the URL the same way :attr:`DATABRICKS` does.
     DATABRICKS_TABLE     = "dbfs+table"
 
+    #: Unity Catalog **external location** addressed by name —
+    #: ``dbfs+extloc:///<name>`` (POSIX form ``/ExternalLocations/<name>``).
+    #: Resolves to a credential-backed :class:`ExternalLocation` whose
+    #: storage path (AWS S3 today) does the actual I/O. The location has
+    #: no path under the name — child files live below it on the backing
+    #: store, reached by joining onto the resolved storage path.
+    DATABRICKS_EXTERNAL_LOCATION = "dbfs+extloc"
+
     #: Databricks all-purpose cluster addressed as a compute endpoint —
     #: ``dbks+cluster://[creds@]host/<cluster_id>?…``. Distinct from
     #: the ``dbfs+`` family because a cluster is a compute resource

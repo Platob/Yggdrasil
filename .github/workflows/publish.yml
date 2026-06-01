@@ -228,44 +228,6 @@ jobs:
           if-no-files-found: error
 
   # --------------------------------------------------------------------------
-  # benchmarks — run the benchmark sweep on every release as a smoke test.
-  #
-  # Advisory: failure is surfaced in the workflow log but does not block
-  # publish (benchmark timing is environment-sensitive; we want a heads-up
-  # on regressions, not a hard gate).
-  # --------------------------------------------------------------------------
-  benchmarks:
-    name: Run benchmark sweep
-    runs-on: ubuntu-latest
-    needs: [detect, build-python]
-    if: needs.detect.outputs.should_publish == 'true'
-    continue-on-error: true
-
-    defaults:
-      run:
-        working-directory: python
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          version: "latest"
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install package with dev extras
-        run: uv pip install --system -e .[dev]
-
-      - name: Run benchmark sweep
-        run: python benchmarks/run_all.py --repeat 3
-
-  # --------------------------------------------------------------------------
   # publish-python — upload ygg to PyPI
   # --------------------------------------------------------------------------
   publish-python:

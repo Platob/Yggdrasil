@@ -63,7 +63,7 @@ Engines register their converters **on import** — pull them in once at startup
 | Module | Purpose | Page |
 |---|---|---|
 | `yggdrasil.aws` | `AWSClient` singleton, S3 filesystem, credential management | [aws](modules/aws/README.md) |
-| `yggdrasil.delta` | Delta Lake log reader (back-compat shim → `yggdrasil.io.nested.delta`) | [delta](modules/delta/README.md) |
+| `yggdrasil.delta` | Delta Lake log reader (back-compat shim → `yggdrasil.io.delta`) | [delta](modules/delta/README.md) |
 
 ## Domain utilities
 

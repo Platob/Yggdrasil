@@ -17,6 +17,7 @@ a stubbed socket layer.
 from __future__ import annotations
 
 import io
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -295,7 +296,7 @@ class TestRead:
         import io as _io
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         sink = _io.BytesIO()
         pq.write_table(
@@ -555,7 +556,7 @@ class TestFormats:
     def test_parquetfile_reader_over_volume(self, workspace, client, service):
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         store = self._store_backed(workspace)
         table = pa.table({"x": pa.array(range(500), type=pa.int64())})
@@ -573,7 +574,7 @@ class TestFormats:
         # via HTTP Range — a fraction of the whole object.
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         store = self._store_backed(workspace)
         ncols = 16
@@ -605,7 +606,7 @@ class TestFormats:
         # column projection range-backed would flip this assertion.
         import pyarrow as pa
         import pyarrow.parquet as pq
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         store = self._store_backed(workspace)
         table = pa.table({f"c{i}": pa.array(range(2000), type=pa.int64())
@@ -879,7 +880,7 @@ class TestWriteAll:
         through write_all via _commit_format_payload: 1 upload,
         1 get_metadata (mode guard size check), 0 downloads."""
         import pyarrow as pa
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         table = pa.table(
             {
@@ -914,7 +915,7 @@ class TestWriteAll:
         After: write_all skips truncate — 1 upload total.
         """
         import pyarrow as pa
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         table = pa.table({"x": pa.array([10, 20, 30], type=pa.int32())})
 
@@ -1081,16 +1082,16 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.assert_not_called()
         assert workspace.files.upload.call_count == 2
 
-    def test_volume_missing_only_creates_volume(
+    def test_volume_missing_creates_volume_after_mkdir_fails(
         self, workspace, client, service
     ) -> None:
-        # Common case: catalog + schema already exist, only the volume
-        # is missing. The upload's ``NotFound("Volume … does not exist")``
-        # message names the volume directly, so the recovery path skips
-        # its cheap ``files.create_directory`` probe and goes straight
-        # to ``volumes.create``. ``files.create_directory`` is only
-        # called once afterwards, to materialise the sub-directory.
+        # Recovery never goes straight to a volume create: it tries the parent
+        # ``create_directory`` first. That NotFounds because the volume is
+        # missing, so it creates the volume (a single ``volumes.create``; the
+        # read names the volume, not the schema, so no parent ensure) and
+        # retries the ``mkdir`` — two ``create_directory`` calls total.
         uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
+        create_dirs = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
 
         def upload(**_kwargs):
             r = uploads.pop(0)
@@ -1098,7 +1099,18 @@ class TestVolumeAutoCreate:
                 raise r
             return r
 
+        def create_directory(_path):
+            r = create_dirs.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
         workspace.files.upload.side_effect = upload
+        workspace.files.create_directory.side_effect = create_directory
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
+        )
+        workspace.volumes.create.return_value = _volume_info()
 
         p = VolumePath(
             "/Volumes/cat/sch/vol/sub/file.bin",
@@ -1106,18 +1118,11 @@ class TestVolumeAutoCreate:
         )
         p.write_bytes(b"payload")
 
-        workspace.catalogs.get.assert_not_called()
-        workspace.schemas.get.assert_not_called()
-        workspace.volumes.read.assert_not_called()
-
-        # Volume created first; catalog/schema untouched because volume
-        # create succeeded. The cheap-path probe was skipped — only the
-        # post-volume-create ``create_directory`` call should land.
+        # mkdir tried first (fails), volume created, mkdir retried.
+        assert workspace.files.create_directory.call_count == 2
+        client.schemas.schema.return_value.ensure_created.assert_not_called()
         workspace.catalogs.create.assert_not_called()
         workspace.schemas.create.assert_not_called()
-        workspace.files.create_directory.assert_called_once_with(
-            "/Volumes/cat/sch/vol/sub",
-        )
         vol_kwargs = workspace.volumes.create.call_args.kwargs
         assert vol_kwargs["catalog_name"] == "cat"
         assert vol_kwargs["schema_name"] == "sch"
@@ -1154,6 +1159,12 @@ class TestVolumeAutoCreate:
 
         workspace.files.upload.side_effect = upload
         workspace.files.create_directory.side_effect = create_directory
+        # Volume genuinely missing, so ``Volume.create``'s read NotFounds
+        # and it proceeds to ``volumes.create``.
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
+        )
+        workspace.volumes.create.return_value = _volume_info()
 
         p = VolumePath(
             "/Volumes/cat/sch/vol/sub/file.bin",
@@ -1166,20 +1177,29 @@ class TestVolumeAutoCreate:
         assert workspace.files.create_directory.call_count == 2
         workspace.volumes.create.assert_called_once()
 
-    def test_schema_missing_creates_schema_then_volume(
+    def test_schema_missing_ensures_schema_then_volume(
         self,
         workspace,
         client,
         service,
     ) -> None:
-        # Schema is also missing — first ``volumes.create`` fails
-        # NotFound, then ``schemas.create`` succeeds, then volume create
-        # is retried. Catalog should not be touched.
-        uploads = [NotFound("Volume does not exist"), None]
-        volume_creates = [NotFound("Schema does not exist"), None]
+        # The parent ``create_directory`` is tried first; it NotFounds (volume
+        # missing) so the volume is created — and that ``volumes.create``
+        # itself NotFounds because the schema is missing, so it ensures the
+        # parent schema (cascading to the catalog — see the schema tests)
+        # through the high-level ``client.schemas`` service and retries.
+        uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
+        create_dirs = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
+        volume_creates = [NotFound("Schema does not exist"), _volume_info()]
 
         def upload(**_kwargs):
             r = uploads.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        def create_directory(_path):
+            r = create_dirs.pop(0)
             if isinstance(r, Exception):
                 raise r
             return r
@@ -1191,6 +1211,10 @@ class TestVolumeAutoCreate:
             return r
 
         workspace.files.upload.side_effect = upload
+        workspace.files.create_directory.side_effect = create_directory
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
+        )
         workspace.volumes.create.side_effect = volumes_create
 
         p = VolumePath(
@@ -1199,53 +1223,7 @@ class TestVolumeAutoCreate:
         )
         p.write_bytes(b"payload")
 
-        workspace.catalogs.create.assert_not_called()
-        workspace.schemas.create.assert_called_once_with(
-            name="sch",
-            catalog_name="cat",
-        )
-        assert workspace.volumes.create.call_count == 2
-
-    def test_catalog_missing_creates_full_chain(
-        self, workspace, client, service
-    ) -> None:
-        # Both schema and catalog are missing — volume.create then
-        # schema.create both fail NotFound, falling through to catalog
-        # → schema → volume creation.
-        uploads = [NotFound("Volume does not exist"), None]
-        volume_creates = [NotFound("Schema does not exist"), None]
-        schema_creates = [NotFound("Catalog does not exist"), None]
-
-        def upload(**_kwargs):
-            r = uploads.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        def volumes_create(**_kwargs):
-            r = volume_creates.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        def schemas_create(**_kwargs):
-            r = schema_creates.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        workspace.files.upload.side_effect = upload
-        workspace.volumes.create.side_effect = volumes_create
-        workspace.schemas.create.side_effect = schemas_create
-
-        p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin",
-            service=service,
-        )
-        p.write_bytes(b"payload")
-
-        workspace.catalogs.create.assert_called_once_with(name="cat")
-        assert workspace.schemas.create.call_count == 2
+        client.schemas.schema.return_value.ensure_created.assert_called_once()
         assert workspace.volumes.create.call_count == 2
 
     def test_already_exists_swallowed(self, workspace, client, service) -> None:
@@ -1286,6 +1264,26 @@ class TestVolumeAutoCreate:
         with pytest.raises(FileNotFoundError):
             p.write_bytes(b"x")
         workspace.volumes.create.assert_not_called()
+
+    def test_recovery_reuses_singleton_cache_no_reflood(
+        self, workspace, client, service
+    ) -> None:
+        # Recovery routes through the idempotent ``Volume.ensure_created``.
+        # Once the first pass creates the volume, the ``Volume`` singleton
+        # caches its info, so a second recovery pass short-circuits on the
+        # cached read and does NOT re-hit ``volumes.create`` — no API flood.
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
+        )
+        workspace.volumes.create.return_value = _volume_info()
+
+        p = VolumePath("/Volumes/cat/sch/vol/sub/file.bin", service=service)
+        p.volume.ensure_created()
+        p.volume.ensure_created()
+
+        workspace.volumes.create.assert_called_once()
+        # second pass never even re-read — the cached info answered it
+        assert workspace.volumes.read.call_count == 1
 
 
 class TestTransportResilience:
@@ -1687,63 +1685,34 @@ class TestCredentialsRefresherSingleton:
 
 class TestVolumeInfoNotFoundRecovery:
 
-    def test_creates_volume_on_not_found_then_re_reads(
+    def test_volume_info_does_not_auto_create_on_not_found(
         self, workspace, client, service
     ) -> None:
-        # First ``volumes.read`` raises NotFound; the recovery path
-        first_call = {"done": False}
-
-        def read(full_name):
-            if not first_call["done"]:
-                first_call["done"] = True
-                raise NotFound("Volume cat.sch.vol does not exist")
-            return _volume_info()
-
-        workspace.volumes.read.side_effect = read
-        workspace.volumes.create.return_value = SimpleNamespace(
-            volume_id="volume-uuid-0001",
+        # Reads never mutate: a missing volume surfaces as NotFound — the
+        # read does NOT auto-create it. Only ``create`` (and write
+        # recovery) creates.
+        workspace.volumes.read.side_effect = NotFound(
+            "Volume 'cat.sch.vol' does not exist"
         )
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
-        info = p.volume_info()
-        assert info.volume_id == "volume-uuid-0001"
-        assert workspace.volumes.read.call_count == 2
-        # The create call should have run with the volume coordinates
-        # parsed from the path.
-        create_kwargs = workspace.volumes.create.call_args.kwargs
-        assert create_kwargs["catalog_name"] == "cat"
-        assert create_kwargs["schema_name"] == "sch"
-        assert create_kwargs["name"] == "vol"
+        with pytest.raises(Exception):
+            p.volume_info()
+        workspace.volumes.create.assert_not_called()
+        assert workspace.volumes.read.call_count == 1
 
-    def test_recovery_also_creates_missing_schema(
+    def test_volume_info_does_not_create_even_when_schema_missing(
         self, workspace, client, service
     ) -> None:
-        read_outcomes = [NotFound("missing"), _volume_info(volume_id="vid")]
-
-        def read(full_name):
-            outcome = read_outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-
-        create_outcomes = [
-            NotFound("schema does not exist"),
-            SimpleNamespace(volume_id="vid"),
-        ]
-
-        def create(**kwargs):
-            outcome = create_outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-
-        workspace.volumes.read.side_effect = read
-        workspace.volumes.create.side_effect = create
+        # Even a "schema does not exist" read error stays a read failure —
+        # no schema ensure, no volume create.
+        workspace.volumes.read.side_effect = NotFound("schema does not exist")
 
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
-        info = p.volume_info()
-        assert info.volume_id == "vid"
-        workspace.schemas.create.assert_called_once()
+        with pytest.raises(Exception):
+            p.volume_info()
+        client.schemas.schema.return_value.ensure_created.assert_not_called()
+        workspace.volumes.create.assert_not_called()
 
     def test_propagates_other_errors_unchanged(
         self, workspace, client, service
@@ -1756,28 +1725,15 @@ class TestVolumeInfoNotFoundRecovery:
             p.volume_info()
         workspace.volumes.create.assert_not_called()
 
-    def test_temporary_credentials_inherits_create_on_not_found(
+    def test_temporary_credentials_reads_without_creating(
         self,
         workspace,
         client,
         service,
     ) -> None:
-        # ``temporary_credentials`` calls ``volume_info`` first, so
-        # the create-on-NotFound flow surfaces transparently — the
-        # caller gets back the AWS creds without ever seeing a
-        # NotFound.
-        read_calls = {"n": 0}
-
-        def read(full_name):
-            read_calls["n"] += 1
-            if read_calls["n"] == 1:
-                raise NotFound("missing")
-            return _volume_info(volume_id="vid-after-create")
-
-        workspace.volumes.read.side_effect = read
-        workspace.volumes.create.return_value = SimpleNamespace(
-            volume_id="vid-after-create",
-        )
+        # ``temporary_credentials`` reads ``volume_info`` first; for an
+        # existing volume it vends creds without ever creating anything.
+        workspace.volumes.read.return_value = _volume_info(volume_id="vid")
         gen = (
             workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         )
@@ -1786,9 +1742,24 @@ class TestVolumeInfoNotFoundRecovery:
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         resp = p.temporary_credentials(mode="read")
         assert resp.aws_temp_credentials.access_key_id == "AKIA-test"
-        workspace.volumes.create.assert_called_once()
+        workspace.volumes.create.assert_not_called()
         gen.assert_called_once()
-        assert gen.call_args.kwargs["volume_id"] == "vid-after-create"
+        assert gen.call_args.kwargs["volume_id"] == "vid"
+
+    def test_temporary_credentials_does_not_auto_create_on_not_found(
+        self,
+        workspace,
+        client,
+        service,
+    ) -> None:
+        # A missing volume surfaces as NotFound through the read — no
+        # auto-create.
+        workspace.volumes.read.side_effect = NotFound("missing")
+
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
+        with pytest.raises(Exception):
+            p.temporary_credentials(mode="read")
+        workspace.volumes.create.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -2033,7 +2004,7 @@ class TestStreamingUpload:
         self, workspace, client, service, monkeypatch
     ):
         import pyarrow as pa
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
         from yggdrasil.path.local_path import LocalPath
 
         self._roundtrip_store(workspace)
@@ -2095,7 +2066,7 @@ class TestStreamingUploadWire:
         from yggdrasil.databricks.volume.volumes import Volumes
         from yggdrasil.http_ import HTTPSession
         from yggdrasil.http_ import retry as _retry
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         monkeypatch.setattr(_retry.time, "sleep", lambda *a, **k: None)
 
@@ -2176,6 +2147,7 @@ class TestUploadVolumeRecovery:
 
     def test_transport_error_ensures_volume_then_retries(self, service, monkeypatch):
         from yggdrasil.http_.exceptions import MaxRetryError
+        from yggdrasil.databricks.volume.volume import Volume
 
         state = {"attempts": 0, "ensure": 0}
 
@@ -2188,8 +2160,8 @@ class TestUploadVolumeRecovery:
                 )
 
         monkeypatch.setattr(
-            VolumePath, "_ensure_volume",
-            lambda self: state.__setitem__("ensure", state["ensure"] + 1) or True,
+            Volume, "ensure_created",
+            lambda self, **_kw: state.__setitem__("ensure", state["ensure"] + 1) or self,
         )
         p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
         p._upload_call_ensuring_volume(do_upload)
@@ -2199,10 +2171,12 @@ class TestUploadVolumeRecovery:
 
     def test_non_transport_error_does_not_create_volume(self, service, monkeypatch):
         # A logic / permission error is not a missing volume — don't create it.
+        from yggdrasil.databricks.volume.volume import Volume
+
         state = {"ensure": 0}
         monkeypatch.setattr(
-            VolumePath, "_ensure_volume",
-            lambda self: state.__setitem__("ensure", state["ensure"] + 1),
+            Volume, "ensure_created",
+            lambda self, **_kw: state.__setitem__("ensure", state["ensure"] + 1) or self,
         )
 
         def do_upload():
@@ -2212,3 +2186,46 @@ class TestUploadVolumeRecovery:
         with pytest.raises(ValueError):
             p._upload_call_ensuring_volume(do_upload)
         assert state["ensure"] == 0
+
+    def test_retries_over_volume_visibility_window(self, service, monkeypatch):
+        # ``ensure_created`` returns but the Files edge keeps 404-ing
+        # "Volume ... does not exist" for a few attempts (eventual
+        # consistency). The recovery must keep retrying — not give up after
+        # one — until the just-created volume becomes visible.
+        from yggdrasil.databricks.volume.volume import Volume
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        monkeypatch.setattr(Volume, "ensure_created", lambda self, **_kw: self)
+
+        state = {"attempts": 0}
+
+        def do_upload():
+            state["attempts"] += 1
+            # Pre-ensure transport drop, then not-yet-visible 404s, then OK.
+            if state["attempts"] == 1:
+                raise OSError("EOF occurred in violation of protocol")
+            if state["attempts"] <= 4:
+                raise FileNotFoundError("Volume 'c.s.v' does not exist.")
+
+        p = VolumePath("/Volumes/c/s/v/z.bin", service=service)
+        p._upload_call_ensuring_volume(do_upload)
+
+        # One transport drop + several invisible-volume 404s before success —
+        # the old single-shot retry would have raised on attempt 2.
+        assert state["attempts"] == 5
+
+    def test_visibility_retry_surfaces_non_not_found_immediately(
+        self, service, monkeypatch
+    ):
+        # A non-not-found error is deterministic — surface it at once, no
+        # sleeping, no looping.
+        sleeps: list[float] = []
+        monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+        def op():
+            raise ValueError("permission or logic error")
+
+        p = VolumePath("/Volumes/c/s/v/z.bin", service=service)
+        with pytest.raises(ValueError):
+            p._retry_until_volume_visible(op)
+        assert sleeps == []

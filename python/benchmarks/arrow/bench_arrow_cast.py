@@ -28,7 +28,7 @@ Coverage in this bench:
 What we do **not** measure here (covered elsewhere):
 
 * Per-format primitive readers (CSV / Parquet / NDJSON / IPC) —
-  ``benchmarks/io/primitive/``.
+  ``benchmarks/io/``.
 * Pandas / Polars / Spark cast kernels — ``benchmarks/data/bench_cast.py``.
 * ``ArrowTabular`` read/write seam — ``benchmarks/io/tabular/bench_tabular.py``.
 

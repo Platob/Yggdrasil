@@ -29,7 +29,7 @@ from typing import Callable
 import pyarrow as pa
 
 from yggdrasil.io.path.path import Path
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.parquet_file import ParquetFile
 
 
 ROWS = 5_000

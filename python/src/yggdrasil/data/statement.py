@@ -535,6 +535,11 @@ class StatementResult(Tabular, Awaitable, Generic[PS]):
     def text(self) -> str:
         return self.statement.text
 
+    def _delete(self, predicate: Any = None, *, wait: Any = True,
+                missing_ok: bool = False, delete_staging: bool = True,
+                **kwargs: Any) -> int:
+        raise NotImplementedError("Cannot delete in %r — it is a reading statement" % self)
+
 
 SR = TypeVar("SR", bound="StatementResult")
 

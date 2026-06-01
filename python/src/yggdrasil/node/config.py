@@ -116,6 +116,11 @@ class Settings:
     # sample and deriving a row cap — preferred over a fixed row count because a
     # wide row costs far more memory than a narrow one. Defaults to 256 MiB.
     analysis_max_bytes: int = 256 * 1024 * 1024
+    # Distinct (row × column) groups a pivot may materialise before computing
+    # the cross-tab. Streaming the group-by is memory bounded, but the grouped
+    # frame is pivoted in-process, so a high-cardinality field combo is capped
+    # here — over it the request is rejected with a hint to add filters.
+    pivot_max_groups: int = 100_000
     # Seconds a PyEnv's resolved interpreter version + installed-library
     # listing stays cached before the next ``pip list`` subprocess runs —
     # keeps the UI's per-env package view from flooding the node.
@@ -250,6 +255,7 @@ def get_settings() -> Settings:
         tabular_preview_max_rows=int(os.getenv("YGG_NODE_TABULAR_PREVIEW_ROWS", "2000")),
         analysis_max_rows=int(os.getenv("YGG_NODE_ANALYSIS_MAX_ROWS", "200000")),
         analysis_max_bytes=int(os.getenv("YGG_NODE_ANALYSIS_MAX_BYTES", str(256 * 1024 * 1024))),
+        pivot_max_groups=int(os.getenv("YGG_NODE_PIVOT_MAX_GROUPS", "100000")),
         pyenv_packages_cache_ttl=float(os.getenv("YGG_NODE_PYENV_PKG_TTL", "60")),
         seed_defaults=_as_bool(os.getenv("YGG_NODE_SEED_DEFAULTS"), True),
         tmp_ttl=int(os.getenv("YGG_NODE_TMP_TTL", str(86_400))),

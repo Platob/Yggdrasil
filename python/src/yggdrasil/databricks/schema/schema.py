@@ -29,7 +29,7 @@ import logging
 import time
 from typing import Any, ClassVar, Iterable, Iterator, Mapping, Optional, TYPE_CHECKING
 
-from databricks.sdk.errors import DatabricksError, NotFound
+from databricks.sdk.errors import DatabricksError
 from databricks.sdk.service.catalog import (
     PermissionsChange,
     Privilege,
@@ -38,21 +38,20 @@ from databricks.sdk.service.catalog import (
     SecurableType,
 )
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
-from yggdrasil.dataclasses import Singleton
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.databricks.path import (
     DatabricksPath,
     TABLE_PATH_PREFIX,
     resolve_path_prefix,
 )
-from yggdrasil.url import URL
+from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
+from yggdrasil.dataclasses import Singleton
+from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
+from yggdrasil.enums.mode import Mode, ModeLike
 from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.path import Path
-from yggdrasil.enums.mode import Mode, ModeLike
-
-from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks_tag_literal
+from yggdrasil.url import URL
 
 if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schemas import Schemas
@@ -530,24 +529,7 @@ class UCSchema(DatabricksPath):
 
     @property
     def infos(self) -> SchemaInfo:
-        """SchemaInfo — local cache first (TTL-guarded), then remote on miss."""
-        now = time.time()
-
-        if self._infos is not None:
-            age = now - (self._infos_fetched_at or 0.0)
-            if self._infos_ttl is None or age < self._infos_ttl:
-                return self._infos
-            logger.debug(
-                "Cache expired for schema %r (age=%.0fs, ttl=%.0fs) — refreshing",
-                self, age, self._infos_ttl,
-            )
-
-        logger.debug("Fetching schema info for %r from remote", self)
-        infos = self.client.workspace_client().schemas.get(full_name=self.full_name())
-        logger.info("Fetched schema info for %r from remote", self)
-        object.__setattr__(self, "_infos", infos)
-        object.__setattr__(self, "_infos_fetched_at", now)
-        return self._infos
+        return self.read_infos()
 
     def read_infos(self, default: Any = ...):
         now = time.time()
@@ -566,7 +548,7 @@ class UCSchema(DatabricksPath):
             infos = self.client.workspace_client().schemas.get(full_name=self.full_name())
         except Exception:
             if default is ...:
-                return default
+                raise
 
             logger.warning(f"Schema {self.full_name(safe=True)} not found", exc_info=True)
             return default
@@ -576,12 +558,17 @@ class UCSchema(DatabricksPath):
         object.__setattr__(self, "_infos_fetched_at", now)
         return infos
 
+    @property
+    def schema_id(self):
+        infos = self.read_infos(default=None)
+        return infos.schema_id if infos is not None else None
+
     def exists(self) -> bool:
         """``True`` if this schema is reachable via the Unity Catalog API."""
         try:
             _ = self.infos
             return True
-        except NotFound:
+        except Exception:
             return False
 
     @property
@@ -595,6 +582,15 @@ class UCSchema(DatabricksPath):
     @property
     def storage_location(self) -> Optional[str]:
         return self.infos.storage_location
+
+    @property
+    def storage_path(self):
+        l = self.storage_location
+
+        if not l:
+            return None
+
+        return Path.from_(l)
 
     @property
     def storage_root(self) -> Optional[str]:
@@ -655,29 +651,44 @@ class UCSchema(DatabricksPath):
             storage_root: External storage root URI.
             missing_ok: Silently succeed if the schema already exists.
         """
-        uc = self.client.workspace_client().schemas
-        logger.debug(
-            "Creating schema %r (storage_root=%s, missing_ok=%s)",
-            self, storage_root, missing_ok,
-        )
-        try:
-            info = uc.create(
+        # Idempotent: a successful read means it already exists — never
+        # auto-create from a read, only here.
+        if self.read_infos(default=None) is None:
+            uc = self.client.workspace_client().schemas
+            logger.debug(
+                "Creating schema %r (storage_root=%s, missing_ok=%s)",
+                self, storage_root, missing_ok,
+            )
+            kwargs = dict(
                 catalog_name=self.catalog_name,
                 name=self.schema_name,
                 comment=comment,
                 properties=properties,
                 storage_root=storage_root,
             )
-            object.__setattr__(self, "_infos", info)
-            object.__setattr__(self, "_infos_fetched_at", time.time())
-        except DatabricksError as exc:
-            if missing_ok and "already exists" in str(exc).lower():
-                logger.debug(
-                    "Schema %r already exists — soft-resetting cache", self,
-                )
-                self._reset_cache()
-            else:
-                raise
+            try:
+                info = uc.create(**kwargs)
+                object.__setattr__(self, "_infos", info)
+                object.__setattr__(self, "_infos_fetched_at", time.time())
+            except Exception as exc:
+                low = str(exc).lower()
+                if missing_ok and "already exists" in low:
+                    logger.debug(
+                        "Schema %r already exists — soft-resetting cache", self,
+                    )
+                    self._reset_cache()
+                elif "not exist" in low or "not found" in low:
+                    # Parent catalog missing — create it and retry once.
+                    logger.info("Schema %r create failed (%s); ensuring parent catalog", self, exc)
+                    self.catalog.ensure_created()
+                    info = uc.create(**kwargs)
+                    object.__setattr__(self, "_infos", info)
+                    object.__setattr__(self, "_infos_fetched_at", time.time())
+                else:
+                    raise
+        # Keep the path stat cache in lock-step with the now-current info so a
+        # follow-up exists() / is_dir() / stat() doesn't observe a stale MISSING.
+        self._persist_stat_cache(self._stat_uncached())
         return self
 
     def ensure_created(
@@ -687,15 +698,15 @@ class UCSchema(DatabricksPath):
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
     ) -> "UCSchema":
-        """Create this schema if it does not already exist, then return ``self``."""
-        if not self.exists():
-            self.create(
-                comment=comment,
-                properties=properties,
-                storage_root=storage_root,
-                missing_ok=True,
-            )
-        return self
+        """Create this schema (and any missing parent catalog) if it doesn't
+        exist, then return ``self``. :meth:`create` is itself idempotent and
+        ensures the parent on a not-found, so this is just a named alias."""
+        return self.create(
+            comment=comment,
+            properties=properties,
+            storage_root=storage_root,
+            missing_ok=True,
+        )
 
     def delete(
         self,

@@ -16,11 +16,15 @@ from yggdrasil.node.api.schemas.network import PeerRegisterRequest
 from yggdrasil.node.api.services.backend import BackendService
 from yggdrasil.node.api.services.fs import FsService
 from yggdrasil.node.api.services.network import NetworkService
+from yggdrasil.node.api.services.saga import SagaService
 from yggdrasil.node.config import Settings
 
 
 def _ctx(home: Path):
-    settings = Settings(node_id="local-node", node_home=home, front_home=home, host="127.0.0.1", port=8100)
+    settings = Settings(
+        node_id="local-node", node_home=home, front_home=home,
+        saga_home=home / ".saga", host="127.0.0.1", port=8100,
+    )
     fs = FsService(settings)
     network = NetworkService(settings, BackendService(settings))
     return settings, fs, network
@@ -45,19 +49,21 @@ class TestPeerUrl(unittest.TestCase):
 class TestNodeRoots(unittest.TestCase):
     def test_self_is_always_a_root(self):
         with tempfile.TemporaryDirectory() as d:
-            _, fs, network = _ctx(Path(d))
-            res = asyncio.run(list_nodes(service=fs, network=network))
+            settings, fs, network = _ctx(Path(d))
+            saga = SagaService(settings)
+            res = asyncio.run(list_nodes(service=fs, network=network, saga=saga))
             roots = res["nodes"]
             self.assertEqual(roots[0]["node_id"], "local-node")
             self.assertTrue(roots[0]["self"])
 
     def test_linked_peer_appears_as_root(self):
         with tempfile.TemporaryDirectory() as d:
-            _, fs, network = _ctx(Path(d))
+            settings, fs, network = _ctx(Path(d))
+            saga = SagaService(settings)
             asyncio.run(network.register_peer(PeerRegisterRequest(
                 node_id="peer-2", host="10.0.0.5", port=8100,
             )))
-            res = asyncio.run(list_nodes(service=fs, network=network))
+            res = asyncio.run(list_nodes(service=fs, network=network, saga=saga))
             ids = [n["node_id"] for n in res["nodes"]]
             self.assertIn("peer-2", ids)
             peer = next(n for n in res["nodes"] if n["node_id"] == "peer-2")

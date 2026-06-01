@@ -29,6 +29,7 @@ from yggdrasil.data.statement import (
     StatementBatch,
 )
 from yggdrasil.databricks.fs import VolumePath
+from yggdrasil.aws.fs.path import S3Path
 from yggdrasil.databricks.warehouse import (
     SQLWarehouse,
     WarehousePreparedStatement,
@@ -106,7 +107,7 @@ def _coerce_external_data_for_spark(
                 )
             out[alias] = entry
             continue
-        if isinstance(value, VolumePath):
+        if isinstance(value, (VolumePath, S3Path)):
             out[alias] = ExternalStatementData(
                 alias,
                 text_value=WarehousePreparedStatement.volume_path_text_value(value),
@@ -135,9 +136,9 @@ def _coerce_external_data_for_spark(
         except Exception as e:
             raise TypeError(
                 f"external_data[{alias!r}]: cannot bind {type(value).__name__} "
-                f"to Spark — accepts VolumePath, ExternalStatementData, Tabular, "
-                f"str, (tabular, text_value), or any frame any_to_arrow_table "
-                f"can convert: {e}"
+                f"to Spark — accepts VolumePath, S3Path, ExternalStatementData, "
+                f"Tabular, str, (tabular, text_value), or any frame "
+                f"any_to_arrow_table can convert: {e}"
             ) from e
         out[alias] = ExternalStatementData(alias, tabular=ArrowTabular(arrow))
 

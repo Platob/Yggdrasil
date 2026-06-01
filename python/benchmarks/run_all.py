@@ -38,7 +38,7 @@ def _discover() -> list[Path]:
     benchmarks directory (recursive).
 
     Benches are organized into module-mirrored subfolders
-    (``benchmarks/data/``, ``benchmarks/io/primitive/``, …) and the
+    (``benchmarks/data/``, ``benchmarks/io/``, …) and the
     HTTP benchmarks live in ``tests/test_yggdrasil/test_http_/benchmarks/``
     — we walk both trees so all benches get picked up.
     """

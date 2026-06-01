@@ -5,6 +5,7 @@ import { fetchWindowRich, type ColKind } from "@/lib/arrow";
 import { createSession, closeSession, materializeSql, type PlanGraph, type SagaFilter, type WindowTransform } from "@/lib/api";
 import TabularAnalyze from "@/components/TabularAnalyze";
 import RegisterSagaModal from "@/components/RegisterSagaModal";
+import { NUMERIC } from "@/lib/format";
 
 export interface TabularColumnDef { name: string; dtype?: string; kind?: ColKind }
 export type Cell = unknown;
@@ -36,7 +37,6 @@ interface Props {
   pageSize?: number;
 }
 
-const NUMERIC = /int|float|double|decimal|num/i;
 const NESTED: ColKind[] = ["list", "struct", "map"];
 const FILTER_OP = (s: string) => (s.trim() !== "" && !isNaN(Number(s)) ? "==" : "contains");
 

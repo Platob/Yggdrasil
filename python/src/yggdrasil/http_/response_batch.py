@@ -571,6 +571,10 @@ class HTTPResponseBatch(Tabular):
     def _write_arrow_batches(self, batches, options=None):
         raise NotImplementedError("HTTPResponseBatch is read-only")
 
+    def _delete(self, predicate=None, *, wait=True, missing_ok=False,
+                delete_staging=True, **kwargs):
+        raise NotImplementedError("HTTPResponseBatch is read-only")
+
     def _read_spark_frame(self, options):
         spark = PyEnv.spark_session(options.spark_session, create=True)
         result = None

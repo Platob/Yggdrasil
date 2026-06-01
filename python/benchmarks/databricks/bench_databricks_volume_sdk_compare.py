@@ -43,7 +43,7 @@ import pyarrow.parquet as pq
 
 from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.http_ import HTTPSession
-from yggdrasil.io.primitive.parquet_file import ParquetFile
+from yggdrasil.io.parquet_file import ParquetFile
 from yggdrasil.url import URL
 
 

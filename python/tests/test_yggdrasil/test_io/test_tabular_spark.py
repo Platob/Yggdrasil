@@ -115,11 +115,10 @@ class TestSparkTabularDatasetAlias(unittest.TestCase):
 
         df = _fake_frame()
         ds = Dataset(df)
-        # The old ``Dataset`` exposed ``.df`` and ``.schema`` and
-        # ``.installed_modules`` — all still present on the merged class.
+        # The old ``Dataset`` exposed ``.df`` and ``.schema`` — both still
+        # present on the merged class.
         self.assertIs(ds.df, df)
         self.assertIsNone(ds.schema)
-        self.assertEqual(ds.installed_modules, set())
 
 
 class TestSparkTabularIsCached(unittest.TestCase):
@@ -329,12 +328,15 @@ class TestSparkTabularToSparkDataset(unittest.TestCase):
         io = SparkTabular(df)
         target = Schema.from_fields([Field("x", "int64")])
 
-        # Stub ``cast_spark_tabular`` so the test doesn't need a live
-        # SparkSession to drive the actual cast — we only need to
-        # verify the dispatch: target set → new instance, schema
-        # stamped, original holder left alone.
+        # Stub the cast so the test doesn't need a live SparkSession — we
+        # only verify the dispatch: target set → new instance, schema
+        # stamped, original holder left alone. ``to_spark_dataset`` casts
+        # via ``Schema.cast_spark_tabular`` (``SparkDataset.from_spark_frame``
+        # → ``schema.cast_spark_tabular(df)``); patching the wrong
+        # ``cast_spark_tabular`` lets the real cast run on the MagicMock
+        # frame and balloon memory, so patch the method actually on the path.
         with mock.patch(
-            "yggdrasil.data.options.CastOptions.cast_spark_tabular",
+            "yggdrasil.data.schema.Schema.cast_spark_tabular",
             return_value=df,
         ):
             out = io.to_spark_dataset(target=target)

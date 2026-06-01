@@ -67,6 +67,7 @@ from typing import (
 
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.url import URL
+from yggdrasil.url.explore import ExploreUrlRepr
 from yggdrasil.lazy_imports import boto3_module, botocore_module
 
 from .config import (
@@ -763,6 +764,31 @@ class AWSClient(Singleton):
         except Exception:
             return None
 
+    @property
+    def explore_url(self) -> URL:
+        """AWS Console home for this client's region — clickable from code."""
+        from yggdrasil.aws.console import account_console_url
+
+        return account_console_url(self.effective_region)
+
+    @property
+    def account(self) -> "AWSAccount":
+        """The :class:`AWSAccount` resource for this client (STS-backed)."""
+        from yggdrasil.aws.account import AWSAccount, AccountService
+
+        return AWSAccount(service=AccountService(client=self))
+
+    @property
+    def batch(self) -> "AWSBatch":
+        """The :class:`AWSBatch` runtime resource for this client.
+
+        Pure ``os.environ`` read — no network, no credentials. ``.is_batch``
+        gates whether the job-id / queue / array-index fields are meaningful.
+        """
+        from yggdrasil.aws.batch import AWSBatch, BatchService
+
+        return AWSBatch(service=BatchService(client=self))
+
     # ==================================================================
     # Session construction internals
     # ==================================================================
@@ -1078,8 +1104,13 @@ class AWSService(ABC):
 # ===========================================================================
 
 
-class AWSResource(ABC):
-    """Abstract base for AWS-backed entities."""
+class AWSResource(ExploreUrlRepr, ABC):
+    """Abstract base for AWS-backed entities.
+
+    Concrete resources (:class:`~yggdrasil.aws.account.AWSAccount`,
+    :class:`~yggdrasil.aws.fs.path.S3Bucket`, …) override :attr:`explore_url`
+    to return a Console deep-link; the inherited :class:`ExploreUrlRepr` then
+    gives a clickable repr / ``_repr_html_`` for free."""
 
     service: AWSService
 

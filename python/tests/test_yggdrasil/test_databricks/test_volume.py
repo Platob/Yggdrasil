@@ -184,6 +184,28 @@ class TestVolumeInfoTTL:
         _ = v.info
         workspace.volumes.read.assert_not_called()
 
+    def test_exists_ignores_fresh_cache_and_probes_live(self, workspace, client):
+        # exists() is a liveness probe — a still-fresh cached VolumeInfo
+        # must NOT shortcut it, or a volume dropped within the TTL keeps
+        # reporting True. Seed a fresh cache, then have the live read
+        # not-found: exists() must re-probe and return False.
+        from databricks.sdk.errors import NotFound as SDKNotFound
+
+        v = Volume(
+            service=Volumes(client=client),
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+            infos=_info(),
+        )
+        assert v._is_fresh()                       # cache says "exists"
+        workspace.volumes.read.side_effect = SDKNotFound(
+            "Volume 'cat.sch.vol' does not exist."
+        )
+
+        assert v.exists() is False                 # ground truth wins
+        workspace.volumes.read.assert_called_once_with("cat.sch.vol")
+        # Stale entry dropped so a later info access doesn't resurrect it.
+        assert v._infos is None
+
 
 class TestVolumeNavigation:
 
@@ -247,14 +269,28 @@ class TestVolumesDictAccess:
 
 
 class TestVolumesServiceCreate:
-    """``client.volumes.create(...)`` should auto-create the parent
-    schema (and catalog) when the volume create fails NotFound on
-    them — not punt the recovery to the caller."""
+    """``Volumes.create(...)`` resolves the :class:`Volume` and delegates to
+    :meth:`Volume.create`, which is **idempotent** (reads first) and
+    auto-creates the missing schema / catalog parents through
+    :meth:`UCSchema.ensure_created` when the read reports them missing — never
+    punting the recovery to the caller."""
 
-    def test_simple_create_delegates_to_volume(self, workspace, client):
-        # Happy path: catalog + schema already exist, single
-        # ``volumes.create`` lands.
+    def test_create_is_idempotent_when_volume_exists(self, workspace, client):
+        # The volume already exists: the read succeeds, so create is a no-op
+        # — no ``volumes.create`` call.
+        workspace.volumes.read.return_value = _info()
+        v = Volumes(client=client).create(
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+        )
+        assert isinstance(v, Volume)
+        workspace.volumes.create.assert_not_called()
+
+    def test_create_makes_missing_volume(self, workspace, client):
+        # Volume missing, parents exist: the read NotFounds without naming the
+        # schema, so a single ``volumes.create`` lands and no parents are made.
+        workspace.volumes.read.side_effect = NotFound("Volume does not exist")
         workspace.volumes.create.return_value = _info()
+
         v = Volumes(client=client).create(
             catalog_name="cat", schema_name="sch", volume_name="vol",
         )
@@ -263,14 +299,16 @@ class TestVolumesServiceCreate:
         workspace.schemas.create.assert_not_called()
         workspace.catalogs.create.assert_not_called()
 
-    def test_schema_missing_creates_schema_then_volume(self, workspace, client):
-        # First ``volumes.create`` fails because the schema doesn't
-        # exist; the service must create the schema and retry the
-        # volume — without forcing the caller to handle NotFound.
-        volume_creates = [NotFound("Schema does not exist"), _info()]
+    def test_create_ensures_parents_on_error_and_retries(self, workspace, client):
+        # The volume is missing (read NotFounds); the first ``volumes.create``
+        # then NotFounds because the schema is missing → ensure the parent
+        # schema (cascading to the catalog — see the schema tests) through the
+        # high-level ``client.schemas`` service, and retry the create.
+        workspace.volumes.read.side_effect = NotFound("Volume does not exist")
+        creates = [NotFound("Schema does not exist"), _info()]
 
         def vol_create(**_kw):
-            r = volume_creates.pop(0)
+            r = creates.pop(0)
             if isinstance(r, Exception):
                 raise r
             return r
@@ -281,42 +319,33 @@ class TestVolumesServiceCreate:
             catalog_name="cat", schema_name="sch", volume_name="vol",
         )
         assert isinstance(v, Volume)
-        workspace.schemas.create.assert_called_once_with(
-            name="sch", catalog_name="cat",
-        )
-        workspace.catalogs.create.assert_not_called()
+        client.schemas.schema.return_value.ensure_created.assert_called_once()
         assert workspace.volumes.create.call_count == 2
 
-    def test_catalog_missing_creates_catalog_schema_then_volume(
-        self, workspace, client,
-    ):
-        # Cascade goes one level deeper: schema create itself raises
-        # NotFound, so the catalog must be created too. After that,
-        # schema and volume retries land.
-        volume_creates = [NotFound("Schema does not exist"), _info()]
-        schema_creates = [NotFound("Catalog does not exist"), None]
-
-        def vol_create(**_kw):
-            r = volume_creates.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        def schema_create(**_kw):
-            r = schema_creates.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        workspace.volumes.create.side_effect = vol_create
-        workspace.schemas.create.side_effect = schema_create
+    def test_create_skips_parent_ensure_when_create_succeeds(self, workspace, client):
+        # Volume missing, parents present: the create lands first try, so no
+        # parent ensure and a single ``volumes.create``.
+        workspace.volumes.read.side_effect = NotFound("Volume does not exist")
+        workspace.volumes.create.return_value = _info()
 
         Volumes(client=client).create(
             catalog_name="cat", schema_name="sch", volume_name="vol",
         )
-        workspace.catalogs.create.assert_called_once_with(name="cat")
-        assert workspace.schemas.create.call_count == 2
-        assert workspace.volumes.create.call_count == 2
+        client.schemas.schema.return_value.ensure_created.assert_not_called()
+        workspace.volumes.create.assert_called_once()
+
+    def test_create_refreshes_stale_missing_stat(self, workspace, client):
+        # A prior probe cached the path stat as MISSING; create must refresh
+        # the stat cache (in lock-step with read info) so a follow-up
+        # is_dir()/exists() sees the volume — no stale MISSING.
+        workspace.volumes.read.side_effect = NotFound("Volume does not exist")
+        workspace.volumes.create.return_value = _info()
+        v = Volumes(client=client).volume(
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+        )
+        assert v.is_dir() is False          # MISSING stat cached from the probe
+        v.create()
+        assert v.is_dir() is True           # create refreshed the stat cache
 
 
 class TestVolumePathDelegation:

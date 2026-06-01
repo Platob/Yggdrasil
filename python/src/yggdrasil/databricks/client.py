@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+from contextvars import ContextVar
 from pathlib import Path
 from threading import RLock
 from typing import (
@@ -38,10 +39,14 @@ if TYPE_CHECKING:
     from .table.tables import Tables
     from .column.columns import Columns
     from .catalog.catalogs import Catalogs
+    from .credentials import Credentials
+    from .external import DatabricksExternal
+    from .external.location import ExternalLocations
     from .schema.schemas import Schemas
     from .volume.volumes import Volumes
     from .warehouse.service import Warehouses
     from .compute.service import Compute
+    from .cluster import Cluster
     from .secrets.service import Secrets
     from .workspaces import Workspaces, Workspace
     from .path import DatabricksPath
@@ -114,6 +119,8 @@ _ENV_DEFAULTS: dict[str, str] = {
     "google_service_account": "DATABRICKS_GOOGLE_SERVICE_ACCOUNT",
     "profile": "DATABRICKS_CONFIG_PROFILE",
     "config_file": "DATABRICKS_CONFIG_FILE",
+    "catalog_name": "DATABRICKS_CATALOG_NAME",
+    "schema_name": "DATABRICKS_SCHEMA_NAME",
 }
 
 
@@ -150,8 +157,32 @@ _STATIC_DEFAULTS: dict[str, Any] = {
     "max_connections_per_pool": _DEFAULT_MAX_CONNECTIONS_PER_POOL,
     "product": "yggdrasil",
     "product_version": ygg_version,
-    "skip_verify": False
+    "skip_verify": False,
 }
+
+
+# Global Unity Catalog context. A client *broadcasts* its ``catalog_name`` /
+# ``schema_name`` into these on construction and when it becomes current, so
+# code without a client reference reads one process-/async-local default
+# through :func:`current_catalog` / :func:`current_schema`.
+# :class:`contextvars.ContextVar` (not a plain global) so concurrent async
+# tasks / threads can scope their own default without clobbering each other.
+CATALOG_NAME: "ContextVar[Optional[str]]" = ContextVar(
+    "databricks_catalog_name", default=None
+)
+SCHEMA_NAME: "ContextVar[Optional[str]]" = ContextVar(
+    "databricks_schema_name", default=None
+)
+
+
+def current_catalog() -> Optional[str]:
+    """The process-/async-local default catalog name, or ``None``."""
+    return CATALOG_NAME.get()
+
+
+def current_schema() -> Optional[str]:
+    """The process-/async-local default schema name, or ``None``."""
+    return SCHEMA_NAME.get()
 
 
 # Lazy snapshot of resolved env-default values. The env values get baked
@@ -272,6 +303,8 @@ class DatabricksClient(Singleton, URLBased):
     max_connections_per_pool: Optional[int]
     product: Optional[str]
     product_version: Optional[str]
+    catalog_name: Optional[str]
+    schema_name: Optional[str]
 
     # ---- private singleton cache -----------------------------------------
 
@@ -416,6 +449,8 @@ class DatabricksClient(Singleton, URLBased):
         product: Any = ...,
         product_version: Any = ...,
         skip_verify: Any = ...,
+        catalog_name: Any = ...,
+        schema_name: Any = ...,
         singleton_ttl: "int | None" = ...,
     ) -> None:
         # Singleton-cached instances are re-entered on every constructor
@@ -457,10 +492,16 @@ class DatabricksClient(Singleton, URLBased):
             max_connections_per_pool=max_connections_per_pool,
             product=product,
             product_version=product_version,
-            skip_verify=skip_verify
+            skip_verify=skip_verify,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
         )
         for name, value in resolved.items():
             self.__dict__[name] = value
+
+        # Broadcast the default catalog / schema so standalone helpers can
+        # read them as the active global context.
+        self._broadcast_catalog_context()
 
         self._was_connected = False
         self._workspace_config: Optional[Config] = None
@@ -510,6 +551,15 @@ class DatabricksClient(Singleton, URLBased):
         # pickle.
         state.pop("_singleton_key_", None)
 
+        # Drop init fields still at their resolved default — the receiver
+        # re-seeds them from the same defaults in ``__setstate__`` (the
+        # singleton identity already travels via ``__getnewargs_ex__``).
+        # Keeps the payload to just the fields that actually differ.
+        defaults = self._resolve_init_kwargs()
+        for name, default in defaults.items():
+            if name in state and state[name] == default:
+                state.pop(name)
+
         # Best-effort. We don't *construct* a Config here — pickling must
         # never trigger a browser flow or network round-trip.
         state["_session_token"] = self._snapshot_session_token()
@@ -542,7 +592,12 @@ class DatabricksClient(Singleton, URLBased):
             self.__dict__[key] = None
         self.__dict__["_session_token"] = None
 
+        # Re-seed init fields from their resolved defaults first, so any the
+        # sender dropped (because they equalled the default) are restored;
+        # the carried ``state`` then overrides only the fields that differ.
+        self.__dict__.update(self._resolve_init_kwargs())
         self.__dict__.update(state)
+        self._broadcast_catalog_context()
 
         if self.is_in_databricks_environment():
             self.auth_type = "runtime"
@@ -755,6 +810,20 @@ class DatabricksClient(Singleton, URLBased):
         global CURRENT_BASE_CLIENT
         with CURRENT_BASE_CLIENT_LOCK:
             CURRENT_BASE_CLIENT = workspace
+        if workspace is not None:
+            workspace._broadcast_catalog_context()
+
+    def _broadcast_catalog_context(self) -> None:
+        """Publish this client's default catalog / schema to the global
+        context vars, read via :func:`current_catalog` / :func:`current_schema`.
+
+        Only non-``None`` values are published — a credential-only client
+        (no catalog / schema configured) leaves an existing active default
+        in place rather than wiping it."""
+        if self.catalog_name is not None:
+            CATALOG_NAME.set(self.catalog_name)
+        if self.schema_name is not None:
+            SCHEMA_NAME.set(self.schema_name)
 
     # -------------------------------------------------------------------------
     # Repr / context manager
@@ -1504,7 +1573,11 @@ class DatabricksClient(Singleton, URLBased):
             return cached
         from .sql.engine import SQLEngine
 
-        cached = SQLEngine(client=self)
+        cached = SQLEngine(
+            client=self,
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        )
         self.__dict__["_sql"] = cached
         return cached
 
@@ -1562,47 +1635,6 @@ class DatabricksClient(Singleton, URLBased):
             spark_session=self.spark(),
             byte_size=byte_size,
         )
-
-    def deploy(
-        self,
-        bundle: "str | Path",
-        *,
-        target: "str | None" = None,
-    ) -> int:
-        """Deploy a Databricks Asset Bundle to this workspace.
-
-        Parses the bundle YAML, resolves the target, syncs workspace
-        files, and upserts every resource defined under ``resources:``.
-
-        *bundle* is a path to a ``databricks.yml`` file or a directory
-        containing one. When a directory is given, the standard bundle
-        filenames are probed (``databricks.yml``, ``databricks.yaml``,
-        ``bundle.yml``, ``bundle.yaml``).
-
-        Returns an exit code (0 on success).
-        """
-        from .cli.bundle.deploy import deploy as _deploy
-
-        bundle_path = Path(bundle) if not isinstance(bundle, Path) else bundle
-
-        if bundle_path.is_dir():
-            _BUNDLE_FILENAMES = (
-                "databricks.yml", "databricks.yaml",
-                "bundle.yml", "bundle.yaml",
-            )
-            for name in _BUNDLE_FILENAMES:
-                candidate = bundle_path / name
-                if candidate.exists():
-                    bundle_path = candidate
-                    break
-            else:
-                raise FileNotFoundError(
-                    f"No bundle file found in {bundle_path}. "
-                    f"Expected one of: {', '.join(_BUNDLE_FILENAMES)}. "
-                    f"Pass the path to the YAML file explicitly."
-                )
-
-        return _deploy(bundle_path, target, client=self)
 
     @property
     def entity_tags(self) -> "EntityTags":
@@ -1738,6 +1770,49 @@ class DatabricksClient(Singleton, URLBased):
         return cached
 
     @property
+    def external(self) -> "DatabricksExternal":
+        """Unity Catalog **external data** umbrella service for this client.
+
+        Groups the securables that bind UC to outside storage —
+        external locations and storage credentials::
+
+            client.external.locations["raw_zone"]          # ExternalLocation
+            client.external.credentials.create_aws("prod_s3", "arn:aws:iam::123:role/R")
+            client.external.credentials["prod_s3"].aws_client(region="us-east-1")
+        """
+        cached = self.__dict__.get("_external")
+        if cached is not None:
+            return cached
+        from .external import DatabricksExternal
+
+        cached = DatabricksExternal(client=self)
+        self.__dict__["_external"] = cached
+        return cached
+
+    @property
+    def external_locations(self) -> "ExternalLocations":
+        """Unity Catalog external-locations service for this client.
+
+        Flat alias onto :attr:`external` — ``client.external.locations``::
+
+            client.external_locations["raw_zone"]          # ExternalLocation
+            client.external_locations.list()               # Iterator[ExternalLocation]
+            client.external_locations.create(name, url, credential_name)
+        """
+        return self.external.locations
+
+    @property
+    def credentials(self) -> "Credentials":
+        """Unity Catalog storage-credentials service for this client.
+
+        Flat alias onto :attr:`external` — ``client.external.credentials``::
+
+            client.credentials.create_aws("prod_s3", "arn:aws:iam::123:role/R")
+            client.credentials["prod_s3"].aws_client(region="us-east-1")  # refreshable
+        """
+        return self.external.credentials
+
+    @property
     def schemas(self) -> "Schemas":
         """Collection-level Unity Catalog schema service for this client.
 
@@ -1752,7 +1827,11 @@ class DatabricksClient(Singleton, URLBased):
             return cached
         from .schema.schemas import Schemas
 
-        cached = Schemas(client=self)
+        cached = Schemas(
+            client=self,
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        )
         self.__dict__["_schemas"] = cached
         return cached
 
@@ -1771,7 +1850,11 @@ class DatabricksClient(Singleton, URLBased):
             return cached
         from .volume.volumes import Volumes
 
-        cached = Volumes(client=self)
+        cached = Volumes(
+            client=self,
+            catalog_name=self.catalog_name,
+            schema_name=self.schema_name,
+        )
         self.__dict__["_volumes"] = cached
         return cached
 
@@ -2046,6 +2129,16 @@ class DatabricksClient(Singleton, URLBased):
         env = DatabricksEnv()
         env = env.withDependencies(list(install_specs))
         return env
+
+    def default_storage_location(
+        self,
+        suffix: str = None
+    ) -> str:
+        base = "s3://odp-aws-dls3-eu-central-1-p-apps/3mv/"
+        if not suffix:
+            return base
+
+        return base + suffix.lstrip("/")
 
 
 DATABRICKS_CLIENT_INIT_NAMES = frozenset(DatabricksClient._INIT_NAMES)

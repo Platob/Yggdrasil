@@ -6,6 +6,7 @@ import {
   type SagaOverview, type MountEntry, type MountNode, type TopAsset, type OpLogEntry,
 } from "@/lib/api";
 import { Sparkline } from "@/components/Sparkline";
+import { ByteUnit } from "@platob/yggdrasil";
 
 // Per mount-kind glyph + colour so the family reads at a glance — mirrors the
 // catalog tree's object-type vocabulary.
@@ -21,10 +22,7 @@ const kindOf = (k: string) => KIND[k] ?? KIND.local;
 
 function fmtBytes(b: number | null | undefined): string {
   if (!b) return "--";
-  if (b < 1024) return `${b} B`;
-  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
-  if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
-  return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  return ByteUnit.format(b, { iec: false }); // shared yggdrasil byte formatting
 }
 function fmtNum(n: number | null | undefined): string {
   if (n == null) return "--";

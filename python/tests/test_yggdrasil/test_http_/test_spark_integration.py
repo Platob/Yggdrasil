@@ -13,6 +13,10 @@ import pytest
 
 pyspark = pytest.importorskip("pyspark")
 
+# Spins a local HTTP server AND a Spark JVM to test fan-out send — heavy.
+# Gated as integration: skipped unless YGGDRASIL_SPARK_INTEGRATION is set.
+pytestmark = pytest.mark.spark_integration
+
 from pyspark.sql import SparkSession
 
 from yggdrasil.http_.cache_config import CacheConfig

@@ -12,14 +12,10 @@ the Spark executor round trip:
   spread positionally; scalar rows arrive as a single arg.
 * keyword-only — ``def f(*, id, name): ...`` survives the same spread.
 
-The fixtures forge a pure-local ``SparkSession`` directly (no
-``PyEnv.spark_session`` round trip) so the test runs in environments
-where ``databricks-connect`` is not installed but the local pyspark
-JVM-mode is reachable.
+Runs on the shared :class:`yggdrasil.spark.tests.SparkTestCase` session.
 """
 from __future__ import annotations
 
-import os
 import unittest
 
 import pyarrow as pa  # noqa: F401  -- referenced by string-form annotations below
@@ -39,50 +35,7 @@ from yggdrasil.data.types.primitive import (
     StringType,
 )
 from yggdrasil.spark.tabular import SparkDataset
-
-
-def _local_spark():
-    """Build a local-only ``SparkSession`` for the apply-signature tests.
-
-    Skips cleanly when pyspark is missing or only supports
-    Databricks Connect (pyspark 4.x without databricks-connect).
-    """
-    try:
-        from pyspark.sql import SparkSession
-    except ImportError:
-        raise unittest.SkipTest("pyspark not installed")
-
-    # Avoid PyEnv's connect-first resolution.
-    os.environ.pop("DATABRICKS_HOST", None)
-    # Spark 3.5 + Java 21 need the legacy ``sun.misc.Unsafe`` / direct
-    # ``ByteBuffer.<init>(long, int)`` reflection paths reopened for Arrow
-    # to allocate off-heap buffers; without these JVM args, ``mapInArrow``
-    # crashes with ``UnsupportedOperationException`` from MemoryUtil.
-    jvm_opens = (
-        "--add-opens=java.base/java.lang=ALL-UNNAMED "
-        "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED "
-        "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED "
-        "--add-opens=java.base/java.io=ALL-UNNAMED "
-        "--add-opens=java.base/java.net=ALL-UNNAMED "
-        "--add-opens=java.base/java.nio=ALL-UNNAMED "
-        "--add-opens=java.base/java.util=ALL-UNNAMED "
-        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
-        "--add-opens=java.base/sun.misc=ALL-UNNAMED"
-    )
-    try:
-        return (
-            SparkSession.builder
-            .master("local[2]")
-            .appName("ygg-test-apply-signatures")
-            .config("spark.sql.shuffle.partitions", "2")
-            .config("spark.sql.execution.arrow.pyspark.enabled", "true")
-            .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true")
-            .config("spark.driver.extraJavaOptions", jvm_opens)
-            .config("spark.executor.extraJavaOptions", jvm_opens)
-            .getOrCreate()
-        )
-    except RuntimeError as exc:
-        raise unittest.SkipTest(f"local SparkSession unavailable: {exc}")
+from yggdrasil.spark.tests import SparkTestCase
 
 
 _OUT_SCHEMA = schema([
@@ -172,39 +125,7 @@ def _whole_batch_polars(df: "pl.DataFrame") -> "pl.DataFrame":
     ]).select(["id", "label", "score"])
 
 
-# ---------------------------------------------------------------------------
-# TestCase — self-managed local SparkSession + Dataset module-install stub.
-# ---------------------------------------------------------------------------
-
-
-class _AppliedSignaturesBase(unittest.TestCase):
-    spark = None  # type: ignore[assignment]
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        cls.spark = _local_spark()
-        # Skip the ygg / pyarrow archive ship — the local cluster already
-        # has the same interpreter and ``sys.path`` as the driver, so the
-        # archive step would only burn CPU. Patch the module-level
-        # function the dataset calls into (a class-level stub would be
-        # dead code; ``_ensure_installed_on_session`` imports from the
-        # module, not the class).
-        from yggdrasil.spark import frame as _frame_module
-        cls._frame_module = _frame_module
-        cls._orig_install = _frame_module._install_modules_on_executors
-        _frame_module._install_modules_on_executors = lambda _session, modules: set(modules)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls._frame_module._install_modules_on_executors = cls._orig_install
-        # Leave the session alive across the test process — Spark startup
-        # is the dominant cost; tearing down would slow neighbours that
-        # share the same JVM.
-        super().tearDownClass()
-
-
-class TestDatasetApplySignatures(_AppliedSignaturesBase):
+class TestDatasetApplySignatures(SparkTestCase):
 
     def test_single_arg_dynamic_to_typed(self) -> None:
         dyn = SparkDataset.from_iterable(range(5), spark_session=self.spark)

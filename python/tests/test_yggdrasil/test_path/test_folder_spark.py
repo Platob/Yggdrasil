@@ -241,8 +241,7 @@ class TestSparkCoalesce(SparkTestCase):
         spark_df = folder.read_spark_frame()
         # After coalesce the RDD should have at most as many partitions
         # as there are leaf files.
-        n_leaves: list = []
-        folder._collect_leaves(n_leaves, FolderOptions())
+        n_leaves = list(folder.iter_leaves(FolderOptions()))
         self.assertLessEqual(
             spark_df.rdd.getNumPartitions(), len(n_leaves),
         )
@@ -265,14 +264,17 @@ class TestSparkCoalesce(SparkTestCase):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.spark_integration
 class TestSparkCompression(SparkTestCase):
 
     def test_large_pickle_gets_compressed(self) -> None:
-        # Build a leaf large enough (> 4 MB pickled) to trigger the
-        # "Z"-prefixed zlib compression path.  We write a single file
-        # with enough rows, then pickle the resulting leaf Tabular and
-        # verify the size + prefix convention.
-        n_rows = 200_000
+        # Build a leaf whose pickle clears the 4 MB ``Z``-prefixed zlib
+        # compression threshold (high-entropy hex payload won't shrink), then
+        # verify the prefix convention + round-trip. 150k rows of int64 + a
+        # 40-char hex string ≈ 7 MB pickled — a safe margin over the threshold
+        # without the original 200k's extra cost.
+        _COMPRESS_THRESHOLD = 4 * 1024 * 1024
+        n_rows = 150_000
         table = pa.table({
             "id": pa.array(range(n_rows), type=pa.int64()),
             "payload": pa.array(
@@ -282,28 +284,17 @@ class TestSparkCompression(SparkTestCase):
         })
         folder = _write_folder(self.tmp_path, table)
 
-        leaves: list = []
-        folder._collect_leaves(leaves, FolderOptions())
+        leaves = list(folder.iter_leaves(FolderOptions()))
         self.assertGreater(len(leaves), 0)
 
-        leaf = leaves[0]
-        raw = pickle.dumps(leaf)
-        _COMPRESS_THRESHOLD = 4 * 1024 * 1024
+        raw = pickle.dumps(leaves[0])
+        self.assertGreater(
+            len(raw), _COMPRESS_THRESHOLD,
+            "fixture too small to exercise the compression path",
+        )
 
-        if len(raw) > _COMPRESS_THRESHOLD:
-            compressed = b"Z" + zlib.compress(raw)
-            self.assertTrue(compressed.startswith(b"Z"))
-            # Verify the round-trip: decompress and unpickle.
-            restored = pickle.loads(zlib.decompress(compressed[1:]))
-            restored_batches = list(restored.read_arrow_batches())
-            restored_rows = sum(b.num_rows for b in restored_batches)
-            self.assertEqual(restored_rows, n_rows)
-        else:
-            # If the leaf pickle is under threshold, the code prefixes
-            # with b"\x00" — still valid, just no compression.
-            prefixed = b"\x00" + raw
-            self.assertTrue(prefixed.startswith(b"\x00"))
-            restored = pickle.loads(prefixed[1:])
-            restored_batches = list(restored.read_arrow_batches())
-            restored_rows = sum(b.num_rows for b in restored_batches)
-            self.assertEqual(restored_rows, n_rows)
+        compressed = b"Z" + zlib.compress(raw)
+        self.assertTrue(compressed.startswith(b"Z"))
+        restored = pickle.loads(zlib.decompress(compressed[1:]))
+        restored_rows = sum(b.num_rows for b in restored.read_arrow_batches())
+        self.assertEqual(restored_rows, n_rows)

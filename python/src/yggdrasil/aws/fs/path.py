@@ -1,49 +1,27 @@
-"""S3-backed :class:`Path` implementation.
+"""S3-backed :class:`Path` implementation — pure-HTTP data plane.
 
-:class:`S3Path` is a :class:`RemotePath` over the ``s3://`` URL
-scheme. The path holds an :class:`yggdrasil.aws.fs.service.S3Service`
-and reaches the boto3-shaped S3 client through ``self.client``
-(a property delegating to ``self.service.boto_client``). Construction
-takes a ``service=`` kwarg; tests build a :class:`unittest.mock.Mock`
-shaped like :class:`S3Service` whose ``boto_client`` attribute is the
-mock boto client.
+Two cooperating :class:`RemotePath` types:
 
-Holder primitives
------------------
+* :class:`S3Bucket` — the ``s3://<bucket>/`` root. A **long-lived singleton**
+  (one per ``(bucket, service)``) that owns the boto3-free S3 data plane: a
+  :class:`~yggdrasil.aws.fs.s3_http.S3HttpClient` (signed with
+  :class:`~yggdrasil.aws.fs.sigv4.SigV4Signer`, riding a pooled
+  :class:`~yggdrasil.http_.session.HTTPSession`) plus the bucket-wide listing
+  cache. Credentials still come from the AWS *client* (env / profile / SSO /
+  STS resolution lives in :class:`~yggdrasil.aws.client.AWSClient`); only the
+  S3 wire moved off boto3.
 
-The new :class:`Path` substrate exposes positional reads / writes
-through five hooks; :class:`S3Path` overrides three of them with
-S3-native equivalents:
+* :class:`S3Path` — a key under a bucket. Lightweight: it resolves its
+  :class:`S3Bucket` (``self.s3_bucket``) and **redirects** every backend call
+  there — ``head`` / ranged ``get`` / ``put`` / multipart ``put`` / ``delete``
+  / ``list`` / batch-delete. Each path only carries its own per-key concerns
+  (range math, stat-cache seeding); bucket-scoped state lives once on the
+  bucket. Reads range-GET (Parquet footer probes cost one request); writes
+  single-PUT under the threshold and stream as multipart above it.
 
-* :meth:`_read_mv` — range-based ``GetObject`` with
-  ``Range: bytes={pos}-{pos+n-1}``. ``n=0`` short-circuits to an
-  empty :class:`memoryview`. A miss surfaces as
-  :class:`FileNotFoundError`; an EOF range yields an empty buffer
-  to match file semantics.
-* :meth:`_write_mv` — read existing object (if any), splice the
-  incoming bytes at ``pos``, and ``PutObject`` the result. S3 has
-  no native partial-write API, so this is a read-modify-write at
-  the object granularity.
-* :meth:`truncate` — ``PutObject`` of the head N bytes.
-* :meth:`_clear` — ``DeleteObject`` (idempotent).
-
-Reads of the whole object pass through the inherited ``read_bytes``
-which calls ``_read_mv(-1, 0)`` once, so a parquet footer probe
-costs one S3 request.
-
-Filesystem surface
-------------------
-
-* :meth:`_stat_uncached` — ``HeadObject`` for the file shape;
-  ``ListObjectsV2(MaxKeys=1, Delimiter='/')`` to disambiguate
-  directory prefixes from missing keys.
-* :meth:`_ls` — ``ListObjectsV2`` paginator, treats common-prefixes
-  as sub-directories. Children inherit the same client.
-* :meth:`_mkdir` — no-op (S3 has no directory concept; prefixes
-  come into existence the moment a child object lands).
-* :meth:`_remove_file` — ``DeleteObject``.
-* :meth:`_remove_dir` — paginated bulk ``DeleteObjects`` (1000 keys
-  per call). Idempotent under ``missing_ok=True``.
+``arrow_filesystem`` / ``arrow_uri`` still hand out a ``pyarrow.fs.S3FileSystem``
+(credential snapshot) for the Arrow/Parquet fast path — orthogonal to the REST
+data plane here.
 """
 
 from __future__ import annotations
@@ -52,215 +30,115 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
 
+from yggdrasil.aws.fs.s3_http import S3HttpClient, S3NotFound
+from yggdrasil.aws.fs.sigv4 import SigV4Signer
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Scheme
 from yggdrasil.enums.media_type import MediaType
 from yggdrasil.path import RemotePath
-from yggdrasil.path._retry import retry_sdk_call
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.io.io_stats import IOStats, IOKind
 from yggdrasil.url import URL
+from yggdrasil.url.explore import ExploreUrlRepr
 
 if TYPE_CHECKING:
     from yggdrasil.aws.fs.service import S3Service
 
 
-__all__ = ["S3Path"]
+__all__ = ["S3Path", "S3Bucket"]
 
 LOGGER = logging.getLogger(__name__)
 
+#: Buckets are stable identities (region/creds rotate underneath, the bucket
+#: doesn't), and each one anchors a pooled HTTPSession — so the bucket singleton
+#: lives much longer than a per-key path's stat-cache horizon.
+_BUCKET_SINGLETON_TTL: float = 3600.0
+
+_ACCEPTED_SCHEMES: frozenset[str] = frozenset({"s3", "s3a", "s3n"})
+
+#: Part size for multipart streaming uploads (>= the 5 MiB S3 minimum).
+_MULTIPART_THRESHOLD: int = 100 * 1024 * 1024
+_MULTIPART_CHUNKSIZE: int = 16 * 1024 * 1024
+
+
+def _bucket_of(data: Any, url: "URL | None") -> "str | None":
+    if url is not None:
+        return url.host
+    if isinstance(data, URL):
+        return data.host
+    if isinstance(data, str):
+        return URL.from_(data).host
+    return None
+
+
+def _normalize_scheme(url: URL) -> URL:
+    """Coerce ``s3a://`` / ``s3n://`` (common in Spark) to canonical ``s3://``."""
+    if url.scheme in _ACCEPTED_SCHEMES and url.scheme != Scheme.S3:
+        return url.with_scheme(Scheme.S3)
+    return url
+
+
+def _can_virtual_host(bucket: str) -> bool:
+    """True when *bucket* is a DNS-safe label that can ride a virtual-host TLS
+    cert (``<bucket>.s3...``). Dotted names break the wildcard cert, so boto3 —
+    and we — drop those to path-style."""
+    return "." not in bucket and 3 <= len(bucket) <= 63
+
 
 # ---------------------------------------------------------------------------
-# S3Path
+# S3Bucket — long-lived bucket singleton owning the HTTP data plane
 # ---------------------------------------------------------------------------
+class S3Bucket(ExploreUrlRepr, RemotePath):
+    """``s3://<bucket>/`` root — owns the signed pure-HTTP S3 client.
 
-
-class S3Path(RemotePath):
-    """:class:`Path` over an S3 bucket via an :class:`S3Service`.
-
-    Construction shapes::
-
-        S3Path("s3://bucket/key.parquet")                  # uses default service
-        S3Path("s3://bucket/", service=my_s3_service)      # explicit service
-        S3Path(url=URL("s3://bucket/key"), service=mock)   # tests inject mocks
-
-    The ``service`` kwarg is an :class:`S3Service` (or anything with
-    a ``boto_client`` attribute exposing the boto3-shaped S3 surface
-    — ``head_object``, ``get_object``, ``put_object``,
-    ``delete_object``, ``delete_objects``, ``list_objects_v2``,
-    ``get_paginator``). The path reaches the boto client through the
-    :attr:`client` property; tests inject a :class:`unittest.mock.Mock`
-    with ``boto_client`` set to the mock boto client.
-
-    Singleton identity caching uses the 5-minute default TTL via a
-    PER-CLASS ``_INSTANCES`` cache (not inherited from
-    :class:`RemotePath`) so a hot ``S3Path(...)`` race never
-    contends on the same lock as a hot ``VolumePath(...)`` /
-    ``DBFSPath(...)`` construction. The matching ``stat_cache_ttl``
-    (also 300s) means a hot read after a hot write rides one
-    ``HeadObject`` no matter how many call sites request the same key.
-
-    Mutating ops (``put_object`` / ``DeleteObject`` /
-    ``DeleteObjects``) call :meth:`invalidate_singleton` before
-    returning so two consumers sharing the singleton see consistent
-    metadata after a write.
+    One instance per ``(bucket, service)``, cached for an hour. Build it
+    implicitly via any :class:`S3Path` (``path.s3_bucket``) or directly with a
+    test transport: ``S3Bucket("b", http=fake_client)``.
     """
 
-    scheme: ClassVar[Scheme] = Scheme.S3
-
-    # Per-class singleton cache — partitions ``__new__`` contention
-    # away from every other :class:`RemotePath` subclass. No
-    # companion lock — :class:`ExpiringDict.get_or_set` is
-    # GIL-atomic.
+    # NB: no ``scheme`` in the class body — S3Path owns the ``s3`` registry
+    # slot (for ``Path.from_("s3://…")`` dispatch). ``S3Bucket.scheme`` is set
+    # post-class so the bucket still carries the typed scheme without a
+    # duplicate registration.
     _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
-        default_ttl=_STAT_CACHE_TTL,
-        max_size=10_000,
+        default_ttl=_BUCKET_SINGLETON_TTL, max_size=4096
     )
-
-    #: URL schemes accepted on input; always normalized to ``s3``.
-    _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = frozenset({"s3", "s3a", "s3n"})
-
-    # ``_read_mv`` range-reads via ``GetObject`` Range, so Parquet
-    # projection pulls the footer + projected chunks only (inherited
-    # :meth:`RemotePath.arrow_random_access_file`).
-    SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = True
-
-    # Arrow/Parquet writes spill the encode to a temp file and stream it to S3
-    # via boto's managed transfer (see :meth:`_upload_stream`), so a multi-GB
-    # write never materialises the encoded payload whole in memory.
-    SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = True
-
-    # At / above ``MULTIPART_THRESHOLD`` an upload runs through boto3's
-    # managed transfer (``upload_fileobj`` + :class:`TransferConfig`),
-    # which splits the object into ``MULTIPART_CHUNKSIZE`` parts uploaded
-    # by up to ``MULTIPART_CONCURRENCY`` threads — past the 5 GiB
-    # single-PUT ceiling and faster on large objects. Below it, a single
-    # ``put_object`` (no extra copy). Tunable per instance / subclass.
-    MULTIPART_THRESHOLD: ClassVar[int] = 100 * 1024 * 1024
-    MULTIPART_CHUNKSIZE: ClassVar[int] = 16 * 1024 * 1024
-    MULTIPART_CONCURRENCY: ClassVar[int] = 8
-
-    # Directory-listing cache: a repeated ``iterdir`` / ``ls`` of the same
-    # prefix within ``LS_CACHE_TTL`` seconds replays the cached child keys
-    # instead of re-paginating S3. Only listings that fully fit within
-    # ``LS_CACHE_MAX_ENTRIES`` are cached (cheap key strings); a larger prefix
-    # streams uncached so a huge directory never balloons memory. Invalidated
-    # on any mutation under the prefix and on ``invalidate_singleton``.
-    LS_CACHE_TTL: ClassVar[float] = _STAT_CACHE_TTL
-    LS_CACHE_MAX_ENTRIES: ClassVar[int] = 10_000
-
-    # ==================================================================
-    # Singleton key
-    # ==================================================================
+    _SINGLETON_TTL: ClassVar[Any] = _BUCKET_SINGLETON_TTL
+    _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = _ACCEPTED_SCHEMES
 
     @classmethod
     def _singleton_key(
-        cls,
-        data: Any = None,
-        *,
-        url: URL | None = None,
-        service: Any = None,
-        **kwargs: Any,
+        cls, data: Any = None, *, bucket: "str | None" = None,
+        service: Any = None, url: "URL | None" = None, **kwargs: Any,
     ) -> Any:
-        """Identity = ``(cls, canonical s3 URL, service)``.
-
-        ``data`` collapses into ``url`` before keying so the string
-        ``"s3://b/k"`` and the equivalent :class:`URL` map to the
-        same singleton. ``service`` is part of the key because two
-        callers binding the same URL to different :class:`S3Service`
-        instances (cross-account access, separate test fixtures)
-        must NOT collide — passing ``service=None`` collapses to the
-        lazy-resolved :class:`S3Service` singleton, so production
-        callers share one instance per URL without paying the
-        singleton key for explicit services.
-        """
-        if url is None:
-            if isinstance(data, URL):
-                url = data
-            elif isinstance(data, str):
-                url = URL.from_(data)
-            else:
-                # No URL → no canonical identity. Fall back to a unique
-                # sentinel so the Singleton machinery doesn't collide
-                # unrelated paths.
-                return (cls, object())
-        # ``url`` is already a :class:`URL` at this point — the
-        # ``URL.from_(url)`` no-op short-circuit costs a function call
-        # plus an ``isinstance`` probe per construction and the
-        # canonical s3 scheme covers >99% of real callers, so the
-        # ``_normalize_scheme`` fast path returns ``url`` unchanged.
-        # ``URL`` is hashable (``hash(self.to_string())``) and equal
-        # field-by-field, so it works as a dict key directly — drop the
-        # ``str(...)`` round trip that was building (and hashing) a
-        # fresh string on every singleton lookup.
-        return (cls, cls._normalize_scheme(url), service)
-
-    # ==================================================================
-    # Construction
-    # ==================================================================
+        return (cls, bucket or _bucket_of(data, url), service)
 
     def __init__(
         self,
         data: Any = None,
         *,
-        url: URL | None = None,
+        bucket: "str | None" = None,
         service: Optional["S3Service"] = None,
-        temporary: bool = False,
-        retry_sleep: Optional[Callable[[float], None]] = None,
+        http: Optional[S3HttpClient] = None,
         singleton_ttl: Any = ...,
         **kwargs: Any,
     ) -> None:
-        # ``singleton_ttl`` is consumed by :meth:`Singleton.__new__`;
-        # accept it here so the constructor signature stays open. The
-        # singleton-cached re-init guard mirrors ``DatabricksPath`` —
-        # the second constructor call collapses onto the live
-        # instance, preserving the bound service + warm stat cache.
         del singleton_ttl
         if getattr(self, "_initialized", False):
             return
-
-        if url is None and isinstance(data, str):
-            url = URL.from_(data)
-            data = None
-        if url is None and isinstance(data, URL):
-            url = data
-            data = None
-        if url is not None:
-            url = self._normalize_scheme(URL.from_(url))
-
-        super().__init__(data=data, url=url, temporary=temporary, **kwargs)
-
-        self._service: Optional["S3Service"] = service
-        # Injection point for tests — replace ``time.sleep`` with a
-        # spy / no-op so retry behavior is observable without burning
-        # wall-clock seconds.
-        self._retry_sleep: Optional[Callable[[float], None]] = retry_sleep
+        bucket = bucket or _bucket_of(data, None)
+        if not bucket:
+            raise ValueError(f"S3Bucket needs a bucket name (got {data!r})")
+        super().__init__(url=URL.from_(f"s3://{bucket}/"), **kwargs)
+        self._bucket = bucket
+        self._service = service
+        self._http = http
+        self._ls_cache: Optional[ExpiringDict] = None
         self._initialized = True
 
-    @classmethod
-    def _normalize_scheme(cls, url: URL) -> URL:
-        """Coerce ``s3a://`` / ``s3n://`` to ``s3://``.
-
-        Both Hadoop variants are common in Spark contexts; the
-        canonical form on disk and in logs is ``s3://``, so we
-        normalize at construction time and round-trip clean.
-        """
-        if url.scheme in cls._ACCEPTED_SCHEMES and url.scheme != cls.scheme:
-            return url.with_scheme(cls.scheme)
-        return url
-
-    # ==================================================================
-    # Service / client access
-    # ==================================================================
-
+    # -- service / client plumbing ------------------------------------
     @property
     def service(self) -> "S3Service":
-        """The :class:`S3Service` this path is bound to.
-
-        Lazily resolves to :meth:`S3Service.current` when none was
-        passed at construction. Tests that inject a service-shaped
-        mock at construction never trigger the lazy branch.
-        """
         if self._service is None:
             from yggdrasil.aws.fs.service import S3Service
 
@@ -268,35 +146,206 @@ class S3Path(RemotePath):
         return self._service
 
     @property
-    def client(self) -> Any:
-        """The boto-shaped S3 client — ``self.service.boto_client``.
+    def http(self) -> S3HttpClient:
+        """The signed pure-HTTP S3 client, built once from the service creds."""
+        if self._http is None:
+            from yggdrasil.enums.aws import AWSRegion
 
-        Convenience accessor so the call sites that issue boto API
-        calls (``self.client.head_object(...)``,
-        ``self.client.get_object(...)``) stay short. The underlying
-        client is owned by the :class:`S3Service`; this property
-        never mints one of its own.
-        """
-        return self.service.boto_client
+            client = self.service.client
+            # Configured region first; otherwise sniff it out of the bucket name
+            # (people bake it in: ``acme-dls3-eu-central-1-p``); else us-east-1.
+            region = getattr(client, "region", None) or AWSRegion.from_text(self._bucket) or "us-east-1"
+            region = str(region)
+            endpoint_url = getattr(client, "endpoint_url", None)
+            managed = not endpoint_url
+            if endpoint_url:  # S3-compatible store (MinIO / localstack) → path-style
+                endpoint, path_style = URL.from_(endpoint_url), True
+            elif _can_virtual_host(self._bucket):
+                endpoint, path_style = URL.from_(f"https://{self._bucket}.s3.{region}.amazonaws.com"), False
+            else:
+                # Dotted / non-DNS-safe bucket names can't ride a virtual-host
+                # TLS cert — fall back to path-style, exactly as boto3 does.
+                endpoint, path_style = URL.from_(f"https://s3.{region}.amazonaws.com"), True
+            signer = SigV4Signer(region=region, credentials_provider=self._credentials)
+            # Inside AWS-managed compute (Batch/ECS/Fargate/Lambda) S3 is
+            # reachable directly over the AWS network / a VPC endpoint, so a
+            # corporate egress proxy doesn't apply — bypass it for the AWS S3
+            # domains. Custom endpoints (MinIO, etc.) keep the proxy.
+            no_proxy = None
+            if managed:
+                from yggdrasil.aws.batch import in_aws_environment
 
-    def _call(self, func, *args, **kwargs):
-        """Invoke *func(*args, **kwargs)* under the standard retry policy.
+                if in_aws_environment():
+                    no_proxy = "amazonaws.com,amazonaws.com.cn,amazonaws-us-gov.com"
+            self._http = S3HttpClient(
+                bucket=self._bucket, endpoint=endpoint, signer=signer,
+                path_style=path_style, region=region, managed=managed, no_proxy=no_proxy,
+            )
+        return self._http
 
-        Transient errors (5xx, 429, BadRequest, throttling, transport
-        timeouts) get up to 4 retries with 1 / 2 / 4 / 8 s sleeps.
-        Permission errors (403, AccessDenied, expired token) get
-        exactly one retry — usually enough to dodge a credential
-        refresh race. Anything else (404 / NoSuchKey / InvalidRange)
-        is deterministic and propagates.
-        """
-        if self._retry_sleep is not None:
-            return retry_sdk_call(func, *args, sleep=self._retry_sleep, **kwargs)
-        return retry_sdk_call(func, *args, **kwargs)
+    def _credentials(self) -> "tuple[str, str, Optional[str]]":
+        creds = self.service.client.session.get_credentials()
+        if creds is None:
+            raise PermissionError(
+                f"No AWS credentials resolved for {self!r}; pure-HTTP S3 requires "
+                "signed requests (configure env / profile / role / SSO)."
+            )
+        frozen = creds.get_frozen_credentials()
+        return frozen.access_key, frozen.secret_key, frozen.token
+
+    # -- bucket-level ops (S3Path redirects here) ---------------------
+    @property
+    def name(self) -> str:
+        return self._bucket
+
+    def iter_keys(self, prefix: str, *, delimiter: "str | None" = None) -> Iterator[str]:
+        """Yield child keys / common-prefixes under *prefix*, one page at a time."""
+        for page in self.http.list(prefix, delimiter=delimiter):
+            yield from page.prefixes
+            for obj in page.objects:
+                # Skip zero-byte ``foo/`` placeholders on a shallow walk — they
+                # resurface as CommonPrefixes.
+                if delimiter and obj.key.endswith("/") and obj.size == 0:
+                    continue
+                yield obj.key
+
+    def delete_prefix(self, prefix: str) -> int:
+        """Bulk-delete every object under *prefix*; returns the count."""
+        batch: "list[str]" = []
+        deleted = 0
+        for page in self.http.list(prefix):
+            for obj in page.objects:
+                batch.append(obj.key)
+                if len(batch) >= 1000:
+                    self.http.delete_batch(batch)
+                    deleted += len(batch)
+                    batch = []
+        if batch:
+            self.http.delete_batch(batch)
+            deleted += len(batch)
+        return deleted
+
+    # -- listing cache (shared by every key under the bucket) ---------
+    @property
+    def ls_cache(self) -> ExpiringDict:
+        if self._ls_cache is None:
+            self._ls_cache = ExpiringDict(default_ttl=_STAT_CACHE_TTL, max_size=10_000)
+        return self._ls_cache
+
+    def invalidate_ls_cache(self, prefix: "str | None" = None) -> None:
+        if self._ls_cache is None:
+            return
+        if prefix is None:
+            self._ls_cache.clear()
+            return
+        for k in [k for k in self._ls_cache if str(k).startswith(prefix)]:
+            self._ls_cache.pop(k, None)
+
+    # -- RemotePath surface for the bucket root -----------------------
+    def _stat_uncached(self) -> IOStats:
+        return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
+
+    def _ls(self, recursive: bool = False, *, singleton_ttl: Any = False) -> Iterator["S3Path"]:
+        for key in self.iter_keys("", delimiter=None if recursive else "/"):
+            yield self._child(key, singleton_ttl=singleton_ttl)
+
+    def _child(self, key: str, *, singleton_ttl: Any = False) -> "S3Path":
+        url = self.url._replace_path("/" + key.lstrip("/"))
+        return S3Path(url=url, service=self._service, s3_bucket=self, singleton_ttl=singleton_ttl)
+
+    def _mkdir(self, parents: bool, exist_ok: bool) -> None:
+        del parents, exist_ok
+
+    def full_path(self) -> str:
+        return f"s3://{self._bucket}/"
+
+    def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
+        del missing_ok, wait
+        raise IsADirectoryError(self.full_path())
+
+    def _remove_dir(self, recursive: bool, missing_ok: bool, wait: WaitingConfig) -> None:
+        del missing_ok, wait
+        if recursive:
+            self.delete_prefix("")
+        self.invalidate_ls_cache()
+
+    def _from_url(self, url: URL) -> "RemotePath":
+        return S3Path(url=url, service=self._service, s3_bucket=self)
+
+    def arrow_filesystem(self, *, region: Optional[str] = None, **overrides: Any) -> Any:
+        return self.service.arrow_filesystem(region=region, **overrides)
+
+    @property
+    def explore_url(self) -> URL:
+        """AWS Console deep-link to this bucket — clickable from code."""
+        from yggdrasil.aws.console import s3_bucket_url
+
+        return s3_bucket_url(self._bucket, getattr(self.service.client, "region", None))
+
+
+# ---------------------------------------------------------------------------
+# S3Path — a key under a bucket; redirects backend ops to its S3Bucket
+# ---------------------------------------------------------------------------
+class S3Path(ExploreUrlRepr, RemotePath):
+    """:class:`Path` over an S3 object key. Backend ops redirect to
+    :attr:`s3_bucket` (the long-lived :class:`S3Bucket` singleton)."""
+
+    scheme: ClassVar[Scheme] = Scheme.S3
+    _INSTANCES: ClassVar[ExpiringDict] = ExpiringDict(
+        default_ttl=_STAT_CACHE_TTL, max_size=10_000
+    )
+    _ACCEPTED_SCHEMES: ClassVar[frozenset[str]] = _ACCEPTED_SCHEMES
+
+    # Range-GET random access (Parquet footer/column projection) + multipart
+    # streaming uploads (multi-GB writes never materialise whole in memory).
+    SUPPORTS_RANGED_RANDOM_ACCESS: ClassVar[bool] = True
+    SUPPORTS_STREAMING_UPLOAD: ClassVar[bool] = True
+
+    MULTIPART_THRESHOLD: ClassVar[int] = _MULTIPART_THRESHOLD
+    MULTIPART_CHUNKSIZE: ClassVar[int] = _MULTIPART_CHUNKSIZE
+
+    @classmethod
+    def _singleton_key(
+        cls, data: Any = None, *, url: URL | None = None,
+        service: Any = None, **kwargs: Any,
+    ) -> Any:
+        if url is None:
+            if isinstance(data, URL):
+                url = data
+            elif isinstance(data, str):
+                url = URL.from_(data)
+            else:
+                return (cls, object())
+        return (cls, _normalize_scheme(url), service)
+
+    def __init__(
+        self,
+        data: Any = None,
+        *,
+        url: URL | None = None,
+        service: Optional["S3Service"] = None,
+        s3_bucket: Optional[S3Bucket] = None,
+        temporary: bool = False,
+        singleton_ttl: Any = ...,
+        **kwargs: Any,
+    ) -> None:
+        del singleton_ttl
+        if getattr(self, "_initialized", False):
+            return
+        if url is None and isinstance(data, str):
+            url, data = URL.from_(data), None
+        if url is None and isinstance(data, URL):
+            url, data = data, None
+        if url is not None:
+            url = _normalize_scheme(URL.from_(url))
+        super().__init__(data=data, url=url, temporary=temporary, **kwargs)
+        self._service = service
+        self._s3_bucket = s3_bucket
+        self._initialized = True
 
     # ==================================================================
-    # URL parts → bucket / key
+    # Bucket / key + the S3Bucket redirect
     # ==================================================================
-
     @property
     def bucket(self) -> str:
         host = self.url.host
@@ -306,367 +355,150 @@ class S3Path(RemotePath):
 
     @property
     def key(self) -> str:
-        path = self.url.path or ""
-        return path.lstrip("/")
+        return (self.url.path or "").lstrip("/")
+
+    @property
+    def s3_bucket(self) -> S3Bucket:
+        """The long-lived :class:`S3Bucket` that owns this key's data plane."""
+        if self._s3_bucket is None:
+            self._s3_bucket = S3Bucket(bucket=self.bucket, service=self._service)
+        return self._s3_bucket
+
+    @property
+    def service(self) -> "S3Service":
+        return self.s3_bucket.service
 
     def full_path(self) -> str:
-        """Render as ``s3://bucket/key``."""
         key = self.key
         return f"s3://{self.bucket}/{key}" if key else f"s3://{self.bucket}/"
 
     @property
     def size(self) -> int:
-        """Object size from a (cached) ``HeadObject``. ``0`` when missing."""
         return int(self._stat().size)
 
     def _from_url(self, url: URL) -> "S3Path":
-        """Sibling :class:`S3Path` with the same service."""
-        return S3Path(url=url, service=self._service)
+        # Same bucket → reuse the resolved S3Bucket so siblings share the client.
+        same_bucket = self._s3_bucket if url.host == self.url.host else None
+        return S3Path(url=url, service=self._service, s3_bucket=same_bucket)
 
     # ==================================================================
-    # PyArrow filesystem fast path
+    # PyArrow filesystem fast path (orthogonal to the REST plane)
     # ==================================================================
-
-    def arrow_filesystem(
-        self,
-        *,
-        region: Optional[str] = None,
-        **overrides: Any,
-    ) -> Any:
-        """Return a :class:`pyarrow.fs.S3FileSystem` for this path's bucket.
-
-        Delegates to :meth:`S3Service.arrow_filesystem` so the
-        credential snapshot logic lives in one place — every call
-        site (raw ``S3Path``, ``VolumePath.arrow_filesystem``, the
-        tabular fast path below) sees the same auth surface.
-
-        For the pyarrow filesystem to know which bucket it's
-        talking to you also need :attr:`arrow_uri` — pyarrow's
-        S3FileSystem takes ``"bucket/key"`` strings, not full
-        ``s3://`` URLs.
-        """
+    def arrow_filesystem(self, *, region: Optional[str] = None, **overrides: Any) -> Any:
         return self.service.arrow_filesystem(region=region, **overrides)
 
     @property
     def arrow_uri(self) -> str:
-        """``bucket/key`` form expected by ``pyarrow.fs.S3FileSystem``.
-
-        pyarrow's filesystem-aware readers (``pq.ParquetFile``,
-        ``pa.ipc.open_file``, …) take a ``bucket/key`` path string
-        paired with the filesystem object — not a full ``s3://`` URL.
-        This property renders that form once so the fast-path call
-        sites stay readable.
-        """
         return f"{self.bucket}/{self.key}"
 
-    # ==================================================================
-    # Stat — uncached probe
-    # ==================================================================
+    @property
+    def explore_url(self) -> URL:
+        """AWS Console deep-link to this object/prefix — clickable from code."""
+        from yggdrasil.aws.console import s3_object_url
 
+        return s3_object_url(self.bucket, self.key, getattr(self.service.client, "region", None))
+
+    # ==================================================================
+    # Stat
+    # ==================================================================
     def _stat_uncached(self) -> IOStats:
-        """One ``HeadObject``; falls through to a list probe for prefixes."""
         if not self.key:
             return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
-
-        try:
-            response = self._call(
-                self.client.head_object,
-                Bucket=self.bucket,
-                Key=self.key,
-            )
-        except Exception as exc:
-            if not _is_not_found(exc):
-                raise
-            response = None
-
-        if response is not None:
+        resp = self.s3_bucket.http.head(self.key)
+        if resp is not None:
             return IOStats(
-                size=int(response.get("ContentLength", 0)),
-                mtime=_mtime_from_response(response),
+                size=int(resp.headers.get("Content-Length", 0) or 0),
+                mtime=_mtime_from_headers(resp.headers),
                 kind=IOKind.FILE,
                 mode=0,
-                media_type=_media_type_from_response(response),
+                media_type=_media_type_from_headers(resp.headers),
             )
-
-        # No object at the exact key — probe whether it's a prefix.
-        prefix = self.key
-        if not prefix.endswith("/"):
-            prefix = prefix + "/"
-        try:
-            response = self._call(
-                self.client.list_objects_v2,
-                Bucket=self.bucket,
-                Prefix=prefix,
-                MaxKeys=1,
-                Delimiter="/",
-            )
-        except Exception:
-            return IOStats(size=0, mtime=0.0, kind=IOKind.MISSING, mode=0)
-
-        if response.get("KeyCount", 0) > 0 or response.get("CommonPrefixes"):
+        # No object at the exact key — is it a prefix?
+        prefix = self.key if self.key.endswith("/") else self.key + "/"
+        page = self.s3_bucket.http.list_page(prefix, delimiter="/", max_keys=1)
+        if page.objects or page.prefixes:
             return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
         return IOStats(size=0, mtime=0.0, kind=IOKind.MISSING, mode=0)
 
     # ==================================================================
-    # Listing
+    # Listing (redirects to the bucket)
     # ==================================================================
-
-    def _ls(
-        self,
-        recursive: bool = False,
-        *,
-        singleton_ttl: Any = False,
-    ) -> Iterator["S3Path"]:
-        """List direct (or recursive) children under this prefix.
-
-        Replays a fresh cached listing when one exists; otherwise paginates S3
-        lazily (one page in flight) and caches the child keys — but only while
-        the listing fits ``LS_CACHE_MAX_ENTRIES``, so a huge prefix streams
-        through in bounded memory and is never cached.
-        """
-        cached = self._ls_cache_get(recursive)
+    def _ls(self, recursive: bool = False, *, singleton_ttl: Any = False) -> Iterator["S3Path"]:
+        prefix = self.key if (not self.key or self.key.endswith("/")) else self.key + "/"
+        cache = self.s3_bucket.ls_cache
+        cache_key = (prefix, recursive)
+        cached = cache.get(cache_key)
         if cached is not None:
             for key in cached:
                 yield self._make_child(key, singleton_ttl=singleton_ttl)
             return
-
-        collected: "list[str] | None" = []   # accumulate for the cache
-        for key in self._iter_listing_keys(recursive):
+        collected: "list[str] | None" = []
+        for key in self.s3_bucket.iter_keys(prefix, delimiter=None if recursive else "/"):
             if collected is not None:
-                if len(collected) < self.LS_CACHE_MAX_ENTRIES:
+                if len(collected) < 10_000:
                     collected.append(key)
                 else:
-                    collected = None   # over the cap → stop caching, keep streaming
+                    collected = None  # too big to cache — keep streaming
             yield self._make_child(key, singleton_ttl=singleton_ttl)
-        # Only a fully-drained listing within the cap is cached. A consumer that
-        # stops early (e.g. a bounded ``ls(limit=...)``) suspends the generator
-        # here, so a partial listing is never cached as if complete.
         if collected is not None:
-            self._ls_cache_set(recursive, collected)
-
-    def _iter_listing_keys(self, recursive: bool) -> Iterator[str]:
-        """Yield child key / common-prefix strings under this prefix, one S3
-        ``list_objects_v2`` page at a time (incremental — no full buffer)."""
-        prefix = self.key
-        if prefix and not prefix.endswith("/"):
-            prefix = prefix + "/"
-
-        kwargs: dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
-        if not recursive:
-            kwargs["Delimiter"] = "/"
-
-        paginator = self.client.get_paginator("list_objects_v2")
-        try:
-            pages = paginator.paginate(**kwargs)
-        except Exception as exc:
-            LOGGER.debug(
-                "Listing S3 prefix %r failed — yielding empty (exc=%r)",
-                self,
-                exc,
-            )
-            return
-
-        for page in pages:
-            for cp in page.get("CommonPrefixes") or ():
-                sub_prefix = cp.get("Prefix")
-                if sub_prefix:
-                    yield sub_prefix
-            for obj in page.get("Contents") or ():
-                key = obj.get("Key")
-                if not key:
-                    continue
-                if not recursive and key.endswith("/") and obj.get("Size", 0) == 0:
-                    # Listing leaks placeholder objects (zero-byte keys ending
-                    # in '/') under non-recursive mode; treat them as
-                    # directories that surface as CommonPrefixes on a walk.
-                    continue
-                yield key
-
-    # -- listing cache ------------------------------------------------------
-
-    def _ls_cache_get(self, recursive: bool) -> "list[str] | None":
-        cache = getattr(self, "_ls_cache", None)
-        return cache.get(recursive) if cache is not None else None
-
-    def _ls_cache_set(self, recursive: bool, keys: "list[str]") -> None:
-        cache = getattr(self, "_ls_cache", None)
-        if cache is None:
-            cache = ExpiringDict(default_ttl=self.LS_CACHE_TTL)
-            self._ls_cache = cache
-        cache[recursive] = keys
-
-    def _invalidate_ls_cache(self) -> None:
-        cache = getattr(self, "_ls_cache", None)
-        if cache is not None:
-            cache.clear()
-
-    def _invalidate_parent_ls(self) -> None:
-        """A write/delete under this key stales the parent prefix's listing."""
-        parent = self.parent
-        if parent is not None and parent is not self:
-            invalidate = getattr(parent, "_invalidate_ls_cache", None)
-            if callable(invalidate):
-                invalidate()
-
-    def invalidate_singleton(self, remove_global: bool = True) -> None:
-        self._invalidate_ls_cache()
-        super().invalidate_singleton(remove_global=remove_global)
+            cache[cache_key] = collected
 
     def _make_child(self, key: str, *, singleton_ttl: Any = False) -> "S3Path":
-        # Skip the ``URL.from_(f"s3://...")`` parse — the bucket/host /
-        # scheme are already canonical on ``self.url`` and only the
-        # path changes. The ``_replace_path`` clone preserves the
-        # invariants without going through :func:`urlsplit` for
-        # every child a listing page yields.
-        #
-        # ``singleton_ttl`` defaults to ``False`` so listing children
-        # stay out of the bounded ``S3Path._INSTANCES`` cache; callers
-        # that want cached children thread it through ``ls``.
         cleaned = key.lstrip("/")
         url = self.url._replace_path("/" + cleaned if cleaned else "/")
-        return S3Path(url=url, service=self._service, singleton_ttl=singleton_ttl)
+        return S3Path(url=url, service=self._service, s3_bucket=self._s3_bucket, singleton_ttl=singleton_ttl)
+
+    def _invalidate_parent_ls(self) -> None:
+        if self._s3_bucket is not None:
+            self._s3_bucket.invalidate_ls_cache()
+
+    def invalidate_singleton(self, remove_global: bool = True) -> None:
+        super().invalidate_singleton(remove_global=remove_global)
 
     # ==================================================================
-    # Mutators — mkdir / remove
+    # mkdir / remove
     # ==================================================================
-
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
-        """No-op — S3 has no directory concept.
-
-        Pure-prefix directories materialize when a child object
-        lands under them. Writing a placeholder zero-byte key would
-        just create cleanup work later.
-        """
-        del parents, exist_ok
+        del parents, exist_ok  # S3 prefixes materialise when a child lands.
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         del wait
-        LOGGER.debug("Deleting S3 object %r (missing_ok=%s)", self, missing_ok)
         try:
-            self._call(
-                self.client.delete_object,
-                Bucket=self.bucket,
-                Key=self.key,
-            )
+            self.s3_bucket.http.delete(self.key)
         except Exception:
             if not missing_ok:
                 raise
             return
-        LOGGER.info("Deleted S3 object %r", self)
         self.invalidate_singleton()
         self._invalidate_parent_ls()
 
-    def _remove_dir(
-        self,
-        recursive: bool,
-        missing_ok: bool,
-        wait: WaitingConfig,
-    ) -> None:
-        """Bulk-delete every object under the prefix.
-
-        Pages through ``ListObjectsV2`` and batches up to 1000 keys
-        per ``DeleteObjects`` call. Errors per-key are aggregated by
-        boto into the response; we surface a single :class:`OSError`
-        when any keys fail unless ``missing_ok=True`` swallows them.
-        """
+    def _remove_dir(self, recursive: bool, missing_ok: bool, wait: WaitingConfig) -> None:
+        del wait
         if not recursive:
-            placeholder = self.key
-            if placeholder and not placeholder.endswith("/"):
-                placeholder = placeholder + "/"
-            LOGGER.debug(
-                "Deleting S3 prefix placeholder %r (missing_ok=%s)",
-                self,
-                missing_ok,
-            )
+            placeholder = self.key if self.key.endswith("/") else self.key + "/"
             try:
-                self._call(
-                    self.client.delete_object,
-                    Bucket=self.bucket,
-                    Key=placeholder,
-                )
+                self.s3_bucket.http.delete(placeholder)
             except Exception:
-                if missing_ok:
-                    return
-                raise
-            LOGGER.info("Deleted S3 prefix placeholder %r", self)
+                if not missing_ok:
+                    raise
             self.invalidate_singleton()
             self._invalidate_parent_ls()
             return
-
-        prefix = self.key
-        if prefix and not prefix.endswith("/"):
-            prefix = prefix + "/"
-
-        LOGGER.debug(
-            "Deleting S3 prefix %r recursively (missing_ok=%s)",
-            self,
-            missing_ok,
-        )
-        paginator = self.client.get_paginator("list_objects_v2")
-        batch: list[dict[str, str]] = []
-        deleted = 0
+        prefix = self.key if self.key.endswith("/") else self.key + "/"
         try:
-            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-                for obj in page.get("Contents") or ():
-                    key = obj.get("Key")
-                    if not key:
-                        continue
-                    batch.append({"Key": key})
-                    if len(batch) >= 1000:
-                        self._delete_batch(batch)
-                        deleted += len(batch)
-                        batch = []
-            if batch:
-                self._delete_batch(batch)
-                deleted += len(batch)
+            self.s3_bucket.delete_prefix(prefix)
         except Exception:
-            if missing_ok:
-                return
-            raise
-        LOGGER.info("Deleted S3 prefix %r (objects=%d)", self, deleted)
+            if not missing_ok:
+                raise
         self.invalidate_singleton()
         self._invalidate_parent_ls()
 
-    def _delete_batch(self, batch: list[dict]) -> None:
-        if not batch:
-            return
-        response = self._call(
-            self.client.delete_objects,
-            Bucket=self.bucket,
-            Delete={"Objects": batch, "Quiet": True},
-        )
-        errors = response.get("Errors") or []
-        if errors:
-            sample = ", ".join(f"{e.get('Key')!r}={e.get('Code')}" for e in errors[:3])
-            more = f" (+{len(errors) - 3} more)" if len(errors) > 3 else ""
-            raise OSError(
-                f"S3 delete_objects reported {len(errors)} error(s): " f"{sample}{more}"
-            )
-
     # ==================================================================
-    # Holder I/O — _read_mv / _write_mv / truncate / _clear
+    # Holder I/O — read / upload
     # ==================================================================
-
-    def read_mv(
-        self,
-        size: int = -1,
-        offset: int = 0,
-        *,
-        cursor: bool = False,
-    ) -> memoryview:
-        """Range read with a whole-file fast path that skips the size probe.
-
-        The base :meth:`Holder.read_mv` resolves a ``size < 0``
-        "read to EOF" request by calling ``self.size`` first, which
-        is one ``HeadObject`` round trip every time the stat cache
-        is cold. For the dominant shape — ``read_bytes()`` /
-        ``read_arrow_table()`` against a fresh path — that probe is
-        wasted: the ``GetObject`` we're about to issue without a
-        ``Range`` header returns the whole object *and* carries the
-        canonical size in ``Content-Length``, which :meth:`_read_mv`
-        folds back into the cache. Partial / positional reads keep
-        the base bounds check so out-of-range windows still raise.
-        """
+    def read_mv(self, size: int = -1, offset: int = 0, *, cursor: bool = False) -> memoryview:
+        # Whole-file fast path skips the size probe: the no-Range GET returns
+        # the object + canonical Content-Length, folded into the stat cache.
         if cursor:
             offset = self._pos
         if size < 0 and offset == 0:
@@ -677,165 +509,57 @@ class S3Path(RemotePath):
         return super().read_mv(size, offset, cursor=cursor)
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
-        """Range-based ``GetObject`` → :class:`memoryview` over bytes.
-
-        :class:`Holder.read_mv` already normalized ``(n, pos)`` to a
-        non-negative range that fits within :attr:`size`, so the
-        ``Range`` header always covers a valid window — except for
-        the ``(-1, 0)`` whole-file fast path above, which feeds
-        ``n == -1`` straight through. Omitting the ``Range`` header
-        in that case asks S3 for the whole object in one call.
-        """
         if n == 0:
             return memoryview(b"")
-
-        kwargs: dict[str, Any] = {"Bucket": self.bucket, "Key": self.key}
-        if n > 0:
-            # Closed range — boto wants inclusive end byte.
-            kwargs["Range"] = f"bytes={pos}-{pos + n - 1}"
-        elif pos > 0:
-            # ``bytes={pos}-`` — open-ended range from ``pos`` to EOF.
-            kwargs["Range"] = f"bytes={pos}-"
-        # else: full-object GET — no ``Range`` header.
-
         try:
-            response = self._call(self.client.get_object, **kwargs)
-        except Exception as exc:
-            if _is_not_found(exc):
-                raise FileNotFoundError(self.full_path()) from exc
-            if _is_invalid_range(exc):
-                return memoryview(b"")
-            raise
-
-        body = response.get("Body")
-        try:
-            data = body.read()
-        finally:
-            close = getattr(body, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-
-        # Seed the stat cache from the response when S3 hands us the
-        # canonical total. ``Content-Range: bytes <a>-<b>/<total>`` is
-        # present on every successful ranged GET; whole-object GETs
-        # (no ``Range`` header) instead surface the size as
-        # ``Content-Length``. Either way the next ``size`` / ``exists``
-        # lookup on this singleton path becomes a local hit — no
-        # separate ``HeadObject`` round trip.
-        total = _content_range_total(response)
-        if total is None and "Range" not in kwargs:
-            cl = response.get("ContentLength") if isinstance(response, dict) else None
-            if isinstance(cl, int):
-                total = cl
-        if total is not None:
-            mtime = _mtime_from_response(response)
-            media_type = _media_type_from_response(response)
-            if self._stat_cached is None:
-                self._persist_stat_cache(
-                    IOStats(
-                        size=total,
-                        kind=IOKind.FILE,
-                        mtime=mtime,
-                        media_type=media_type,
-                    )
-                )
-            else:
-                self._stat_cached.size = total
-                if mtime:
-                    self._stat_cached.mtime = mtime
-                if media_type is not None and self._stat_cached.media_type is None:
-                    self._stat_cached.media_type = media_type
-                # Reset the TTL window so the fresh data we just folded
-                # in lives a full ``stat_cache_ttl`` before re-probing.
-                self._persist_stat_cache(self._stat_cached)
-
-        return memoryview(data or b"")
+            resp = self.s3_bucket.http.get(self.key, start=pos, length=n)
+        except S3NotFound as exc:
+            raise FileNotFoundError(self.full_path()) from exc
+        data = resp.content or b""
+        # Seed the stat cache from a whole-object GET's Content-Length.
+        if n < 0 and pos == 0 and self._stat_cached is None:
+            self._persist_stat_cache(
+                IOStats(size=len(data), kind=IOKind.FILE, mtime=time.time(),
+                        media_type=_media_type_from_headers(resp.headers))
+            )
+        return memoryview(data)
 
     def _upload(self, content: bytes) -> int:
         size = len(content)
-        LOGGER.debug("Writing S3 object %r (bytes=%d)", self, size)
+        ct = self.media_type.mime_type.value if self.media_type else None
         if size >= self.MULTIPART_THRESHOLD:
-            # Managed multipart: boto3 splits into MULTIPART_CHUNKSIZE
-            # parts and uploads up to MULTIPART_CONCURRENCY in parallel,
-            # also lifting the 5 GiB single-PUT cap. ``upload_fileobj``
-            # streams the BytesIO in chunk-sized reads, so peak transfer
-            # memory is bounded by chunksize × concurrency rather than
-            # another full copy.
-            import io as _io
-
-            from boto3.s3.transfer import TransferConfig
-
-            config = TransferConfig(
-                multipart_threshold=self.MULTIPART_THRESHOLD,
-                multipart_chunksize=self.MULTIPART_CHUNKSIZE,
-                max_concurrency=self.MULTIPART_CONCURRENCY,
-                use_threads=True,
-            )
-            self._call(
-                self.client.upload_fileobj,
-                _io.BytesIO(content),
-                self.bucket,
-                self.key,
-                Config=config,
-            )
+            self.s3_bucket.http.put_streamed(self.key, _chunked(content, self.MULTIPART_CHUNKSIZE), content_type=ct)
         else:
-            self._call(
-                self.client.put_object,
-                Bucket=self.bucket,
-                Key=self.key,
-                Body=content,
-            )
-        LOGGER.info("Wrote S3 object %r (bytes=%d)", self, size)
+            self.s3_bucket.http.put(self.key, content, content_type=ct)
         self._persist_stat_cache(
-            IOStats(
-                size=size,
-                kind=IOKind.FILE,
-                mtime=time.time(),
-                media_type=self.media_type,
-            )
+            IOStats(size=size, kind=IOKind.FILE, mtime=time.time(), media_type=self.media_type)
         )
         self._cache_after_upload(bytes(content), size)
         self._invalidate_parent_ls()
         return size
 
-    def _upload_stream(self, source: "Any") -> int:
-        """Stream *source* (a local spill file) to S3 without materialising it.
-
-        The Arrow/Parquet write path spills the encode to a temp file and hands
-        it here; ``upload_fileobj`` reads that file in bounded chunks (managed
-        multipart past ``MULTIPART_THRESHOLD``), so peak memory is one
-        chunk × concurrency rather than the whole object. Falls back to the
-        materialising :meth:`_upload` if the source isn't a local file. Skips
-        the read-after-write page cache (it would re-materialise the body);
-        later reads re-fetch via ranged GET.
-        """
+    def _upload_stream(self, source: Any) -> int:
+        """Stream a local spill file to S3 as multipart parts (bounded memory)."""
         os_path = getattr(source, "os_path", None) if getattr(source, "is_local_path", False) else None
         if os_path is None:
             return self._upload(source.read_bytes())
-
-        from boto3.s3.transfer import TransferConfig
-
+        ct = self.media_type.mime_type.value if self.media_type else None
         size = int(source.size)
-        config = TransferConfig(
-            multipart_threshold=self.MULTIPART_THRESHOLD,
-            multipart_chunksize=self.MULTIPART_CHUNKSIZE,
-            max_concurrency=self.MULTIPART_CONCURRENCY,
-            use_threads=True,
-        )
-        LOGGER.debug("Streaming S3 object %r from %s (bytes=%d)", self, os_path, size)
-        with open(os_path, "rb") as fh:
-            self._call(self.client.upload_fileobj, fh, self.bucket, self.key, Config=config)
-        LOGGER.info("Streamed S3 object %r (bytes=%d)", self, size)
+
+        def _parts() -> Iterator[bytes]:
+            with open(os_path, "rb") as fh:
+                while True:
+                    chunk = fh.read(self.MULTIPART_CHUNKSIZE)
+                    if not chunk:
+                        return
+                    yield chunk
+
+        if size >= self.MULTIPART_THRESHOLD:
+            self.s3_bucket.http.put_streamed(self.key, _parts(), content_type=ct)
+        else:
+            self.s3_bucket.http.put(self.key, source.read_bytes(), content_type=ct)
         self._persist_stat_cache(
-            IOStats(
-                size=size,
-                kind=IOKind.FILE,
-                mtime=time.time(),
-                media_type=self.media_type,
-            )
+            IOStats(size=size, kind=IOKind.FILE, mtime=time.time(), media_type=self.media_type)
         )
         self._note_streamed_upload(size)
         self._invalidate_parent_ls()
@@ -848,93 +572,34 @@ class S3Path(RemotePath):
     def _clear(self) -> None:
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
 
-    # ==================================================================
-    # Repr
-    # ==================================================================
 
-    def __repr__(self) -> str:
-        marker = ", temporary=True" if self.temporary else ""
-        return f"S3Path({self.full_path()!r}{marker})"
+# S3Bucket carries the typed scheme but defers the ``s3`` registry slot to
+# S3Path (set after both classes so __init_subclass__ doesn't double-register).
+S3Bucket.scheme = Scheme.S3
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _chunked(data: bytes, size: int) -> Iterator[bytes]:
+    for i in range(0, len(data), size):
+        yield data[i : i + size]
 
 
-def _is_not_found(exc: BaseException) -> bool:
-    """True when *exc* looks like a ``404`` / ``NoSuchKey``.
-
-    Doesn't import botocore — checks duck-typed attributes so the
-    helper works with both real boto exceptions and the simpler
-    shapes a test mock may raise.
-    """
-    code = ""
-    status = None
-    response = getattr(exc, "response", None)
-    if isinstance(response, dict):
-        code = response.get("Error", {}).get("Code", "") or ""
-        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-    if isinstance(exc, FileNotFoundError):
-        return True
-    if status == 404:
-        return True
-    if code in ("404", "NoSuchKey", "NotFound"):
-        return True
-    name = type(exc).__name__
-    return name in ("NoSuchKey", "NotFound", "404")
-
-
-def _is_invalid_range(exc: BaseException) -> bool:
-    """True when *exc* looks like a ``416`` Range Not Satisfiable."""
-    response = getattr(exc, "response", None)
-    if isinstance(response, dict):
-        code = response.get("Error", {}).get("Code", "")
-        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-        if code == "InvalidRange" or status == 416:
-            return True
-    return False
-
-
-def _content_range_total(response: Any) -> "int | None":
-    """Extract the full-object size from an S3 ranged-GET response.
-
-    Boto surfaces the ``Content-Range`` response header verbatim as
-    ``ContentRange`` on the response dict — format ``bytes 0-99/200``
-    where ``200`` is the canonical object size. Returns ``None`` when
-    the header is absent (whole-object GETs leave it off) or when the
-    total slot is ``*`` (rare; means the size was unknown to S3).
-    """
-    content_range = response.get("ContentRange") if isinstance(response, dict) else None
-    if not content_range or "/" not in content_range:
+def _media_type_from_headers(headers: Any) -> "MediaType | None":
+    ct = headers.get("Content-Type") or headers.get("content-type") if headers else None
+    if not ct:
         return None
-    suffix = content_range.split("/", 1)[1].strip()
-    if not suffix.isdigit():
-        return None
-    return int(suffix)
+    return MediaType.from_(ct, default=None)
 
 
-def _media_type_from_response(response: Any) -> "MediaType | None":
-    """Resolve a :class:`MediaType` from an S3 GET/HEAD response.
-
-    S3 surfaces the object's MIME type in the ``ContentType`` field
-    (when the upload set one, or when ``inferred-content-type`` is
-    enabled on the bucket). Returns ``None`` when the field is absent
-    or unparseable — the caller falls back to URL-extension inference.
-    """
-    if not isinstance(response, dict):
-        return None
-    content_type = response.get("ContentType")
-    if not content_type:
-        return None
-    return MediaType.from_(content_type, default=None)
-
-
-def _mtime_from_response(response: Any) -> float:
-    last_modified = response.get("LastModified")
-    if last_modified is None:
+def _mtime_from_headers(headers: Any) -> float:
+    lm = (headers.get("Last-Modified") or headers.get("last-modified")) if headers else None
+    if not lm:
         return 0.0
     try:
-        return float(last_modified.timestamp())
+        from email.utils import parsedate_to_datetime
+
+        return parsedate_to_datetime(lm).timestamp()
     except Exception:
         return 0.0

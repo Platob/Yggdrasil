@@ -110,7 +110,7 @@ def test_ygg_bytesio_media_type_promotes_subclass() -> None:
     Pass media_type to the constructor so ``BytesIO.__new__``
     dispatches into the registered :class:`JSONFile` leaf.
     """
-    from yggdrasil.io.primitive import JSONFile
+    from yggdrasil.io.json_file import JSONFile
 
     src = IO(b'{"a":1}', media_type=MediaType(MimeTypes.JSON))
     assert isinstance(src, JSONFile)

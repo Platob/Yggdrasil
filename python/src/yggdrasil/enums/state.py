@@ -1,5 +1,8 @@
 """Backend-agnostic execution + order state enum.
 
+PARITY: ported to JS/TS at packages/yggdrasil/enums/state.ts — keep in sync.
+
+
 Every async-execution surface in yggdrasil — Databricks SQL warehouse
 statements, Spark jobs, Mongo / Postgres commands, FastAPI long-running
 tasks — *and* every order-style lifecycle (FIX-protocol order flows,

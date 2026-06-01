@@ -72,14 +72,24 @@ _global_tmpdir: Path | None = None
 
 
 def _default_config(warehouse_dir: Path, app_name: str) -> dict[str, str]:
-    """Sensible defaults for local-mode integration tests."""
+    """Light, fast defaults for local-mode Spark tests.
+
+    Tuned for *tiny* fixtures on a single shared session: minimal
+    partitions/parallelism, no UI, no adaptive/shuffle-service overhead,
+    and Arrow on. The JVM boot itself is the dominant cost and is paid
+    once (the session is process-global), so these knobs mostly shave
+    per-query latency and memory.
+    """
     return {
         "spark.app.name": app_name,
         "spark.driver.host": "localhost",
         "spark.driver.bindAddress": "127.0.0.1",
         # Tiny shuffle partitions — we're not doing real work here.
         "spark.sql.shuffle.partitions": "1",
-        "spark.default.parallelism": "2",
+        "spark.default.parallelism": "1",
+        # Adaptive execution + coalescing only add planning overhead on the
+        # single-partition toy data these tests use.
+        "spark.sql.adaptive.enabled": "false",
         # Arrow accelerates toPandas / createDataFrame(pandas).
         "spark.sql.execution.arrow.pyspark.enabled": "true",
         "spark.sql.execution.arrow.pyspark.fallback.enabled": "true",
@@ -90,6 +100,12 @@ def _default_config(warehouse_dir: Path, app_name: str) -> dict[str, str]:
         "spark.local.dir": str(warehouse_dir / "local"),
         # Fail fast rather than retrying on local-mode hiccups.
         "spark.task.maxFailures": "1",
+        # Cap memory so a stray test can't balloon the JVM; plenty for
+        # the byte-scale fixtures here.
+        "spark.driver.memory": "1g",
+        "spark.driver.maxResultSize": "512m",
+        # No external shuffle service / dynamic allocation in local mode.
+        "spark.dynamicAllocation.enabled": "false",
         # Don't bind a UI — noisy and flaky in CI.
         "spark.ui.enabled": "false",
         "spark.ui.showConsoleProgress": "false",

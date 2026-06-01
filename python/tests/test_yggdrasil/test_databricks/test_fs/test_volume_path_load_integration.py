@@ -153,7 +153,7 @@ class TestVolumeLoadIntegration(DatabricksIntegrationCase):
     def test_large_parquet_streaming_round_trip(self) -> None:
         import pyarrow as pa
 
-        from yggdrasil.io.primitive.parquet_file import ParquetFile
+        from yggdrasil.io.parquet_file import ParquetFile
 
         rows = _env_int("DATABRICKS_INTEGRATION_PARQUET_ROWS", 1_000_000)
         table = pa.table({
@@ -171,10 +171,6 @@ class TestVolumeLoadIntegration(DatabricksIntegrationCase):
         self.assertEqual(back.num_rows, rows)
         self.assertEqual(back.column("v").to_pylist()[:3], [0, 2, 4])
 
-    @unittest.skipUnless(
-        os.environ.get("DATABRICKS_INTEGRATION_RUN_MULTIPART"),
-        "set DATABRICKS_INTEGRATION_RUN_MULTIPART to run the ≥100 MiB multipart upload",
-    )
     def test_multipart_upload_round_trip(self) -> None:
         # Above the single-PUT ceiling → presigned concurrent multipart parts.
         size = VolumePath.MULTIPART_MIN_SIZE + _MIB

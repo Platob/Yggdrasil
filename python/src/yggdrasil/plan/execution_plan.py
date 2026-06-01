@@ -150,6 +150,11 @@ class ExecutionPlan(Tabular[O], Generic[O]):
     ) -> None:
         raise TypeError(f"{type(self).__name__} is read-only as a Tabular.")
 
+    def _delete(self, predicate: Any = None, *, wait: Any = True,
+                missing_ok: bool = False, delete_staging: bool = True,
+                **kwargs: Any) -> int:
+        raise NotImplementedError(f"{type(self).__name__} is read-only as a Tabular.")
+
     def _collect_schema(self, options: O) -> "Schema":
         result = self.execute()
         if isinstance(result, OperationResult):

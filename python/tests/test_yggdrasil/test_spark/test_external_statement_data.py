@@ -154,8 +154,13 @@ class TestSparkExternalStatementData(SparkTestCase, ArrowTestCase):
             external_data={"src": tab},
         )
         result = SparkStatementResult(statement=stmt)
+        # ``Awaitable.start`` only re-raises the captured failure when it
+        # waits — ``wait=False`` is fire-and-forget regardless of
+        # ``raise_error``. ``_start`` runs synchronously (it registers the
+        # views, hits the AnalysisException on the bad column, and cleans
+        # up in its ``except``), so wait for the result to surface it.
         with self.assertRaises(Exception):
-            result.start(wait=False, raise_error=True)
+            result.start(wait=True, raise_error=True)
 
         # The view was registered then dropped on the failure cleanup
         # path; ``text_value`` is reset so the next start() attempt mints

@@ -369,7 +369,9 @@ class TestOSErrorFallback:
         real_open = builtins.open
 
         def bad_open(path, *a, **kw):
-            if "/Workspace/Users/alice/explode" in str(path):
+            # Match the mount path regardless of OS separator (Windows joins
+            # the fake root with ``\``).
+            if "/Workspace/Users/alice/explode" in str(path).replace("\\", "/"):
                 raise PermissionError("simulated")
             return real_open(path, *a, **kw)
 

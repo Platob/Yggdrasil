@@ -15,6 +15,8 @@ from ..schemas.analysis import (
     ForecastResult,
     OhlcRequest,
     OhlcResult,
+    PivotRequest,
+    PivotResult,
     SeriesRequest,
     SeriesResult,
 )
@@ -41,6 +43,20 @@ async def aggregate(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/aggregate", json_body=req.model_dump())
     return await service.aggregate(req)
+
+
+@router.post("/pivot", response_model=PivotResult)
+async def pivot(
+    req: PivotRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> PivotResult:
+    """Excel-style pivot: rows × columns (cross-tab) × measures. Streams the
+    group-by (bounded memory), shapes a wide table, top-N caps columns."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/pivot", json_body=req.model_dump())
+    return await service.pivot(req)
 
 
 @router.get("/describe", response_model=DescribeResult)

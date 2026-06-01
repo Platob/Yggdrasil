@@ -38,7 +38,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar, Iterable, Literal, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 from urllib.parse import (
     parse_qsl,
     quote,
@@ -50,13 +50,12 @@ from urllib.parse import (
 )
 
 import pyarrow as pa
-
-from yggdrasil.url.hive import hive_split
 from yggdrasil.lazy_imports import (
     io_class,
     media_type_class,
     mime_type_class,
 )
+from yggdrasil.url.hive import hive_split
 
 __all__ = [
     "URL",
@@ -420,7 +419,7 @@ class URL(os.PathLike):
     _parent_url: "URL | None" = field(default=None, init=False, repr=False, compare=False)
     # Memoised :attr:`extensions` and :attr:`media_type`. Both are
     # derived from the immutable :attr:`path` and are hit on every
-    # leaf-resolution / codec dispatch in :mod:`yggdrasil.io.nested`
+    # leaf-resolution / codec dispatch in :mod:`yggdrasil.io`
     # (and any caller that asks "what format is this URL?"). The
     # extensions walk is a few string splits; the media_type walk
     # additionally fires :meth:`MediaType.from_url` (codec + mime
@@ -751,7 +750,7 @@ class URL(os.PathLike):
 
         Memoised on :attr:`_media_type_cache` — the same URL is hit
         by every leaf-resolution / codec dispatch in
-        :mod:`yggdrasil.io.nested` and by the lazy
+        :mod:`yggdrasil.io` and by the lazy
         :attr:`IO.media_type` fallback on every cursor that bound
         only a URL. ``None`` is a real value (URL has no extensions
         / no registered media type), so the sentinel ``...`` flags

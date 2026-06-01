@@ -62,14 +62,13 @@ from typing import (
 )
 
 import pyarrow as pa
-
+from yggdrasil.disposable import Disposable
 from yggdrasil.enums import MediaType, MimeType
 from yggdrasil.enums.mode import Mode, ModeLike
-from yggdrasil.dataclasses.singleton import Singleton
-from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular.base import O, Tabular
-from .io_stats import IOStats
 from yggdrasil.url import URL, URLBased
+
+from .io_stats import IOStats
 
 if TYPE_CHECKING:
     pass
@@ -254,20 +253,43 @@ _HOLDER_FORMAT_REGISTRY: "dict[str, type[IO]]" = {}
 _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED: bool = False
 
 
-def _bootstrap_holder_format_registry() -> None:
-    """Force-load every concrete format-leaf package once.
+def _bootstrap_primitive_format_leaves() -> None:
+    """Force-load the single-buffer format leaves (parquet / csv / …).
 
-    Each leaf module registers its ``mime_type`` via
-    :meth:`IO.__init_subclass__` on import, so importing the leaf
-    packages is enough to populate :data:`_HOLDER_FORMAT_REGISTRY`.
+    These have no dependency on :class:`yggdrasil.path.folder.Folder`, so
+    they are safe to import eagerly — even from inside ``folder``'s own
+    module body, which does exactly that so per-child dispatch never pays
+    a cold-miss. Each leaf registers its ``mime_type`` via
+    :meth:`IO.__init_subclass__` on import.
+    """
+    import yggdrasil.io.arrow_ipc_file  # noqa: F401
+    import yggdrasil.io.parquet_file  # noqa: F401
+    import yggdrasil.io.csv_file  # noqa: F401
+    import yggdrasil.io.json_file  # noqa: F401
+    import yggdrasil.io.ndjson_file  # noqa: F401
+    import yggdrasil.io.xlsx_file  # noqa: F401
+    import yggdrasil.io.pickle_file  # noqa: F401
+
+
+def _bootstrap_holder_format_registry() -> None:
+    """Force-load every concrete format leaf once.
+
+    The leaves live directly under :mod:`yggdrasil.io` (the ``primitive``
+    / ``nested`` grouping packages were flattened away), so they are
+    imported explicitly here rather than as two umbrella packages. The
+    nested leaves (``zip_file`` / ``delta``) depend on
+    :class:`yggdrasil.path.folder.Folder`, so they load *after* the
+    primitives and only through this full bootstrap — never from
+    ``folder``'s module body, which would close an import cycle.
     Idempotent — the module-level flag short-circuits repeat calls.
     """
     global _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED
     if _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
         return
     _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED = True
-    import yggdrasil.io.primitive  # noqa: F401
-    import yggdrasil.io.nested  # noqa: F401
+    _bootstrap_primitive_format_leaves()
+    import yggdrasil.io.zip_file  # noqa: F401
+    import yggdrasil.io.delta  # noqa: F401
 
 
 def _resolve_format_target(
@@ -1315,7 +1337,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         # Miss may just mean the leaf package hasn't been imported
         # yet — force the side-effect bootstrap once and retry. This
         # is what catches nested leaves (ZipFile / Folder / DeltaFolder)
-        # for callers that never touched ``yggdrasil.io.nested``.
+        # for callers that never touched ``yggdrasil.io.delta``.
         if not _HOLDER_FORMAT_REGISTRY_BOOTSTRAPPED:
             _bootstrap_holder_format_registry()
             hit = _HOLDER_FORMAT_REGISTRY.get(mt.mime_type.name)
@@ -1408,6 +1430,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             return out
         if cursor:
             offset = self._pos
+        read_to_end = size < 0
         total = self.size
         offset = _resolve_pos(offset, total)
         if offset < 0 or offset > total:
@@ -1424,8 +1447,25 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             )
 
         out = self._read_mv(size, offset)
+        # A remote backend can learn the object's *true* (larger) size while
+        # serving a whole-object read — a stale / eventually-consistent stat
+        # (or a server that ignored the Range) undersized the request and
+        # truncated the body, e.g. a Parquet footer goes missing. For a read
+        # to the end, top up the tail from the now-fresh size so the caller
+        # still gets the complete object instead of a short buffer.
+        if read_to_end and offset == 0 and len(out) < self.size:
+            chunks, have = [bytes(out)], len(out)
+            fresh = self.size
+            while have < fresh:
+                more = self._read_mv(fresh - have, have)
+                if not len(more):
+                    break
+                chunks.append(bytes(more))
+                have += len(more)
+                fresh = self.size
+            out = memoryview(b"".join(chunks))
         if cursor:
-            self._pos = offset + size
+            self._pos = offset + len(out)
         return out
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
@@ -2032,6 +2072,18 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             "to write Arrow record batches into this byte buffer."
         )
 
+    def _delete(
+        self,
+        predicate: "Any" = None,
+        *,
+        wait: "Any" = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: "Any",
+    ) -> int:
+        """Row-level delete for a byte-backed leaf — generic rewrite."""
+        return self._delete_rewrite(predicate, **kwargs)
+
     def flush(self) -> None:
         """Push buffered writes to the durable backing.
 
@@ -2120,7 +2172,9 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         if isinstance(value, URL) and value.scheme == self.scheme:
             self._url = value
             return
-        self._url = URL.from_(value).with_scheme(self.scheme)
+        self._url = URL.from_(value)
+        if not self._url.scheme:
+            self._url.with_scheme(self.scheme, inplace=True)
 
     # ------------------------------------------------------------------
     # Backing-shape predicates

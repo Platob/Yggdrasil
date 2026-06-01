@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     import pyarrow.dataset as pds
     from pyspark.sql import DataFrame as SparkDataFrame
     from yggdrasil.execution.expr import Predicate, PredicateLike
+    from yggdrasil.dataclasses.waiting import WaitingConfigArg
     from yggdrasil.io.holder import Holder
     from yggdrasil.spark.tabular import SparkDataset
 
@@ -842,43 +843,90 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
     def delete(
         self,
-        predicate: "PredicateLike",
+        predicate: "PredicateLike" = None,
         *,
-        options: "O | None" = None,
+        wait: "WaitingConfigArg" = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
         **kwargs: Any,
-    ) -> int:
-        """Delete every row matching *predicate*. Return rows removed.
+    ) -> "Table":
+        """Delete rows matching *predicate*; return this tabular.
 
         *predicate* is a :class:`Predicate` from
-        :mod:`yggdrasil.execution.expr` or a SQL string
-        that parses into one (``"id IN (1,2,3)"``,
-        ``"price > 100 AND region = 'EU'"``).
+        :mod:`yggdrasil.execution.expr` or a SQL string that parses into
+        one (``"id IN (1,2,3)"``, ``"price > 100 AND region = 'EU'"``).
+        ``None`` means "no filter" — every row is removed (``DELETE FROM t``
+        with no ``WHERE``).
+
+        ``wait`` / ``missing_ok`` / ``delete_staging`` are honoured by
+        resource-backed subclasses (e.g.
+        :class:`yggdrasil.databricks.table.table.Table`, which drops the
+        table asset); the generic row-rewrite path ignores them. Any extra
+        ``**kwargs`` (e.g. ``options=DeltaOptions(...)``) flow through to
+        :meth:`_delete`.
 
         The default implementation reads every batch, drops rows the
         predicate accepts, and rewrites the leaf with the survivors.
-        Aggregator subclasses
-        (:class:`yggdrasil.path.folder.Folder`) override
-        to walk children, prune subtrees whose partition bounds make
-        the predicate trivially false, and only rewrite the leaves
-        that actually hold matched rows — so a delete on a hive-
-        partitioned tree never scans partitions it can prove don't
-        match.
+        Aggregator subclasses (:class:`yggdrasil.path.folder.Folder`)
+        override to walk children, prune subtrees whose partition bounds
+        make the predicate trivially false, and only rewrite the leaves
+        that actually hold matched rows.
         """
         from yggdrasil.execution.expr import Expression, Predicate
 
-        if isinstance(predicate, str):
-            predicate = Expression.from_sql(predicate)
-        if not isinstance(predicate, Predicate):
-            raise TypeError(
-                f"{type(self).__name__}.delete expected a Predicate "
-                f"(or a SQL string parseable to one); got "
-                f"{type(predicate).__name__}: {predicate!r}."
-            )
-        return self._delete(
-            predicate, self.check_options(options, overrides=locals()),
+        if predicate is not None:
+            if isinstance(predicate, str):
+                predicate = Expression.from_sql(predicate)
+            if not isinstance(predicate, Predicate):
+                raise TypeError(
+                    f"{type(self).__name__}.delete expected a Predicate "
+                    f"(or a SQL string parseable to one); got "
+                    f"{type(predicate).__name__}: {predicate!r}."
+                )
+        self._delete(
+            predicate,
+            wait=wait,
+            missing_ok=missing_ok,
+            delete_staging=delete_staging,
+            **kwargs,
         )
+        return self
 
-    def _delete(self, predicate: "Predicate", options: O) -> int:
+    @abstractmethod
+    def _delete(
+        self,
+        predicate: "Predicate" = None,
+        *,
+        wait: "WaitingConfigArg" = True,
+        missing_ok: bool = False,
+        delete_staging: bool = True,
+        **kwargs: Any,
+    ) -> int:
+        """Remove rows matching *predicate* (``None`` = all); return rows deleted.
+
+        Every concrete tabular declares its own delete strategy:
+
+        * writable leaves (:class:`~yggdrasil.io.holder.IO`,
+          :class:`~yggdrasil.arrow.tabular.ArrowTabular`,
+          :class:`~yggdrasil.spark.tabular.SparkDataset`) delegate to the
+          generic :meth:`_delete_rewrite` — filter every batch, rewrite
+          the survivors;
+        * aggregators (:class:`~yggdrasil.path.folder.Folder`,
+          :class:`~yggdrasil.io.delta.delta_folder.DeltaFolder`) prune /
+          rewrite per leaf;
+        * read-only tabulars (:class:`LazyTabular`, :class:`ExecutionPlan`,
+          :class:`StatementResult`, :class:`HTTPResponseBatch`) raise.
+
+        ``options`` and other read/write overrides ride in via ``**kwargs``;
+        ``wait`` / ``missing_ok`` / ``delete_staging`` exist for signature
+        parity with resource-backed deletes and are ignored by row paths.
+        """
+
+    def _delete_rewrite(
+        self,
+        predicate: "Predicate" = None,
+        **kwargs: Any,
+    ) -> int:
         """Generic single-leaf delete: filter all batches, rewrite.
 
         Routes the row-level work through
@@ -886,12 +934,17 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         filter runs in pyarrow's C++ kernels — no Python row
         iteration. Counts rows by diffing input vs. surviving sizes
         as the stream goes by, keeping the streaming property: only
-        one batch resides in memory at a time.
+        one batch resides in memory at a time. A ``None`` *predicate*
+        removes every row. Returns the number of rows deleted.
+
+        Reusable building block for the writable ``_delete``
+        implementations. ``options`` (and any other read/write override)
+        ride in via ``**kwargs``.
         """
+        options = self.check_options(kwargs.pop("options", None), **kwargs)
         survivors: "list[pa.RecordBatch]" = []
         kept_rows = 0
         total_rows = 0
-        not_pred = ~predicate
 
         def _counted() -> "Iterator[pa.RecordBatch]":
             nonlocal total_rows
@@ -899,9 +952,14 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
                 total_rows += b.num_rows
                 yield b
 
-        for kept in not_pred.filter_arrow_batches(_counted()):
-            kept_rows += kept.num_rows
-            survivors.append(kept)
+        if predicate is None:
+            # No filter → delete every row; drain to count, keep nothing.
+            for _ in _counted():
+                pass
+        else:
+            for kept in (~predicate).filter_arrow_batches(_counted()):
+                kept_rows += kept.num_rows
+                survivors.append(kept)
         deleted = total_rows - kept_rows
         if deleted == 0:
             return 0
