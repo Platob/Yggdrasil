@@ -141,6 +141,29 @@ class TestWrite:
         fmt = kwargs["format"]
         assert getattr(fmt, "name", str(fmt)).upper() == "AUTO"
 
+    def test_upload_rewinds_stream_parked_at_eof(self, workspace, client, service) -> None:
+        """A stream handed to ``_upload`` already at EOF must still POST
+        the whole object — the same corruption that bit the VolumePath
+        kernel-mount path (reading from ``tell()`` truncated to empty).
+        WorkspacePath's closure ``seek(0)``s before the SDK reads, so the
+        full body lands regardless of the caller's cursor."""
+        import io
+
+        seen: list[bytes] = []
+
+        def upload_side_effect(**kwargs: object) -> None:
+            stream = kwargs["content"]
+            seen.append(stream.read())  # type: ignore[union-attr]
+
+        workspace.workspace.get_status.side_effect = NotFound()
+        workspace.workspace.upload.side_effect = upload_side_effect
+
+        buf = io.BytesIO(b"payload-bytes")
+        buf.seek(0, io.SEEK_END)            # caller left the cursor at EOF
+        WorkspacePath("/Workspace/eof", service=service)._upload(buf)
+
+        assert seen == [b"payload-bytes"]
+
     def test_stream_input_routes_through_upload(self, workspace, client, service) -> None:
         """Caller-supplied ``BinaryIO`` is coerced to a yggdrasil
         :class:`IO[bytes]` by the public :meth:`Holder.write_stream`
