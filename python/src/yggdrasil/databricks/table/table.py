@@ -3332,9 +3332,13 @@ class Table(DatabricksPath):
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
         cast_options = CastOptions.check(options=cast_options)
 
-        if mode_enum == Mode.OVERWRITE and not match_by:
-            self.delete(wait=True, missing_ok=True, delete_staging=False)
-
+        # OVERWRITE replaces the table's rows atomically via the
+        # ``INSERT OVERWRITE TABLE ... SELECT`` that ``_build_dml_statements``
+        # emits — the live table (and its schema) is kept, so we must NOT drop
+        # it up front. Dropping here broke the async SQL-source overwrite: it
+        # carries no ``cast_options.target`` to recreate from, so the drop left
+        # nothing for the INSERT OVERWRITE to land in. A missing target is still
+        # created below when an explicit schema is available.
         if not self.exists():
             target_field = cast_options.target
             if target_field is not None:

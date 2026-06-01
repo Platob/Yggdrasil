@@ -903,8 +903,9 @@ def _build_dml_statements(
 
     * :attr:`Mode.TRUNCATE` with ``match_by`` → DELETE + INSERT.
     * :attr:`Mode.TRUNCATE` no keys → ``TRUNCATE TABLE`` + INSERT.
-    * :attr:`Mode.OVERWRITE` → plain INSERT (the caller already cleared the
-      target up front).
+    * :attr:`Mode.OVERWRITE` with ``match_by`` → keyed DELETE + INSERT.
+    * :attr:`Mode.OVERWRITE` no keys → ``INSERT OVERWRITE`` (atomic full
+      replace; the live table + schema are preserved, no drop up front).
     """
     cols_quoted = ", ".join(quote_ident(c) for c in columns)
     statements: list[str] = []
