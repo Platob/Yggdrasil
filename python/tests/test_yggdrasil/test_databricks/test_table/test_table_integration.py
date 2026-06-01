@@ -754,5 +754,13 @@ class TestTableAsyncInsertLogPathIntegration(_TableFixture):
         processed = load_async(self.client.tables, logs_path(self.table), wait=True)
         self.assertEqual(processed, 1)
         self.assertEqual(self._count(), 3)
+        # The loader deletes the log + data through its *own* path handles, so
+        # these producer-side handles still hold a fresh (60s TTL) ``FILE`` stat
+        # from staging them — ``VolumePath`` keeps a per-instance stat cache and
+        # two handles to the same path don't share it. Drop the cached view so
+        # ``exists()`` re-probes the server (the deletion is out-of-band from
+        # these handles' perspective, exactly like the real cross-process job).
+        log_path.invalidate_singleton()
+        data_path.invalidate_singleton()
         self.assertFalse(log_path.exists())
         self.assertFalse(data_path.exists())
