@@ -8,10 +8,10 @@ into a *drop-and-aggregate* pipeline:
   that **records where the data was written** (its uniform URL, so the data can
   live anywhere) — no warehouse statement runs at call time.
 - A **file-arrival trigger** on the ``logs/`` directory wakes a deployed
-  serverless job whose Python entry point (``ygg-job table-async-load
-  <full_name>``) drives :meth:`Tables.async_insert`: read every pending log,
-  group by ``(target table, mode)``, run one aggregated ``INSERT`` per group,
-  then clear the consumed logs + data.
+  serverless job whose Python entry point (``ygg databricks table
+  execute_async_insert --logs <dir>``) drives :meth:`Tables.async_insert`:
+  read every pending log, group by ``(target table, mode)``, run one
+  aggregated ``INSERT`` per group, then clear the consumed logs + data.
 
 Only ``OVERWRITE`` and ``APPEND`` (no ``match_by``) are supported for now.
 
@@ -83,9 +83,9 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
     Creates the watched ``logs/`` dir, builds + uploads the full ygg wheel
     (:func:`~yggdrasil.databricks.job.wheel.ensure_ygg_wheel` — ygg +
     databricks-sdk), and upserts a serverless job whose single python-wheel
-    task runs ``ygg-job table-async-load <full_name>`` when a log lands. Any
-    stale job watching the same logs dir is pruned so a single job owns the
-    trigger.
+    task runs ``ygg databricks table execute_async_insert --logs <dir>`` when a
+    log lands. Any stale job watching the same logs dir is pruned so a single
+    job owns the trigger.
     """
     from databricks.sdk.service.compute import Environment
     from databricks.sdk.service.jobs import (
@@ -119,9 +119,14 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
                 task_key="async-load",
                 environment_key="default",
                 python_wheel_task=PythonWheelTask(
+                    # Run the ygg CLI on the cluster:
+                    #   ygg databricks table execute_async_insert --logs <dir>
                     package_name="ygg",
-                    entry_point="ygg-job",
-                    parameters=["table-async-load", table.full_name()],
+                    entry_point="ygg",
+                    parameters=[
+                        "databricks", "table", "execute_async_insert",
+                        "--logs", logs.full_path(),
+                    ],
                 ),
             )
         ],

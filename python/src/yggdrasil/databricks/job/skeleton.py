@@ -146,7 +146,7 @@ class Task(_Runnable, Generic[T]):
 
     #: wheel / serverless defaults (shared with :class:`Flow`).
     package_name: str = "ygg"
-    entry_point: str = "ygg-job"
+    entry_point: str = "ygg"
     serverless: bool = True
     environment_key: str = "default"
 
@@ -203,7 +203,7 @@ class Flow(_Runnable):
     """A callable flow; deploys as a Databricks **serverless** job."""
 
     package_name: str = "ygg"
-    entry_point: str = "ygg-job"
+    entry_point: str = "ygg"
     task_key: str = "run"
 
     #: Serverless environment version (default **v5**).

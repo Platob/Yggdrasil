@@ -177,8 +177,8 @@ def ensure_ygg_wheel(client: Any, *, workspace_dir: str = WORKSPACE_WHL_DIR) -> 
     """Build the **full ygg wheel** — the live ``yggdrasil`` package with its
     ``[databricks]`` dependencies **plus the latest ``databricks-sdk``** — and
     upload every produced wheel to *workspace_dir*; return their workspace
-    paths. The bundle a serverless job installs by path (no index) to run any
-    ``ygg-job`` task on the cluster."""
+    paths. The bundle a serverless job installs by path (no index) to run the
+    ``ygg`` CLI on the cluster."""
     return ensure_wheel(
         client, "yggdrasil",
         workspace_dir=workspace_dir,

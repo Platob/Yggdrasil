@@ -156,10 +156,13 @@ class TestEnsureAsyncJob:
         assert fa.wait_after_last_change_seconds == 120        # 2-min buffering
         assert fa.min_time_between_triggers_seconds == 120
         task = kwargs["tasks"][0]
-        # ygg-job table-async-load <full_name> on the cluster
+        # ygg databricks table execute_async_insert --logs <dir> on the cluster
         assert task.python_wheel_task.package_name == "ygg"
-        assert task.python_wheel_task.entry_point == "ygg-job"
-        assert task.python_wheel_task.parameters == ["table-async-load", "c.s.t"]
+        assert task.python_wheel_task.entry_point == "ygg"
+        assert task.python_wheel_task.parameters == [
+            "databricks", "table", "execute_async_insert",
+            "--logs", "/Volumes/c/s/t/.sql/async/logs",
+        ]
         # serverless v5; the built ygg wheel is shipped as the dependencies
         env = kwargs["environments"][0]
         assert env.spec.environment_version == "5"

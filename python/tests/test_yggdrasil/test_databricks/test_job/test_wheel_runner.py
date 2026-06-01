@@ -1,4 +1,4 @@
-"""Unit tests for the ygg-job runner + wheel build/upload (no live cluster)."""
+"""Unit tests for the wheel build/upload (no live cluster)."""
 from __future__ import annotations
 
 import os
@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from yggdrasil.databricks.job import runner, wheel
+from yggdrasil.databricks.job import wheel
 
 
 # --------------------------------------------------------------------------- #
@@ -45,43 +45,6 @@ def _build_fake_wheel(tmp_path, monkeypatch) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# runner — ygg-job CLI
-# --------------------------------------------------------------------------- #
-class TestRunner:
-    def test_table_async_load_runs_loader(self):
-        client = MagicMock()
-        table = MagicMock()
-        client.tables.__getitem__.return_value = table
-        table.service.async_insert.return_value = 3
-        logs = MagicMock()
-        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
-             patch("yggdrasil.databricks.table.async_job.logs_path", return_value=logs):
-            n = runner.table_async_load("c.s.t")
-        client.tables.__getitem__.assert_called_once_with("c.s.t")
-        # the runner drives the service loader over the table's logs dir
-        table.service.async_insert.assert_called_once_with(logs, wait=True)
-        assert n == 3
-
-    def test_main_dispatches_subcommand(self):
-        with patch.object(runner, "table_async_load", return_value=2) as f:
-            rc = runner.main(["table-async-load", "c.s.t"])
-        f.assert_called_once_with("c.s.t")
-        assert rc == 0
-
-    def test_unknown_command_exits(self):
-        with pytest.raises(SystemExit):
-            runner.main(["nope"])
-
-    def test_missing_command_exits(self):
-        with pytest.raises(SystemExit):
-            runner.main([])
-
-    def test_missing_table_arg_exits(self):
-        with pytest.raises(SystemExit):
-            runner.main(["table-async-load"])
-
-
-# --------------------------------------------------------------------------- #
 # wheel — build + upload + ensure
 # --------------------------------------------------------------------------- #
 class TestWheel:
@@ -103,11 +66,11 @@ class TestWheel:
         text = wheel._render_pyproject(
             "ygg", "1.2.3", "yggdrasil",
             ["pyarrow>=10"],
-            {"ygg-job": "yggdrasil.databricks.job.runner:main"},
+            {"ygg": "yggdrasil.cli.main:main"},
         )
         assert 'name = "ygg"' in text and 'version = "1.2.3"' in text
         assert '"pyarrow>=10",' in text
-        assert 'ygg-job = "yggdrasil.databricks.job.runner:main"' in text
+        assert 'ygg = "yggdrasil.cli.main:main"' in text
         assert 'include = ["yggdrasil*"]' in text
 
     def test_synthesize_project_copies_package_and_writes_pyproject(self, tmp_path):
