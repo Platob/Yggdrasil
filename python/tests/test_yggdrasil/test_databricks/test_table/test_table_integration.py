@@ -12,17 +12,12 @@ that only meaningfully exercises against a live Unity Catalog endpoint:
   :attr:`Table.table_type`, :attr:`Table.is_view`, :attr:`Table.table_id`.
 - :class:`Tables` collection — ``find`` returns the same singleton as
   the fixture handle; ``find_table_remote`` bypasses the cache.
-- :meth:`Table.set_tags` / :meth:`Table.unset_tags` at the table level
-  and :meth:`Column.set_tags` / :meth:`Table.update_columns_tags` for
-  columns, against the ``entity_tag_assignments`` REST API.
-- :meth:`Table.with_column` / :meth:`Table.with_columns` schema
-  evolution — ADD COLUMN, RENAME COLUMN, DROP via OVERWRITE.
-- :meth:`Table.rename` round-trip (and rename back so cleanup lands on
-  the right ``full_name``).
-- :meth:`Table.clone` deep clone — fresh target, data carried, cloned
-  rows read back identically.
+- :meth:`Table.set_tags` / :meth:`Table.unset_tags` (table + column tags).
+- :meth:`Table.with_column` / :meth:`Table.with_columns` schema evolution.
+- :meth:`Table.rename` / :meth:`Table.clone` round-trips.
 - View shape — :meth:`Table.create_view`, :attr:`Table.is_view`,
-  :attr:`Table.view_definition`, view rename + view clone.
+  :attr:`Table.view_definition`, view rename.
+- Storage-path surface and the async-insert drop → loader round-trip.
 
 Skip rules
 ----------
@@ -30,14 +25,14 @@ Skipped wholesale unless ``DATABRICKS_HOST`` is set. The catalog /
 schema are read from :envvar:`DATABRICKS_INTEGRATION_CATALOG`
 (default ``trading``) and :envvar:`DATABRICKS_INTEGRATION_SCHEMA`
 (default ``unittest``); the test identity must have CREATE TABLE on
-the target schema. Tag tests degrade to ``unittest.SkipTest`` when
-the identity lacks the matching grant rather than failing the suite.
+the target schema. Permission-gated operations degrade to
+``unittest.SkipTest`` rather than failing the suite.
 
 Cleanup
 -------
-Each test class provisions its own throw-away table (``yg_<purpose>_<hex>``)
-and drops it cascade-style in ``tearDownClass`` so a failed run leaves
-at most one orphan table behind.
+Each class provisions one throw-away table (dropped in
+``tearDownClass``); per-test sibling tables minted via :meth:`_sibling`
+are dropped in ``tearDown`` — so a failed run leaves at most one orphan.
 """
 
 from __future__ import annotations
@@ -80,26 +75,12 @@ __all__ = [
 ]
 
 
-def _resolve_catalog() -> str:
-    name = os.environ.get(
-        "DATABRICKS_INTEGRATION_CATALOG", "trading",
-    ).strip()
+def _resolve_env(var: str, default: str) -> str:
+    name = os.environ.get(var, default).strip()
     if not name:
         raise unittest.SkipTest(
-            "DATABRICKS_INTEGRATION_CATALOG is empty — set it to a "
-            "catalog the test identity has CREATE TABLE on."
-        )
-    return name
-
-
-def _resolve_schema() -> str:
-    name = os.environ.get(
-        "DATABRICKS_INTEGRATION_SCHEMA", "unittest",
-    ).strip()
-    if not name:
-        raise unittest.SkipTest(
-            "DATABRICKS_INTEGRATION_SCHEMA is empty — set it to a "
-            "schema the test identity has CREATE TABLE on."
+            f"{var} is empty — set it to a location the test identity "
+            f"has CREATE TABLE on."
         )
     return name
 
@@ -125,12 +106,12 @@ def _sample_data() -> pa.Table:
 
 
 class _TableFixture(DatabricksIntegrationCase):
-    """Per-class throw-away managed table.
+    """Per-class throw-away managed table + shared helpers.
 
     Subclasses inherit :attr:`table` (an empty Delta table with the
-    ``_sample_schema`` shape) and a :attr:`schema_name` /
-    :attr:`catalog_name` pair so they can mint sibling tables when
-    needed without re-resolving env vars.
+    ``_sample_schema`` shape), the resolved ``catalog_name`` /
+    ``schema_name``, and helpers to run a quick SQL query, count rows,
+    mint sibling / ghost tables, and skip cleanly on a permission error.
     """
 
     catalog_name: ClassVar[str]
@@ -142,9 +123,9 @@ class _TableFixture(DatabricksIntegrationCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.catalog_name = _resolve_catalog()
-        cls.schema_name = _resolve_schema()
-        cls.table_name = f"{cls.table_prefix}"
+        cls.catalog_name = _resolve_env("DATABRICKS_INTEGRATION_CATALOG", "trading")
+        cls.schema_name = _resolve_env("DATABRICKS_INTEGRATION_SCHEMA", "unittest")
+        cls.table_name = cls.table_prefix
         full_name = f"{cls.catalog_name}.{cls.schema_name}.{cls.table_name}"
         try:
             cls.table = cls.client.tables.table(full_name)
@@ -152,22 +133,55 @@ class _TableFixture(DatabricksIntegrationCase):
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(
                 f"Cannot create table {full_name}: {exc}. Override "
-                f"DATABRICKS_INTEGRATION_CATALOG / "
-                f"DATABRICKS_INTEGRATION_SCHEMA with a location the "
-                f"test identity can write to."
+                f"DATABRICKS_INTEGRATION_CATALOG / DATABRICKS_INTEGRATION_SCHEMA "
+                f"with a location the test identity can write to."
             ) from exc
 
     @classmethod
     def tearDownClass(cls) -> None:
-        try:
-            table = getattr(cls, "table", None)
-            if table is not None:
-                try:
-                    table.delete(missing_ok=True)
-                except Exception:
-                    pass
-        finally:
-            super().tearDownClass()
+        table = getattr(cls, "table", None)
+        if table is not None:
+            try:
+                table.delete(missing_ok=True)
+            except Exception:
+                pass
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._cleanup: list[str] = []
+
+    def tearDown(self) -> None:
+        for full_name in self._cleanup:
+            try:
+                self.client.tables.table(full_name).delete(missing_ok=True)
+            except Exception:
+                pass
+        super().tearDown()
+
+    # -- helpers -------------------------------------------------------
+    def _sibling(self, prefix: str) -> str:
+        """A throw-away sibling table's full name, registered for cleanup."""
+        full = f"{self.catalog_name}.{self.schema_name}.{prefix}_{secrets.token_hex(4)}"
+        self._cleanup.append(full)
+        return full
+
+    def _ghost(self) -> Table:
+        """A handle to a (cleanup-registered) table that does not exist."""
+        return self.client.tables.table(self._sibling("yg_ghost"))
+
+    def _sql(self, query: str) -> pa.Table:
+        return self.client.sql(
+            catalog_name=self.catalog_name, schema_name=self.schema_name,
+        ).execute(query).to_arrow_table()
+
+    def _count(self, table: "Table | None" = None) -> int:
+        table = table or self.table
+        rows = self._sql(f"SELECT COUNT(*) AS n FROM {table.full_name(safe=True)}")
+        return int(rows.column("n").to_pylist()[0])
+
+    def _skip(self, exc: Exception, what: str) -> None:
+        raise unittest.SkipTest(f"{what}: {exc}.")
 
 
 @pytest.mark.integration
@@ -180,36 +194,21 @@ class TestTableLifecycleIntegration(_TableFixture):
         self.assertTrue(self.table.exists())
 
     def test_ensure_created_is_idempotent(self) -> None:
-        # Second ensure_created on a same-shape table must NOT raise —
-        # the AUTO mode path returns self.
+        # Second ensure_created on a same-shape table must NOT raise.
         result = self.table.ensure_created(_sample_schema())
         self.assertIs(result, self.table)
         self.assertTrue(self.table.exists())
 
     def test_or_replace_resets_table_in_place(self) -> None:
-        # Drop a row in so we can detect the replacement.
         self.table.insert(_sample_data(), mode=Mode.OVERWRITE)
-        replaced = self.table.create(
-            _sample_schema(),
-            or_replace=True,
-        )
+        replaced = self.table.create(_sample_schema(), or_replace=True)
         self.assertIs(replaced, self.table)
         self.assertTrue(self.table.exists())
-        count = self.client.sql(
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-        ).execute(
-            f"SELECT COUNT(*) AS n FROM {self.table.full_name(safe=True)}"
-        ).to_arrow_table()
-        self.assertEqual(count.column("n").to_pylist(), [0])
+        self.assertEqual(self._count(), 0)
 
     def test_delete_missing_table_with_missing_ok(self) -> None:
-        ghost_name = f"yg_ghost_{secrets.token_hex(4)}"
-        ghost = self.client.tables.table(
-            f"{self.catalog_name}.{self.schema_name}.{ghost_name}"
-        )
         try:
-            ghost.delete(missing_ok=True)
+            self._ghost().delete(missing_ok=True)
         except DatabricksError:
             self.fail(
                 "Table.delete(missing_ok=True) leaked DatabricksError "
@@ -217,12 +216,8 @@ class TestTableLifecycleIntegration(_TableFixture):
             )
 
     def test_delete_missing_table_raises_by_default(self) -> None:
-        ghost_name = f"yg_ghost_{secrets.token_hex(4)}"
-        ghost = self.client.tables.table(
-            f"{self.catalog_name}.{self.schema_name}.{ghost_name}"
-        )
         with self.assertRaises(DatabricksError):
-            ghost.delete()
+            self._ghost().delete()
 
 
 @pytest.mark.integration
@@ -251,8 +246,6 @@ class TestTableInfoIntegration(_TableFixture):
         self.assertTrue(self.table.table_id)
 
     def test_table_type_is_managed(self) -> None:
-        # The fixture builds via the default sql_create path; UC reports
-        # this back as MANAGED.
         _ = self.table.infos  # warm the cache so ``table_type`` is populated
         self.assertEqual(self.table.table_type, TableType.MANAGED)
         self.assertFalse(self.table.is_view)
@@ -271,11 +264,7 @@ class TestTableInfoIntegration(_TableFixture):
         self.assertEqual(names, ["id", "label", "amount"])
 
     def test_exists_false_on_missing_table(self) -> None:
-        ghost = self.client.tables.table(
-            f"{self.catalog_name}.{self.schema_name}."
-            f"yg_ghost_{secrets.token_hex(4)}"
-        )
-        self.assertFalse(ghost.exists())
+        self.assertFalse(self._ghost().exists())
 
 
 @pytest.mark.integration
@@ -285,12 +274,10 @@ class TestTablesCollectionIntegration(_TableFixture):
     table_prefix = "yg_collection"
 
     def test_find_returns_singleton_with_fixture(self) -> None:
-        # ``find`` (via the engine / client.tables) collapses to the
-        # same singleton instance as the fixture handle.
+        # ``find`` collapses to the same singleton as the fixture handle.
         found = self.client.tables.find_table(
             f"{self.catalog_name}.{self.schema_name}.{self.table_name}",
         )
-        self.assertIsNotNone(found)
         self.assertIs(found, self.table)
 
     def test_find_remote_returns_info(self) -> None:
@@ -308,14 +295,13 @@ class TestTablesCollectionIntegration(_TableFixture):
             self.client.tables.find_table_remote(
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
-                table_name=f"yg_ghost_{secrets.token_hex(4)}",
+                table_name=self._ghost().table_name,
             )
 
 
 @pytest.mark.integration
 class TestTableTagsIntegration(_TableFixture):
-    """:meth:`Table.set_tags` / :meth:`Table.unset_tags` and column tags
-    round-trips against ``entity_tag_assignments``."""
+    """Table + column tag round-trips against ``entity_tag_assignments``."""
 
     table_prefix = "yg_tags"
 
@@ -329,16 +315,14 @@ class TestTableTagsIntegration(_TableFixture):
         raise exc
 
     def test_set_and_read_table_tags(self) -> None:
-        tag_key = f"yg_test_{secrets.token_hex(3)}"
-        tag_value = f"v_{secrets.token_hex(2)}"
+        tag_key, tag_value = f"yg_test_{secrets.token_hex(3)}", f"v_{secrets.token_hex(2)}"
         try:
             self.table.set_tags({tag_key: tag_value})
         except (DatabricksError, PermissionDenied) as exc:
             self._skip_if_no_tag_grant(exc)
         try:
             tags = self.client.entity_tags.entity_tags(
-                "tables", self.table.full_name(), as_dict=True,
-                cache_ttl=None,
+                "tables", self.table.full_name(), as_dict=True, cache_ttl=None,
             )
             self.assertEqual(tags.get(tag_key), tag_value)
         finally:
@@ -348,21 +332,18 @@ class TestTableTagsIntegration(_TableFixture):
                 pass
 
     def test_set_tags_empty_mapping_is_noop(self) -> None:
-        # Empty / None mapping must short-circuit without an API call
-        # and return self.
+        # Empty / None mapping short-circuits without an API call.
         self.assertIs(self.table.set_tags({}), self.table)
         self.assertIs(self.table.set_tags(None), self.table)
 
     def test_unset_missing_tag_with_if_exists(self) -> None:
-        ghost_key = f"yg_ghost_{secrets.token_hex(3)}"
         try:
-            self.table.unset_tags([ghost_key], if_exists=True)
+            self.table.unset_tags([f"yg_ghost_{secrets.token_hex(3)}"], if_exists=True)
         except DatabricksError as exc:
             self._skip_if_no_tag_grant(exc)
 
     def test_set_and_read_column_tags(self) -> None:
-        tag_key = f"yg_col_{secrets.token_hex(3)}"
-        tag_value = f"v_{secrets.token_hex(2)}"
+        tag_key, tag_value = f"yg_col_{secrets.token_hex(3)}", f"v_{secrets.token_hex(2)}"
         col = self.table.column("label")
         try:
             col.set_tags({tag_key: tag_value})
@@ -370,15 +351,12 @@ class TestTableTagsIntegration(_TableFixture):
             self._skip_if_no_tag_grant(exc)
         try:
             tags = self.client.entity_tags.entity_tags(
-                "columns", col.entity_name, as_dict=True,
-                cache_ttl=None,
+                "columns", col.entity_name, as_dict=True, cache_ttl=None,
             )
             self.assertEqual(tags.get(tag_key), tag_value)
-            # ``Table.column_tags`` re-reads through the same cache —
-            # the assignment surfaces under the column's name.
+            # ``Table.column_tags`` re-reads through the same cache.
             self.assertIn(tag_key, {
-                a.tag_key
-                for a in self.table.column_tags.get("label", ())
+                a.tag_key for a in self.table.column_tags.get("label", ())
             })
         finally:
             try:
@@ -396,9 +374,6 @@ class TestTableTagsIntegration(_TableFixture):
         except (DatabricksError, PermissionDenied) as exc:
             self._skip_if_no_tag_grant(exc)
         try:
-            # Every column either succeeded (None) or surfaced an
-            # exception in the result dict — the call itself must
-            # round-trip without raising.
             self.assertEqual(set(results.keys()), set(batch.keys()))
         finally:
             for col_name, tags in batch.items():
@@ -419,14 +394,9 @@ class TestTableSchemaEvolutionIntegration(_TableFixture):
     def test_with_column_adds_new_column(self) -> None:
         new_col = Field(name=f"extra_{secrets.token_hex(2)}", dtype=pa.string())
         self.table.with_column(new_col)
-        self.assertIsNotNone(
-            self.table.column(new_col.name, raise_error=False)
-        )
+        self.assertIsNotNone(self.table.column(new_col.name, raise_error=False))
         # Tidy up so the next test starts from the canonical 3-column shape.
-        self.client.sql(
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-        ).execute(
+        self._sql(
             f"ALTER TABLE {self.table.full_name(safe=True)} "
             f"DROP COLUMN `{new_col.name}`"
         )
@@ -434,81 +404,48 @@ class TestTableSchemaEvolutionIntegration(_TableFixture):
 
     def test_with_columns_overwrite_drops_missing(self) -> None:
         # OVERWRITE keeps only the columns in the supplied list — any
-        # column missing from it is dropped. Use a tightly-scoped table
-        # so we don't mutate the shared fixture beyond the test.
-        target = self.client.tables.table(
-            f"{self.catalog_name}.{self.schema_name}."
-            f"yg_overwrite_{secrets.token_hex(4)}"
+        # column missing from it is dropped. Use a sibling table so the
+        # shared fixture is untouched.
+        target = self.client.tables.table(self._sibling("yg_overwrite"))
+        target.ensure_created(_sample_schema())
+        target.with_columns(
+            [Field(name="id", dtype=pa.int64(), nullable=False),
+             Field(name="note", dtype=pa.string())],
+            mode=Mode.OVERWRITE,
         )
-        try:
-            target.ensure_created(_sample_schema())
-            # Keep only ``id`` + a brand-new column; ``label`` / ``amount``
-            # must disappear.
-            new_col = Field(name="note", dtype=pa.string())
-            keep_id = Field(name="id", dtype=pa.int64(), nullable=False)
-            target.with_columns([keep_id, new_col], mode=Mode.OVERWRITE)
-            names = {c.name for c in target.columns}
-            self.assertIn("id", names)
-            self.assertIn("note", names)
-            self.assertNotIn("label", names)
-            self.assertNotIn("amount", names)
-        finally:
-            try:
-                target.delete(missing_ok=True)
-            except Exception:
-                pass
+        names = {c.name for c in target.columns}
+        self.assertEqual(names & {"id", "note", "label", "amount"}, {"id", "note"})
 
 
 @pytest.mark.integration
-class TestTableRenameIntegration(DatabricksIntegrationCase):
-    """:meth:`Table.rename` round-trip on a dedicated throw-away table."""
+class TestTableRenameIntegration(_TableFixture):
+    """:meth:`Table.rename` round-trip."""
 
-    catalog_name: ClassVar[str]
-    schema_name: ClassVar[str]
-    initial_name: ClassVar[str]
-    table: ClassVar[Table]
+    table_prefix = "yg_rename"
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        cls.catalog_name = _resolve_catalog()
-        cls.schema_name = _resolve_schema()
-        cls.initial_name = f"yg_rename_{secrets.token_hex(4)}"
-        full_name = f"{cls.catalog_name}.{cls.schema_name}.{cls.initial_name}"
-        try:
-            cls.table = cls.client.tables.table(full_name)
-            cls.table.ensure_created(_sample_schema())
-        except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(
-                f"Cannot create table {full_name}: {exc}."
-            ) from exc
+    def test_rename_to_empty_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            self.table.rename("   ")
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        try:
-            table = getattr(cls, "table", None)
-            if table is not None:
-                try:
-                    table.delete(missing_ok=True)
-                except Exception:
-                    pass
-        finally:
-            super().tearDownClass()
+    def test_rename_to_same_name_is_noop(self) -> None:
+        before = self.table.table_name
+        result = self.table.rename(before)
+        self.assertIs(result, self.table)
+        self.assertEqual(self.table.table_name, before)
 
     def test_rename_updates_name_and_remote_state(self) -> None:
+        initial = self.table.table_name
         new_name = f"yg_renamed_{secrets.token_hex(4)}"
         try:
             self.table.rename(new_name)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(
-                f"Test identity cannot rename table: {exc}."
-            )
+            self._skip(exc, "Test identity cannot rename table")
         self.assertEqual(self.table.table_name, new_name)
         self.assertEqual(
             self.table.full_name(),
             f"{self.catalog_name}.{self.schema_name}.{new_name}",
         )
-        # New name is reachable; old name isn't.
+        # New name is reachable; the old name isn't.
         fresh = self.client.tables.find_table_remote(
             catalog_name=self.catalog_name,
             schema_name=self.schema_name,
@@ -519,18 +456,8 @@ class TestTableRenameIntegration(DatabricksIntegrationCase):
             self.client.tables.find_table_remote(
                 catalog_name=self.catalog_name,
                 schema_name=self.schema_name,
-                table_name=self.initial_name,
+                table_name=initial,
             )
-
-    def test_rename_to_same_name_is_noop(self) -> None:
-        before = self.table.table_name
-        result = self.table.rename(before)
-        self.assertIs(result, self.table)
-        self.assertEqual(self.table.table_name, before)
-
-    def test_rename_to_empty_raises(self) -> None:
-        with self.assertRaises(ValueError):
-            self.table.rename("   ")
 
 
 @pytest.mark.integration
@@ -541,40 +468,20 @@ class TestTableCloneIntegration(_TableFixture):
 
     def setUp(self) -> None:
         super().setUp()
-        # Seed the source with deterministic rows so the clone has
-        # something concrete to mirror.
+        # Seed the source with deterministic rows for the clone to mirror.
         self.table.insert(_sample_data(), mode=Mode.OVERWRITE)
-        self._clone_targets: list[str] = []
-
-    def tearDown(self) -> None:
-        for full_name in self._clone_targets:
-            try:
-                self.client.tables.table(full_name).delete(missing_ok=True)
-            except Exception:
-                pass
-        super().tearDown()
-
-    def _clone_target_name(self) -> str:
-        name = f"yg_clone_tgt_{secrets.token_hex(4)}"
-        full = f"{self.catalog_name}.{self.schema_name}.{name}"
-        self._clone_targets.append(full)
-        return name
 
     def test_deep_clone_copies_rows(self) -> None:
-        target_name = self._clone_target_name()
+        target_name = self._sibling("yg_clone_tgt").split(".")[-1]
         try:
             cloned = self.table.clone(target_name)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"Cannot clone table: {exc}.")
+            self._skip(exc, "Cannot clone table")
         self.assertEqual(cloned.table_name, target_name)
         self.assertTrue(cloned.exists())
-        rows = self.client.sql(
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-        ).execute(
-            f"SELECT id, label, amount FROM {cloned.full_name(safe=True)} "
-            f"ORDER BY id"
-        ).to_arrow_table()
+        rows = self._sql(
+            f"SELECT id, label, amount FROM {cloned.full_name(safe=True)} ORDER BY id"
+        )
         self.assertEqual(rows.num_rows, 3)
         self.assertEqual(rows.column("id").to_pylist(), [1, 2, 3])
         self.assertEqual(rows.column("label").to_pylist(), ["a", "b", "c"])
@@ -584,14 +491,13 @@ class TestTableCloneIntegration(_TableFixture):
             self.table.clone(self.table.full_name())
 
     def test_clone_missing_ok_skips_when_target_present(self) -> None:
-        target_name = self._clone_target_name()
+        target_name = self._sibling("yg_clone_tgt").split(".")[-1]
         try:
             first = self.table.clone(target_name)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"Cannot clone table: {exc}.")
+            self._skip(exc, "Cannot clone table")
         self.assertTrue(first.exists())
-        # Second call with missing_ok must not raise even though the
-        # target is already there.
+        # Second call with missing_ok must not raise though the target exists.
         self.table.clone(target_name, missing_ok=True)
 
 
@@ -605,31 +511,19 @@ class TestTableViewIntegration(_TableFixture):
     def setUp(self) -> None:
         super().setUp()
         self.table.insert(_sample_data(), mode=Mode.OVERWRITE)
-        self._view_full_names: list[str] = []
 
-    def tearDown(self) -> None:
-        for full_name in self._view_full_names:
-            try:
-                self.client.tables.table(full_name).delete(missing_ok=True)
-            except Exception:
-                pass
-        super().tearDown()
-
-    def _new_view_handle(self) -> Table:
-        name = f"yg_view_{secrets.token_hex(4)}"
-        full = f"{self.catalog_name}.{self.schema_name}.{name}"
-        self._view_full_names.append(full)
-        return self.client.tables.view(full)
+    def _new_view(self) -> Table:
+        return self.client.tables.view(self._sibling("yg_view"))
 
     def test_create_view_sets_view_definition(self) -> None:
-        view = self._new_view_handle()
+        view = self._new_view()
         try:
             view.create_view(
                 f"SELECT id, label FROM {self.table.full_name(safe=True)}",
                 mode=Mode.OVERWRITE,
             )
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"Cannot create view: {exc}.")
+            self._skip(exc, "Cannot create view")
         self.assertTrue(view.exists())
         _ = view.infos  # warm the cache so ``is_view`` reads from it
         self.assertTrue(view.is_view)
@@ -637,42 +531,34 @@ class TestTableViewIntegration(_TableFixture):
         self.assertIn("SELECT", (view.view_definition or "").upper())
 
     def test_view_read_round_trips(self) -> None:
-        view = self._new_view_handle()
+        view = self._new_view()
         try:
             view.create_view(
-                f"SELECT id, label FROM {self.table.full_name(safe=True)} "
-                f"WHERE id >= 2",
+                f"SELECT id, label FROM {self.table.full_name(safe=True)} WHERE id >= 2",
                 mode=Mode.OVERWRITE,
             )
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"Cannot create view: {exc}.")
-        rows = self.client.sql(
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-        ).execute(
-            f"SELECT id, label FROM {view.full_name(safe=True)} ORDER BY id"
-        ).to_arrow_table()
+            self._skip(exc, "Cannot create view")
+        rows = self._sql(f"SELECT id, label FROM {view.full_name(safe=True)} ORDER BY id")
         self.assertEqual(rows.column("id").to_pylist(), [2, 3])
         self.assertEqual(rows.column("label").to_pylist(), ["b", "c"])
 
     def test_view_rename_round_trip(self) -> None:
-        view = self._new_view_handle()
+        view = self._new_view()
         try:
             view.create_view(
                 f"SELECT id FROM {self.table.full_name(safe=True)}",
                 mode=Mode.OVERWRITE,
             )
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"Cannot create view: {exc}.")
+            self._skip(exc, "Cannot create view")
         _ = view.infos
         new_name = f"yg_view_renamed_{secrets.token_hex(4)}"
-        self._view_full_names.append(
-            f"{self.catalog_name}.{self.schema_name}.{new_name}"
-        )
+        self._cleanup.append(f"{self.catalog_name}.{self.schema_name}.{new_name}")
         try:
             view.rename(new_name)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"Cannot rename view: {exc}.")
+            self._skip(exc, "Cannot rename view")
         self.assertEqual(view.table_name, new_name)
         self.assertTrue(view.exists())
 
@@ -681,50 +567,34 @@ class TestTableViewIntegration(_TableFixture):
 class TestTableStoragePathIntegration(_TableFixture):
     """Storage-path surface — :attr:`Table.staging_volume`,
     :meth:`Table.staging_folder`, :meth:`Table.insert_volume_path`,
-    :meth:`Table.temporary_credentials`, and :meth:`Table.storage_location`.
+    :meth:`Table.temporary_credentials`, :meth:`Table.storage_path`.
 
-    These methods all bottom out in Unity Catalog APIs (Volumes, Files,
+    These bottom out in Unity Catalog APIs (Volumes, Files,
     ``temporary_table_credentials``) and only meaningfully exercise
-    against a live workspace. The unit-test sibling
-    (:mod:`tests.test_yggdrasil.test_databricks.test_sql.test_table_insert_volume_path`)
-    already pins the pure path-generation behaviour with mocks; this
-    suite walks the full round trip.
+    against a live workspace.
     """
 
     table_prefix = "yg_storage"
 
     def test_staging_volume_collapses_to_singleton(self) -> None:
-        # Two reads of the property must hand back the same Volume —
-        # the lazy slot is populated on first access and reused.
         first = self.table.staging_volume
-        second = self.table.staging_volume
-        self.assertIs(first, second)
+        self.assertIs(first, self.table.staging_volume)
         self.assertIsInstance(first, Volume)
         self.assertEqual(first.catalog_name, self.catalog_name)
         self.assertEqual(first.schema_name, self.schema_name)
-        # Volume name is derived from the table name (lowercased,
-        # tag-safe) — pin the shape so a regression in the derivation
-        # rule surfaces here rather than at the first write.
-        expected_volume_name = self.client.safe_tag_value(
-            self.table_name, repl="_",
-        ).lower()
-        self.assertEqual(first.volume_name, expected_volume_name)
+        # Volume name is derived from the table name (lowercased, tag-safe).
+        expected = self.client.safe_tag_value(self.table_name, repl="_").lower()
+        self.assertEqual(first.volume_name, expected)
 
     def test_staging_volume_ensure_created_round_trips(self) -> None:
         volume = self.table.staging_volume
         try:
             volume.ensure_created(comment="yggdrasil storage path integration")
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(
-                f"Cannot create staging volume {volume.full_name()}: {exc}."
-            )
+            self._skip(exc, f"Cannot create staging volume {volume.full_name()}")
         try:
             self.assertTrue(volume.exists())
         finally:
-            # The fixture's tearDownClass also drops the staging volume
-            # via ``Table.delete(delete_staging=True)``; calling it
-            # here keeps a per-test failure from leaving an orphan
-            # behind when the suite is run in isolation.
             try:
                 volume.delete(missing_ok=True)
             except Exception:
@@ -735,67 +605,42 @@ class TestTableStoragePathIntegration(_TableFixture):
         async_path = self.table.staging_folder(async_write=True)
         self.assertIsInstance(tmp, VolumePath)
         self.assertIsInstance(async_path, VolumePath)
-        # Folder layout is part of the staging contract — the warehouse
-        # insert path globs ``.sql/tmp`` and the async-applier task
-        # subscribes to ``.sql/async/insert`` for file-arrival triggers.
+        # Folder layout is part of the staging contract.
         self.assertTrue(tmp.full_path().rstrip("/").endswith(".sql/tmp"))
-        self.assertTrue(
-            async_path.full_path().rstrip("/").endswith(".sql/async/insert")
-        )
-        # The ``temporary`` flag round-trips onto the returned path so
-        # callers can chain ``with`` blocks for auto-cleanup.
+        self.assertTrue(async_path.full_path().rstrip("/").endswith(".sql/async/insert"))
         self.assertTrue(tmp.temporary)
         self.assertFalse(async_path.temporary)
 
     def test_insert_volume_path_is_unique_per_call(self) -> None:
-        a = self.table.insert_volume_path()
-        b = self.table.insert_volume_path()
+        a, b = self.table.insert_volume_path(), self.table.insert_volume_path()
         self.assertNotEqual(a.full_path(), b.full_path())
         for p in (a, b):
             self.assertTrue(p.full_path().endswith(".parquet"))
-            # Path lives under the staging volume's ``.sql/tmp`` folder.
             self.assertIn("/.sql/tmp/", p.full_path())
 
     def test_insert_volume_path_round_trips_parquet(self) -> None:
         try:
             self.table.staging_volume.ensure_created()
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(
-                f"Cannot create staging volume: {exc}."
-            )
+            self._skip(exc, "Cannot create staging volume")
         path = self.table.insert_volume_path(temporary=False)
-        data = pa.table(
-            {
-                "id": pa.array([10, 20], type=pa.int64()),
-                "label": pa.array(["x", "y"], type=pa.string()),
-            }
-        )
-        path.as_media(media_type=MediaTypes.PARQUET).write_table(
-            data, mode=Mode.OVERWRITE,
-        )
+        data = pa.table({
+            "id": pa.array([10, 20], type=pa.int64()),
+            "label": pa.array(["x", "y"], type=pa.string()),
+        })
+        path.as_media(media_type=MediaTypes.PARQUET).write_table(data, mode=Mode.OVERWRITE)
         try:
             self.assertGreater(path.size, 0)
         finally:
             path.unlink(missing_ok=True)
 
     def test_temporary_credentials_returns_creds(self) -> None:
-        # ``temporary_credentials`` is a thin pass-through over
-        # ``temporary_table_credentials.generate_temporary_table_credentials``
-        # — the call must round-trip and return a response keyed by
-        # this table's id.
         try:
-            response = self.table.temporary_credentials(
-                operation=TableOperation.READ,
-            )
+            response = self.table.temporary_credentials(operation=TableOperation.READ)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(
-                f"Cannot vend temporary table credentials: {exc}."
-            )
+            self._skip(exc, "Cannot vend temporary table credentials")
         self.assertIsNotNone(response)
-        # The SDK response carries an ``expiration_time`` and one of
-        # ``aws_temp_credentials`` / ``azure_user_delegation_sas`` /
-        # ``gcp_oauth_token`` depending on cloud — we don't pin the
-        # cloud-specific slot, but at least one must be populated.
+        # At least one cloud-specific credential slot must be populated.
         cred_attrs = (
             "aws_temp_credentials",
             "azure_user_delegation_sas",
@@ -808,118 +653,80 @@ class TestTableStoragePathIntegration(_TableFixture):
         )
 
     def test_storage_location_returns_addressable_path(self) -> None:
-        # ``storage_location`` collapses to a :class:`Path` over the
-        # backing cloud store via the table-bound :class:`AWSClient`.
-        # Only AWS workspaces vend the read creds we need here — skip
-        # cleanly on Azure / GCP rather than failing.
+        # ``storage_path`` collapses to a :class:`Path` over the backing
+        # cloud store; only AWS workspaces vend the read creds we need —
+        # skip cleanly on Azure / GCP (any failure) rather than failing.
         try:
             path = self.table.storage_path()
-        except NotImplementedError as exc:
-            raise unittest.SkipTest(
-                f"storage_location not implemented on this workspace: {exc}."
-            )
-        except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(
-                f"Cannot resolve storage_location (non-AWS workspace?): {exc}."
-            )
         except Exception as exc:
-            # AWSClient construction raises on non-AWS workspaces with
-            # a non-Databricks exception type — collapse to a skip
-            # rather than a hard fail so the suite stays portable.
-            raise unittest.SkipTest(
-                f"storage_location unavailable: {exc}."
-            )
+            self._skip(exc, "storage_location unavailable (non-AWS workspace?)")
         self.assertIsNotNone(path)
-        # Managed tables on AWS resolve to an ``s3://...`` URL — the
-        # full_path must at minimum be a non-empty string.
         self.assertTrue(str(path.full_path()))
 
 
 @pytest.mark.integration
 class TestTableAsyncInsertIntegration(_TableFixture):
-    """``insert(wait=False)`` drop → ``TableJob`` aggregate-load round-trip.
+    """``insert(wait=False)`` drop → loader aggregate-load round-trip.
 
-    Exercises the real volume I/O: ``async_insert`` stages the Parquet to the
-    table's tmp path and drops a JSON operation log (no warehouse statement),
-    then the loader reads the log, builds one aggregated ``INSERT`` per
-    ``(target, mode)`` group and loads it through ygg, clearing the consumed
-    log + data. The loader is driven directly (``TableJob.process``) — the live
-    file-arrival job is best-effort and may need compute wired into the
-    definition before it can auto-trigger.
+    ``async_insert`` stages the Parquet to the table's tmp path and drops a
+    JSON operation log (no warehouse statement); ``Tables.async_insert`` then
+    reads the log, builds one aggregated ``INSERT`` per ``(target, mode)``
+    group, loads it, and clears the consumed log + data. The loader is driven
+    directly — the live file-arrival job (``Table.async_job()``) is not
+    exercised here.
     """
 
     table_prefix = "yg_async"
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        # Drop the file-arrival job the async path may have created.
-        try:
-            from yggdrasil.databricks.table.async_job import TableJob
-
-            #cls.client.jobs.delete(name=TableJob.job_name(cls.table))
-        except Exception:
-            pass
-        super().tearDownClass()
-
-    def _count(self) -> int:
-        result = self.client.sql(
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-        ).execute(
-            f"SELECT COUNT(*) AS n FROM {self.table.full_name(safe=True)}"
-        ).to_arrow_table()
-        return int(result.column("n").to_pylist()[0])
+    def setUp(self) -> None:
+        super().setUp()
+        # The class table is shared across the async tests — start each from
+        # empty so row-count assertions are order-independent.
+        self.table.insert(_sample_data().slice(0, 0), mode=Mode.OVERWRITE)
 
     def test_async_drop_then_loader_appends(self) -> None:
-        import json
+        from yggdrasil.databricks.table.async_job import AsyncInsert, logs_path
 
-        from yggdrasil.databricks.table.async_job import TableJob
-
-        # 1. async insert → stage Parquet + drop a JSON operation log, no DML.
         try:
             log_path = self.table.async_insert(_sample_data(), mode=Mode.APPEND)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(
-                f"async insert needs volume write access: {exc}."
-            )
+            self._skip(exc, "async insert needs volume write access")
 
         self.assertTrue(log_path.exists())
-        record = json.loads(bytes(log_path.read_bytes()))
-        self.assertEqual(record["target"], self.table.full_name())
-        self.assertEqual(record["mode"], "append")
-
-        # the staged Parquet lives exactly where the log says it does
-        data_path = TableJob(self.table)._data_file(record["data"])
+        op = AsyncInsert.from_log(log_path)
+        self.assertEqual(op.target, self.table.full_name())
+        self.assertEqual(op.mode, "append")
+        # the staged Parquet lives exactly where the log's uniform URL says
+        data_path = op.data_path(self.table.client)
         self.assertTrue(data_path.exists())
 
-        # consumed log + data are gone
+        # run the loader: aggregate + load, then clear the consumed log + data
+        processed = self.client.tables.async_insert(logs_path(self.table), wait=True)
+        self.assertEqual(processed, 1)
+        self.assertEqual(self._count(), 3)
         self.assertFalse(log_path.exists())
         self.assertFalse(data_path.exists())
 
     def test_async_overwrite_replaces_rows(self) -> None:
-        from yggdrasil.databricks.table.async_job import TableJob
+        from yggdrasil.databricks.table.async_job import logs_path
 
-        # seed some rows synchronously
         try:
             self.table.insert(_sample_data(), mode=Mode.APPEND)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"seed insert failed: {exc}.")
+            self._skip(exc, "seed insert failed")
         self.assertEqual(self._count(), 3)
 
-        # async OVERWRITE drop + load should reset to just the new rows
-        overwrite_rows = pa.table(
-            {
-                "id": pa.array([9], type=pa.int64()),
-                "label": pa.array(["z"], type=pa.string()),
-                "amount": pa.array([9.5], type=pa.float64()),
-            }
-        )
+        overwrite_rows = pa.table({
+            "id": pa.array([9], type=pa.int64()),
+            "label": pa.array(["z"], type=pa.string()),
+            "amount": pa.array([9.5], type=pa.float64()),
+        })
         try:
             self.table.async_insert(overwrite_rows, mode=Mode.OVERWRITE)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"async insert failed: {exc}.")
+            self._skip(exc, "async insert failed")
 
-        TableJob(self.table).run(wait=True)
+        self.client.tables.async_insert(logs_path(self.table), wait=True)
         self.assertEqual(self._count(), 1)
 
     def test_async_rejects_merge_mode(self) -> None:
