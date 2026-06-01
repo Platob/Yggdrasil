@@ -38,6 +38,11 @@ def _normalize_ws(sql: str) -> str:
     return " ".join(sql.split())
 
 
+async def _drain(awaitable):
+    """``await`` an insert op/batch from a sync test."""
+    return await awaitable
+
+
 # --------------------------------------------------------------------------- #
 # Table.insert(wait=False) routing
 # --------------------------------------------------------------------------- #
@@ -210,6 +215,60 @@ class TestDatabricksTableInsert:
         with patch("yggdrasil.databricks.path.DatabricksPath.from_") as dp:
             op.data_path(client="CL")
         dp.assert_called_once_with("dbfs+volume:/x.parquet", client="CL")
+
+    def test_execute_builds_dml_and_runs_via_sql_insert(self):
+        # The op renders its own source SELECT and loads it through the
+        # target's sql_insert — no external DML building.
+        from yggdrasil.enums.state import State
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+
+        inner = MagicMock(state=State.SUCCEEDED, is_done=True, error=None, retryable=False)
+        target = MagicMock()
+        target.sql_insert.return_value = inner
+        op = DatabricksTableInsert(
+            target=target, mode="append",
+            data="dbfs+volume:/c/s/t/.sql/tmp/x.parquet", client=MagicMock(),
+        )
+        ret = op.execute(wait=True)
+        assert ret is op and op.is_succeeded
+        assert op.result is inner
+        target.sql_insert.assert_called_once()
+        assert target.sql_insert.call_args.args[0].startswith("SELECT * FROM parquet.`")
+        assert target.sql_insert.call_args.kwargs["mode"] == "append"
+
+    def test_start_without_wait_then_await(self):
+        import asyncio
+        from yggdrasil.enums.state import State
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+
+        inner = MagicMock(state=State.SUCCEEDED, is_done=True, error=None, retryable=False)
+        target = MagicMock()
+        target.sql_insert.return_value = inner
+        op = DatabricksTableInsert(
+            target=target, mode="append",
+            data="dbfs+volume:/c/s/t/.sql/tmp/x.parquet", client=MagicMock(),
+        )
+        op.start(wait=False)
+        assert op.started
+        asyncio.run(_drain(op))
+        assert op.is_succeeded
+
+    def test_execute_propagates_a_failed_load(self):
+        from yggdrasil.enums.state import State
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+
+        inner = MagicMock(
+            state=State.FAILED, is_done=True,
+            error=RuntimeError("boom"), retryable=False,
+        )
+        target = MagicMock()
+        target.sql_insert.return_value = inner
+        op = DatabricksTableInsert(
+            target=target, mode="append",
+            data="dbfs+volume:/c/s/t/.sql/tmp/x.parquet", client=MagicMock(),
+        )
+        with pytest.raises(RuntimeError, match="boom"):
+            op.execute(wait=True)
 
     def test_table_url_round_trips_and_is_a_table_source(self):
         # The Spark dispatch records a ``dbfs+table://`` URL; the op-log keeps
@@ -463,6 +522,30 @@ class TestDatabricksInsertBatch:
         assert sql.startswith("MERGE INTO c.s.t AS T")
         assert "ROW_NUMBER()" in sql            # dedup'd source feeds the MERGE
 
+    def test_execute_runs_the_union_through_sql_insert(self):
+        # The batch is self-executing: it renders the UNION ALL body and runs
+        # it through the (bound) target's sql_insert — no external DML.
+        from yggdrasil.enums.state import State
+        from yggdrasil.databricks.table.insert import DatabricksInsertBatch
+        [batch] = DatabricksInsertBatch.group([
+            self._op("a", mode="append", target="c.s.t", ts=1.0),
+            self._op("b", mode="append", target="c.s.t", ts=2.0),
+        ])
+        target = MagicMock()
+        target.sql_insert.return_value = MagicMock(
+            state=State.SUCCEEDED, is_done=True, error=None, retryable=False,
+        )
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_") as dp:
+            dp.side_effect = lambda u, **k: MagicMock(
+                full_path=MagicMock(return_value="/Volumes" + u.split(":", 1)[1]),
+            )
+            batch.execute(target=target, wait=True)
+        assert batch.is_succeeded
+        target.sql_insert.assert_called_once()
+        body = target.sql_insert.call_args.args[0]
+        assert "UNION ALL" in body
+        assert target.sql_insert.call_args.kwargs["mode"] == "append"
+
 
 # --------------------------------------------------------------------------- #
 # stage_async_insert (producer)
@@ -668,13 +751,13 @@ class TestLoadAsync:
 
         assert processed == 2
         # one insert_into load per (target, mode) group, with the union
-        target.insert_into.assert_called_once()
-        union = target.insert_into.call_args.args[0]
+        target.sql_insert.assert_called_once()
+        union = target.sql_insert.call_args.args[0]
         assert "UNION ALL" in union
         # the uniform URL is resolved to the warehouse-facing path for the query
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in union
-        assert target.insert_into.call_args.kwargs["mode"] == "append"
+        assert target.sql_insert.call_args.kwargs["mode"] == "append"
         # consumed logs + data (reconstructed from the uniform URL) cleaned up
         log_a.unlink.assert_called_once()
         log_b.unlink.assert_called_once()
@@ -693,9 +776,9 @@ class TestLoadAsync:
         with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
             processed = load_async(svc, logs, wait=False)
         assert processed == 2
-        target.insert_into.assert_called_once()
-        sql = target.insert_into.call_args.args[0]
-        assert target.insert_into.call_args.kwargs["mode"] == "overwrite"
+        target.sql_insert.assert_called_once()
+        sql = target.sql_insert.call_args.args[0]
+        assert target.sql_insert.call_args.kwargs["mode"] == "overwrite"
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in sql
         assert "a.parquet" not in sql            # superseded — not in the load
         data_paths["dbfs+volume:/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
@@ -715,8 +798,8 @@ class TestLoadAsync:
 
         assert processed == 2
         assert set(tables) == {"c.s.t1", "c.s.t2"}
-        tables["c.s.t1"].insert_into.assert_called_once()
-        tables["c.s.t2"].insert_into.assert_called_once()
+        tables["c.s.t1"].sql_insert.assert_called_once()
+        tables["c.s.t2"].sql_insert.assert_called_once()
 
     def test_single_log_file_path_string(self):
         from yggdrasil.databricks.table.insert import load_async
@@ -730,7 +813,7 @@ class TestLoadAsync:
                    side_effect=lambda p, **k: log if p == "/logs/a.json" else MagicMock()):
             processed = load_async(svc, "/logs/a.json")
         assert processed == 1
-        target.insert_into.assert_called_once()
+        target.sql_insert.assert_called_once()
 
     def test_log_files_arg_skips_the_directory_scan(self):
         from yggdrasil.databricks.table.insert import load_async
@@ -742,7 +825,7 @@ class TestLoadAsync:
         with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
             processed = load_async(svc, log_files=[log_a, log_b], wait=False)
         assert processed == 2
-        target.insert_into.assert_called_once()   # one (target, mode) group
+        target.sql_insert.assert_called_once()   # one (target, mode) group
         log_a.unlink.assert_called_once()
         log_b.unlink.assert_called_once()
 
@@ -762,6 +845,6 @@ class TestLoadAsync:
         with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
             processed = dispatch_async(svc, ops)
         assert processed == 2
-        target.insert_into.assert_called_once()
-        union = target.insert_into.call_args.args[0]
+        target.sql_insert.assert_called_once()
+        union = target.sql_insert.call_args.args[0]
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union

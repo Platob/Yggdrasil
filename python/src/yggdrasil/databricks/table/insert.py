@@ -47,7 +47,10 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from yggdrasil.data import Field
 from yggdrasil.databricks.sql.sql_utils import quote_ident
+from yggdrasil.dataclasses.awaitable import Awaitable
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.enums.mode import Mode
+from yggdrasil.enums.state import State
 from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from yggdrasil.path import Path
 
@@ -113,8 +116,91 @@ def _new_op_id() -> str:
     return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
 
 
+class _InsertExecution(Awaitable):
+    """:class:`Awaitable` execution shared by :class:`DatabricksTableInsert`
+    and :class:`DatabricksInsertBatch`.
+
+    Both build their own INSERT / MERGE DML and run it — callers don't render
+    SQL or drive a warehouse batch externally. :meth:`execute` (and the
+    :class:`Awaitable` ``start`` / ``wait`` / ``await``) drive an inner
+    :class:`StatementBatch`: :meth:`_submit` (overridden per subclass) renders
+    the source and hands it to ``Table.sql_insert``, whose warehouse path runs
+    the statements via ``execute_many``. The Awaitable mirrors that inner
+    batch's state, so ``op.start(wait=False)`` fires the load and ``await op``
+    / ``op.wait()`` block on it.
+    """
+
+    #: The inner :class:`StatementBatch` (or backend result) the load drives.
+    _inner: Any = None
+
+    def _submit(self, *, wait: bool, raise_error: bool) -> Any:
+        """Render this op/batch's DML and submit it — return the inner batch."""
+        raise NotImplementedError
+
+    def execute(
+        self,
+        *,
+        target: Any = None,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+    ) -> "_InsertExecution":
+        """Build and run this insert. ``target`` rebinds the destination
+        :class:`Table` (the async loader resolves a name → Table here). With
+        ``wait`` (default) blocks until the statements finish; ``wait=False``
+        fires them and returns immediately (poll via :meth:`wait` / ``await``).
+        """
+        if target is not None:
+            self.target = target
+        return self.start(wait=wait, raise_error=raise_error)
+
+    @property
+    def result(self) -> Any:
+        """The inner :class:`StatementBatch` driving the load (``None`` until
+        :meth:`start` / :meth:`execute`)."""
+        return self._inner
+
+    # -- Awaitable hooks ------------------------------------------------------
+
+    def _start(self) -> None:
+        self._inner = self._submit(wait=False, raise_error=False)
+        self._sync_from_inner()
+
+    def _poll(self) -> None:
+        inner = self._inner
+        if inner is not None and hasattr(inner, "wait"):
+            inner.wait(wait=False, raise_error=False)
+        self._sync_from_inner()
+
+    def _sync_from_inner(self) -> None:
+        inner = self._inner
+        if inner is None:
+            # Nothing to run (e.g. an empty batch) — treat as done.
+            self._state = State.SUCCEEDED
+            return
+        st = getattr(inner, "state", None)
+        if st is not None:
+            try:
+                self._state = State.from_(st)
+                return
+            except (TypeError, ValueError):
+                pass
+        # A backend result without a coercible state (or a non-Awaitable
+        # one) is taken as done once it reports so.
+        if getattr(inner, "is_done", True):
+            self._state = State.SUCCEEDED
+
+    def _error_for_status(self) -> "BaseException | None":
+        inner = self._inner
+        return getattr(inner, "error", None) if inner is not None else None
+
+    @property
+    def retryable(self) -> bool:
+        inner = getattr(self, "_inner", None)
+        return bool(getattr(inner, "retryable", False))
+
+
 @dataclass
-class DatabricksTableInsert:
+class DatabricksTableInsert(_InsertExecution):
     """One insert operation — the full ``arrow_insert`` surface in one object.
 
     Carries the ``target`` table, the save ``mode``, the staged ``data``
@@ -176,6 +262,9 @@ class DatabricksTableInsert:
         # Cache for the materialised data URL — populated on the first
         # :attr:`data_url` read so a spark-stage / volume-dump runs once.
         self._data_url_cache: "str | None" = None
+        # The :class:`StatementBatch` this op's execution drives — set by
+        # :meth:`_start` (the :class:`Awaitable` lifecycle).
+        self._inner: Any = None
         self.mode = Mode.from_(self.mode, default=Mode.APPEND)
         # The drop pipeline only knows how to aggregate OVERWRITE / APPEND;
         # the keyed modes have no UNION-ALL story. The synchronous path
@@ -448,9 +537,29 @@ class DatabricksTableInsert:
         """Back-compat alias for :func:`make_sql_select` over this op."""
         return make_sql_select(self, client=client)
 
+    def _submit(self, *, wait: bool, raise_error: bool) -> Any:
+        """Render this op's source ``SELECT`` and load it through the target's
+        ``sql_insert`` — which builds the INSERT / MERGE DML and runs it via
+        ``execute_many``. The target must be a :class:`Table` (pass it to
+        :meth:`execute` when the op only carries the name)."""
+        target = self._target_table()
+        return target.sql_insert(
+            self.select_sql(client=self.client),
+            mode=self.mode.name.lower(),
+            match_by=self.match_by,
+            update_column_names=self.update_column_names,
+            zorder_by=self.zorder_by,
+            optimize_after_merge=self.optimize_after_merge,
+            vacuum_hours=self.vacuum_hours,
+            safe_merge=self.safe_merge,
+            predicate=self.predicate,
+            wait=wait,
+            raise_error=raise_error,
+        )
+
 
 @dataclass
-class DatabricksInsertBatch:
+class DatabricksInsertBatch(_InsertExecution):
     """All ops staged for one ``target`` — aggregated into a single load.
 
     Groups a target's :class:`DatabricksTableInsert` ops and centralizes the
@@ -459,14 +568,33 @@ class DatabricksInsertBatch:
     everything staged before it), else the first active op's mode. Every
     consumed op is retained on :attr:`logs` so the loader can clean up
     superseded data too.
+
+    Like a single op it is :class:`Awaitable` and self-executing —
+    :meth:`execute` (or ``start`` / ``await``) renders the aggregated
+    ``UNION ALL`` body and runs it through the target's ``sql_insert``.
     """
 
     target: "Table"
     logs: "list[DatabricksTableInsert]" = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self._inner: Any = None
+
     def append(self, op: "DatabricksTableInsert") -> "DatabricksInsertBatch":
         self.logs.append(op)
         return self
+
+    def _submit(self, *, wait: bool, raise_error: bool) -> Any:
+        """Render the aggregated source body and load it through the target's
+        ``sql_insert`` (which builds the DML + runs ``execute_many``)."""
+        client = getattr(self.target, "client", None)
+        return self.target.sql_insert(
+            self.make_sql(client),
+            mode=self.mode.name.lower(),
+            match_by=self.match_by,
+            wait=wait,
+            raise_error=raise_error,
+        )
 
     @property
     def mode(self) -> Mode:
@@ -1326,11 +1454,10 @@ def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> in
             "loading %d file(s) into %s (%s)",
             len(batch.active), target_name, mode.name.lower(),
         )
-        # The batch is the single place the load source is generated.
-        target.insert_into(
-            batch.make_sql(client), mode=mode.name.lower(),
-            match_by=batch.match_by, wait=wait,
-        )
+        # The batch builds + runs its own DML — bind the resolved Table and
+        # let it execute (renders the UNION ALL body, runs it via the
+        # target's sql_insert / execute_many).
+        batch.execute(target=target, wait=wait)
         # Clear consumed logs + data (incl. superseded ops) after a load —
         # unlink a staged file, drop a staged table (the Spark dispatch).
         for op in batch.logs:
