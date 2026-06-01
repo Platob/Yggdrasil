@@ -253,9 +253,15 @@ class PickleFile(IO[Any, PickleOptions]):
         iterator = iter(batches)
         first = next(iterator, None)
         if first is None:
-            if action is Mode.OVERWRITE:
+            if action is not Mode.OVERWRITE:
+                return None
+            # Empty input: pickle a 0-row table carrying the bound schema
+            # so the object round-trips as an empty, typed table instead
+            # of a truncated holder.
+            first = self._empty_overwrite_batch(options)
+            if first is None:
                 self.truncate(0)
-            return None
+                return None
 
         if action in _MERGE_MODES and has_existing:
             rewrite_options = options.with_target(self.collect_schema(options))

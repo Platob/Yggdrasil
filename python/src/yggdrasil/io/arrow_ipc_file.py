@@ -307,12 +307,14 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         iterator = iter(batches)
         first = next(iterator, None)
         if first is None and action is Mode.OVERWRITE:
-            # Empty payload + OVERWRITE → an empty file with the
-            # caller's schema (if any) is preferable to leaving stale
-            # bytes; truncate and bail.
-            self.truncate(0)
-            return None
-        if first is None:
+            # Empty input: replay a 0-row batch carrying the bound schema
+            # through the writer so the file is a valid IPC file (schema +
+            # footer, no batches) rather than a 0-byte stub.
+            first = self._empty_overwrite_batch(options)
+            if first is None:
+                self.truncate(0)
+                return None
+        elif first is None:
             return None
 
         if action in _MERGE_MODES and has_existing:

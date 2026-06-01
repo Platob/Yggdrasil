@@ -378,30 +378,17 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         iterator = iter(batches)
         first = next(iterator, None)
         if first is None and action is Mode.OVERWRITE:
-            # No incoming rows. ``to_batches()`` on a 0-row table yields an
-            # empty iterator, so the schema would otherwise be lost here. When
-            # a schema is known (target/source bound, or the source table's own
-            # schema threaded through by ``_write_arrow_table``) stage a valid,
-            # schema-bearing 0-row Parquet instead of a truncated 0-byte file —
-            # a downstream reader (e.g. a warehouse ``INSERT … SELECT FROM
-            # parquet.`<path>```) then sees an empty table rather than a
-            # missing/unparseable file.
-            schema_field = options.merged
-            if schema_field is not None:
-                with self.arrow_output_stream() as sink:
-                    pq.ParquetWriter(
-                        sink,
-                        schema_field.to_arrow_schema(),
-                        compression=options.compression,
-                        compression_level=options.compression_level,
-                        use_dictionary=options.use_dictionary,
-                        write_statistics=options.write_statistics,
-                    ).close()
+            # No incoming rows: ``to_batches()`` on a 0-row table yields an
+            # empty iterator, dropping the schema. Replay a 0-row batch
+            # carrying the bound schema through the writer below so the file
+            # is a valid empty Parquet (footer + schema) rather than a
+            # truncated 0-byte stub a reader can't parse.
+            first = self._empty_overwrite_batch(options)
+            if first is None:
+                self.seek(0)
+                self.truncate(0)
                 return
-            self.seek(0)
-            self.truncate(0)
-            return
-        if first is None:
+        elif first is None:
             return
 
         if action in _MERGE_MODES and _has_existing:

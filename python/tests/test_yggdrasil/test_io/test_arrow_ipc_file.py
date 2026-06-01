@@ -550,3 +550,41 @@ class TestFastPathEquivalence:
         ).read_all()
         assert fast_table.equals(slow_table)
         assert fast_table.equals(table)
+
+
+class TestEmptyOverwriteWritesValidFile:
+    """An empty input under OVERWRITE through the generic path route must
+    persist a valid Arrow IPC file (schema + footer, no batches), not a
+    0-byte stub."""
+
+    def test_empty_table_writes_schema(self, tmp_path) -> None:
+        import pyarrow.ipc as _ipc
+        from yggdrasil.enums import Mode
+
+        empty = pa.table(
+            {"id": pa.array([], type=pa.int64()),
+             "amount": pa.array([], type=pa.float64())}
+        )
+        path = LocalPath(str(tmp_path / "empty.arrow"))
+        path.write_table(empty, mode=Mode.OVERWRITE)
+
+        assert path.size > 0
+        with open(str(tmp_path / "empty.arrow"), "rb") as fh:
+            reader = _ipc.open_file(fh)
+            assert reader.schema.names == ["id", "amount"]
+            assert reader.read_all().num_rows == 0
+
+    def test_empty_batches_overwrite_uses_bound_schema(self) -> None:
+        import pyarrow.ipc as _ipc
+        from yggdrasil.enums import Mode
+        from yggdrasil.data.options import CastOptions
+
+        schema = pa.schema([("id", pa.int64()), ("amount", pa.float64())])
+        mem = Memory()
+        leaf = ArrowIPCFile(holder=mem, owns_holder=False)
+        leaf._write_arrow_batches(
+            iter([]), leaf.check_options(CastOptions(mode=Mode.OVERWRITE, target=schema)),
+        )
+        reader = _ipc.open_file(pa.BufferReader(mem.to_bytes()))
+        assert reader.schema.names == ["id", "amount"]
+        assert reader.read_all().num_rows == 0
