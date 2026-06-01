@@ -751,6 +751,11 @@ class LocalPath(Path):
         """
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        # A bare truncate changes the size without flowing through
+        # ``write_mv`` / ``_touch_stat``; drop any stat held for the
+        # current open context so the next ``size`` read re-fstats.
+        if self._stat_contextual:
+            self._drop_stat_cache()
         if self._fd >= 0:
             os.ftruncate(self._fd, n)
             return n
@@ -774,3 +779,7 @@ class LocalPath(Path):
             os.remove(self.os_path)
         except FileNotFoundError:
             pass
+        # The file is gone — forget a context-held stat that still says
+        # it's a non-empty FILE.
+        if self._stat_contextual:
+            self._drop_stat_cache()

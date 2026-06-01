@@ -24,6 +24,13 @@ delegates straight to :class:`URL` — :class:`Path` adds no parsing
 of its own. Subclass dispatch is a small registry keyed by URL
 scheme; :meth:`Path.from_` resolves a candidate via the registry
 and falls back to :class:`LocalPath`.
+
+PARITY: packages/yggdrasil/path/path.ts ports only the pure-path
+value layer. The holder I/O contract here — stat probing, the
+contextual stat cache (``_probe_stat`` / ``_persist_stat_cache``,
+held for an open context and unpersisted on release), and the
+acquire/release lifecycle — has no TS counterpart yet; it belongs
+to the (still unported) ``../io`` / ``../http_`` layer there.
 """
 
 from __future__ import annotations
@@ -77,12 +84,27 @@ class Path(IO, os.PathLike, ABC):
     scheme: ClassVar[str] = ""
 
     STAT_CACHE_TTL: ClassVar["float | None"] = None
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
+    # The stat-cache slots are per-process IO scratch, never identity:
+    # :class:`Singleton` (and the Databricks paths' bespoke
+    # ``__getstate__``) drop them on pickle so a replicated / re-hydrated
+    # path re-probes its own backend instead of trusting a snapshot from
+    # whichever process created it.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {"_stat_cached", "_stat_cached_at", "_stat_contextual"}
+    )
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._stat_cached: IOStats | None = None
         self._stat_cached_at: float = 0.0
+        # ``True`` while the cached entry is held only for the current
+        # open context (a probe seeded by :meth:`_probe_stat` inside a
+        # ``with`` / acquired window). Such an entry is dropped on
+        # release and the moment a write lands — it never outlives the
+        # context that minted it. ``False`` marks a durable entry seeded
+        # by :meth:`_persist_stat_cache` (a listing / upload side effect)
+        # that lives by :attr:`STAT_CACHE_TTL`.
+        self._stat_contextual: bool = False
 
     # ==================================================================
     # Construction / coercion
@@ -220,23 +242,58 @@ class Path(IO, os.PathLike, ABC):
     def size(self) -> int:
         # Fast path: a seeded :class:`IOStats` (from a listing entry
         # or a previous probe) skips the per-call backend round trip.
+        return int(self._probe_stat().size)
+
+    def _probe_stat(self) -> IOStats:
+        """One stat read, with contextual caching layered over the TTL cache.
+
+        Returns the cached :class:`IOStats` when fresh — a durable
+        TTL entry seeded by :meth:`_persist_stat_cache`, or a probe
+        held for the current open context. Otherwise runs the backend
+        :meth:`_stat` once.
+
+        **Contextual caching.** While the path is acquired (inside a
+        ``with`` block, or for the lifetime of an :meth:`open` cursor),
+        a probe with no durable cache behind it is held for the rest of
+        the context, so the burst of :attr:`size` / :meth:`exists` /
+        :meth:`is_file` / :meth:`is_dir` / :attr:`mtime` checks a single
+        read or write makes collapses to one round trip. Backends that
+        already cache durably (:class:`RemotePath` persists inside
+        :meth:`_stat`) fill the slot themselves — their entry is left
+        untouched here. The held entry is unpersisted on release
+        (:meth:`_release`) and dropped the instant a write lands
+        (:meth:`_touch_stat`), so it can never go stale under the
+        caller's own mutations.
+        """
         cached = self._stat_cached_fresh()
         if cached is not None:
-            return int(cached.size)
-        return int(self._stat().size)
+            return cached
+        result = self._stat()
+        if self._stat_cached is None and self._acquired:
+            self._stat_cached = result
+            self._stat_cached_at = time.monotonic()
+            self._stat_contextual = True
+        return result
 
     def _stat_cached_fresh(self) -> "IOStats | None":
-        """Return the cached :class:`IOStats` when still inside its TTL.
+        """Return the cached :class:`IOStats` when still trustworthy.
 
         ``None`` when the slot is empty *or* the entry has expired
-        past :attr:`stat_cache_ttl`. Subclasses that always want a
-        fresh probe (e.g. test scaffolding) override
-        :attr:`stat_cache_ttl` to ``0`` so this method always returns
-        ``None``.
+        past :attr:`STAT_CACHE_TTL`. A *contextual* entry (held for the
+        current open context) is fresh for the whole context regardless
+        of TTL — it lives and dies with the acquire window and is
+        dropped on any write, so within-context staleness can't arise.
+        Subclasses that always want a fresh probe (e.g. test
+        scaffolding) override :attr:`STAT_CACHE_TTL` to ``0`` so a
+        durable entry always returns ``None``.
         """
         cached = self._stat_cached
         if cached is None:
             return None
+        if self._stat_contextual:
+            # Held for this context only — trust it while still acquired;
+            # a stray entry past release (shouldn't happen) re-probes.
+            return cached if self._acquired else None
         ttl = self.STAT_CACHE_TTL
         if ttl is None:
             return cached
@@ -279,39 +336,38 @@ class Path(IO, os.PathLike, ABC):
             return n
         finally:
             bio.close()
+            # The size just changed under a context-held stat — drop it
+            # so the next ``size`` read in this window re-probes. (Writes
+            # via ``write_mv`` flow through ``_touch_stat``; a bare
+            # ``truncate`` does not, so close the gap here.)
+            if self._stat_contextual:
+                self._drop_stat_cache()
 
     def _clear(self) -> None:
         """:class:`Holder` primitive: drop the backing entirely (idempotent)."""
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
+        # The backing is gone — a context-held FILE/size snapshot would
+        # now misreport. Durable entries are dropped by the backend's
+        # ``_remove_file`` → invalidate; clear any contextual one too.
+        if self._stat_contextual:
+            self._drop_stat_cache()
 
     # ==================================================================
     # Filesystem surface — thin wrappers over the abstract hooks
     # ==================================================================
 
     def exists(self) -> bool:
-        cached = self._stat_cached_fresh()
-        if cached is not None:
-            return cached.kind != IOKind.MISSING
-        return self._stat().kind != IOKind.MISSING
+        return self._probe_stat().kind != IOKind.MISSING
 
     def is_file(self) -> bool:
-        cached = self._stat_cached_fresh()
-        if cached is not None:
-            return cached.kind == IOKind.FILE
-        return self._stat().kind == IOKind.FILE
+        return self._probe_stat().kind == IOKind.FILE
 
     def is_dir(self) -> bool:
-        cached = self._stat_cached_fresh()
-        if cached is not None:
-            return cached.kind == IOKind.DIRECTORY
-        return self._stat().kind == IOKind.DIRECTORY
+        return self._probe_stat().kind == IOKind.DIRECTORY
 
     @property
     def mtime(self) -> float:
-        cached = self._stat_cached_fresh()
-        if cached is not None:
-            return float(cached.mtime or 0.0) if cached.kind != IOKind.MISSING else 0.0
-        s = self._stat()
+        s = self._probe_stat()
         return float(s.mtime or 0.0) if s.kind != IOKind.MISSING else 0.0
 
     def _persist_stat_cache(self, stats: IOStats) -> None:
@@ -328,6 +384,17 @@ class Path(IO, os.PathLike, ABC):
         """
         self._stat_cached = stats
         self._stat_cached_at = time.monotonic()
+        # Seeded entries are durable: they live by ``STAT_CACHE_TTL`` and
+        # survive a context release (a listing walk that opens each child
+        # in turn must not lose the metadata the listing already paid
+        # for). Clear the contextual flag in case a prior probe set it.
+        self._stat_contextual = False
+
+    def _drop_stat_cache(self) -> None:
+        """Forget any cached :class:`IOStats` — durable or contextual."""
+        self._stat_cached = None
+        self._stat_cached_at = 0.0
+        self._stat_contextual = False
 
     def invalidate_singleton(self, remove_global: bool = True) -> None:
         """Drop the cached :class:`IOStats` *and* pop self from
@@ -338,9 +405,37 @@ class Path(IO, os.PathLike, ABC):
         their own caches (schema, table info, column lists) override
         and chain ``super().invalidate_singleton(...)``.
         """
-        self._stat_cached = None
-        self._stat_cached_at = 0.0
+        self._drop_stat_cache()
         super().invalidate_singleton(remove_global=remove_global)
+
+    def _touch_stat(self, **kwargs: Any) -> None:
+        """Drop a context-held stat after a write, then update holder fields.
+
+        A write just landed: a stat held only for this open context now
+        under-reports the size, so the next :attr:`size` / :meth:`exists`
+        check in the same context must re-probe. Durable entries are the
+        backend's to refresh (:class:`RemotePath` re-stamps its own via
+        :meth:`_persist_stat_cache` / ``_stamp_buffered_size``), so they
+        are left alone. ``_touch_stat`` is the choke point every write
+        path flows through, which makes it the one place to keep the
+        contextual cache honest.
+        """
+        if self._stat_contextual:
+            self._drop_stat_cache()
+        super()._touch_stat(**kwargs)
+
+    def _release(self) -> None:
+        """Unpersist the contextual stat cache, then run the base release.
+
+        A probe held only for this open context is dropped so the next
+        context re-probes the backend fresh; durable TTL entries
+        (listing / upload seeds) survive untouched. Subclasses with their
+        own release work (LocalPath closes the fd, RemotePath flushes
+        dirty pages) chain through here via ``super()._release()``.
+        """
+        if self._stat_contextual:
+            self._drop_stat_cache()
+        super()._release()
 
     def iterdir(
         self, *, limit: "int | None" = None, singleton_ttl: Any = False,
@@ -385,8 +480,7 @@ class Path(IO, os.PathLike, ABC):
         # MISSING (so unlink silently no-ops) or cached the wrong kind
         # (file vs directory) is exactly how a deletion appears not to
         # work. Drop the cached stat so the probe below hits the backend.
-        self._stat_cached = None
-        self._stat_cached_at = 0.0
+        self._drop_stat_cache()
         kind = self._stat().kind
         if kind == IOKind.DIRECTORY:
             raise IsADirectoryError(
@@ -408,8 +502,7 @@ class Path(IO, os.PathLike, ABC):
         # wrong kind) would make the remove no-op or take the wrong
         # branch. ``unlink`` already cleared the cache; do it here too so
         # a direct ``remove()`` call is equally fresh.
-        self._stat_cached = None
-        self._stat_cached_at = 0.0
+        self._drop_stat_cache()
         stat = self._stat()
         kind = stat.kind
         wait = WaitingConfig.from_(wait)
@@ -476,8 +569,7 @@ class Path(IO, os.PathLike, ABC):
         start = time.monotonic()
         iteration = 0
         while True:
-            self._stat_cached = None
-            self._stat_cached_at = 0.0
+            self._drop_stat_cache()
             if not self.exists():
                 return self
             if cfg.timeout > 0 and (time.monotonic() - start) >= cfg.timeout:

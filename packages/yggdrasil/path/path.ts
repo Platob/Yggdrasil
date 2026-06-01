@@ -5,6 +5,14 @@
 // pathlib-style value identity (URL-backed accessors + navigation). The IO
 // contract (read/write arrow batches) lands in ``../io`` and, for remote nodes,
 // the node HTTP client in ``../http_`` — see those modules' headers.
+//
+// PARITY GAP: the Python ``Path`` also carries a stat layer the IO contract
+// rides on — backend stat probing plus a *contextual* stat cache (a probe
+// held for the lifetime of an open context, unpersisted on release and
+// dropped on write) that collapses the burst of size/exists/is_* checks one
+// read or write makes. That lives with the unported ``../io`` holder
+// lifecycle; this value-only port has no acquire/release window to cache
+// against, so there is nothing to mirror here yet.
 
 import { URL } from "../url";
 import type { MediaType } from "../enums";

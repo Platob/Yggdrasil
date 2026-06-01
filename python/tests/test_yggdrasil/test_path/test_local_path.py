@@ -266,6 +266,92 @@ class TestStat:
 
 
 # ---------------------------------------------------------------------------
+# TestContextualStatCache — stat caching held for an open context, dropped
+# on release / on write.
+# ---------------------------------------------------------------------------
+
+
+class TestContextualStatCache:
+
+    def _counting(self, p: LocalPath) -> list[int]:
+        """Wrap ``p._stat`` so each backend probe bumps a counter."""
+        calls = [0]
+        real = p._stat
+
+        def counted() -> IOStats:
+            calls[0] += 1
+            return real()
+
+        p._stat = counted  # type: ignore[method-assign]
+        return calls
+
+    def test_no_caching_when_unacquired(self, tmp_path: pathlib.Path) -> None:
+        target = tmp_path / "u.bin"
+        target.write_bytes(b"abc")
+        p = LocalPath(str(target), singleton_ttl=False)
+        calls = self._counting(p)
+
+        # Outside any open context every probe hits the backend live —
+        # the contextual cache only engages while acquired.
+        p.exists()
+        p.is_file()
+        assert p.size == 3
+        assert calls[0] == 3
+
+    def test_probes_collapse_within_context(self, tmp_path: pathlib.Path) -> None:
+        target = tmp_path / "c.bin"
+        target.write_bytes(b"hello")
+        p = LocalPath(str(target), singleton_ttl=False)
+        calls = self._counting(p)
+
+        with p:
+            # First probe fills the contextual cache; the rest are local
+            # hits — one round trip for the whole burst.
+            assert p.exists()
+            assert p.is_file()
+            assert not p.is_dir()
+            assert p.size == 5
+            _ = p.mtime
+            assert calls[0] == 1
+
+    def test_cache_unpersisted_on_release(self, tmp_path: pathlib.Path) -> None:
+        target = tmp_path / "r.bin"
+        target.write_bytes(b"hello")
+        p = LocalPath(str(target), singleton_ttl=False)
+
+        with p:
+            assert p.size == 5
+            assert p._stat_cached is not None and p._stat_contextual
+
+        # Released: the contextual entry is gone, so a fresh context sees
+        # an externally-grown file rather than the stale snapshot.
+        assert p._stat_cached is None
+        target.write_bytes(b"hello-world")
+        with p:
+            assert p.size == 11
+
+    def test_write_drops_contextual_cache(self, tmp_path: pathlib.Path) -> None:
+        target = tmp_path / "w.bin"
+        target.write_bytes(b"abc")
+        p = LocalPath(str(target), singleton_ttl=False)
+
+        with p.open("rb+") as fh:
+            assert p.size == 3          # seeds the contextual cache
+            fh.write_bytes(b"abcdefgh")  # mutation flows through _touch_stat
+            assert p.size == 8           # re-probed, not the cached 3
+
+    def test_truncate_drops_contextual_cache(self, tmp_path: pathlib.Path) -> None:
+        target = tmp_path / "t.bin"
+        target.write_bytes(b"abcdefgh")
+        p = LocalPath(str(target), singleton_ttl=False)
+
+        with p:
+            assert p.size == 8   # seeds the contextual cache
+            p.truncate(2)
+            assert p.size == 2   # truncate dropped the stale snapshot
+
+
+# ---------------------------------------------------------------------------
 # TestDirectoryOps
 # ---------------------------------------------------------------------------
 
