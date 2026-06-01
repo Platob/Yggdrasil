@@ -1338,10 +1338,9 @@ class DatabricksClient(Singleton, URLBased):
 
         .. deprecated:: 0.8.31
            Use :meth:`open` for byte IO
-           (``client.open("/Volumes/cat/sch/vol/x", "rb")``), or build
-           the path directly via
-           ``DatabricksPath.from_(parts, client=self)`` when you need
-           the resource itself.
+           (``client.open("/Volumes/cat/sch/vol/x", "rb")``), or
+           :meth:`path` when you need the (non-opened) resource itself
+           (``client.path("/Volumes/cat/sch/vol/x")``).
 
         Args:
             parts: Path parts or string to parse.
@@ -1354,7 +1353,7 @@ class DatabricksClient(Singleton, URLBased):
         warnings.warn(
             "DatabricksClient.dbfs_path is deprecated; use "
             "DatabricksClient.open(path, mode) for IO or "
-            "DatabricksPath.from_(path, client=...) for the path object.",
+            "DatabricksClient.path(path) for the path object.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -1393,6 +1392,38 @@ class DatabricksClient(Singleton, URLBased):
             else DatabricksPath.from_(obj=path, client=self)
         )
         return target.open(mode=mode, **kwargs)
+
+    def path(
+        self,
+        path: Any,
+        *,
+        temporary: bool = False,
+        **kwargs: Any,
+    ) -> "Path":
+        """Build a path bound to this workspace — *without* opening it.
+
+        The non-opening companion to :meth:`open`: strings like
+        ``/Volumes/cat/sch/vol/x`` or ``dbfs+volume:///cat/sch/vol/x``
+        dispatch to the right concrete :class:`DatabricksPath` subclass
+        (DBFS / Volumes / Workspace), while a pre-built
+        :class:`~yggdrasil.path.Path` is returned verbatim so callers can
+        mix in S3 / HTTP / local paths without losing the workspace
+        binding.
+
+        Use this when you want the path resource itself — ``ls`` /
+        ``stat`` / ``write_table`` / child navigation — and :meth:`open`
+        when you want an :class:`IO` byte cursor. ``temporary`` and any
+        extra ``**kwargs`` ride straight through to
+        :meth:`DatabricksPath.from_`.
+        """
+        from yggdrasil.path import Path
+        from .path import DatabricksPath
+
+        if isinstance(path, Path):
+            return path
+        return DatabricksPath.from_(
+            obj=path, client=self, temporary=temporary, **kwargs,
+        )
 
     @staticmethod
     def _base_tmp_path(

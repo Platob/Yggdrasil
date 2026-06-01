@@ -90,6 +90,51 @@ class TestDatabricksClientOpen:
         )
 
 
+class TestDatabricksClientPath:
+    """:meth:`DatabricksClient.path` — the non-opening companion to
+    :meth:`open`: builds the bound path resource without opening it."""
+
+    def test_string_path_routes_through_databricks_path_from(self, client):
+        fake_path = MagicMock()
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+            return_value=fake_path,
+        ) as from_:
+            result = client.path("/Volumes/cat/sch/vol/x")
+        from_.assert_called_once_with(
+            obj="/Volumes/cat/sch/vol/x", client=client, temporary=False,
+        )
+        # The path is returned as-is — never opened.
+        fake_path.open.assert_not_called()
+        assert result is fake_path
+
+    def test_existing_path_returned_verbatim(self, client):
+        path = MagicMock(spec=VolumePath)
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+        ) as from_:
+            result = client.path(path)
+        from_.assert_not_called()
+        path.open.assert_not_called()
+        assert result is path
+
+    def test_temporary_and_kwargs_ride_through(self, client):
+        fake_path = MagicMock()
+        with patch(
+            "yggdrasil.databricks.path.DatabricksPath.from_",
+            return_value=fake_path,
+        ) as from_:
+            client.path(
+                "/Volumes/cat/sch/vol/x", temporary=True, service=None,
+            )
+        from_.assert_called_once_with(
+            obj="/Volumes/cat/sch/vol/x",
+            client=client,
+            temporary=True,
+            service=None,
+        )
+
+
 class TestDbfsPathDeprecation:
 
     def test_dbfs_path_emits_deprecation_warning(self, client):
