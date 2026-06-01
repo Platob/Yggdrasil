@@ -1,6 +1,7 @@
 """``ygg databricks table`` — table operations (async insert, …)."""
 from __future__ import annotations
 
+import argparse
 import sys
 from typing import Any
 
@@ -43,21 +44,31 @@ class TablesCommand:
         )
         ai.set_defaults(handler=cls._async_insert)
 
-        ex = sub.add_parser(
-            "execute_async_insert",
-            help="Run the async loader over pending op-logs (group by table, "
-                 "aggregate, load).",
-        )
-        ex.add_argument(
-            "--logs",
-            help="A log file or a logs directory to scan for pending op-logs.",
-        )
-        ex.add_argument(
-            "--log-file", dest="log_files", action="append", metavar="PATH",
-            help="An explicit op-log file to consume (repeatable); skips the "
-                 "directory scan.",
-        )
-        ex.set_defaults(handler=cls._execute_async_insert)
+        # ``execute_insert`` runs the loader over the dropped op-logs: scan the
+        # ``--logs`` folder, group by table into a ``DatabricksInsertBatch`` and
+        # let each batch execute itself. ``execute_async_insert`` is kept as a
+        # hidden alias so file-arrival jobs deployed under the old name keep
+        # firing.
+        for name in ("execute_insert", "execute_async_insert"):
+            ex = sub.add_parser(
+                name,
+                help=(
+                    "Run the loader over pending op-logs (group by table, "
+                    "aggregate, execute each batch)."
+                    if name == "execute_insert" else argparse.SUPPRESS
+                ),
+            )
+            ex.add_argument(
+                "--logs",
+                help="The logs folder to scan for pending op-logs (or a single "
+                     "log file).",
+            )
+            ex.add_argument(
+                "--log-file", dest="log_files", action="append", metavar="PATH",
+                help="An explicit op-log file to consume (repeatable); skips the "
+                     "directory scan.",
+            )
+            ex.set_defaults(handler=cls._execute_insert)
 
         parser.set_defaults(handler=lambda args, bc: parser.print_help() or 1)
 
@@ -89,11 +100,12 @@ class TablesCommand:
         return 0
 
     @classmethod
-    def _execute_async_insert(cls, args: Any, build_client: Any) -> int:
+    def _execute_insert(cls, args: Any, build_client: Any) -> int:
         from yggdrasil.databricks.table.insert import load_async
 
         client = build_client(args)
-        # Loader: the logs carry full metadata, so it only needs their path(s).
+        # Loader: the logs carry full metadata, so it only needs their path(s);
+        # load_async groups them per target into self-executing batches.
         n = load_async(
             client.tables, logs=args.logs, log_files=args.log_files or None, wait=True,
         )

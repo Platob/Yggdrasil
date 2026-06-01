@@ -27,7 +27,7 @@ The async drop pipeline on top of this:
   data was written** (its uniform URL) — no warehouse statement runs.
 - A **file-arrival trigger** on ``logs/`` wakes a serverless job
   (:func:`ensure_async_job`) whose entry point runs
-  ``ygg databricks table execute_async_insert --logs <dir>`` → :func:`load_async`:
+  ``ygg databricks table execute_insert --logs <dir>`` → :func:`load_async`:
   read every pending log, group by **target table** into a
   :class:`DatabricksInsertBatch`, run one aggregated load per target, then
   clear the consumed logs + data.
@@ -1392,13 +1392,13 @@ def load_async(
 
     Each log carries the full metadata, so the loader parses each into a
     :class:`DatabricksTableInsert`, groups by **target table** into a
-    :class:`DatabricksInsertBatch`, runs one aggregated load per target via
-    the target table's ``insert_into`` (the batch renders one ``UNION ALL``
-    body — deduplicated when keyed), then clears the consumed logs + data.
+    :class:`DatabricksInsertBatch`, and lets each batch execute itself
+    (:meth:`DatabricksInsertBatch.execute` — one ``UNION ALL`` body per
+    target, deduplicated when keyed), then clears the consumed logs + data.
     Returns the number of operations processed.
 
     The loader behind the file-arrival job and the ``ygg databricks table
-    execute_async_insert`` CLI. *tables* is the :class:`Tables` service.
+    execute_insert`` CLI. *tables* is the :class:`Tables` service.
     """
     from yggdrasil.databricks.path import DatabricksPath
 
@@ -1435,9 +1435,9 @@ def load_async(
 
 
 def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> int:
-    """Group parsed ops by target into a :class:`DatabricksInsertBatch` and load
-    each through the target's ``insert_into`` (one aggregated body per target),
-    clearing the consumed logs + data afterward. Returns the op count."""
+    """Group parsed ops by target into a :class:`DatabricksInsertBatch` and let
+    each batch execute itself (one aggregated body per target), clearing the
+    consumed logs + data afterward. Returns the op count."""
     client = tables.client
     batches = DatabricksInsertBatch.group(ops)
     if not batches:
@@ -1483,8 +1483,8 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
     Creates the watched ``logs/`` dir, builds + uploads the full ygg wheel
     (:func:`~yggdrasil.databricks.job.wheel.ensure_ygg_wheel`), and upserts a
     serverless job whose single python-wheel task runs ``ygg databricks table
-    execute_async_insert --logs <dir>`` when a log lands. Any stale job
-    watching the same logs dir is pruned so a single job owns the trigger.
+    execute_insert --logs <dir>`` when a log lands. Any stale job watching the
+    same logs dir is pruned so a single job owns the trigger.
     """
     from databricks.sdk.service.compute import Environment
     from databricks.sdk.service.jobs import (
@@ -1519,11 +1519,11 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
                 environment_key="default",
                 python_wheel_task=PythonWheelTask(
                     # Run the ygg CLI on the cluster:
-                    #   ygg databricks table execute_async_insert --logs <dir>
+                    #   ygg databricks table execute_insert --logs <dir>
                     package_name="ygg",
                     entry_point="ygg",
                     parameters=[
-                        "databricks", "table", "execute_async_insert",
+                        "databricks", "table", "execute_insert",
                         "--logs", logs.full_path(),
                     ],
                 ),
