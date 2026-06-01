@@ -618,11 +618,13 @@ class TestLogicalResourceByteOpsRaise:
 
 
 class TestSingletonIdentityThroughDispatcher:
-    """Repeated dispatch on the same POSIX seed must collapse onto the
-    same singleton — every caller in the process should share the
-    cached resource state."""
+    """A leaf *file* path is no longer singleton-cached: repeated
+    dispatch on the same POSIX seed mints distinct-but-equal instances
+    (each with its own stat cache, so a delete/mutation seen through one
+    isn't masked by a sibling). The heavyweight *resources* — a Unity
+    Catalog ``Volume`` — still collapse onto one shared singleton."""
 
-    def test_same_volume_path_collapses(self, volumes_service):
+    def test_same_volume_path_distinct_but_equal(self, volumes_service):
         a = DatabricksPath(
             "/Volumes/main/sales/raw/x.parquet",
             service=volumes_service,
@@ -631,7 +633,8 @@ class TestSingletonIdentityThroughDispatcher:
             "/Volumes/main/sales/raw/x.parquet",
             service=volumes_service,
         )
-        assert a is b
+        assert a is not b
+        assert a == b
 
     def test_same_volume_collapses_via_service(self, client):
         # The dispatcher entry point for ``Volume`` is constrained by
@@ -649,15 +652,16 @@ class TestSingletonIdentityThroughDispatcher:
 
     def test_url_form_and_posix_form_collapse(self, volumes_service):
         # The dispatcher normalizes ``/Volumes/cat/sch/vol/x`` to
-        # ``dbfs+volume:///cat/sch/vol/x`` before keying the singleton
-        # cache, so both spellings should land on the same instance.
+        # ``dbfs+volume:///cat/sch/vol/x`` before keying, so both
+        # spellings share one singleton key and compare equal — even
+        # though leaf paths are no longer interned to one instance.
         a = DatabricksPath(
             "/Volumes/main/sales/raw/x", service=volumes_service,
         )
         b = DatabricksPath(
             "dbfs+volume:///main/sales/raw/x", service=volumes_service,
         )
-        assert a is b
+        assert a == b
 
 
 # ===========================================================================
@@ -1102,9 +1106,10 @@ class TestVolumePathNavigationStillWorks:
             schema_name="sales",
             volume_name="raw",
         )
-        # ``vol / "x/y.parquet"`` and ``vol.path("x/y.parquet")`` are the
-        # same VolumePath singleton.
-        assert (vol / "x/y.parquet") is vol.path("x/y.parquet")
+        # ``vol / "x/y.parquet"`` and ``vol.path("x/y.parquet")`` address
+        # the same VolumePath — equal by value (leaf paths aren't interned
+        # to one instance).
+        assert (vol / "x/y.parquet") == vol.path("x/y.parquet")
 
     def test_with_name_and_suffix_on_volume_path(self, volumes_service):
         vp = VolumePath(
@@ -1233,11 +1238,13 @@ class TestBuildFromExploreUrl:
         assert isinstance(sch, UCSchema)
         assert (sch.catalog_name, sch.schema_name) == ("main", "sales")
 
-    def test_explore_url_and_posix_collapse_to_same_singleton(
+    def test_explore_url_and_posix_collapse_to_same_key(
         self, volumes_service,
     ):
         # The two spellings of one file address the same VolumePath — the
-        # explore link drops its host so the canonical URL key matches.
+        # explore link drops its host so the canonical URL key matches, so
+        # the paths compare equal (leaf paths aren't interned to one
+        # instance).
         a = VolumePath(
             "/Volumes/main/sales/raw/dir/file.parquet", service=volumes_service,
         )
@@ -1246,7 +1253,7 @@ class TestBuildFromExploreUrl:
             "?volumePath=/Volumes/main/sales/raw/dir/file.parquet",
             service=volumes_service,
         )
-        assert a is b
+        assert a == b
 
     def test_volume_path_explore_url_round_trips(self, volumes_service):
         # A VolumePath's own ``explore_url`` rebuilds the same path.

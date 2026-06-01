@@ -456,14 +456,17 @@ class DatabricksPath(RemotePath, DatabricksResource):
     :class:`VolumePath`, ``/Workspace/...`` → :class:`WorkspacePath`,
     everything else → :class:`DBFSPath`).
 
-    Singleton identity caching uses the 1-minute default TTL via a
-    PER-CLASS ``_INSTANCES`` cache so a hot ``DatabricksPath(...)``
-    race never contends on the same lock as a hot ``S3Path(...)`` /
-    ``HTTPPath(...)`` construction. Concrete subclasses
-    (:class:`DBFSPath`, :class:`VolumePath`, :class:`WorkspacePath`)
-    declare their own ``_INSTANCES`` on top, partitioning further so
-    a volumes-heavy workload doesn't slow down DBFS or workspace
-    listings.
+    Like every leaf :class:`RemotePath`, Databricks file paths are
+    **not** singleton-cached (``_SINGLETON_TTL = ...`` inherited): the
+    workspace client lives on the shared :class:`DatabricksClient`
+    singleton, so a path is a cheap redirector and two callers asking
+    for the same URL get independent stat caches — a delete or
+    external change seen through one never hides behind a sibling's
+    stale snapshot. The per-class ``_INSTANCES`` dict is retained only
+    so an explicit ``singleton_ttl=`` / :meth:`to_singleton` opt-in
+    partitions away from a hot ``S3Path`` / ``HTTPPath`` construction.
+    The Unity Catalog *resources* (``UCCatalog`` / ``UCSchema`` /
+    ``Volume``) keep their own process-lifetime singleton identity.
     """
 
     scheme: ClassVar[Scheme] = Scheme.DBFS
