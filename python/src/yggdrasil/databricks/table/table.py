@@ -3359,8 +3359,9 @@ class Table(DatabricksPath):
 
         Builds + uploads the full ygg wheel and upserts a serverless job that
         watches ``.sql/async/logs`` and aggregates the operation logs
-        :meth:`async_insert` drops into one ``INSERT`` per ``(target, mode)``
-        group. See :func:`~yggdrasil.databricks.table.async_job.ensure_async_job`.
+        :meth:`async_insert` drops into one ``INSERT`` per target (an
+        OVERWRITE supersedes everything staged before it).
+        See :func:`~yggdrasil.databricks.table.async_job.ensure_async_job`.
         """
         from yggdrasil.databricks.table.async_job import ensure_async_job
 
@@ -3404,8 +3405,9 @@ class Table(DatabricksPath):
         """Loader side of :meth:`async_insert` — load *data* into the table now.
 
         Synchronous :meth:`insert_into`. The file-arrival loader
-        (:meth:`Tables.async_insert`) calls this per ``(target, mode)`` group
-        with the aggregated ``UNION ALL`` query over the staged Parquet.
+        (:meth:`Tables.async_insert`) calls this once per target with the
+        :class:`~yggdrasil.databricks.table.async_job.DatabricksInsertBatch`'s
+        aggregated ``UNION ALL`` query over the staged Parquet.
         """
         return self.insert_into(
             data, mode=mode, match_by=match_by,

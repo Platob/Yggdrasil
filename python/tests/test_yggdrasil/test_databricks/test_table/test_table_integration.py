@@ -685,7 +685,9 @@ class TestTableAsyncInsertIntegration(_TableFixture):
         self.table.insert(_sample_data().slice(0, 0), mode=Mode.OVERWRITE)
 
     def test_async_drop_then_loader_appends(self) -> None:
-        from yggdrasil.databricks.table.async_job import AsyncInsert, logs_path
+        from yggdrasil.databricks.table.async_job import (
+            DatabricksTableInsert, logs_path,
+        )
 
         try:
             log_path = self.table.async_insert(_sample_data(), mode=Mode.APPEND)
@@ -693,9 +695,9 @@ class TestTableAsyncInsertIntegration(_TableFixture):
             self._skip(exc, "async insert needs volume write access")
 
         self.assertTrue(log_path.exists())
-        op = AsyncInsert.from_log(log_path)
+        op = DatabricksTableInsert.from_log(log_path)
         self.assertEqual(op.target, self.table.full_name())
-        self.assertEqual(op.mode, "append")
+        self.assertEqual(op.mode, Mode.APPEND)
         # the staged Parquet lives exactly where the log's uniform URL says
         data_path = op.data_path(self.table.client)
         self.assertTrue(data_path.exists())

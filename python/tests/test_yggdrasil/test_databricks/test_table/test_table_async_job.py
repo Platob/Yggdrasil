@@ -57,31 +57,110 @@ class TestInsertRouting:
 
 
 # --------------------------------------------------------------------------- #
-# AsyncInsert dataclass — parsing / serialization / validation
+# DatabricksTableInsert — parsing / serialization / validation / SQL
 # --------------------------------------------------------------------------- #
-class TestAsyncInsertRecord:
+class TestDatabricksTableInsert:
     def test_round_trips_through_the_log(self):
-        from yggdrasil.databricks.table.async_job import AsyncInsert
-        op = AsyncInsert(target="c.s.t", mode="append", data="dbfs+volume:/x.parquet")
+        from yggdrasil.databricks.table.async_job import DatabricksTableInsert
+        from yggdrasil.enums.mode import Mode
+        op = DatabricksTableInsert(
+            target="c.s.t", mode="append", data="dbfs+volume:/x.parquet",
+        )
         log = MagicMock()
         log.read_bytes.return_value = op.to_json()
-        parsed = AsyncInsert.from_log(log)
-        assert (parsed.target, parsed.mode, parsed.data) == ("c.s.t", "append", "dbfs+volume:/x.parquet")
+        parsed = DatabricksTableInsert.from_log(log)
+        # mode is the typed enum; target / data keep their serialized form
+        assert parsed.target == "c.s.t"
+        assert parsed.mode is Mode.APPEND
+        assert parsed.data == "dbfs+volume:/x.parquet"
         assert parsed.op_id == op.op_id and parsed.ts == op.ts
         assert parsed.log_file is log            # keeps the file for cleanup
-        assert parsed.group_key == ("c.s.t", "append")
+        assert parsed.group_key == "c.s.t"       # one INSERT per target
+
+    def test_to_json_normalizes_typed_fields(self):
+        # A producer-built op holds typed Table / Mode / Path; to_json emits
+        # the string op-log form the loader reads back.
+        from yggdrasil.databricks.table.async_job import DatabricksTableInsert
+        target = MagicMock()
+        target.full_name.return_value = "c.s.t"
+        data = MagicMock()
+        data.to_url.return_value.to_string.return_value = "dbfs+volume:/x.parquet"
+        payload = json.loads(
+            DatabricksTableInsert(target=target, mode="overwrite", data=data).to_json()
+        )
+        assert payload["target"] == "c.s.t"
+        assert payload["mode"] == "overwrite"
+        assert payload["data"] == "dbfs+volume:/x.parquet"
 
     def test_rejects_bad_mode(self):
-        from yggdrasil.databricks.table.async_job import AsyncInsert
+        from yggdrasil.databricks.table.async_job import DatabricksTableInsert
         with pytest.raises(ValueError, match="OVERWRITE / APPEND"):
-            AsyncInsert(target="c.s.t", mode="merge", data="dbfs+volume:/x.parquet")
+            DatabricksTableInsert(target="c.s.t", mode="merge", data="dbfs+volume:/x.parquet")
 
     def test_data_path_reconstructs_from_uniform_url(self):
-        from yggdrasil.databricks.table.async_job import AsyncInsert
-        op = AsyncInsert(target="c.s.t", mode="append", data="dbfs+volume:/x.parquet")
+        from yggdrasil.databricks.table.async_job import DatabricksTableInsert
+        op = DatabricksTableInsert(target="c.s.t", mode="append", data="dbfs+volume:/x.parquet")
         with patch("yggdrasil.databricks.path.DatabricksPath.from_") as dp:
             op.data_path(client="CL")
         dp.assert_called_once_with("dbfs+volume:/x.parquet", client="CL")
+
+    def test_select_sql_renders_warehouse_parquet_ref(self):
+        # The op is the single place a staged file's SELECT is generated.
+        from yggdrasil.databricks.table.async_job import DatabricksTableInsert
+        op = DatabricksTableInsert(target="c.s.t", mode="append", data="dbfs+volume:/c/s/t/x.parquet")
+        path = MagicMock()
+        path.full_path.return_value = "/Volumes/c/s/t/x.parquet"
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_", return_value=path):
+            sql = op.select_sql(client="CL")
+        assert sql == "SELECT * FROM parquet.`/Volumes/c/s/t/x.parquet`"
+
+
+# --------------------------------------------------------------------------- #
+# DatabricksInsertBatch — grouping / OVERWRITE supersede / aggregated SQL
+# --------------------------------------------------------------------------- #
+class TestDatabricksInsertBatch:
+    @staticmethod
+    def _op(data, *, mode="append", ts=0.0, target="c.s.t"):
+        from yggdrasil.databricks.table.async_job import DatabricksTableInsert
+        op = DatabricksTableInsert(target=target, mode=mode, data=data, ts=ts)
+        # render select_sql without touching DatabricksPath
+        op.select_sql = lambda client=None, _d=data: f"SELECT * FROM parquet.`{_d}`"  # type: ignore
+        return op
+
+    def test_groups_by_target(self):
+        from yggdrasil.databricks.table.async_job import DatabricksInsertBatch
+        ops = [self._op("a", target="c.s.t1"), self._op("b", target="c.s.t2"),
+               self._op("c", target="c.s.t1")]
+        batches = {b.logs[0].target_name: b for b in DatabricksInsertBatch.group(ops)}
+        assert set(batches) == {"c.s.t1", "c.s.t2"}
+        assert len(batches["c.s.t1"].logs) == 2
+
+    def test_appends_union_in_ts_order(self):
+        from yggdrasil.databricks.table.async_job import DatabricksInsertBatch
+        from yggdrasil.enums.mode import Mode
+        [batch] = DatabricksInsertBatch.group(
+            [self._op("b", ts=2.0), self._op("a", ts=1.0)]
+        )
+        assert batch.mode is Mode.APPEND
+        assert batch.make_sql() == (
+            "SELECT * FROM parquet.`a` UNION ALL SELECT * FROM parquet.`b`"
+        )
+
+    def test_overwrite_supersedes_earlier_ops_but_keeps_them_for_cleanup(self):
+        from yggdrasil.databricks.table.async_job import DatabricksInsertBatch
+        from yggdrasil.enums.mode import Mode
+        [batch] = DatabricksInsertBatch.group([
+            self._op("a", mode="append", ts=1.0),
+            self._op("b", mode="overwrite", ts=2.0),
+            self._op("c", mode="append", ts=3.0),
+        ])
+        # OVERWRITE wins → mode is OVERWRITE; only b + c feed the load …
+        assert batch.mode is Mode.OVERWRITE
+        assert batch.make_sql() == (
+            "SELECT * FROM parquet.`b` UNION ALL SELECT * FROM parquet.`c`"
+        )
+        # … but the superseded 'a' is still tracked so its data gets cleaned up
+        assert len(batch.logs) == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -304,17 +383,29 @@ class TestTablesAsyncInsertLoader:
         data_paths["dbfs+volume:/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
         data_paths["dbfs+volume:/c/s/t/.sql/tmp/b.parquet"].unlink.assert_called_once()
 
-    def test_splits_by_mode(self):
+    def test_overwrite_supersedes_earlier_append_for_same_target(self):
+        # append then overwrite for one target → a single OVERWRITE load (the
+        # overwrite wins); both logs + data are still consumed.
         from yggdrasil.databricks.table.tables import Tables
         svc = _service()
-        logs = _logs_dir(_log("a", mode="append"), _log("b", mode="overwrite"))
+        logs = _logs_dir(
+            _log("a", mode="append"), _log("b", mode="overwrite"),
+        )
         target = MagicMock()
+        from_fn, data_paths = _fake_databricks_from()
         with patch.object(Tables, "__getitem__", return_value=target), \
-             patch("yggdrasil.databricks.path.DatabricksPath.from_"):
-            processed = svc.async_insert(logs)
+             patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
+            processed = svc.async_insert(logs, wait=False)
         assert processed == 2
-        modes = {c.kwargs["mode"] for c in target.execute_async_insert.call_args_list}
-        assert modes == {"append", "overwrite"}      # one INSERT per mode
+        # one INSERT for the target, in OVERWRITE mode over the overwrite's data
+        target.execute_async_insert.assert_called_once()
+        sql = target.execute_async_insert.call_args.args[0]
+        assert target.execute_async_insert.call_args.kwargs["mode"] == "overwrite"
+        assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in sql
+        assert "a.parquet" not in sql            # superseded — not in the load
+        # both consumed logs + data cleaned up (incl. the superseded one)
+        data_paths["dbfs+volume:/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
+        data_paths["dbfs+volume:/c/s/t/.sql/tmp/b.parquet"].unlink.assert_called_once()
 
     def test_groups_by_target_table_from_logs(self):
         # logs name their own target — the loader resolves each, no table arg.
@@ -367,16 +458,16 @@ class TestTablesAsyncInsertLoader:
         log_b.unlink.assert_called_once()
 
     def test_dispatch_async_groups_preparsed_ops(self):
-        # dispatch_async takes already-parsed AsyncInsert ops directly.
+        # dispatch_async takes already-parsed DatabricksTableInsert ops directly.
         from yggdrasil.databricks.table.tables import Tables
-        from yggdrasil.databricks.table.async_job import AsyncInsert
+        from yggdrasil.databricks.table.async_job import DatabricksTableInsert
         svc = _service()
         log_a, log_b = MagicMock(), MagicMock()
         ops = [
-            AsyncInsert(target="c.s.t", mode="append",
-                        data="dbfs+volume:/c/s/t/.sql/tmp/a.parquet", log_file=log_a),
-            AsyncInsert(target="c.s.t", mode="append",
-                        data="dbfs+volume:/c/s/t/.sql/tmp/b.parquet", log_file=log_b),
+            DatabricksTableInsert(target="c.s.t", mode="append",
+                                  data="dbfs+volume:/c/s/t/.sql/tmp/a.parquet", log_file=log_a),
+            DatabricksTableInsert(target="c.s.t", mode="append",
+                                  data="dbfs+volume:/c/s/t/.sql/tmp/b.parquet", log_file=log_b),
         ]
         target = MagicMock()
         from_fn, _ = _fake_databricks_from()

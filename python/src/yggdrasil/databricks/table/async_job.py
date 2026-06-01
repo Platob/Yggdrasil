@@ -10,8 +10,15 @@ into a *drop-and-aggregate* pipeline:
 - A **file-arrival trigger** on the ``logs/`` directory wakes a deployed
   serverless job whose Python entry point (``ygg databricks table
   execute_async_insert --logs <dir>``) drives :meth:`Tables.async_insert`:
-  read every pending log, group by ``(target table, mode)``, run one
-  aggregated ``INSERT`` per group, then clear the consumed logs + data.
+  read every pending log, group by **target table**, run one aggregated
+  ``INSERT`` per target, then clear the consumed logs + data.
+
+The INSERT statement is generated in one place: :class:`DatabricksTableInsert`
+renders the per-file ``SELECT`` for a single staged Parquet and
+:class:`DatabricksInsertBatch` aggregates a target's ops into one
+``SELECT … UNION ALL …`` body (with OVERWRITE superseding everything staged
+before it). The loader hands that body straight to
+:meth:`Table.execute_async_insert`.
 
 Only ``OVERWRITE`` and ``APPEND`` (no ``match_by``) are supported for now.
 
@@ -28,8 +35,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from yggdrasil.enums.mode import Mode
+from yggdrasil.path import Path
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.fs.volume_path import VolumePath
     from yggdrasil.databricks.table.table import Table
 
@@ -38,7 +47,8 @@ __all__ = [
     "LOGS_SUBDIR",
     "ASYNC_MODES",
     "BUFFER_SECONDS",
-    "AsyncInsert",
+    "DatabricksTableInsert",
+    "DatabricksInsertBatch",
     "stage_async_insert",
     "job_name",
     "logs_path",
@@ -71,63 +81,171 @@ def _new_op_id() -> str:
 
 
 @dataclass
-class AsyncInsert:
-    """One async-insert operation — the typed content of an op-log.
+class DatabricksTableInsert:
+    """One async-insert operation — the typed content of an op-log, and the
+    single place that renders the per-file ``SELECT``.
 
-    Carries everything the loader needs: the ``target`` table (full name), the
-    ``mode``, and the staged ``data``'s **uniform URL**. Owns the op-log
-    schema — :meth:`from_log` parses a dropped log and :meth:`to_json`
-    serializes one — so the producer and loader share one safe type instead of
-    ad-hoc dicts / positional tuples.
+    Carries everything the loader needs: the ``target`` table, the ``mode``,
+    and the staged ``data`` location (a uniform URL on disk, a :class:`Path`
+    once read back). Owns the op-log schema — :meth:`from_log` parses a dropped
+    log and :meth:`to_json` serializes one — and :meth:`select_sql` renders the
+    warehouse-facing ``SELECT * FROM parquet.`<path>``` for this op so producer,
+    loader, and SQL all share one safe type instead of ad-hoc dicts / strings.
+
+    ``target`` may be a :class:`Table` or its full name; ``data`` may be a
+    :class:`Path` or a uniform-URL string — both are normalized lazily through
+    the bound :attr:`client` when a concrete object is needed.
     """
 
-    target: str
-    mode: str
-    data: str
+    target: "Table | str"
+    mode: Mode
+    data: "Path | str"
+    client: "DatabricksClient | None" = None
     op_id: str = field(default_factory=_new_op_id)
     ts: float = field(default_factory=time.time)
     #: the on-disk op-log (set when read back) — cleaned up after a load.
-    log_file: Any = None
+    log_file: "Path | None" = None
 
     def __post_init__(self) -> None:
-        if Mode.from_(self.mode, default=Mode.APPEND) not in ASYNC_MODES:
+        self.mode = Mode.from_(self.mode, default=Mode.APPEND)
+        if self.mode not in ASYNC_MODES:
             raise ValueError(
-                f"async insert supports only OVERWRITE / APPEND, got {self.mode!r}"
+                f"async insert supports only OVERWRITE / APPEND, got {self.mode.name}"
             )
 
+    # -- construction ---------------------------------------------------------
+
     @classmethod
-    def from_log(cls, log_file: Any) -> "AsyncInsert":
-        """Parse an op-log file into an :class:`AsyncInsert` (keeps *log_file*)."""
-        r = json.loads(bytes(log_file.read_bytes()))
+    def from_log(cls, log_file: Any, *, client: Any = None) -> "DatabricksTableInsert":
+        """Parse an op-log file into an op (keeps *log_file* for cleanup)."""
+        mapping = json.loads(bytes(log_file.read_bytes()))
+        op = cls.from_json(mapping, client=client)
+        op.log_file = log_file
+        return op
+
+    @classmethod
+    def from_json(cls, mapping: dict, *, client: Any = None) -> "DatabricksTableInsert":
+        """Rebuild an op from its serialized op-log payload."""
         return cls(
-            target=r["target"],
-            mode=r["mode"],
-            data=r["data"],
-            op_id=r.get("op_id") or _new_op_id(),
-            ts=r.get("ts") or time.time(),
-            log_file=log_file,
+            target=mapping["target"],
+            mode=Mode.from_(mapping["mode"]),
+            data=mapping["data"],
+            client=client,
+            op_id=mapping.get("op_id") or _new_op_id(),
+            ts=mapping.get("ts") or time.time(),
         )
 
     def to_json(self) -> bytes:
         """Serialize to the JSON op-log payload."""
         return json.dumps({
             "op_id": self.op_id,
-            "target": self.target,
-            "mode": self.mode,
-            "data": self.data,
+            "target": self.target_name,
+            "mode": self.mode.name.lower(),
+            "data": self.data_url,
             "ts": self.ts,
         }).encode()
 
-    @property
-    def group_key(self) -> "tuple[str, str]":
-        """``(target, mode)`` — the loader aggregates one ``INSERT`` per group."""
-        return (self.target, self.mode)
+    # -- normalized views -----------------------------------------------------
 
-    def data_path(self, client: Any) -> Any:
-        """Reconstruct the staged-data :class:`Path` from its uniform URL."""
+    @property
+    def target_name(self) -> str:
+        """``catalog.schema.table`` — the grouping key and log ``target``."""
+        full_name = getattr(self.target, "full_name", None)
+        return full_name() if callable(full_name) else str(self.target)
+
+    @property
+    def data_url(self) -> str:
+        """The staged data's uniform URL (round-trippable, location-agnostic)."""
+        to_url = getattr(self.data, "to_url", None)
+        return to_url().to_string() if callable(to_url) else str(self.data)
+
+    @property
+    def group_key(self) -> str:
+        """The target a batch aggregates over — one ``INSERT`` per target."""
+        return self.target_name
+
+    def data_path(self, client: Any = None) -> "Path":
+        """Resolve the staged data to a concrete :class:`Path`.
+
+        Already a :class:`Path` → returned as-is; a uniform-URL string →
+        reconstructed through the bound (or supplied) client so the loader can
+        read / clean it up wherever it landed.
+        """
+        if isinstance(self.data, Path):
+            return self.data
         from yggdrasil.databricks.path import DatabricksPath
 
-        return DatabricksPath.from_(self.data, client=client)
+        return DatabricksPath.from_(self.data, client=client or self.client)
+
+    def select_sql(self, client: Any = None) -> str:
+        """The warehouse-facing ``SELECT`` over this op's staged Parquet.
+
+        The single source of truth for how one staged file enters the
+        aggregated load — ``SELECT * FROM parquet.`<warehouse path>```.
+        """
+        path = self.data_path(client)
+        full_path = getattr(path, "full_path", None)
+        ref = full_path() if callable(full_path) else str(self.data)
+        return f"SELECT * FROM parquet.`{ref}`"
+
+
+@dataclass
+class DatabricksInsertBatch:
+    """All async ops staged for one ``target`` — aggregated into a single INSERT.
+
+    Groups a target's :class:`DatabricksTableInsert` ops and centralizes the
+    statement generation: :meth:`make_sql` renders the ``SELECT … UNION ALL …``
+    body, and :attr:`mode` is ``OVERWRITE`` when any retained op overwrites
+    (an OVERWRITE supersedes everything staged before it), else ``APPEND``.
+    Every consumed op is retained on :attr:`logs` so the loader can clean up
+    superseded data too.
+    """
+
+    target: "Table"
+    logs: "list[DatabricksTableInsert]" = field(default_factory=list)
+
+    def append(self, op: "DatabricksTableInsert") -> "DatabricksInsertBatch":
+        self.logs.append(op)
+        return self
+
+    @property
+    def mode(self) -> Mode:
+        """``OVERWRITE`` if any op overwrites, else ``APPEND``."""
+        return (
+            Mode.OVERWRITE
+            if any(op.mode is Mode.OVERWRITE for op in self.logs)
+            else Mode.APPEND
+        )
+
+    @property
+    def active(self) -> "list[DatabricksTableInsert]":
+        """The ops that actually feed the INSERT, in timestamp order.
+
+        Everything from the latest OVERWRITE onward — earlier ops are
+        superseded by it (but still tracked on :attr:`logs` for cleanup).
+        """
+        ordered = sorted(self.logs, key=lambda op: op.ts)
+        cut = 0
+        for i, op in enumerate(ordered):
+            if op.mode is Mode.OVERWRITE:
+                cut = i
+        return ordered[cut:]
+
+    def make_sql(self, client: Any = None) -> str:
+        """The aggregated source body: one ``SELECT`` per active op, UNION'd."""
+        return " UNION ALL ".join(op.select_sql(client) for op in self.active)
+
+    @classmethod
+    def group(
+        cls, ops: "Iterable[DatabricksTableInsert]",
+    ) -> "list[DatabricksInsertBatch]":
+        """Group *ops* by target into one batch each."""
+        grouped: "dict[str, DatabricksInsertBatch]" = {}
+        for op in ops:
+            grouped.setdefault(
+                op.group_key, cls(target=op.target),
+            ).append(op)
+        return list(grouped.values())
 
 
 def job_name(table: "Table") -> str:
@@ -155,7 +273,7 @@ def stage_async_insert(
     match_by: "list[str] | None" = None,
     cast_options: Any = None,
 ) -> "VolumePath":
-    """Stage *data* as Parquet + drop an :class:`AsyncInsert` op-log — no warehouse.
+    """Stage *data* as Parquet + drop a :class:`DatabricksTableInsert` op-log.
 
     The producer behind :meth:`Table.async_insert`: write the rows to the
     table's default tmp staging path and drop a JSON op-log under
@@ -181,10 +299,11 @@ def stage_async_insert(
     data_file = table.insert_volume_path(table, temporary=False)
     data_file.write_table(data, cast_options, mode=Mode.OVERWRITE)
 
-    op = AsyncInsert(
-        target=table.full_name(),
-        mode=mode_enum.name.lower(),
-        data=data_file.to_url().to_string(),
+    op = DatabricksTableInsert(
+        target=table,
+        mode=mode_enum,
+        data=data_file,
+        client=table.client,
     )
     log_file = logs_path(table) / f"{op.op_id}.json"
     log_file.write_bytes(op.to_json())
