@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -55,6 +56,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.databricks.fs.volume_path import VolumePath
     from yggdrasil.databricks.table.table import Table
     from yggdrasil.execution.expr import Predicate
+    from yggdrasil.io.tabular.base import Tabular
 
 __all__ = [
     "ASYNC_ROOT",
@@ -99,6 +101,13 @@ _NAME_PREFIX = "[YGG][ASYNC]"
 #: substituted for the concrete external-data ``VolumePath`` at prepare time.
 ALIAS_TMPSRC = "__tmpsrc__"
 
+#: Schema (under the *target's* catalog) where a Spark-frame ``data`` source is
+#: staged as a temporary Delta table before its URL is recorded in the op-log.
+#: ``None`` (the default) stages alongside the target — same catalog *and*
+#: schema, just a temp table name; set ``YGG_DATABRICKS_STAGING_SCHEMA`` to
+#: route staging into a dedicated schema in the same catalog.
+STAGING_SCHEMA: "str | None" = os.getenv("YGG_DATABRICKS_STAGING_SCHEMA") or None
+
 
 def _new_op_id() -> str:
     return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
@@ -122,14 +131,28 @@ class DatabricksTableInsert:
     string for human inspection but isn't reconstructed (there's no SQL→AST
     parser, and the async drop path never carries one anyway).
 
-    ``target`` may be a :class:`Table` or its full name; ``data`` may be a
-    :class:`Path` or a uniform-URL string — both are normalized lazily through
-    the bound :attr:`client` when a concrete object is needed.
+    ``target`` may be a :class:`Table` or its full name; ``data`` is any
+    :class:`Tabular` source (a Spark frame, an S3 / Volume :class:`Path`, an
+    Arrow / pandas table, a local path, …) or a uniform-URL string. It is
+    materialised to a durable, loader-readable URL lazily — on the first
+    :attr:`data_url` read (i.e. when the op is serialized to its log) —
+    dispatching on the source type:
+
+    * **Spark frame** → staged into a temporary Delta table in the target's
+      catalog (under :data:`STAGING_SCHEMA`, default the target's own schema)
+      with a temp name; the log points at that table's URL.
+    * **S3 / Volume path** → already a durable cloud location; its URL is kept
+      as-is (the common producer path — :func:`stage_async_insert` pre-stages
+      to a Volume).
+    * **anything else** (Arrow / pandas / a local or in-memory path) → dumped
+      to the target's staging Volume as Parquet; the log points at the file.
+
+    The materialised URL is cached, so serializing twice writes once.
     """
 
     target: "Table | str"
     mode: Mode
-    data: "Path | str"
+    data: "Tabular | Path | str"
     client: "DatabricksClient | None" = None
     op_id: str = field(default_factory=_new_op_id)
     ts: float = field(default_factory=time.time)
@@ -150,6 +173,9 @@ class DatabricksTableInsert:
     safe_merge: bool = False
 
     def __post_init__(self) -> None:
+        # Cache for the materialised data URL — populated on the first
+        # :attr:`data_url` read so a spark-stage / volume-dump runs once.
+        self._data_url_cache: "str | None" = None
         self.mode = Mode.from_(self.mode, default=Mode.APPEND)
         # The drop pipeline only knows how to aggregate OVERWRITE / APPEND;
         # the keyed modes have no UNION-ALL story. The synchronous path
@@ -239,9 +265,107 @@ class DatabricksTableInsert:
 
     @property
     def data_url(self) -> str:
-        """The staged data's uniform URL (round-trippable, location-agnostic)."""
-        to_url = getattr(self.data, "to_url", None)
-        return to_url().to_string() if callable(to_url) else str(self.data)
+        """The staged data's uniform URL (round-trippable, location-agnostic).
+
+        Materialises :attr:`data` on first read, dispatching on its type —
+        see the class docstring. The result is cached so a Spark stage /
+        Volume dump runs at most once per op.
+        """
+        if self._data_url_cache is None:
+            self._data_url_cache = self._resolve_data_url()
+        return self._data_url_cache
+
+    @staticmethod
+    def _url_string(obj: Any) -> str:
+        to_url = getattr(obj, "to_url", None)
+        return to_url().to_string() if callable(to_url) else str(obj)
+
+    def _resolve_data_url(self) -> str:
+        """Materialise :attr:`data` to a durable, loader-readable URL.
+
+        Dispatches on the source type (Spark → temp table, S3 / Volume path →
+        keep, else → dump to the target's staging Volume). See the class
+        docstring for the rationale.
+        """
+        data = self.data
+        # Already a serialized URL string — nothing to stage.
+        if isinstance(data, str):
+            return data
+
+        from yggdrasil.io.tabular.base import Tabular
+
+        # Spark frame: can't be serialized — stage it as a temp Delta table
+        # in the target's catalog and point the log at the table. Gated on a
+        # real :class:`Tabular` so a plain object never misfires the
+        # ``_native_spark_frame`` probe.
+        if isinstance(data, Tabular) and data._native_spark_frame() is not None:
+            return self._url_string(self._stage_spark_table(data))
+
+        # S3 / Volume path: already a durable cloud location the loader reads
+        # directly — keep its URL as-is.
+        from yggdrasil.aws.fs.path import S3Path
+        from yggdrasil.databricks.fs.volume_path import VolumePath
+
+        if isinstance(data, (S3Path, VolumePath)):
+            return self._url_string(data)
+
+        # Anything else (Arrow / pandas / a local or in-memory path): dump to
+        # the target's staging Volume as Parquet, point the log at the file.
+        return self._url_string(self._dump_to_volume(data))
+
+    def _target_table(self) -> "Table":
+        """The :class:`Table` to stage against — materialisation needs its
+        catalog / staging Volume.
+
+        The producer always constructs the op with the bound :class:`Table`;
+        a bare-string ``target`` (the shape an op-log round-trips to) carries
+        no client-resolvable staging surface, so a non-string ``data`` source
+        on such an op is unsupported.
+        """
+        target = self.target
+        if hasattr(target, "staging_volume") and hasattr(target, "catalog_name"):
+            return target  # a Table
+        raise TypeError(
+            "Staging a non-string `data` source needs a Table `target` "
+            f"(got {type(target).__name__!r}); build the op with the bound "
+            "Table so its catalog / staging volume can be reached."
+        )
+
+    def _stage_spark_table(self, data: Any) -> "Table":
+        """Stage a Spark *data* frame into a temp Delta table; return it.
+
+        Same catalog as the target, :data:`STAGING_SCHEMA` (default the
+        target's own schema), a unique temp name keyed off :attr:`op_id`.
+        """
+        from yggdrasil.databricks.table.table import Table
+
+        target = self._target_table()
+        staging = Table(
+            service=target.service,
+            catalog_name=target.catalog_name,
+            schema_name=STAGING_SCHEMA or target.schema_name,
+            table_name=f"_ygg_stg_{self.op_id.replace('-', '_')}",
+            temporary=True,
+        )
+        name = staging.full_name()
+        to_table = getattr(data, "to_table", None)
+        if callable(to_table):
+            to_table(name, mode="overwrite")
+        else:
+            from yggdrasil.spark.tabular import SparkTabular
+
+            SparkTabular.from_spark_frame(data._native_spark_frame()).to_table(
+                name, mode="overwrite",
+            )
+        return staging
+
+    def _dump_to_volume(self, data: Any) -> "VolumePath":
+        """Write *data* as Parquet to the target's staging Volume; return the
+        :class:`VolumePath` it landed at."""
+        target = self._target_table()
+        vp = target.insert_volume_path(target, temporary=False)
+        vp.write_table(data, mode=Mode.OVERWRITE)
+        return vp
 
     @property
     def group_key(self) -> str:
@@ -1038,14 +1162,17 @@ def stage_async_insert(
         data = IO.from_(data).read_arrow_table()
 
     # Data goes to the default tmp staging path (kept until consumed); the log
-    # records its uniform URL so the loader reads it wherever it landed.
+    # records its uniform URL so the loader reads it wherever it landed. The
+    # op carries that already-durable URL string, so its serialize-time
+    # dispatch is a no-op "keep" (the data is staged here, with the caller's
+    # ``cast_options``, rather than re-dumped by the op).
     data_file = table.insert_volume_path(table, temporary=False)
     data_file.write_table(data, cast_options, mode=Mode.OVERWRITE)
 
     op = DatabricksTableInsert(
         target=table,
         mode=mode_enum,
-        data=data_file,
+        data=data_file.to_url().to_string(),
         client=table.client,
     )
     log_file = logs_path(table) / f"{op.op_id}.json"

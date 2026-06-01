@@ -96,19 +96,76 @@ class TestDatabricksTableInsert:
         assert parsed.group_key == "c.s.t"       # one load per target
 
     def test_to_json_normalizes_typed_fields(self):
-        # A producer-built op holds typed Table / Mode / Path; to_json emits
-        # the string op-log form the loader reads back.
+        # A producer-built op holds typed Table / Mode; to_json emits the
+        # string op-log form the loader reads back. An already-durable URL
+        # string ``data`` is kept as-is by the serialize-time dispatch.
         from yggdrasil.databricks.table.insert import DatabricksTableInsert
         target = MagicMock()
         target.full_name.return_value = "c.s.t"
-        data = MagicMock()
-        data.to_url.return_value.to_string.return_value = "dbfs+volume:/x.parquet"
         payload = json.loads(
-            DatabricksTableInsert(target=target, mode="overwrite", data=data).to_json()
+            DatabricksTableInsert(
+                target=target, mode="overwrite", data="dbfs+volume:/x.parquet",
+            ).to_json()
         )
         assert payload["target"] == "c.s.t"
         assert payload["mode"] == "overwrite"
         assert payload["data"] == "dbfs+volume:/x.parquet"
+
+    def test_data_url_keeps_string_source(self):
+        # An already-durable URL string is kept verbatim (the read-back /
+        # pre-staged producer shape).
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+        op = DatabricksTableInsert(target="c.s.t", mode="append", data="s3://b/k.parquet")
+        assert op.data_url == "s3://b/k.parquet"
+
+    def test_data_url_dumps_arrow_source_to_volume(self):
+        # A non-spark, non-cloud-path Tabular (Arrow table) is dumped to the
+        # target's staging Volume; the log points at the file.
+        from yggdrasil.arrow.tabular import ArrowTabular
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+        target = MagicMock()
+        target.full_name.return_value = "c.s.t"
+        op = DatabricksTableInsert(
+            target=target, mode="append", data=ArrowTabular(pa.table({"a": [1, 2]})),
+        )
+        with patch.object(DatabricksTableInsert, "_dump_to_volume") as dump:
+            dump.return_value.to_url.return_value.to_string.return_value = (
+                "dbfs+volume:/c/s/t/.sql/tmp/x.parquet"
+            )
+            assert op.data_url == "dbfs+volume:/c/s/t/.sql/tmp/x.parquet"
+            dump.assert_called_once()
+
+    def test_data_url_stages_spark_source_as_table(self):
+        # A Spark frame can't be serialized — it's staged into a temp Delta
+        # table and the log points at the table URL.
+        from yggdrasil.arrow.tabular import ArrowTabular
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+        target = MagicMock()
+        target.full_name.return_value = "c.s.t"
+        with patch.object(ArrowTabular, "_native_spark_frame", return_value=object()), \
+                patch.object(DatabricksTableInsert, "_stage_spark_table") as stage:
+            stage.return_value.to_url.return_value.to_string.return_value = (
+                "dbfs+table://h/c/staging/_ygg_stg_x"
+            )
+            op = DatabricksTableInsert(
+                target=target, mode="overwrite", data=ArrowTabular(pa.table({"a": [1]})),
+            )
+            assert op.data_url == "dbfs+table://h/c/staging/_ygg_stg_x"
+            stage.assert_called_once()
+
+    def test_data_url_materialises_once(self):
+        # The dispatch (and its staging side-effect) runs at most once.
+        from yggdrasil.arrow.tabular import ArrowTabular
+        from yggdrasil.databricks.table.insert import DatabricksTableInsert
+        target = MagicMock()
+        op = DatabricksTableInsert(
+            target=target, mode="append", data=ArrowTabular(pa.table({"a": [1]})),
+        )
+        with patch.object(DatabricksTableInsert, "_dump_to_volume") as dump:
+            dump.return_value.to_url.return_value.to_string.return_value = "dbfs+volume:/x"
+            _ = op.data_url
+            _ = op.data_url
+            dump.assert_called_once()
 
     def test_schema_and_maintenance_fields_round_trip(self):
         # The richer keyed-write surface persists in the op-log and rebuilds.
