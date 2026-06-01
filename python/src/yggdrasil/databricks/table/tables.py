@@ -40,14 +40,6 @@ __all__ = ["Tables"]
 logger = logging.getLogger(__name__)
 
 
-def _best_effort_unlink(path: Any) -> None:
-    """Remove *path* if present; cleanup failures are logged, never raised."""
-    try:
-        path.unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001 - cleanup is best-effort
-        logger.debug("async cleanup: failed to remove %s", path, exc_info=True)
-
-
 class Tables(DatabricksService):
     """Collection-level service for Unity Catalog tables.
 
@@ -256,104 +248,6 @@ class Tables(DatabricksService):
             schema_name=schema_name or self.schema_name,
             table_name=table_name or view_name,
         )
-
-    def async_insert(
-        self,
-        logs: Any = None,
-        *,
-        log_files: "Iterable[Any] | None" = None,
-        wait: Any = True,
-        limit: int | None = None,
-    ) -> int:
-        """Execute the pending async inserts described by the op-logs.
-
-        Pass **either** *logs* — a path to a JSON operation-log file or a
-        directory of them (a :class:`Path` or a path string), scanned for
-        ``*.json`` — **or** *log_files*, an explicit, pre-gathered iterable of
-        log files (paths or strings) to consume directly, skipping the scan
-        (e.g. the exact files a file-arrival trigger reported).
-
-        Each log carries the full metadata — target table, mode, and the
-        staged data's uniform URL — so the loader needs nothing else: it parses
-        each into a
-        :class:`~yggdrasil.databricks.table.async_job.DatabricksTableInsert`
-        and hands them to :meth:`dispatch_async`, which **groups by target**
-        into a :class:`~yggdrasil.databricks.table.async_job.DatabricksInsertBatch`,
-        runs one aggregated ``INSERT`` per target via
-        :meth:`Table.execute_async_insert`, then clears the consumed logs +
-        data. Returns the number of operations processed.
-
-        The loader behind the file-arrival job and the
-        ``ygg databricks table execute_async_insert`` CLI.
-        """
-        from yggdrasil.databricks.path import DatabricksPath
-        from yggdrasil.databricks.table.async_job import DatabricksTableInsert
-
-        if log_files is not None:
-            files = [
-                DatabricksPath.from_(f, client=self.client) if isinstance(f, str) else f
-                for f in log_files
-            ]
-        else:
-            logs_path = (
-                DatabricksPath.from_(logs, client=self.client)
-                if isinstance(logs, str) else logs
-            )
-            if logs_path is None or not logs_path.exists():
-                logger.info("async loader: %s does not exist — nothing to do", logs_path)
-                return 0
-            files = (
-                [f for f in logs_path.iterdir() if str(f.name).endswith(".json")]
-                if logs_path.is_dir() else [logs_path]
-            )
-
-        ops: list[DatabricksTableInsert] = []
-        for log_file in files:
-            try:
-                ops.append(DatabricksTableInsert.from_log(log_file, client=self.client))
-            except Exception:
-                logger.warning("skipping unreadable async log %s", log_file)
-                continue
-            if limit is not None and len(ops) >= limit:
-                break
-
-        return self.dispatch_async(ops, wait=wait)
-
-    def dispatch_async(self, ops: "Iterable[Any]", *, wait: Any = True) -> int:
-        """Group parsed ops by target into a
-        :class:`~yggdrasil.databricks.table.async_job.DatabricksInsertBatch`
-        and load each through :meth:`Table.execute_async_insert` (the batch
-        renders one aggregated ``UNION ALL`` body per target), clearing the
-        consumed logs + data afterward. Returns the number of operations
-        processed."""
-        from yggdrasil.databricks.table.async_job import DatabricksInsertBatch
-
-        batches = DatabricksInsertBatch.group(ops)
-        if not batches:
-            logger.info("async loader: no pending operation logs")
-            return 0
-        logger.info("async loader: %d target group(s)", len(batches))
-
-        processed = 0
-        for batch in batches:
-            target_name = batch.logs[0].target_name
-            target = self[target_name]
-            mode = batch.mode
-            logger.info(
-                "loading %d file(s) into %s (%s)",
-                len(batch.active), target_name, mode.name.lower(),
-            )
-            # The batch is the single place the INSERT source is generated.
-            target.execute_async_insert(
-                batch.make_sql(self.client), mode=mode.name.lower(), wait=wait,
-            )
-            # Clear consumed logs + data (incl. superseded ops) after a
-            # successful load.
-            for op in batch.logs:
-                _best_effort_unlink(op.log_file)
-                _best_effort_unlink(op.data_path(self.client))
-            processed += len(batch.logs)
-        return processed
 
     def catalog(self, name: str | None = None) -> "UCCatalog":
         """Return a :class:`UCCatalog` using this service's client.

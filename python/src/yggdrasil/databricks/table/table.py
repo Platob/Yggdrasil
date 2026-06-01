@@ -159,38 +159,35 @@ def _needs_column_mapping(col_name: str) -> bool:
 
 
 INFOS_TTL: float = 300.0
-_ALIAS_TMPSRC = "__tmpsrc__"
 
-
-# ---------------------------------------------------------------------------
-# DML statement helpers — shared by every insert path.
-#
-# All three insert paths (arrow / spark / sql) feed through the same DML
-# generator below.  They differ only in how the *source* is prepared:
+# The insert DML generator lives in one place — :mod:`insert`. The three sync
+# paths (arrow / spark / sql) build a source reference and feed it through the
+# same builders re-exported here; they differ only in how the *source* is
+# prepared:
 #
 #   arrow → stage Parquet to a UC Volume; reference it via ``{__tmpsrc__}``
 #   spark → register a temp view; reference it by quoted name
 #   sql   → wrap caller's query + CAST projection
 #
-# Save modes:
-#   - ``append``    insert-only; with ``match_by`` only non-matching rows
-#   - ``overwrite`` drop, then insert
-#   - ``truncate``  in-place wipe + insert; with ``match_by`` targeted DELETE
-#   - ``auto``      default; with ``match_by`` only non-matching rows
-#                   (lightweight append: target is probed by the match
-#                   keys only, no full read)
-#   - ``upsert`` /
-#     ``merge``     MERGE INTO with full update-and-insert; the
-#                   keyed-DELETE + INSERT pair is emitted as a
-#                   fallback when the engine MERGE fails.
-#
-# Merge ``ON`` is built null-safe (``<=>``) so NULL matches NULL.
-#
 # Retry semantics: caller-supplied ``retry`` (a ``WaitingConfig`` arg) is
 # applied only to DML statements (INSERT/MERGE/DELETE/UPDATE).
-# TRUNCATE/OPTIMIZE/VACUUM stay non-retryable on purpose: re-running
-# TRUNCATE after a successful INSERT is dangerous, and
-# OPTIMIZE/VACUUM are best-effort maintenance.
+# TRUNCATE/OPTIMIZE/VACUUM stay non-retryable on purpose: re-running TRUNCATE
+# after a successful INSERT is dangerous, and OPTIMIZE/VACUUM are best-effort.
+from yggdrasil.databricks.table.insert import (  # noqa: E402
+    ALIAS_TMPSRC as _ALIAS_TMPSRC,
+    DatabricksTableInsert,
+    make_sql_insert,
+    make_sql_select,
+    _append_maintenance_statements,
+    _build_cast_column_projection,
+    _build_column_projection,
+    _build_dml_statements,
+    _build_where_predicates,
+)
+
+
+# ---------------------------------------------------------------------------
+# DML retry / execution helpers — kept local to the table layer.
 # ---------------------------------------------------------------------------
 
 
@@ -285,25 +282,6 @@ def _execute_dml(
     return batch
 
 
-def _build_match_condition(
-    match_by: list[str],
-    *,
-    left_alias: str,
-    right_alias: str,
-    null_safe: bool = True,
-    extra_predicates: Optional[Iterable[str]] = None,
-) -> str:
-    """Build a merge ``ON`` expression from key columns and optional extras."""
-    op = "<=>" if null_safe else "="
-    clauses = [
-        f"{left_alias}.{quote_ident(k)} {op} {right_alias}.{quote_ident(k)}"
-        for k in match_by
-    ]
-    if extra_predicates:
-        clauses.extend(p for p in extra_predicates if p)
-    return " AND ".join(clauses)
-
-
 def _coalesce_predicate(
     cast_options: "CastOptions | None",
     predicate: "Predicate | None",
@@ -323,283 +301,6 @@ def _coalesce_predicate(
     if opts.predicate is None:
         return opts.copy(predicate=predicate)
     return opts.copy(predicate=opts.predicate & predicate)
-
-
-def _build_where_predicates(
-    where: Predicate | None,
-    *,
-    target_alias: str,
-) -> list[str]:
-    """Render *where* as a target-aliased SQL clause for MERGE / DELETE.
-
-    Returns a ``list[str]`` (0 or 1 elements) so the downstream DML
-    builders can splice it into an AND chain.
-    """
-    if where is None:
-        return []
-    aliased = _alias_columns(where, target_alias)
-    sql = expr_to_sql(aliased, dialect=Dialect.DATABRICKS)
-    return [sql]
-
-
-def _alias_columns(expr, alias: str):
-    """Walk *expr* and stamp every :class:`Column` with ``alias``.
-
-    Used by :func:`_wrap_user_predicate` to lift a user predicate
-    onto the target-side of a MERGE so ``foo`` becomes ``T.foo``.
-    Returns a new tree — the AST is immutable so we never mutate
-    the caller's predicate.
-    """
-    from yggdrasil.execution.expr.nodes import (
-        Arithmetic,
-        Between,
-        Cast,
-        Column,
-        Comparison,
-        InList,
-        IsNull,
-        Like,
-        Logical,
-        Not,
-    )
-
-    if isinstance(expr, Column):
-        return type(expr)(
-            name=expr.name,
-            field=expr.field,
-            alias=expr.alias,
-            qualifier=alias,
-        )
-    if isinstance(expr, Comparison):
-        return Comparison(
-            _alias_columns(expr.left, alias),
-            expr.op,
-            _alias_columns(expr.right, alias),
-        )
-    if isinstance(expr, Logical):
-        return Logical(
-            expr.op,
-            tuple(_alias_columns(o, alias) for o in expr.operands),
-        )
-    if isinstance(expr, Not):
-        return Not(_alias_columns(expr.operand, alias))
-    if isinstance(expr, Between):
-        return Between(
-            _alias_columns(expr.target, alias),
-            _alias_columns(expr.low, alias),
-            _alias_columns(expr.high, alias),
-            negated=expr.negated,
-        )
-    if isinstance(expr, InList):
-        return InList(
-            target=_alias_columns(expr.target, alias),
-            values=expr.values,
-            negated=expr.negated,
-            includes_null=expr.includes_null,
-        )
-    if isinstance(expr, IsNull):
-        return IsNull(_alias_columns(expr.target, alias), negated=expr.negated)
-    if isinstance(expr, Like):
-        return Like(
-            target=_alias_columns(expr.target, alias),
-            pattern=expr.pattern,
-            case_insensitive=expr.case_insensitive,
-            negated=expr.negated,
-        )
-    if isinstance(expr, Cast):
-        return Cast(_alias_columns(expr.operand, alias), expr.dtype)
-    if isinstance(expr, Arithmetic):
-        return Arithmetic(
-            expr.op,
-            _alias_columns(expr.left, alias),
-            _alias_columns(expr.right, alias),
-        )
-    return expr
-
-
-
-def _build_column_projection(
-    fields: "Iterable[Field]",
-    *,
-    source_alias: "str | None" = None,
-) -> str:
-    """Build a plain column-reference projection list for INSERT/MERGE.
-
-    Each :class:`Field` contributes one bare (or alias-qualified)
-    quoted column reference — no per-column ``CAST(... AS <ddl>)``
-    wrapper.  The data has already been aligned to the target schema
-    upstream: ``arrow_insert`` writes through
-    :meth:`CastOptions.cast_arrow_tabular` before staging,
-    ``spark_insert`` aligns the DataFrame via
-    :func:`any_to_spark_dataframe`, and the warehouse INSERT itself
-    performs implicit coercion at the column boundary, so the engine
-    accepts the rows as-is.  Skipping the explicit CAST keeps the SQL
-    short — important for wide / deeply nested schemas where the
-    spelled-out DDL bloated statements past the warehouse text
-    limits — and avoids paying for redundant per-column validation.
-
-    Used by :meth:`Table.arrow_insert`, :meth:`Table.spark_insert`,
-    and :meth:`Table.sql_insert` (the latter passes
-    ``source_alias="raw_src"`` so columns resolve against the wrapped
-    user query).
-    """
-    parts: list[str] = []
-    alias = quote_ident(source_alias) if source_alias else None
-    for f in fields:
-        col = quote_ident(f.name)
-        parts.append(f"{alias}.{col}" if alias else col)
-    return ", ".join(parts)
-
-
-def _build_cast_column_projection(
-    target_fields: "Iterable[Field]",
-    *,
-    source: "Field | None" = None,
-    source_alias: str,
-) -> str:
-    """Build a SELECT projection that CASTs source columns to target Spark types.
-
-    For each target field:
-
-    * **present in source, same type** — bare ``alias.`col``` (no CAST)
-    * **present in source, different type** —
-      ``CAST(alias.`col` AS <spark_type>)``
-    * **missing from source** —
-      ``CAST(NULL AS <spark_type>) AS `col```
-
-    *source* is the :class:`Field` describing the source schema.
-    Child lookup uses :meth:`Field.get` — no intermediate dict.
-    When a source child's Spark type matches the target's, the CAST
-    is skipped. When *source* is ``None`` every target column is
-    assumed present with an unknown type (always CAST).
-    """
-    alias = quote_ident(source_alias)
-    parts: list[str] = []
-    for f in target_fields:
-        col = quote_ident(f.name)
-        target_spark = f.to_spark_name(
-            with_name=False, with_nullable=False, with_comment=False,
-        )
-        src = source.get(f.name) if source is not None else ...
-
-        if src is None:
-            parts.append(f"CAST(NULL AS {target_spark}) AS {col}")
-        elif src is ...:
-            parts.append(f"CAST({alias}.{col} AS {target_spark})")
-        else:
-            source_spark = src.to_spark_name(
-                with_name=False, with_nullable=False, with_comment=False,
-            )
-            if source_spark == target_spark:
-                parts.append(f"{alias}.{col}")
-            else:
-                parts.append(f"CAST({alias}.{col} AS {target_spark})")
-    return ", ".join(parts)
-
-
-def _build_delete_insert_statements(
-    *,
-    target_location: str,
-    source_sql: str,
-    columns: list[str],
-    match_by: list[str],
-    prune_predicates: list[str],
-) -> list[str]:
-    """Build the keyed-DELETE + INSERT pair used by upsert and the merge fallback.
-
-    Always emits exactly two statements: a key-scoped ``DELETE`` against
-    target rows whose match keys appear in ``source_sql``, followed by a
-    plain ``INSERT INTO ... SELECT``.  ``columns`` is the projection that
-    bridges source → target — callers narrow it to the intersection of
-    source-side columns when feeding a fallback so non-matching columns
-    are filtered out.
-
-    Databricks/Spark SQL doesn't accept ``DELETE FROM target USING source``;
-    the keyed delete is rendered as ``DELETE FROM target T WHERE EXISTS
-    (...)`` so it parses on Delta.  ``prune_predicates`` lift onto the
-    outer ``WHERE`` so the target scan is bounded before the EXISTS
-    subquery runs.
-    """
-    cols_quoted = ", ".join(quote_ident(c) for c in columns)
-    key_cols = ", ".join(quote_ident(k) for k in match_by)
-    key_match = " AND ".join(
-        f"T.{quote_ident(k)} <=> S.{quote_ident(k)}"
-        for k in match_by
-    )
-    exists_clause = (
-        f"EXISTS (\n"
-        f"  SELECT 1 FROM (\n"
-        f"    SELECT DISTINCT {key_cols} FROM ({source_sql}) AS src\n"
-        f"  ) AS S\n"
-        f"  WHERE {key_match}\n"
-        f")"
-    )
-    where_clauses = [*prune_predicates, exists_clause]
-    where_sql = "\n  AND ".join(where_clauses)
-    return [
-        f"DELETE FROM {target_location} AS T\nWHERE {where_sql}",
-        f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}",
-    ]
-
-
-def _build_merge_statement(
-    *,
-    target_location: str,
-    source_sql: str,
-    columns: list[str],
-    match_by: list[str],
-    update_column_names: Optional[list[str]],
-    prune_predicates: list[str],
-    insert_only: bool = False,
-) -> str:
-    """Render a single ``MERGE INTO ...`` statement.
-
-    Used by :func:`_build_dml_statements` when ``safe_merge=False``
-    (the default) — Databricks / Delta supports MERGE natively and
-    plans the keyed dedup once instead of twice (one delete + one
-    insert) the way the safe path does.
-
-    ``insert_only=True`` emits a MERGE with only the ``WHEN NOT
-    MATCHED THEN INSERT`` clause — the keyed-APPEND shape. Without
-    it, the full update-and-insert MERGE runs.
-    """
-    cols_quoted = ", ".join(quote_ident(c) for c in columns)
-    on_condition = _build_match_condition(
-        match_by, left_alias="T", right_alias="S",
-        null_safe=True, extra_predicates=prune_predicates,
-    )
-    insert_clause = (
-        f"WHEN NOT MATCHED THEN INSERT ({cols_quoted}) "
-        f"VALUES ({', '.join(f'S.{quote_ident(c)}' for c in columns)})"
-    )
-    if insert_only:
-        return (
-            f"MERGE INTO {target_location} AS T\n"
-            f"USING (\n{source_sql}\n) AS S\n"
-            f"ON {on_condition}\n"
-            f"{insert_clause}"
-        )
-
-    update_column_names_effective = (
-        update_column_names
-        if update_column_names is not None
-        else [c for c in columns if c not in match_by]
-    )
-    update_clause = ""
-    if update_column_names_effective:
-        update_set = ", ".join(
-            f"T.{quote_ident(c)} = S.{quote_ident(c)}"
-            for c in update_column_names_effective
-        )
-        update_clause = f"WHEN MATCHED THEN UPDATE SET {update_set}\n"
-
-    return (
-        f"MERGE INTO {target_location} AS T\n"
-        f"USING (\n{source_sql}\n) AS S\n"
-        f"ON {on_condition}\n"
-        f"{update_clause}"
-        f"{insert_clause}"
-    )
 
 
 def _spark_filter_existing_keys(
@@ -633,200 +334,6 @@ def _spark_filter_existing_keys(
         return data_df.join(key_df, list(match_by), "left_anti"), True
     except Exception:
         return data_df, False
-
-
-def _build_anti_join_insert(
-    *,
-    target_location: str,
-    source_sql: str,
-    columns: list[str],
-    match_by: list[str],
-    prune_predicates: list[str],
-) -> list[str]:
-    """Build a keyed APPEND that filters out rows already in the target.
-
-    Renders one statement of the shape::
-
-        INSERT INTO target (cols)
-        SELECT cols FROM (source) AS S
-        WHERE NOT EXISTS (
-          SELECT 1 FROM target AS T
-          WHERE T.k1 <=> S.k1 AND ... [AND prune_predicates]
-        )
-
-    No ``MERGE``, no fallback, no retry — Databricks / Spark / any
-    SQL engine that supports correlated ``EXISTS`` runs this
-    natively. The ``<=>`` null-safe comparison matches the legacy
-    MERGE behavior so rows with NULL key columns line up.
-
-    ``prune_predicates`` (target-aliased) narrow the EXISTS scan
-    to the matching partitions, so the keyed dedup doesn't read
-    the whole target.
-    """
-    cols_quoted = ", ".join(quote_ident(c) for c in columns)
-    key_match = " AND ".join(
-        f"T.{quote_ident(k)} <=> S.{quote_ident(k)}"
-        for k in match_by
-    )
-    exists_where = "\n    AND ".join([key_match, *prune_predicates])
-    exists_clause = (
-        f"NOT EXISTS (\n"
-        f"  SELECT 1 FROM {target_location} AS T\n"
-        f"  WHERE {exists_where}\n"
-        f")"
-    )
-    return [
-        f"INSERT INTO {target_location} ({cols_quoted})\n"
-        f"SELECT {cols_quoted} FROM (\n{source_sql}\n) AS S\n"
-        f"WHERE {exists_clause}"
-    ]
-
-
-def _append_maintenance_statements(
-    statements: list[str],
-    *,
-    target_location: str,
-    zorder_by: Optional[list[str]],
-    optimize_after_merge: bool,
-    keyed: bool,
-    vacuum_hours: Optional[int],
-) -> None:
-    """Tack on OPTIMIZE / VACUUM statements when configured."""
-    if zorder_by:
-        zorder_cols = ", ".join(quote_ident(c) for c in zorder_by)
-        statements.append(f"OPTIMIZE {target_location} ZORDER BY ({zorder_cols})")
-    if optimize_after_merge and keyed:
-        statements.append(f"OPTIMIZE {target_location}")
-    if vacuum_hours is not None:
-        statements.append(f"VACUUM {target_location} RETAIN {int(vacuum_hours)} HOURS")
-
-
-def _build_dml_statements(
-    *,
-    target_location: str,
-    source_sql: str,
-    columns: list[str],
-    mode: Mode,
-    match_by: Optional[list[str]],
-    update_column_names: Optional[list[str]],
-    prune_predicates: list[str],
-    zorder_by: Optional[list[str]] = None,
-    optimize_after_merge: bool = False,
-    vacuum_hours: Optional[int] = None,
-    safe_merge: bool = False,
-) -> list[str]:
-    """Generate INSERT / MERGE / DELETE / OPTIMIZE / VACUUM SQL.
-
-    Mode dispatch when ``match_by`` is set:
-
-    * **safe_merge=False (default)** — emit a single ``MERGE INTO``
-      statement. Databricks / Delta plans the keyed dedup once;
-      :attr:`Mode.UPSERT` / :attr:`Mode.MERGE` get the full
-      update-and-insert MERGE, :attr:`Mode.APPEND` /
-      :attr:`Mode.AUTO` get the insert-only variant.
-    * **safe_merge=True** — sidestep MERGE entirely.
-      :attr:`Mode.UPSERT` / :attr:`Mode.MERGE` run a keyed ``DELETE``
-      followed by ``INSERT`` (incoming wins on overlap).
-      :attr:`Mode.APPEND` / :attr:`Mode.AUTO` run
-      ``INSERT ... WHERE NOT EXISTS (...)`` so existing rows are
-      filtered at INSERT time. Useful for backends without native
-      MERGE, for callers that want "do exactly the dedup you wrote
-      down" semantics, or for the Spark fast-path
-      (:func:`_spark_filter_existing_keys`) which pre-filters the
-      DataFrame before submission and downgrades to plain INSERT.
-
-    Mode without keys:
-
-    * :attr:`Mode.TRUNCATE` with ``match_by`` → DELETE + INSERT
-      (truncate-by-key).
-    * :attr:`Mode.TRUNCATE` no keys → ``TRUNCATE TABLE`` + INSERT.
-    * :attr:`Mode.OVERWRITE` → plain INSERT (the caller already
-      cleared the target up front).
-    """
-    cols_quoted = ", ".join(quote_ident(c) for c in columns)
-    statements: list[str] = []
-
-    if mode in (Mode.TRUNCATE, Mode.OVERWRITE):
-        if mode == Mode.TRUNCATE and match_by:
-            statements.extend(_build_delete_insert_statements(
-                target_location=target_location,
-                source_sql=source_sql,
-                columns=columns,
-                match_by=match_by,
-                prune_predicates=prune_predicates,
-            ))
-        elif mode == Mode.TRUNCATE:
-            statements.extend([
-                f"TRUNCATE TABLE {target_location}",
-                f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}",
-            ])
-        elif match_by:
-            statements.extend(_build_delete_insert_statements(
-                target_location=target_location,
-                source_sql=source_sql,
-                columns=columns,
-                match_by=match_by,
-                prune_predicates=prune_predicates,
-            ))
-        else:
-            statements.append(
-                f"INSERT OVERWRITE {target_location} ({cols_quoted})\n{source_sql}"
-            )
-
-    elif match_by and not safe_merge:
-        # Native MERGE INTO — Databricks / Delta plans the dedup
-        # once. Insert-only for APPEND/AUTO; full update + insert
-        # for UPSERT/MERGE.
-        statements.append(_build_merge_statement(
-            target_location=target_location,
-            source_sql=source_sql,
-            columns=columns,
-            match_by=match_by,
-            update_column_names=update_column_names,
-            prune_predicates=prune_predicates,
-            insert_only=mode in (Mode.APPEND, Mode.AUTO),
-        ))
-
-    elif match_by and mode in (Mode.UPSERT, Mode.MERGE):
-        # safe_merge=True + UPSERT — keyed DELETE then INSERT.
-        # Same outcome as MERGE but without the engine-specific
-        # syntax; the staged source reads twice, which is the trade
-        # the caller opted into.
-        statements.extend(_build_delete_insert_statements(
-            target_location=target_location,
-            source_sql=source_sql,
-            columns=columns,
-            match_by=match_by,
-            prune_predicates=prune_predicates,
-        ))
-
-    elif match_by:
-        # safe_merge=True + AUTO/APPEND — INSERT NOT EXISTS so
-        # existing rows are filtered at INSERT time. The Spark
-        # fast path replaces this with a DataFrame anti-join one
-        # layer up in :meth:`Table.spark_insert`.
-        statements.extend(_build_anti_join_insert(
-            target_location=target_location,
-            source_sql=source_sql,
-            columns=columns,
-            match_by=match_by,
-            prune_predicates=prune_predicates,
-        ))
-
-    else:
-        statements.append(
-            f"INSERT INTO {target_location} ({cols_quoted})\n{source_sql}"
-        )
-
-    _append_maintenance_statements(
-        statements,
-        target_location=target_location,
-        zorder_by=zorder_by,
-        optimize_after_merge=optimize_after_merge,
-        keyed=bool(match_by),
-        vacuum_hours=vacuum_hours,
-    )
-    return statements
 
 
 def _delta_conf_for(
@@ -3166,14 +2673,15 @@ class Table(DatabricksPath):
         """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
 
         ``wait=False`` switches to the **async drop** path
-        (:meth:`async_insert`): the staged Parquet + a JSON operation log are
-        written under the table's ``.sql/async`` area and a file-arrival job
-        (:meth:`async_job`) aggregates and loads them later — no warehouse
-        statement runs here. Only ``OVERWRITE`` / ``APPEND`` with no
-        ``match_by`` qualify; anything else (or a query / Spark source) falls
-        through to the normal synchronous path.
+        (:func:`~yggdrasil.databricks.table.insert.stage_async_insert`): the
+        staged Parquet + a JSON operation log are written under the table's
+        ``.sql/async`` area and a file-arrival job (:meth:`async_job`)
+        aggregates and loads them later — no warehouse statement runs here.
+        Only ``OVERWRITE`` / ``APPEND`` with no ``match_by`` qualify; anything
+        else (or a query / Spark source) falls through to the normal
+        synchronous path.
         """
-        from yggdrasil.databricks.table.async_job import ASYNC_MODES
+        from yggdrasil.databricks.table.insert import ASYNC_MODES, stage_async_insert
 
         if (
             wait is False
@@ -3182,7 +2690,7 @@ class Table(DatabricksPath):
             and not isinstance(data, (PreparedStatement, StatementResult))
             and not PreparedStatement.looks_like_query(data)
         ):
-            return self.async_insert(data, mode=mode, **kwargs)
+            return stage_async_insert(self, data, mode=mode, **kwargs)
         return self.insert_into(
             data,
             mode=mode,
@@ -3359,60 +2867,13 @@ class Table(DatabricksPath):
 
         Builds + uploads the full ygg wheel and upserts a serverless job that
         watches ``.sql/async/logs`` and aggregates the operation logs
-        :meth:`async_insert` drops into one ``INSERT`` per target (an
+        ``insert(..., wait=False)`` drops into one load per target (an
         OVERWRITE supersedes everything staged before it).
-        See :func:`~yggdrasil.databricks.table.async_job.ensure_async_job`.
+        See :func:`~yggdrasil.databricks.table.insert.ensure_async_job`.
         """
-        from yggdrasil.databricks.table.async_job import ensure_async_job
+        from yggdrasil.databricks.table.insert import ensure_async_job
 
         return ensure_async_job(self)
-
-    def async_insert(
-        self,
-        data: Any,
-        *,
-        mode: Mode | str | None = None,
-        match_by: Optional[list[str]] = None,
-        cast_options: Optional[CastOptions] = None,
-        **kwargs: Any,
-    ) -> "VolumePath":
-        """Stage *data* as Parquet + drop a JSON operation log — no warehouse.
-
-        Thin wrapper over
-        :func:`~yggdrasil.databricks.table.async_job.stage_async_insert`: the
-        rows land at the table's default tmp staging path and an op-log under
-        ``.sql/async/logs/`` records the staged data's uniform URL, so the
-        file-arrival job can pick it up. Returns the log path. Only
-        ``OVERWRITE`` / ``APPEND`` with no ``match_by``; a path/URL string
-        source is read first. The loader side is :meth:`execute_async_insert`.
-        """
-        from yggdrasil.databricks.table.async_job import stage_async_insert
-
-        return stage_async_insert(
-            self, data, mode=mode, match_by=match_by, cast_options=cast_options,
-        )
-
-    def execute_async_insert(
-        self,
-        data: Any,
-        *,
-        mode: Mode | str | None = None,
-        match_by: Optional[list[str]] = None,
-        cast_options: Optional[CastOptions] = None,
-        wait: WaitingConfigArg = True,
-        **kwargs: Any,
-    ) -> "StatementBatch | Tabular | None":
-        """Loader side of :meth:`async_insert` — load *data* into the table now.
-
-        Synchronous :meth:`insert_into`. The file-arrival loader
-        (:meth:`Tables.async_insert`) calls this once per target with the
-        :class:`~yggdrasil.databricks.table.async_job.DatabricksInsertBatch`'s
-        aggregated ``UNION ALL`` query over the staged Parquet.
-        """
-        return self.insert_into(
-            data, mode=mode, match_by=match_by,
-            cast_options=cast_options, wait=wait, **kwargs,
-        )
 
     def arrow_insert(
         self,
@@ -3493,30 +2954,35 @@ class Table(DatabricksPath):
         if return_data:
             output_data = staging.read_arrow_table()
 
-        prune_predicates = _build_where_predicates(
-            cast_options.predicate, target_alias="T",
-        )
-
         columns = list(existing_schema.field_names())
         # Plain column projection — the staged Parquet was already
         # cast to the target schema in :meth:`CastOptions.cast_arrow_tabular`
         # before the write, and the warehouse INSERT applies the
         # column-boundary coercion on top.  No per-column CAST needed.
-        source_projection = _build_column_projection(existing_schema.fields)
-        source_sql = f"SELECT {source_projection} FROM {{{_ALIAS_TMPSRC}}}"
-
-        sql_texts = _build_dml_statements(
-            target_location=target_location,
-            source_sql=source_sql,
-            columns=columns,
+        # The staged Parquet is referenced through the ``{__tmpsrc__}``
+        # placeholder, substituted for the external-data Volume path at
+        # prepare time.
+        op = DatabricksTableInsert(
+            target=target,
             mode=mode_enum,
+            data=staging,
+            client=self.client,
+            schema=existing_schema,
+            predicate=cast_options.predicate,
             match_by=match_by,
             update_column_names=update_column_names,
-            prune_predicates=prune_predicates,
+            cast_options=cast_options,
             zorder_by=zorder_by,
             optimize_after_merge=optimize_after_merge,
             vacuum_hours=vacuum_hours,
             safe_merge=safe_merge,
+        )
+        source_sql = make_sql_select(op, source=f"{{{_ALIAS_TMPSRC}}}")
+        sql_texts = make_sql_insert(
+            op,
+            target_location=target_location,
+            source_sql=source_sql,
+            columns=columns,
         )
 
         retry_active = retry is not None

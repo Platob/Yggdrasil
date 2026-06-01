@@ -63,19 +63,23 @@ class TablesCommand:
 
     @classmethod
     def _async_insert(cls, args: Any, build_client: Any) -> int:
+        from yggdrasil.databricks.table.insert import (
+            ensure_async_job, load_async, stage_async_insert,
+        )
+
         client = build_client(args)
-        # Producer: Table.async_insert reads the path/URL source and stages a
+        # Producer: stage_async_insert reads the path/URL source and stages a
         # Parquet + drops a JSON op-log (full metadata) — the CLI stays thin.
         table = client.tables[args.table_name]
-        log_file = table.async_insert(args.data, mode=args.mode)
+        log_file = stage_async_insert(table, args.data, mode=args.mode)
         sys.stdout.write(f"async insert staged → {log_file.full_path()}\n")
 
         if args.execute:
             # Loader only needs the log path — the log carries everything.
-            n = client.tables.async_insert(log_file.full_path(), wait=True)
+            n = load_async(client.tables, log_file.full_path(), wait=True)
             sys.stdout.write(f"executed {n} pending operation(s)\n")
         elif args.ensure_job:
-            job = table.async_job()
+            job = ensure_async_job(table)
             sys.stdout.write(f"loader job ready: {getattr(job, 'job_id', job)}\n")
         else:
             sys.stdout.write(
@@ -86,10 +90,12 @@ class TablesCommand:
 
     @classmethod
     def _execute_async_insert(cls, args: Any, build_client: Any) -> int:
+        from yggdrasil.databricks.table.insert import load_async
+
         client = build_client(args)
         # Loader: the logs carry full metadata, so it only needs their path(s).
-        n = client.tables.async_insert(
-            logs=args.logs, log_files=args.log_files or None, wait=True,
+        n = load_async(
+            client.tables, logs=args.logs, log_files=args.log_files or None, wait=True,
         )
         sys.stdout.write(f"executed {n} pending operation(s)\n")
         return 0
