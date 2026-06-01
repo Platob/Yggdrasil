@@ -249,6 +249,37 @@ class Tables(DatabricksService):
             table_name=table_name or view_name,
         )
 
+    def async_insert(
+        self,
+        table_name: "Table | str",
+        source: Any,
+        *,
+        mode: ModeLike = None,
+        ensure_job: bool = False,
+    ) -> Any:
+        """Stage *source* for an async (file-arrival) load into *table_name*.
+
+        Resolves the target table (a :class:`Table` or dotted name), reads
+        *source* into Arrow when it's a path/URL string (format inferred — a
+        local path, a Volume, or ``s3://…``; anything else is treated as
+        already-tabular data), then routes through the async drop path
+        (:meth:`Table.insert` with ``wait=False``): a Parquet is staged and a
+        JSON operation log dropped under the table's ``.sql/async`` area for
+        the file-arrival loader. With ``ensure_job=True`` the loader job is
+        get-or-created so the drop is picked up automatically.
+
+        Returns the operation-log path. This is the single entry point the
+        ``ygg databricks table async_insert`` CLI delegates to.
+        """
+        table = table_name if isinstance(table_name, Table) else self[table_name]
+        if isinstance(source, str):
+            from yggdrasil.io.holder import IO
+            source = IO.from_(source).read_arrow_table()
+        log_file = table.insert(source, wait=False, mode=mode)
+        if ensure_job:
+            table.async_job().ensure()
+        return log_file
+
     def catalog(self, name: str | None = None) -> "UCCatalog":
         """Return a :class:`UCCatalog` using this service's client.
 

@@ -42,26 +42,17 @@ class TablesCommand:
 
     @classmethod
     def _async_insert(cls, args: Any, build_client: Any) -> int:
-        from yggdrasil.enums.mode import Mode
-        from yggdrasil.io.holder import IO
-
         client = build_client(args)
-        table = client.tables[args.table_name]
-
-        # Read the source (format inferred from the path) into Arrow, then
-        # route through the async drop path: ``wait=False`` stages a Parquet +
-        # drops a JSON op-log under the table's ``.sql/async`` area; the
-        # file-arrival job aggregates and loads it later.
-        data = IO.from_(args.data).read_arrow_table()
-        log_file = table.insert(data, wait=False, mode=Mode.from_(args.mode))
-
+        # All the work lives in the service — read source + async drop +
+        # optional loader-job deploy — so the CLI stays a thin shell.
+        log_file = client.tables.async_insert(
+            args.table_name,
+            args.data,
+            mode=args.mode,
+            ensure_job=args.ensure_job,
+        )
         sys.stdout.write(f"async insert staged → {log_file.full_path()}\n")
-        if args.ensure_job:
-            job = table.async_job().ensure().job
-            sys.stdout.write(
-                f"loader job ready: {getattr(job, 'job_id', job)}\n"
-            )
-        else:
+        if not args.ensure_job:
             sys.stdout.write(
                 "deploy the loader once with `--ensure-job` (or "
                 "`table.async_job().ensure()`) so the drop is picked up.\n"

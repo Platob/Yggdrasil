@@ -5,7 +5,6 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.cli import main
-from yggdrasil.enums.mode import Mode
 
 
 class TestTableHelp(unittest.TestCase):
@@ -27,17 +26,15 @@ class TestTableHelp(unittest.TestCase):
 
 
 class TestTableAsyncInsertDispatch(unittest.TestCase):
+    """The CLI is a thin shell — it delegates to ``client.tables.async_insert``."""
 
-    def test_async_insert_routes_to_table_insert(self):
+    def test_async_insert_delegates_to_service(self):
         client = MagicMock()
-        table = MagicMock()
-        client.tables.__getitem__.return_value = table
-        arrow = object()
-        source = MagicMock()
-        source.read_arrow_table.return_value = arrow
+        log_file = MagicMock()
+        log_file.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs/op.json"
+        client.tables.async_insert.return_value = log_file
 
-        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
-             patch("yggdrasil.io.holder.IO.from_", return_value=source) as io_from:
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client):
             rc = main([
                 "table", "async_insert",
                 "--table-name", "cat.sch.tbl",
@@ -46,22 +43,14 @@ class TestTableAsyncInsertDispatch(unittest.TestCase):
             ])
 
         self.assertEqual(rc, 0)
-        client.tables.__getitem__.assert_called_once_with("cat.sch.tbl")
-        io_from.assert_called_once_with("s3://bucket/data.parquet")
-        source.read_arrow_table.assert_called_once_with()
-        table.insert.assert_called_once_with(arrow, wait=False, mode=Mode.OVERWRITE)
-        # without --ensure-job the loader job is not deployed
-        table.async_job.assert_not_called()
+        client.tables.async_insert.assert_called_once_with(
+            "cat.sch.tbl", "s3://bucket/data.parquet",
+            mode="overwrite", ensure_job=False,
+        )
 
-    def test_async_insert_ensure_job_deploys_loader(self):
+    def test_async_insert_passes_ensure_job_and_default_mode(self):
         client = MagicMock()
-        table = MagicMock()
-        client.tables.__getitem__.return_value = table
-        source = MagicMock()
-        source.read_arrow_table.return_value = object()
-
-        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
-             patch("yggdrasil.io.holder.IO.from_", return_value=source):
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client):
             rc = main([
                 "table", "async_insert",
                 "--table-name", "cat.sch.tbl",
@@ -70,8 +59,6 @@ class TestTableAsyncInsertDispatch(unittest.TestCase):
             ])
 
         self.assertEqual(rc, 0)
-        # default mode is append
-        table.insert.assert_called_once_with(
-            source.read_arrow_table.return_value, wait=False, mode=Mode.APPEND,
+        client.tables.async_insert.assert_called_once_with(
+            "cat.sch.tbl", "data.parquet", mode="append", ensure_job=True,
         )
-        table.async_job.return_value.ensure.assert_called_once_with()

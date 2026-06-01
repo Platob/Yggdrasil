@@ -260,3 +260,58 @@ class TestProcess:
         assert processed == 2
         modes = {c.kwargs["mode"] for c in t.insert.call_args_list}
         assert modes == {"append", "overwrite"}      # one INSERT per mode
+
+
+# --------------------------------------------------------------------------- #
+# Tables.async_insert — service entry point the CLI delegates to
+# --------------------------------------------------------------------------- #
+class TestTablesAsyncInsert:
+    def _service(self):
+        from yggdrasil.databricks.table.tables import Tables
+        return Tables(client=MagicMock())
+
+    def test_reads_string_source_then_async_inserts(self):
+        from yggdrasil.databricks.table.tables import Tables
+        svc = self._service()
+        table = MagicMock()
+        arrow = object()
+        src = MagicMock()
+        src.read_arrow_table.return_value = arrow
+        with patch.object(Tables, "__getitem__", return_value=table), \
+             patch("yggdrasil.io.holder.IO.from_", return_value=src) as io_from:
+            out = svc.async_insert("c.s.t", "s3://b/data.parquet", mode="overwrite")
+        io_from.assert_called_once_with("s3://b/data.parquet")
+        src.read_arrow_table.assert_called_once_with()
+        table.insert.assert_called_once_with(arrow, wait=False, mode="overwrite")
+        table.async_job.assert_not_called()
+        assert out is table.insert.return_value
+
+    def test_ensure_job_deploys_loader(self):
+        from yggdrasil.databricks.table.tables import Tables
+        svc = self._service()
+        table = MagicMock()
+        with patch.object(Tables, "__getitem__", return_value=table), \
+             patch("yggdrasil.io.holder.IO.from_", return_value=MagicMock()):
+            svc.async_insert("c.s.t", "data.parquet", ensure_job=True)
+        table.async_job.return_value.ensure.assert_called_once_with()
+
+    def test_non_string_data_is_not_re_read(self):
+        from yggdrasil.databricks.table.tables import Tables
+        svc = self._service()
+        table = MagicMock()
+        data = object()
+        with patch.object(Tables, "__getitem__", return_value=table), \
+             patch("yggdrasil.io.holder.IO.from_") as io_from:
+            svc.async_insert("c.s.t", data, mode="append")
+        io_from.assert_not_called()
+        table.insert.assert_called_once_with(data, wait=False, mode="append")
+
+    def test_table_instance_passed_through_without_lookup(self):
+        from yggdrasil.databricks.table.tables import Tables
+        svc = self._service()
+        table = MagicMock(spec=Table)
+        with patch.object(Tables, "__getitem__") as getitem, \
+             patch("yggdrasil.io.holder.IO.from_"):
+            svc.async_insert(table, object(), mode="append")
+        getitem.assert_not_called()
+        table.insert.assert_called_once()
