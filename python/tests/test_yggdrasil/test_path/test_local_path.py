@@ -266,6 +266,70 @@ class TestStat:
 
 
 # ---------------------------------------------------------------------------
+# TestStatCacheCoherence — a seeded stat cache (e.g. from a directory
+# listing, where ``_ls`` primes every child off ``scandir``) must track
+# the child's own modifying operations. LocalPath has no TTL, so a stale
+# entry would otherwise stick for the lifetime of the instance.
+# ---------------------------------------------------------------------------
+
+
+class TestStatCacheCoherence:
+
+    def _listed_child(self, tmp_path: pathlib.Path, name: str) -> LocalPath:
+        """A child handle whose stat slot is seeded by ``iterdir``."""
+        folder = LocalPath(str(tmp_path), singleton_ttl=False)
+        return next(c for c in folder.iterdir() if c.name == name)
+
+    def test_write_updates_seeded_size(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "w.bin").write_bytes(b"hello")
+        child = self._listed_child(tmp_path, "w.bin")
+        assert child.size == 5  # seeded off scandir
+
+        child.write_bytes(b"hello world!!! longer now")
+        assert child.size == (tmp_path / "w.bin").stat().st_size == 25
+
+    def test_truncate_updates_seeded_size(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "t.bin").write_bytes(b"abcdefghij")
+        child = self._listed_child(tmp_path, "t.bin")
+        assert child.size == 10
+
+        child.truncate(3)
+        assert child.size == (tmp_path / "t.bin").stat().st_size == 3
+
+    def test_clear_invalidates_seeded_stat(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "c.bin").write_bytes(b"data")
+        child = self._listed_child(tmp_path, "c.bin")
+        assert child.exists()
+
+        child._clear()
+        assert not (tmp_path / "c.bin").exists()
+        assert not child.exists()  # re-probes the backend, not the snapshot
+
+    def test_write_flips_cached_missing_to_file(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        p = LocalPath(str(tmp_path / "m.bin"), singleton_ttl=False)
+        # Simulate a prior probe that cached MISSING (the shape a
+        # TTL-backed remote backend would carry forward).
+        p._persist_stat_cache(IOStats(kind=IOKind.MISSING, size=0, mtime=0.0))
+        assert not p.exists()
+
+        p.write_bytes(b"abc")
+        assert p.exists()
+        assert p.is_file()
+        assert p.size == 3
+
+    def test_mkdir_refreshes_cached_missing(self, tmp_path: pathlib.Path) -> None:
+        p = LocalPath(str(tmp_path / "d"), singleton_ttl=False)
+        p._persist_stat_cache(IOStats(kind=IOKind.MISSING, size=0, mtime=0.0))
+        assert not p.exists()
+
+        p.mkdir()
+        assert p.exists()
+        assert p.is_dir()
+
+
+# ---------------------------------------------------------------------------
 # TestDirectoryOps
 # ---------------------------------------------------------------------------
 

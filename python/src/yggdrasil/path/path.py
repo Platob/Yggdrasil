@@ -77,7 +77,14 @@ class Path(IO, os.PathLike, ABC):
     scheme: ClassVar[str] = ""
 
     STAT_CACHE_TTL: ClassVar["float | None"] = None
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
+    #: Stat-cache slots are per-instance, backend-derived state — never
+    #: pickle them. A path serialized on one node and rehydrated on
+    #: another must re-probe rather than trust a snapshot of *this*
+    #: node's view. Subclasses that filter ``__getstate__`` by this set
+    #: (e.g. :class:`DatabricksPath`) rely on the slots being listed here.
+    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset(
+        {"_stat_cached", "_stat_cached_at"}
+    )
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -276,6 +283,10 @@ class Path(IO, os.PathLike, ABC):
             bio.truncate(n)
             bio.seek(0)
             self._bwrite(bio, 0, Mode.OVERWRITE)
+            # The backing is now ``n`` bytes — reflect it in the stat
+            # cache so a seeded entry (from a listing) doesn't keep
+            # reporting the pre-truncate size.
+            self._touch_stat(size=n)
             return n
         finally:
             bio.close()
@@ -283,6 +294,11 @@ class Path(IO, os.PathLike, ABC):
     def _clear(self) -> None:
         """:class:`Holder` primitive: drop the backing entirely (idempotent)."""
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
+        # The backing is gone — a cached FILE/size snapshot would now lie.
+        # Drop it so the next probe re-checks the backend (and reports
+        # MISSING) instead of trusting the pre-clear state.
+        self._stat_cached = None
+        self._stat_cached_at = 0.0
 
     # ==================================================================
     # Filesystem surface — thin wrappers over the abstract hooks
@@ -329,6 +345,47 @@ class Path(IO, os.PathLike, ABC):
         self._stat_cached = stats
         self._stat_cached_at = time.monotonic()
 
+    def _touch_stat(
+        self,
+        *,
+        size: "int | None" = None,
+        mtime: "float | None" = None,
+        media_type: Any = None,
+    ) -> None:
+        """Keep the filesystem stat cache coherent after a write.
+
+        :class:`Holder._touch_stat` updates the holder-owned ``_size`` /
+        ``_mtime`` / ``_media_type`` slots, but :class:`Path` reads its
+        :attr:`size` / :meth:`exists` / :meth:`is_file` / :meth:`is_dir`
+        / :attr:`mtime` off the cached :class:`IOStats`
+        (:attr:`_stat_cached`), not those slots. A directory listing
+        seeds that cache per child off cheap metadata (``os.scandir``
+        stat, S3 ``ListObjectsV2`` size, Databricks
+        ``list_directory_contents``); without propagating the write
+        here, a follow-up modify on a *listed* child would keep
+        reporting the pre-write size — and there's no TTL to age it out
+        on local backends (``STAT_CACHE_TTL is None``).
+
+        Only an existing entry is refreshed. A cold slot stays cold so
+        the next probe still hits the backend — this preserves
+        :class:`LocalPath`'s always-fresh stat (its ``_stat`` never
+        seeds the cache) and avoids fabricating an ``mtime`` we don't
+        have. A write turns a ``MISSING`` entry into a ``FILE``.
+        """
+        super()._touch_stat(size=size, mtime=mtime, media_type=media_type)
+        cached = self._stat_cached
+        if cached is None:
+            return
+        if size is not None:
+            cached.size = int(size)
+            if cached.kind == IOKind.MISSING:
+                cached.kind = IOKind.FILE
+        if mtime is not None:
+            cached.mtime = float(mtime)
+        if media_type is not None:
+            cached.media_type = media_type
+        self._stat_cached_at = time.monotonic()
+
     def invalidate_singleton(self, remove_global: bool = True) -> None:
         """Drop the cached :class:`IOStats` *and* pop self from
         ``_INSTANCES``. Single canonical invalidator for paths.
@@ -370,6 +427,19 @@ class Path(IO, os.PathLike, ABC):
 
     def mkdir(self, parents: bool = True, exist_ok: bool = True) -> "Path":
         self._mkdir(parents=parents, exist_ok=exist_ok)
+        # The path is now a directory. Refresh the stat cache to match —
+        # a slot left at MISSING (from an ``exists()`` probe taken before
+        # the create) would make a follow-up ``exists`` / ``is_dir``
+        # report the directory as absent until the entry aged out. Seed
+        # DIRECTORY directly so remote backends skip a re-probe round trip.
+        self._persist_stat_cache(
+            IOStats(
+                kind=IOKind.DIRECTORY,
+                size=0,
+                mtime=time.time(),
+                media_type=self.media_type,
+            )
+        )
         return self
 
     def unlink(self, missing_ok: bool = True, wait: WaitingConfigArg = True) -> None:

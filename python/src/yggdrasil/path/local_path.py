@@ -753,6 +753,7 @@ class LocalPath(Path):
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
         if self._fd >= 0:
             os.ftruncate(self._fd, n)
+            self._touch_stat(size=n)
             return n
 
         fd = _open_with_mkdir_retry(self.os_path, _default_open_flags())
@@ -760,6 +761,8 @@ class LocalPath(Path):
             os.ftruncate(fd, n)
         finally:
             os.close(fd)
+        # Keep a listing-seeded stat cache in step with the new size.
+        self._touch_stat(size=n)
         return n
 
     def _clear(self) -> None:
@@ -774,3 +777,8 @@ class LocalPath(Path):
             os.remove(self.os_path)
         except FileNotFoundError:
             pass
+        # The file is gone — drop any listing-seeded stat snapshot so the
+        # next probe re-checks the filesystem instead of reporting the
+        # cleared file as still present at its old size.
+        self._stat_cached = None
+        self._stat_cached_at = 0.0
