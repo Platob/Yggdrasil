@@ -347,6 +347,27 @@ class TestDatabricksInsertBatch:
         assert "ROW_NUMBER() OVER ( PARTITION BY `id`" in body
         assert "__ygg_rn__ = 1" in body
 
+    def test_keyed_merge_dedup_orders_by_arrival_latest_wins(self):
+        # Across several drops the dedup must keep the LATEST drop's row per key
+        # — tag each file with its arrival ordinal and order by it DESC, so the
+        # winner is deterministic (not an arbitrary row).
+        from yggdrasil.databricks.table.insert import DatabricksInsertBatch
+        schema = _schema(("id", pa.int64()), ("v", pa.float64()))
+        [batch] = DatabricksInsertBatch.group([
+            self._op("a", mode="merge", match_by=["id"], schema=schema, ts=1.0),
+            self._op("b", mode="merge", match_by=["id"], schema=schema, ts=2.0),
+            self._op("c", mode="merge", match_by=["id"], schema=schema, ts=3.0),
+        ])
+        body = _normalize_ws(batch.make_sql())
+        # one arrival ordinal per file (3 drops → seq 0,1,2), union of all three
+        assert body.count("UNION ALL") == 2
+        assert "0 AS __ygg_seq__" in body
+        assert "1 AS __ygg_seq__" in body
+        assert "2 AS __ygg_seq__" in body
+        # deterministic incoming-wins ordering, and both helpers projected away
+        assert "ORDER BY __ygg_seq__ DESC" in body
+        assert "EXCEPT (__ygg_rn__, __ygg_seq__)" in body
+
     def test_append_batch_skips_dedup(self):
         from yggdrasil.databricks.table.insert import DatabricksInsertBatch
         [batch] = DatabricksInsertBatch.group([
@@ -368,6 +389,78 @@ class TestDatabricksInsertBatch:
         sql = _normalize_ws(stmts[0])
         assert sql.startswith("MERGE INTO c.s.t AS T")
         assert "ROW_NUMBER()" in sql            # dedup'd source feeds the MERGE
+
+
+# --------------------------------------------------------------------------- #
+# MERGE DML generation aggregated from several inner merges (the loader's
+# many-file-arrivals → one MERGE path)
+# --------------------------------------------------------------------------- #
+class TestBatchedMergeDML:
+    @staticmethod
+    def _merge_batch(n, *, match_by, mode="merge", schema=None, update_cols=None):
+        from yggdrasil.databricks.table.insert import (
+            DatabricksInsertBatch, DatabricksTableInsert,
+        )
+        ops = []
+        for i in range(n):
+            op = DatabricksTableInsert(
+                target="c.s.t", mode=mode, data=f"f{i}", ts=float(i),
+                match_by=match_by, schema=schema, update_column_names=update_cols,
+            )
+            op.select_sql = lambda client=None, _d=f"f{i}": f"SELECT * FROM parquet.`{_d}`"  # type: ignore
+            ops.append(op)
+        [batch] = DatabricksInsertBatch.group(ops)
+        return batch
+
+    def _sql(self, batch):
+        from yggdrasil.databricks.table.insert import make_sql_insert
+        return _normalize_ws(make_sql_insert(batch, target_location="c.s.t")[0])
+
+    def test_three_merges_render_one_full_merge(self):
+        schema = _schema(("id", pa.int64()), ("v", pa.float64()), ("w", pa.string()))
+        sql = self._sql(self._merge_batch(3, match_by=["id"], schema=schema))
+        # one MERGE INTO over the deduped union of all three drops
+        assert sql.startswith("MERGE INTO c.s.t AS T USING (")
+        assert sql.count("UNION ALL") == 2
+        # null-safe key match
+        assert "ON T.`id` <=> S.`id`" in sql
+        # update every non-key column, insert the full row
+        assert "WHEN MATCHED THEN UPDATE SET T.`v` = S.`v`, T.`w` = S.`w`" in sql
+        assert "WHEN NOT MATCHED THEN INSERT (`id`, `v`, `w`)" in sql
+        assert "VALUES (S.`id`, S.`v`, S.`w`)" in sql
+
+    def test_composite_key_merge(self):
+        schema = _schema(
+            ("id", pa.int64()), ("region", pa.string()), ("v", pa.float64()),
+        )
+        sql = self._sql(self._merge_batch(2, match_by=["id", "region"], schema=schema))
+        # both keys in the ON, both excluded from the UPDATE SET, both in PARTITION
+        assert "ON T.`id` <=> S.`id` AND T.`region` <=> S.`region`" in sql
+        assert "UPDATE SET T.`v` = S.`v`" in sql
+        assert "T.`id`" not in sql.split("UPDATE SET")[1].split("WHEN NOT")[0]
+        assert "PARTITION BY `id`, `region`" in sql
+
+    def test_update_column_names_override_restricts_set(self):
+        schema = _schema(
+            ("id", pa.int64()), ("v", pa.float64()), ("w", pa.string()),
+        )
+        sql = self._sql(
+            self._merge_batch(2, match_by=["id"], schema=schema, update_cols=["v"])
+        )
+        # only the named column is updated; 'w' is insert-only
+        assert "UPDATE SET T.`v` = S.`v` WHEN NOT MATCHED" in sql
+        assert "T.`w` = S.`w`" not in sql
+
+    def test_keyed_append_is_insert_only_merge(self):
+        # APPEND + keys → insert-only MERGE (no UPDATE clause), no dedup CTE.
+        schema = _schema(("id", pa.int64()), ("v", pa.float64()))
+        sql = self._sql(
+            self._merge_batch(2, match_by=["id"], mode="append", schema=schema)
+        )
+        assert sql.startswith("MERGE INTO c.s.t AS T")
+        assert "WHEN MATCHED THEN UPDATE" not in sql
+        assert "WHEN NOT MATCHED THEN INSERT" in sql
+        assert "ROW_NUMBER()" not in sql            # insert-only doesn't dedup
 
 
 # --------------------------------------------------------------------------- #

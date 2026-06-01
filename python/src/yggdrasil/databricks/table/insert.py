@@ -469,26 +469,30 @@ def _batch_source_sql(batch: "DatabricksInsertBatch", *, client: Any) -> str:
     a keyed ``MERGE`` / ``UPSERT``, the staged files can carry duplicate keys
     across drops, and Delta's MERGE errors when several source rows match the
     same target row — so the union is wrapped in a ``ROW_NUMBER() … = 1`` CTE
-    that keeps the **last** row per key (incoming-wins, matching the
-    DELETE+INSERT semantics). ``OVERWRITE`` / ``APPEND`` need no dedup.
+    that keeps the row from the **latest drop** per key (incoming-wins, matching
+    the DELETE+INSERT semantics). ``OVERWRITE`` / ``APPEND`` need no dedup.
     """
-    union = " UNION ALL ".join(
-        op.select_sql(client=client) for op in batch.active
-    )
+    active = batch.active
     match_by = batch.match_by
     if not match_by or batch.mode not in (Mode.UPSERT, Mode.MERGE):
-        return union
+        return " UNION ALL ".join(op.select_sql(client=client) for op in active)
 
+    # The staged files have no natural ordering column to break ties on, so tag
+    # each file's rows with its arrival ordinal (``active`` is in ts order — the
+    # order the drops landed). ROW_NUMBER then orders by that ordinal DESC and
+    # keeps rn=1, so across files that stage the same key the **latest** drop
+    # wins deterministically (instead of an arbitrary row), and the downstream
+    # MERGE sees at most one source row per target key.
+    union = " UNION ALL ".join(
+        f"SELECT __ygg_src__.*, {seq} AS __ygg_seq__ FROM (\n"
+        f"{op.select_sql(client=client)}\n) AS __ygg_src__"
+        for seq, op in enumerate(active)
+    )
     partition = ", ".join(quote_ident(k) for k in match_by)
-    # The staged files have no natural ordering column to break ties on, so
-    # ROW_NUMBER orders by the partition keys themselves — within a key every
-    # row is interchangeable except that the window keeps exactly one,
-    # collapsing the cross-file duplicates so the downstream MERGE sees at most
-    # one source row per target key.
     return (
-        f"SELECT * EXCEPT (__ygg_rn__) FROM (\n"
+        f"SELECT * EXCEPT (__ygg_rn__, __ygg_seq__) FROM (\n"
         f"  SELECT *, ROW_NUMBER() OVER (\n"
-        f"    PARTITION BY {partition} ORDER BY {partition}\n"
+        f"    PARTITION BY {partition} ORDER BY __ygg_seq__ DESC\n"
         f"  ) AS __ygg_rn__ FROM (\n{union}\n  ) AS __ygg_union__\n"
         f") AS __ygg_dedup__\nWHERE __ygg_rn__ = 1"
     )

@@ -162,6 +162,50 @@ class TestAsyncInsertModes(_AsyncFixture):
         with self.assertRaises(ValueError):
             stage_async_insert(tbl, _data([(1, "a", 1.0)]), mode=Mode.MERGE)
 
+    def test_several_merge_file_arrivals_aggregate_latest_wins(self):
+        # Several independent async merge drops (each its own "file arrival" /
+        # op-log) targeting one table are aggregated by the loader into a single
+        # MERGE INTO over the deduped union. Keys staged in more than one drop
+        # resolve to the LATEST drop's row (incoming-wins, deterministic).
+        from yggdrasil.databricks.table.insert import (
+            load_async, logs_path, stage_async_insert,
+        )
+
+        tbl = self._new_table()
+        try:
+            tbl.insert(_data([(1, "seed1", 1.0), (2, "seed2", 2.0)]), mode=Mode.APPEND)
+            # three drops, in arrival order; overlapping keys across them:
+            #   id 3 appears in all three → drop C must win
+            #   id 2 updated by A; id 1 updated by C; id 4 inserted by B
+            stage_async_insert(
+                tbl, _data([(2, "A2", 20.0), (3, "A3", 30.0)]),
+                mode=Mode.MERGE, match_by=["id"],
+            )
+            stage_async_insert(
+                tbl, _data([(3, "B3", 31.0), (4, "B4", 40.0)]),
+                mode=Mode.MERGE, match_by=["id"],
+            )
+            stage_async_insert(
+                tbl, _data([(1, "C1", 11.0), (3, "C3", 33.0)]),
+                mode=Mode.MERGE, match_by=["id"],
+            )
+        except (DatabricksError, PermissionDenied) as exc:
+            self.skipTest(f"async insert needs volume write access: {exc}")
+
+        # One aggregated load consumes all three op-logs.
+        processed = load_async(self.client.tables, logs_path(tbl), wait=True)
+        self.assertEqual(processed, 3)
+
+        self.assertEqual(
+            self._rows(tbl),
+            {
+                1: ("C1", 11.0),   # seeded, updated by drop C
+                2: ("A2", 20.0),   # seeded, updated by drop A
+                3: ("C3", 33.0),   # in A, B, C → latest (C) wins
+                4: ("B4", 40.0),   # inserted by drop B
+            },
+        )
+
 
 @unittest.skipUnless(__import__("os").getenv("DATABRICKS_HOST"), "needs DATABRICKS_HOST")
 class TestAsyncInsertDeployedJob(_AsyncFixture):
