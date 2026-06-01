@@ -752,7 +752,34 @@ class LocalPath(Path):
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
         if self._fd >= 0:
-            os.ftruncate(self._fd, n)
+            # File is open ⇒ it exists. Only issue the ``ftruncate`` when
+            # the size actually changes — a no-op ``truncate(n)`` (the
+            # common ``truncate(0)`` overwrite-prelude on a freshly-opened,
+            # already-empty target) shouldn't pay a write syscall. The
+            # stat cache is refreshed either way.
+            if os.fstat(self._fd).st_size != n:
+                os.ftruncate(self._fd, n)
+            self._touch_stat(size=n)
+            return n
+
+        # Un-acquired: read the real on-disk size first (0 when the file
+        # is missing). A no-op truncate skips the
+        # ``open(O_CREAT)+ftruncate+close`` entirely.
+        try:
+            current = os.stat(self.os_path).st_size
+        except (FileNotFoundError, NotADirectoryError):
+            # Missing file: ``truncate(0)`` is already satisfied (no
+            # bytes) — don't force-create it just to zero it; the
+            # overwrite-prelude's following write materialises the file.
+            # A larger truncate must still create the n-byte file.
+            if n == 0:
+                return 0
+            current = -1
+
+        if current == n:
+            # Already exactly ``n`` bytes — keep the listing-seeded stat
+            # cache in step without touching the backing.
+            self._touch_stat(size=n)
             return n
 
         fd = _open_with_mkdir_retry(self.os_path, _default_open_flags())
@@ -760,6 +787,8 @@ class LocalPath(Path):
             os.ftruncate(fd, n)
         finally:
             os.close(fd)
+        # Keep a listing-seeded stat cache in step with the new size.
+        self._touch_stat(size=n)
         return n
 
     def _clear(self) -> None:
@@ -774,3 +803,8 @@ class LocalPath(Path):
             os.remove(self.os_path)
         except FileNotFoundError:
             pass
+        # The file is gone — drop any listing-seeded stat snapshot so the
+        # next probe re-checks the filesystem instead of reporting the
+        # cleared file as still present at its old size.
+        self._stat_cached = None
+        self._stat_cached_at = 0.0

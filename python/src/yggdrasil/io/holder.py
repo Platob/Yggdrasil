@@ -68,7 +68,7 @@ from yggdrasil.enums.mode import Mode, ModeLike
 from yggdrasil.io.tabular.base import O, Tabular
 from yggdrasil.url import URL, URLBased
 
-from .io_stats import IOStats
+from .io_stats import IOStats, IOKind
 
 if TYPE_CHECKING:
     pass
@@ -417,6 +417,14 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     #: :attr:`scheme`.
     mime_type: "ClassVar[MimeType | None]" = None
 
+    # The stat-cache machinery (``STAT_CACHE_TTL`` / ``_stat_cached`` /
+    # ``_stat_cached_at`` + ``_stat_cached_fresh`` / ``_persist_stat_cache``
+    # + the ``_TRANSIENT_STATE_ATTRS`` pickle filter) lives on the
+    # :class:`~yggdrasil.io.tabular.base.Tabular` base so the cached
+    # :class:`IOStats` — which also carries the schema in its ``field``
+    # — is shared by every tabular, byte-backed or not. :meth:`_touch_stat`
+    # (below) still owns the write-side mutation of that snapshot.
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Auto-register concrete subclasses keyed on :attr:`mime_type`.
 
@@ -452,6 +460,11 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         "_xxh3_64_cached",
         "_xxh3_64_size",
         "_xxh3_64_mtime",
+        # ``_stat_cached`` / ``_stat_cached_at`` are NOT slots here — they
+        # live in ``__dict__`` and are set by ``Tabular.__init__`` (the
+        # base that owns the cached :class:`IOStats`). ``Tabular`` has no
+        # ``__slots__``, so every holder instance carries a ``__dict__``
+        # for them regardless.
         # Cursor + mode state — pulled up from the former :class:`IO`
         # subclass after the Holder ↔ IO merge so every Holder gains
         # an opt-in seekable cursor. Read/write primitives advance
@@ -934,6 +947,12 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             self._media_type = stat.media_type
         else:
             self._media_type = ...
+        # ``_stat_cached`` / ``_stat_cached_at`` are initialised by
+        # ``Tabular.__init__`` (run via ``super().__init__`` above) — the
+        # cached :class:`IOStats` is shared at the Tabular level. The
+        # caller-supplied ``stat`` seeds the scalar ``_size`` / ``_mtime``
+        # / ``_media_type`` slots only; the stat cache stays cold so
+        # backend-bound holders still re-probe kind on first access.
         self.temporary: bool = bool(temporary)
 
         for prio in (binary, path, data):
@@ -1765,6 +1784,10 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     # returned ``IOStats`` no longer round-trips, since each call
     # produces a fresh instance.
 
+    # ``_stat_cached_fresh`` / ``_persist_stat_cache`` live on the
+    # :class:`~yggdrasil.io.tabular.base.Tabular` base — the cached
+    # :class:`IOStats` (stat + schema ``field``) is shared there.
+
     def stat(self) -> IOStats:
         """Snapshot the holder's metadata into a fresh :class:`IOStats`.
 
@@ -1811,6 +1834,19 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         write loops; callers that actually want the freshness should
         either pass ``mtime=`` or call :meth:`touch_mtime` once at
         the end of the operation.
+
+        The cached :class:`IOStats` snapshot (:attr:`_stat_cached`),
+        when one is warm, is mutated in place by the same call — a
+        directory listing seeds that snapshot per child off cheap
+        metadata (``os.scandir`` stat, S3 ``ListObjectsV2`` size,
+        Databricks ``list_directory_contents``), and the filesystem
+        predicates (:attr:`size` / :meth:`exists` / :meth:`is_file` /
+        :meth:`is_dir` / :attr:`mtime`) read off it rather than the
+        scalar slots. Propagating here keeps a seeded child from
+        reporting its pre-write size forever (there's no TTL to age it
+        out on local backends). A cold snapshot is left cold so the
+        next probe still hits the backend; a write turns a ``MISSING``
+        entry into a ``FILE``.
         """
         if size is not None:
             self._size = int(size)
@@ -1818,6 +1854,19 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             self._mtime = float(mtime)
         if media_type is not None:
             self._media_type = media_type
+
+        cached = self._stat_cached
+        if cached is None:
+            return
+        if size is not None:
+            cached.size = int(size)
+            if cached.kind == IOKind.MISSING:
+                cached.kind = IOKind.FILE
+        if mtime is not None:
+            cached.mtime = float(mtime)
+        if media_type is not None:
+            cached.media_type = media_type
+        self._stat_cached_at = time.monotonic()
 
     def touch_mtime(self, when: float | None = None) -> None:
         """Stamp the holder's mtime with the current time.
@@ -3456,6 +3505,24 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             self.truncate(0)
             if n > 0:
                 self.write_bytes(view, cursor=True)
+
+        # A tabular leaf knows the content type it just wrote (its
+        # ``mime_type``). Keep the backing holder's cached stat in step so
+        # a follow-up ``stat()`` / format re-dispatch (``for_holder``)
+        # reports the format that's actually on the holder rather than a
+        # stale or never-set media type. Only an *existing* cached stat is
+        # refreshed — without one the type resolves fresh on the next
+        # probe, so there's nothing to keep coherent.
+        if n > 0:
+            holder = self._parent if self._parent is not None else self
+            holder_stat = getattr(holder, "_stat_cached", None)
+            cls_mime = type(self).mime_type
+            if holder_stat is not None and cls_mime is not None:
+                resolved = self.media_type
+                codec = getattr(resolved, "codec", None)
+                mt = MediaType(mime_type=cls_mime, codec=codec)
+                if holder_stat.media_type != mt:
+                    holder_stat.media_type = mt
 
         if restore_pos is not None:
             self._pos = min(restore_pos, self.size)

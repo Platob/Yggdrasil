@@ -27,7 +27,7 @@ The async drop pipeline on top of this:
   data was written** (its uniform URL) — no warehouse statement runs.
 - A **file-arrival trigger** on ``logs/`` wakes a serverless job
   (:func:`ensure_async_job`) whose entry point runs
-  ``ygg databricks table execute_async_insert --logs <dir>`` → :func:`load_async`:
+  ``ygg databricks table execute_insert --logs <dir>`` → :func:`load_async`:
   read every pending log, group by **target table** into a
   :class:`DatabricksInsertBatch`, run one aggregated load per target, then
   clear the consumed logs + data.
@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -46,7 +47,10 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from yggdrasil.data import Field
 from yggdrasil.databricks.sql.sql_utils import quote_ident
+from yggdrasil.dataclasses.awaitable import Awaitable
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.enums.mode import Mode
+from yggdrasil.enums.state import State
 from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from yggdrasil.path import Path
 
@@ -55,6 +59,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.databricks.fs.volume_path import VolumePath
     from yggdrasil.databricks.table.table import Table
     from yggdrasil.execution.expr import Predicate
+    from yggdrasil.io.tabular.base import Tabular
 
 __all__ = [
     "ASYNC_ROOT",
@@ -99,13 +104,158 @@ _NAME_PREFIX = "[YGG][ASYNC]"
 #: substituted for the concrete external-data ``VolumePath`` at prepare time.
 ALIAS_TMPSRC = "__tmpsrc__"
 
+#: Schema (under the *target's* catalog) where a Spark-frame ``data`` source is
+#: staged as a temporary Delta table before its URL is recorded in the op-log.
+#: ``None`` (the default) stages alongside the target — same catalog *and*
+#: schema, just a temp table name; set ``YGG_DATABRICKS_STAGING_SCHEMA`` to
+#: route staging into a dedicated schema in the same catalog.
+STAGING_SCHEMA: "str | None" = os.getenv("YGG_DATABRICKS_STAGING_SCHEMA") or None
+
 
 def _new_op_id() -> str:
     return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
 
 
+class _InsertExecution(Awaitable):
+    """:class:`Awaitable` execution shared by :class:`DatabricksTableInsert`
+    and :class:`DatabricksInsertBatch`.
+
+    Both build their own INSERT / MERGE DML and run it — callers don't render
+    SQL or drive a warehouse batch externally. :meth:`execute` (and the
+    :class:`Awaitable` ``start`` / ``wait`` / ``await``) drive an inner
+    :class:`StatementBatch`: :meth:`_submit` (overridden per subclass) renders
+    the statement list and runs it through the target's SQL engine via
+    ``execute_many``. The Awaitable mirrors that inner batch's state, so
+    ``op.start(wait=False)`` fires the load and ``await op`` / ``op.wait()``
+    block on it.
+    """
+
+    #: The inner :class:`StatementBatch` (or backend result) the load drives.
+    _inner: Any = None
+    #: Per-run knobs stashed by :meth:`execute` for :meth:`_submit` to read.
+    _engine: Any = None
+    _retry: Any = None
+
+    def _submit(self, *, wait: bool, raise_error: bool) -> Any:
+        """Render this op/batch's DML and submit it — return the inner batch."""
+        raise NotImplementedError
+
+    def execute(
+        self,
+        *,
+        target: Any = None,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        engine: Any = None,
+        retry: WaitingConfigArg | None = None,
+    ) -> "_InsertExecution":
+        """Build and run this insert. ``target`` rebinds the destination
+        :class:`Table` (the async loader resolves a name → Table here);
+        ``engine`` forces the ``"api"`` / ``"spark"`` backend, ``retry`` a
+        per-statement retry policy. With ``wait`` (default) blocks until the
+        statements finish; ``wait=False`` fires them and returns immediately
+        (poll via :meth:`wait` / ``await``).
+        """
+        if target is not None:
+            self.target = target
+        self._engine = engine
+        self._retry = retry
+        return self.start(wait=wait, raise_error=raise_error)
+
+    def _run_dml(
+        self,
+        target: Any,
+        texts: "list[str]",
+        *,
+        staging: Any = None,
+        source_ref: "str | None" = None,
+        wait: bool,
+        raise_error: bool,
+    ) -> Any:
+        """Prepare *texts* as warehouse statements and run them via
+        ``execute_many``.
+
+        When a Volume *staging* file backs the source, it is registered on
+        the source-reading statement (matched by *source_ref* in the text)
+        so its temporary scratch is reclaimed after the load — the same
+        cleanup binding the old inline ``arrow_insert`` did.
+        """
+        from yggdrasil.databricks.warehouse import WarehousePreparedStatement
+
+        prepared = []
+        for sql in texts:
+            external = (
+                {ALIAS_TMPSRC: staging}
+                if (staging is not None and source_ref and source_ref in sql)
+                else None
+            )
+            prepared.append(
+                WarehousePreparedStatement.prepare(
+                    sql,
+                    client=target.client,
+                    external_volume_paths=external,
+                    catalog_name=target.catalog_name,
+                    schema_name=target.schema_name,
+                )
+            )
+        if not prepared:
+            return None
+        return target.sql.execute_many(
+            statements=prepared,
+            wait=wait,
+            raise_error=raise_error,
+            engine=self._engine,
+            retry=self._retry,
+        )
+
+    @property
+    def result(self) -> Any:
+        """The inner :class:`StatementBatch` driving the load (``None`` until
+        :meth:`start` / :meth:`execute`)."""
+        return self._inner
+
+    # -- Awaitable hooks ------------------------------------------------------
+
+    def _start(self) -> None:
+        self._inner = self._submit(wait=False, raise_error=False)
+        self._sync_from_inner()
+
+    def _poll(self) -> None:
+        inner = self._inner
+        if inner is not None and hasattr(inner, "wait"):
+            inner.wait(wait=False, raise_error=False)
+        self._sync_from_inner()
+
+    def _sync_from_inner(self) -> None:
+        inner = self._inner
+        if inner is None:
+            # Nothing to run (e.g. an empty batch) — treat as done.
+            self._state = State.SUCCEEDED
+            return
+        st = getattr(inner, "state", None)
+        if st is not None:
+            try:
+                self._state = State.from_(st)
+                return
+            except (TypeError, ValueError):
+                pass
+        # A backend result without a coercible state (or a non-Awaitable
+        # one) is taken as done once it reports so.
+        if getattr(inner, "is_done", True):
+            self._state = State.SUCCEEDED
+
+    def _error_for_status(self) -> "BaseException | None":
+        inner = self._inner
+        return getattr(inner, "error", None) if inner is not None else None
+
+    @property
+    def retryable(self) -> bool:
+        inner = getattr(self, "_inner", None)
+        return bool(getattr(inner, "retryable", False))
+
+
 @dataclass
-class DatabricksTableInsert:
+class DatabricksTableInsert(_InsertExecution):
     """One insert operation — the full ``arrow_insert`` surface in one object.
 
     Carries the ``target`` table, the save ``mode``, the staged ``data``
@@ -122,14 +272,28 @@ class DatabricksTableInsert:
     string for human inspection but isn't reconstructed (there's no SQL→AST
     parser, and the async drop path never carries one anyway).
 
-    ``target`` may be a :class:`Table` or its full name; ``data`` may be a
-    :class:`Path` or a uniform-URL string — both are normalized lazily through
-    the bound :attr:`client` when a concrete object is needed.
+    ``target`` may be a :class:`Table` or its full name; ``data`` is any
+    :class:`Tabular` source (a Spark frame, an S3 / Volume :class:`Path`, an
+    Arrow / pandas table, a local path, …) or a uniform-URL string. It is
+    materialised to a durable, loader-readable URL lazily — on the first
+    :attr:`data_url` read (i.e. when the op is serialized to its log) —
+    dispatching on the source type:
+
+    * **Spark frame** → staged into a temporary Delta table in the target's
+      catalog (under :data:`STAGING_SCHEMA`, default the target's own schema)
+      with a temp name; the log points at that table's URL.
+    * **S3 / Volume path** → already a durable cloud location; its URL is kept
+      as-is (the common producer path — :func:`stage_async_insert` pre-stages
+      to a Volume).
+    * **anything else** (Arrow / pandas / a local or in-memory path) → dumped
+      to the target's staging Volume as Parquet; the log points at the file.
+
+    The materialised URL is cached, so serializing twice writes once.
     """
 
     target: "Table | str"
     mode: Mode
-    data: "Path | str"
+    data: "Tabular | Path | str"
     client: "DatabricksClient | None" = None
     op_id: str = field(default_factory=_new_op_id)
     ts: float = field(default_factory=time.time)
@@ -150,6 +314,12 @@ class DatabricksTableInsert:
     safe_merge: bool = False
 
     def __post_init__(self) -> None:
+        # Cache for the materialised data URL — populated on the first
+        # :attr:`data_url` read so a spark-stage / volume-dump runs once.
+        self._data_url_cache: "str | None" = None
+        # The :class:`StatementBatch` this op's execution drives — set by
+        # :meth:`_start` (the :class:`Awaitable` lifecycle).
+        self._inner: Any = None
         self.mode = Mode.from_(self.mode, default=Mode.APPEND)
         # The drop pipeline only knows how to aggregate OVERWRITE / APPEND;
         # the keyed modes have no UNION-ALL story. The synchronous path
@@ -239,21 +409,163 @@ class DatabricksTableInsert:
 
     @property
     def data_url(self) -> str:
-        """The staged data's uniform URL (round-trippable, location-agnostic)."""
-        to_url = getattr(self.data, "to_url", None)
-        return to_url().to_string() if callable(to_url) else str(self.data)
+        """The staged data's uniform URL (round-trippable, location-agnostic).
+
+        Materialises :attr:`data` on first read, dispatching on its type —
+        see the class docstring. The result is cached so a Spark stage /
+        Volume dump runs at most once per op.
+        """
+        if self._data_url_cache is None:
+            self._data_url_cache = self._resolve_data_url()
+        return self._data_url_cache
+
+    @staticmethod
+    def _url_string(obj: Any) -> str:
+        to_url = getattr(obj, "to_url", None)
+        return to_url().to_string() if callable(to_url) else str(obj)
+
+    def _resolve_data_url(self) -> str:
+        """Materialise :attr:`data` to a durable, loader-readable URL.
+
+        Dispatches on the source type (Spark → temp table, S3 / Volume path →
+        keep, else → dump to the target's staging Volume). See the class
+        docstring for the rationale.
+        """
+        data = self.data
+        # Already a serialized URL string — nothing to stage.
+        if isinstance(data, str):
+            return data
+
+        from yggdrasil.io.tabular.base import Tabular
+
+        # Spark frame: can't be serialized — stage it as a temp Delta table
+        # in the target's catalog and point the log at the table. Gated on a
+        # real :class:`Tabular` so a plain object never misfires the
+        # ``_native_spark_frame`` probe.
+        if isinstance(data, Tabular) and data._native_spark_frame() is not None:
+            return self._url_string(self._stage_spark_table(data))
+
+        # S3 / Volume path: already a durable cloud location the loader reads
+        # directly — keep its URL as-is.
+        from yggdrasil.aws.fs.path import S3Path
+        from yggdrasil.databricks.fs.volume_path import VolumePath
+
+        if isinstance(data, (S3Path, VolumePath)):
+            return self._url_string(data)
+
+        # Anything else (Arrow / pandas / a local or in-memory path): dump to
+        # the target's staging Volume as Parquet, point the log at the file.
+        return self._url_string(self._dump_to_volume(data))
+
+    def _target_table(self) -> "Table":
+        """The :class:`Table` to stage against — materialisation needs its
+        catalog / staging Volume.
+
+        The producer always constructs the op with the bound :class:`Table`;
+        a bare-string ``target`` (the shape an op-log round-trips to) carries
+        no client-resolvable staging surface, so a non-string ``data`` source
+        on such an op is unsupported.
+        """
+        target = self.target
+        if hasattr(target, "staging_volume") and hasattr(target, "catalog_name"):
+            return target  # a Table
+        raise TypeError(
+            "Staging a non-string `data` source needs a Table `target` "
+            f"(got {type(target).__name__!r}); build the op with the bound "
+            "Table so its catalog / staging volume can be reached."
+        )
+
+    def _stage_spark_table(self, data: Any) -> "Table":
+        """Stage a Spark *data* frame into a temp Delta table; return it.
+
+        Same catalog as the target, :data:`STAGING_SCHEMA` (default the
+        target's own schema), a unique temp name keyed off :attr:`op_id`.
+        """
+        from yggdrasil.databricks.table.table import Table
+
+        target = self._target_table()
+        staging = Table(
+            service=target.service,
+            catalog_name=target.catalog_name,
+            schema_name=STAGING_SCHEMA or target.schema_name,
+            table_name=f"_ygg_stg_{self.op_id.replace('-', '_')}",
+            temporary=True,
+        )
+        name = staging.full_name()
+        to_table = getattr(data, "to_table", None)
+        if callable(to_table):
+            to_table(name, mode="overwrite")
+        else:
+            from yggdrasil.spark.tabular import SparkTabular
+
+            SparkTabular.from_spark_frame(data._native_spark_frame()).to_table(
+                name, mode="overwrite",
+            )
+        return staging
+
+    def _dump_to_volume(self, data: Any) -> "VolumePath":
+        """Write *data* as Parquet to the target's staging Volume; return the
+        :class:`VolumePath` it landed at."""
+        target = self._target_table()
+        vp = target.insert_volume_path(target, temporary=False)
+        vp.write_table(data, mode=Mode.OVERWRITE)
+        return vp
 
     @property
     def group_key(self) -> str:
         """The target a batch aggregates over — one load per target."""
         return self.target_name
 
+    @property
+    def is_table_source(self) -> bool:
+        """``True`` when the staged ``data`` is a Delta **table** (the Spark
+        dispatch), rather than a staged file.
+
+        Recognises both a live :class:`Table` ``data`` and the
+        ``dbfs+table://`` URL the op-log round-trips to — so the loader reads
+        the right shape whether it holds the producer's object or rebuilt it
+        from a log.
+        """
+        from yggdrasil.databricks.table.table import Table
+
+        data = self.data
+        if isinstance(data, Table):
+            return True
+        if isinstance(data, str):
+            from yggdrasil.url import URL
+
+            try:
+                return URL.from_(data).scheme == Table.scheme.value
+            except Exception:
+                return False
+        return False
+
+    def staged_source(self, client: Any = None) -> "Tabular":
+        """Rebuild the staged ``data`` into the concrete :class:`Tabular` the
+        loader reads / cleans up.
+
+        A live Tabular (the producer's source) is returned unchanged. A
+        serialized URL is rebuilt through the bound (or supplied) client:
+        ``dbfs+table://`` → the :class:`Table` it names; any other path URL →
+        the matching :class:`Path` (see :meth:`data_path`). The on-disk URL
+        is kept verbatim on :attr:`data` — rebuilding only happens here, at
+        consume time — so the op-log round-trips byte-for-byte.
+        """
+        if not isinstance(self.data, str):
+            return self.data
+        if self.is_table_source:
+            from yggdrasil.databricks.table.table import Table
+
+            return Table.from_url(self.data, client=client or self.client)
+        return self.data_path(client)
+
     def data_path(self, client: Any = None) -> "Path":
-        """Resolve the staged data to a concrete :class:`Path`.
+        """Resolve a staged **file** ``data`` to a concrete :class:`Path`.
 
         Already a :class:`Path` → returned as-is; a uniform-URL string →
         reconstructed through the bound (or supplied) client so the loader can
-        read / clean it up wherever it landed.
+        read / clean it up wherever it landed. Use :meth:`staged_source` when
+        the data may be a table (the Spark dispatch) instead of a file.
         """
         if isinstance(self.data, Path):
             return self.data
@@ -261,13 +573,65 @@ class DatabricksTableInsert:
 
         return DatabricksPath.from_(self.data, client=client or self.client)
 
+    def cleanup_staged_data(self, client: Any = None) -> None:
+        """Best-effort removal of the staged data after a load — drop a staged
+        Delta table (the Spark dispatch), else unlink the staged file."""
+        if self.is_table_source:
+            table = self.staged_source(client)
+            try:
+                table.delete(wait=True, missing_ok=True, delete_staging=False)
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                logger.debug(
+                    "async cleanup: failed to drop staged table %s",
+                    table, exc_info=True,
+                )
+            return
+        _best_effort_unlink(self.data_path(client))
+
     def select_sql(self, client: Any = None) -> str:
         """Back-compat alias for :func:`make_sql_select` over this op."""
         return make_sql_select(self, client=client)
 
+    def _submit(self, *, wait: bool, raise_error: bool) -> Any:
+        """Render this op's INSERT / MERGE statement list and run it via
+        ``execute_many`` — the specialized table load, fully self-contained.
+
+        A staged Volume file is referenced as ``parquet.`<path>``` and
+        registered for post-load cleanup; a Spark-staged Delta table reads
+        straight from the table. The target must be a :class:`Table` (pass it
+        to :meth:`execute` when the op only carries the name)."""
+        from yggdrasil.databricks.warehouse import WarehousePreparedStatement
+
+        target = self._target_table()
+        schema = self.schema if (self.schema and self.schema.fields) else target.collect_schema()
+        columns = [f.name for f in schema.fields] if schema and schema.fields else None
+
+        staging = None
+        source_ref = None
+        source_sql = None
+        if not self.is_table_source:
+            staged = self.staged_source(self.client)
+            if getattr(staged, "full_path", None) is not None:
+                staging = staged
+                source_ref = WarehousePreparedStatement.volume_path_text_value(staged)
+                source_sql = make_sql_select(self, source=source_ref)
+
+        texts = make_sql_insert(
+            self,
+            target_location=target.full_name(safe=True),
+            source_sql=source_sql,
+            columns=columns,
+            client=self.client,
+        )
+        return self._run_dml(
+            target, texts,
+            staging=staging, source_ref=source_ref,
+            wait=wait, raise_error=raise_error,
+        )
+
 
 @dataclass
-class DatabricksInsertBatch:
+class DatabricksInsertBatch(_InsertExecution):
     """All ops staged for one ``target`` — aggregated into a single load.
 
     Groups a target's :class:`DatabricksTableInsert` ops and centralizes the
@@ -276,14 +640,42 @@ class DatabricksInsertBatch:
     everything staged before it), else the first active op's mode. Every
     consumed op is retained on :attr:`logs` so the loader can clean up
     superseded data too.
+
+    Like a single op it is :class:`Awaitable` and self-executing —
+    :meth:`execute` (or ``start`` / ``await``) renders the aggregated
+    INSERT / MERGE over the ``UNION ALL`` body and runs it via
+    ``execute_many``.
     """
 
     target: "Table"
     logs: "list[DatabricksTableInsert]" = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self._inner: Any = None
+
     def append(self, op: "DatabricksTableInsert") -> "DatabricksInsertBatch":
         self.logs.append(op)
         return self
+
+    def _submit(self, *, wait: bool, raise_error: bool) -> Any:
+        """Render the aggregated INSERT / MERGE statement list (over the
+        deduplicated ``UNION ALL`` source) and run it via ``execute_many``.
+
+        Async ops carry no schema, so the target's columns are collected
+        here; the per-op staged files are read in place as
+        ``parquet.`<path>``` (cleanup runs separately via
+        :meth:`DatabricksTableInsert.cleanup_staged_data`)."""
+        target = self.target
+        client = getattr(target, "client", None)
+        schema = target.collect_schema()
+        columns = [f.name for f in schema.fields] if schema and schema.fields else None
+        texts = make_sql_insert(
+            self,
+            target_location=target.full_name(safe=True),
+            columns=columns,
+            client=client,
+        )
+        return self._run_dml(target, texts, wait=wait, raise_error=raise_error)
 
     @property
     def mode(self) -> Mode:
@@ -373,6 +765,10 @@ def make_sql_select(
       is substituted for the external-data ``VolumePath`` at prepare time),
       project the op's schema columns from it: ``SELECT <projection> FROM
       <source>``.
+
+    When the staged data is a Delta **table** (the Spark dispatch records a
+    ``dbfs+table://`` URL), the default reads straight from the table —
+    ``SELECT * FROM <catalog.schema.table>`` — rather than ``parquet.`<path>```.
     """
     if source is not None:
         if op.schema is not None and op.schema.fields:
@@ -380,6 +776,10 @@ def make_sql_select(
         else:
             projection = "*"
         return f"SELECT {projection} FROM {source}"
+
+    if op.is_table_source:
+        table = op.staged_source(client)
+        return f"SELECT * FROM {table.full_name(safe=True)}"
 
     path = op.data_path(client)
     full_path = getattr(path, "full_path", None)
@@ -409,7 +809,7 @@ def make_sql_insert(
     """
     if isinstance(target, DatabricksInsertBatch):
         return _make_batch_insert(
-            target, target_location=target_location, client=client,
+            target, target_location=target_location, columns=columns, client=client,
         )
     return _make_op_insert(
         target,
@@ -498,16 +898,20 @@ def _make_batch_insert(
     batch: "DatabricksInsertBatch",
     *,
     target_location: "str | None",
+    columns: "list[str] | None" = None,
     client: Any,
 ) -> list[str]:
     location = _resolve_target_location(batch.target, target_location)
     source_sql = _batch_source_sql(batch, client=client)
     head = batch.active[0] if batch.active else None
-    columns = (
-        [f.name for f in head.schema.fields]
-        if head is not None and head.schema is not None and head.schema.fields
-        else []
-    )
+    if columns is None:
+        # Async ops carry no schema — caller (batch._submit) passes the
+        # target's columns; fall back to the head op's schema otherwise.
+        columns = (
+            [f.name for f in head.schema.fields]
+            if head is not None and head.schema is not None and head.schema.fields
+            else []
+        )
     prune_predicates = _build_where_predicates(
         head.predicate if head is not None else None, target_alias="T",
     )
@@ -1038,14 +1442,17 @@ def stage_async_insert(
         data = IO.from_(data).read_arrow_table()
 
     # Data goes to the default tmp staging path (kept until consumed); the log
-    # records its uniform URL so the loader reads it wherever it landed.
+    # records its uniform URL so the loader reads it wherever it landed. The
+    # op carries that already-durable URL string, so its serialize-time
+    # dispatch is a no-op "keep" (the data is staged here, with the caller's
+    # ``cast_options``, rather than re-dumped by the op).
     data_file = table.insert_volume_path(table, temporary=False)
     data_file.write_table(data, cast_options, mode=Mode.OVERWRITE)
 
     op = DatabricksTableInsert(
         target=table,
         mode=mode_enum,
-        data=data_file,
+        data=data_file.to_url().to_string(),
         client=table.client,
     )
     log_file = logs_path(table) / f"{op.op_id}.json"
@@ -1070,13 +1477,13 @@ def load_async(
 
     Each log carries the full metadata, so the loader parses each into a
     :class:`DatabricksTableInsert`, groups by **target table** into a
-    :class:`DatabricksInsertBatch`, runs one aggregated load per target via
-    the target table's ``insert_into`` (the batch renders one ``UNION ALL``
-    body — deduplicated when keyed), then clears the consumed logs + data.
+    :class:`DatabricksInsertBatch`, and lets each batch execute itself
+    (:meth:`DatabricksInsertBatch.execute` — one ``UNION ALL`` body per
+    target, deduplicated when keyed), then clears the consumed logs + data.
     Returns the number of operations processed.
 
     The loader behind the file-arrival job and the ``ygg databricks table
-    execute_async_insert`` CLI. *tables* is the :class:`Tables` service.
+    execute_insert`` CLI. *tables* is the :class:`Tables` service.
     """
     from yggdrasil.databricks.path import DatabricksPath
 
@@ -1113,9 +1520,9 @@ def load_async(
 
 
 def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> int:
-    """Group parsed ops by target into a :class:`DatabricksInsertBatch` and load
-    each through the target's ``insert_into`` (one aggregated body per target),
-    clearing the consumed logs + data afterward. Returns the op count."""
+    """Group parsed ops by target into a :class:`DatabricksInsertBatch` and let
+    each batch execute itself (one aggregated body per target), clearing the
+    consumed logs + data afterward. Returns the op count."""
     client = tables.client
     batches = DatabricksInsertBatch.group(ops)
     if not batches:
@@ -1132,15 +1539,15 @@ def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> in
             "loading %d file(s) into %s (%s)",
             len(batch.active), target_name, mode.name.lower(),
         )
-        # The batch is the single place the load source is generated.
-        target.insert_into(
-            batch.make_sql(client), mode=mode.name.lower(),
-            match_by=batch.match_by, wait=wait,
-        )
-        # Clear consumed logs + data (incl. superseded ops) after a load.
+        # The batch builds + runs its own DML — bind the resolved Table and
+        # let it execute (renders the UNION ALL body, runs it via the
+        # target's sql_insert / execute_many).
+        batch.execute(target=target, wait=wait)
+        # Clear consumed logs + data (incl. superseded ops) after a load —
+        # unlink a staged file, drop a staged table (the Spark dispatch).
         for op in batch.logs:
             _best_effort_unlink(op.log_file)
-            _best_effort_unlink(op.data_path(client))
+            op.cleanup_staged_data(client)
         processed += len(batch.logs)
     return processed
 
@@ -1161,8 +1568,8 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
     Creates the watched ``logs/`` dir, builds + uploads the full ygg wheel
     (:func:`~yggdrasil.databricks.job.wheel.ensure_ygg_wheel`), and upserts a
     serverless job whose single python-wheel task runs ``ygg databricks table
-    execute_async_insert --logs <dir>`` when a log lands. Any stale job
-    watching the same logs dir is pruned so a single job owns the trigger.
+    execute_insert --logs <dir>`` when a log lands. Any stale job watching the
+    same logs dir is pruned so a single job owns the trigger.
     """
     from databricks.sdk.service.compute import Environment
     from databricks.sdk.service.jobs import (
@@ -1197,11 +1604,11 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
                 environment_key="default",
                 python_wheel_task=PythonWheelTask(
                     # Run the ygg CLI on the cluster:
-                    #   ygg databricks table execute_async_insert --logs <dir>
+                    #   ygg databricks table execute_insert --logs <dir>
                     package_name="ygg",
                     entry_point="ygg",
                     parameters=[
-                        "databricks", "table", "execute_async_insert",
+                        "databricks", "table", "execute_insert",
                         "--logs", logs.full_path(),
                     ],
                 ),

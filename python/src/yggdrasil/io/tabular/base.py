@@ -56,9 +56,10 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from abc import abstractmethod
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any, Generic, Iterator, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 from yggdrasil.data.data_field import Field as _Field
@@ -67,6 +68,7 @@ from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.disposable import Disposable
 from yggdrasil.enums import MediaType, MimeType, Mode, ModeLike
+from yggdrasil.io.io_stats import IOStats
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.url.based import URLBased
 
@@ -75,6 +77,71 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+#: Placeholder column-name prefix pyarrow uses for pandas index levels
+#: that had no ``name`` on the source DataFrame (``__index_level_0__``
+#: for an unnamed top level, ``__index_level_1__`` for the second level
+#: of a partially-named MultiIndex, …). On read we map these back to
+#: ``None`` so the round-trip matches the source.
+_INDEX_PLACEHOLDER_PREFIX: str = "__index_level_"
+
+
+def _is_default_range_index(frame: "pandas.DataFrame") -> bool:
+    """Is this the freebie ``RangeIndex(0, len(df), 1, name=None)``?
+
+    Default pandas indexes carry no information the read side has to
+    recover — ``to_pandas()`` synthesises the same range from scratch.
+    Skipping preservation for this case avoids writing a synthetic
+    ``__index_level_0__`` column that would just hold ``0, 1, …, n-1``.
+    Every *other* index (named, non-zero start / non-unit step, or an
+    arbitrary label set like ``[5, 3, 1]``) carries information and
+    MUST be persisted so it round-trips on read.
+    """
+    idx = frame.index
+    return (
+        type(idx).__name__ == "RangeIndex"
+        and idx.name is None
+        and getattr(idx, "start", 0) == 0
+        and getattr(idx, "step", 1) == 1
+        and getattr(idx, "stop", 0) == len(frame)
+    )
+
+
+def _collect_index_levels(schema: pa.Schema) -> "list[tuple[int, str]]":
+    """Extract pandas index levels from yggdrasil tags or ``b"pandas"`` metadata.
+
+    Returns ``(level_position, column_name)`` pairs. Prefers the
+    ``index_key`` / ``index_key_level`` per-field tags written by
+    :func:`_tag_index_columns`; falls back to pyarrow's ``b"pandas"``
+    JSON blob's ``index_columns`` when those are absent — so files
+    produced by ``pandas.to_parquet`` / ``pandas.to_feather``, Spark,
+    or other tools still restore their index on read.
+    """
+    import yggdrasil.pickle.json as ygg_json
+
+    levels: "list[tuple[int, str]]" = []
+    for f in schema:
+        meta = f.metadata
+        if not meta or not meta.get(_Field._TAG_KEY_INDEX_KEY):
+            continue
+        raw_level = meta.get(_Field._TAG_KEY_INDEX_KEY_LEVEL)
+        try:
+            pos = int(raw_level) if raw_level is not None else 0
+        except (TypeError, ValueError):
+            pos = 0
+        levels.append((pos, f.name))
+    if levels:
+        return levels
+
+    raw = (schema.metadata or {}).get(b"pandas")
+    if not raw:
+        return levels
+    pmeta = ygg_json.loads(raw)
+    for pos, entry in enumerate(pmeta.get("index_columns", ())):
+        if isinstance(entry, str):
+            levels.append((pos, entry))
+    return levels
 
 
 def _tag_index_columns(table: pa.Table) -> pa.Table:
@@ -513,6 +580,23 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
     mime_type: "ClassVar[MimeType | None]" = None
 
+    #: Lifetime of a seeded :attr:`_stat_cached` entry. ``None`` (the
+    #: default) trusts a seeded snapshot until it is explicitly
+    #: invalidated — right for in-memory and local-filesystem holders.
+    #: Remote backends override with a finite TTL so a snapshot can't
+    #: outlive the backend's own mutation window. Only gates the *stat*
+    #: fields; the cached schema (``field``) is read regardless of TTL.
+    STAT_CACHE_TTL: "ClassVar[float | None]" = None
+    #: The cached :class:`IOStats` (stat snapshot + schema ``field``) is
+    #: per-instance, backend-derived state — never pickle it. A tabular
+    #: serialized on one node and rehydrated on another must re-probe
+    #: rather than trust a snapshot of *this* node's view. Subclasses
+    #: that filter ``__getstate__`` by this set (e.g.
+    #: :class:`DatabricksPath`) rely on the slots being listed here.
+    _TRANSIENT_STATE_ATTRS: "ClassVar[frozenset[str]]" = frozenset(
+        {"_stat_cached", "_stat_cached_at"}
+    )
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         mt = cls.__dict__.get("mime_type")
@@ -550,7 +634,15 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         """
         super().__init__()
         self.tabular_parent: "Tabular | None" = tabular_parent
-        self._schema_cache: "Schema | Any" = ...
+        # Cached :class:`IOStats` — the single home for both the stat
+        # snapshot (size / mtime / kind, used by byte-backed holders)
+        # and the tabular schema (``field``, used by every Tabular). The
+        # ``_schema_cache`` property reads / writes the schema through
+        # it. Cold by default: ``_stat_cached_at == 0`` marks "never
+        # seeded" so :meth:`_stat_cached_fresh` re-probes the stat side
+        # until a listing / probe fills it in.
+        self._stat_cached: "IOStats | None" = None
+        self._stat_cached_at: float = 0.0
         self._url: "URL | None" = None
 
     def to_url(self) -> "URL":
@@ -563,6 +655,93 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     @property
     def url(self) -> "URL":
         return self.to_url()
+
+    # ==================================================================
+    # Cached IOStats — shared home for the stat snapshot AND the schema.
+    # The stat fields (size / mtime / kind) are gated by
+    # :attr:`STAT_CACHE_TTL` via :meth:`_stat_cached_fresh`; the schema
+    # (``field``) is read through the :attr:`_schema_cache` property
+    # regardless of stat freshness.
+    # ==================================================================
+
+    def _stat_cached_fresh(self) -> "IOStats | None":
+        """Return the cached :class:`IOStats` when its *stat* side is fresh.
+
+        ``None`` when the slot is cold (``_stat_cached_at <= 0`` — never
+        stamped as a real stat snapshot, e.g. an entry that only carries
+        a cached schema ``field``) *or* the entry has expired past
+        :attr:`STAT_CACHE_TTL`. ``TTL is None`` trusts a stamped snapshot
+        until it is explicitly invalidated; ``TTL <= 0`` always
+        re-probes. In-memory holders never stamp the slot, so this stays
+        ``None`` for them and their authoritative ``_size`` / ``_mtime``
+        answer instead.
+        """
+        cached = self._stat_cached
+        if cached is None or self._stat_cached_at <= 0.0:
+            return None
+        ttl = self.STAT_CACHE_TTL
+        if ttl is None:
+            return cached
+        if ttl <= 0:
+            return None
+        if (time.monotonic() - self._stat_cached_at) <= ttl:
+            return cached
+        return None
+
+    def _persist_stat_cache(self, stats: IOStats) -> None:
+        """Seed :attr:`_stat_cached` with a known :class:`IOStats` and
+        stamp it fresh.
+
+        Useful for backends that learn metadata as a side-effect of a
+        listing (S3 ``ListObjectsV2`` returns size + mtime per object,
+        Databricks ``Files.list_directory_contents`` returns
+        ``is_directory`` + ``file_size``, ``os.scandir`` exposes
+        ``is_dir`` / ``is_file`` cheaply) or a read / write where the
+        response body's length IS the new size. The next filesystem
+        predicate (:attr:`size` / :meth:`exists` / :meth:`is_file` /
+        :meth:`is_dir` / :attr:`mtime`) collapses to a local hit.
+
+        A schema cached on the previous entry carries over when the
+        incoming *stats* doesn't bring its own — a stat refresh
+        (TTL expiry, HeadObject) shouldn't drop a known schema, which
+        is invalidated separately on mutation.
+        """
+        prior = self._stat_cached
+        if stats.field is None and prior is not None and prior.field is not None:
+            stats.field = prior.field
+        self._stat_cached = stats
+        self._stat_cached_at = time.monotonic()
+
+    @property
+    def _schema_cache(self) -> "Schema | Any":
+        """The cached schema, stored in :attr:`_stat_cached`'s ``field``.
+
+        Returns the ``...`` sentinel when no schema is cached, matching
+        the slot-based contract every caller (``collect_schema``,
+        folder / spark / arrow tabulars) was written against — they keep
+        working unchanged while the storage moves into the shared
+        :class:`IOStats`.
+        """
+        stat = self._stat_cached
+        if stat is not None and stat.field is not None:
+            return stat.field
+        return ...
+
+    @_schema_cache.setter
+    def _schema_cache(self, value: "Schema | Any") -> None:
+        stat = self._stat_cached
+        if value is ...:
+            # Clear the schema, leave any stat snapshot intact.
+            if stat is not None:
+                stat.field = None
+            return
+        if stat is None:
+            # No stat yet — mint a cold entry (``_stat_cached_at`` stays
+            # 0 so :meth:`_stat_cached_fresh` won't mistake it for a real
+            # stat snapshot) that carries only the schema.
+            self._stat_cached = IOStats(field=value)
+        else:
+            stat.field = value
 
     # ==================================================================
     # Static values — column → constant invariants across every row
@@ -1606,28 +1785,31 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         )
 
     def _read_pandas_frame(self, options: O) -> "pandas.DataFrame":
+        """Read the table and restore the pandas index it was written with.
+
+        Index levels are recovered from yggdrasil's ``index_key`` /
+        ``index_key_level`` per-field tags (written by
+        :meth:`_write_pandas_frame`), falling back to pyarrow's
+        ``b"pandas"`` ``index_columns`` blob for files produced by other
+        tools — see :func:`_collect_index_levels`. Tagged columns are
+        promoted into the index in level order; ``__index_level_N__``
+        placeholders map back to the unnamed levels they came from.
+        """
         table = self._read_arrow_table(options)
         df = table.to_pandas()
-        levels: list[tuple[int, str]] = []
-        for f in table.schema:
-            meta = f.metadata
-            if not meta or not meta.get(_Field._TAG_KEY_INDEX_KEY):
-                continue
-            raw_level = meta.get(_Field._TAG_KEY_INDEX_KEY_LEVEL)
-            try:
-                pos = int(raw_level) if raw_level is not None else 0
-            except (TypeError, ValueError):
-                pos = 0
-            levels.append((pos, f.name))
-        if levels:
-            levels.sort()
-            names = [name for _, name in levels]
-            df = df.set_index(names)
-            df.index.names = [
-                None if isinstance(n, str) and n.startswith("__index_level_")
-                else n
-                for n in df.index.names
-            ]
+        levels = _collect_index_levels(table.schema)
+        if not levels:
+            return df
+        levels.sort()
+        present = [name for _, name in levels if name in df.columns]
+        if not present:
+            return df
+        df = df.set_index(present)
+        df.index.names = [
+            None if isinstance(n, str) and n.startswith(_INDEX_PLACEHOLDER_PREFIX)
+            else n
+            for n in df.index.names
+        ]
         return df
 
     def write_pandas_frame(
@@ -1639,7 +1821,16 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         self._write_pandas_frame(frame, self.check_options(options, overrides=locals()))
 
     def _write_pandas_frame(self, frame: "pandas.DataFrame", options: O) -> None:
-        include_index = any(n is not None for n in frame.index.names)
+        # Persist every index that carries information so it round-trips
+        # on read — named, non-trivial RangeIndex, or an arbitrary label
+        # set (``[5, 3, 1]``). Only the freebie ``RangeIndex(0, n, 1)``
+        # is dropped: ``to_pandas`` regenerates it for free. ``any(name
+        # is not None)`` used to gate this, which silently lost every
+        # fully-unnamed non-default index (e.g. a sliced / reordered
+        # frame) — ``preserve_index`` then materialises the levels as
+        # ``__index_level_N__`` columns that :func:`_tag_index_columns`
+        # marks and :meth:`_read_pandas_frame` restores.
+        include_index = not _is_default_range_index(frame)
 
         fast_casted: "pa.Table | None" = None
         target = getattr(options, "target", None)

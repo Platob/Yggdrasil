@@ -32,26 +32,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.arrow.ops import upsert_arrow_batches
-from yggdrasil.data.data_field import Field as _Field
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.enums import MimeTypes, Mode
 from yggdrasil.lazy_imports import polars_module, pyarrow_dataset_module
 from yggdrasil.io.base import IO
-from yggdrasil.pickle import json as ygg_json
 
 if TYPE_CHECKING:
-    import pandas
     import polars as pl
     import pyarrow.dataset as pds
 
-
-#: Placeholder column-name prefix pyarrow uses for index levels that
-#: had no ``name`` on the source DataFrame (``__index_level_0__`` for
-#: an unnamed top level, ``__index_level_1__`` for the second level of
-#: a partially-named MultiIndex, …). When restoring the index on read
-#: we map these back to ``None`` so the round-trip matches the source.
-_INDEX_PLACEHOLDER_PREFIX: str = "__index_level_"
 
 #: Parquet footers with large metadata (many row groups / columns, big column
 #: statistics) blow past pyarrow's default thrift deserialization limits and
@@ -65,39 +55,6 @@ _THRIFT_LIMITS = {
 
 
 __all__ = ["ParquetFile", "ParquetOptions"]
-
-
-def _collect_index_levels(schema: pa.Schema) -> list[tuple[int, str]]:
-    """Extract index levels from yggdrasil tags or pyarrow ``b"pandas"`` metadata.
-
-    Returns a list of ``(level_position, column_name)`` pairs. Prefers
-    the ``index_key`` / ``index_key_level`` per-field tags; falls back
-    to the ``b"pandas"`` JSON blob when those are absent (files written
-    by ``pandas.to_parquet``, Spark, etc.).
-    """
-    levels: list[tuple[int, str]] = []
-    for f in schema:
-        meta = f.metadata
-        if not meta:
-            continue
-        if meta.get(_Field._TAG_KEY_INDEX_KEY):
-            raw_level = meta.get(_Field._TAG_KEY_INDEX_KEY_LEVEL)
-            try:
-                pos = int(raw_level) if raw_level is not None else 0
-            except (TypeError, ValueError):
-                pos = 0
-            levels.append((pos, f.name))
-    if levels:
-        return levels
-
-    raw = (schema.metadata or {}).get(b"pandas")
-    if not raw:
-        return levels
-    pmeta = ygg_json.loads(raw)
-    for pos, entry in enumerate(pmeta.get("index_columns", ())):
-        if isinstance(entry, str):
-            levels.append((pos, entry))
-    return levels
 
 
 #: Modes that read existing bytes, merge with the incoming stream,
@@ -510,133 +467,9 @@ class ParquetFile(IO[bytes, ParquetOptions]):
             ) as writer:
                 writer.write_table(casted, row_group_size=options.row_group_size)
 
-    # ==================================================================
-    # Pandas — tag each index level as a Field, set_index() on read
-    # ==================================================================
-
-    @staticmethod
-    def _is_default_range_index(frame: "pandas.DataFrame") -> bool:
-        """Is this the freebie ``RangeIndex(0, len(df), 1, name=None)``?
-
-        Default pandas indexes carry no information the read side has
-        to recover — ``to_pandas()`` synthesises the same range from
-        scratch. Skipping the tag for this case avoids writing a
-        synthetic ``__index_level_0__`` column that would just hold
-        ``0, 1, …, n-1``.
-        """
-        idx = frame.index
-        return (
-            type(idx).__name__ == "RangeIndex"
-            and idx.name is None
-            and getattr(idx, "start", 0) == 0
-            and getattr(idx, "step", 1) == 1
-            and getattr(idx, "stop", 0) == len(frame)
-        )
-
-    def _write_pandas_frame(
-        self, frame: "pandas.DataFrame", options: ParquetOptions,
-    ) -> None:
-        """Write a pandas DataFrame, tagging index columns in the schema.
-
-        ``preserve_index=True`` materialises every index level as a
-        real column (named after the level, or ``__index_level_N__``
-        when the level was unnamed). Each materialised column then
-        gets an ``index_key`` + ``index_key_level`` per-field tag carrying
-        its level position, and pyarrow's ``b"pandas"`` JSON blob is
-        stripped — the yggdrasil schema is now the single source of
-        truth for the round-trip, visible to every engine that reads
-        through a :class:`Field` tree. :meth:`_read_pandas_frame`
-        reads the tag back and promotes those columns into the
-        pandas index via ``set_index``.
-
-        Default ``RangeIndex(0, len(df))`` skips preservation entirely
-        — its values can be regenerated for free on the read side.
-        Target-bound writes also defer to the base path: a strict
-        target schema has no slot for an index round-trip.
-        """
-        if getattr(options, "target", None) is not None:
-            super()._write_pandas_frame(frame, options)
-            return
-
-        if self._is_default_range_index(frame):
-            self._write_arrow_table(
-                pa.Table.from_pandas(frame, preserve_index=False),
-                options,
-            )
-            return
-
-        table = pa.Table.from_pandas(frame, preserve_index=True)
-
-        # Parse pyarrow's ``b"pandas"`` JSON to discover which columns
-        # are index levels and in what order. ``preserve_index=True``
-        # always materialises every level as a column, so range
-        # descriptors (dicts in ``index_columns``) shouldn't surface —
-        # filter to strings defensively in case a future pyarrow
-        # version changes the shape.
-        raw = (table.schema.metadata or {}).get(b"pandas")
-        pandas_meta = ygg_json.loads(raw) if raw else {}
-        level_by_name: dict[str, int] = {
-            entry: position
-            for position, entry in enumerate(pandas_meta.get("index_columns", ()))
-            if isinstance(entry, str)
-        }
-
-        if not level_by_name:
-            # No materialised index columns to tag. Drop ``b"pandas"``
-            # so the write side stays the single source of truth.
-            self._write_arrow_table(
-                table.replace_schema_metadata(None), options,
-            )
-            return
-
-        tagged_fields: list[pa.Field] = []
-        for arrow_field in table.schema:
-            level = level_by_name.get(arrow_field.name)
-            if level is None:
-                tagged_fields.append(arrow_field)
-                continue
-            merged = dict(arrow_field.metadata or {})
-            merged[_Field._TAG_KEY_INDEX_KEY] = b"true"
-            merged[_Field._TAG_KEY_INDEX_KEY_LEVEL] = str(level).encode("ascii")
-            tagged_fields.append(arrow_field.with_metadata(merged))
-
-        enriched = pa.Table.from_arrays(
-            list(table.itercolumns()),
-            schema=pa.schema(tagged_fields, metadata=None),
-        )
-        self._write_arrow_table(enriched, options)
-
-    def _read_pandas_frame(self, options: ParquetOptions) -> "pandas.DataFrame":
-        """Restore the pandas index from ``index_key`` tags or ``b"pandas"`` metadata.
-
-        First checks for yggdrasil's own ``index_key`` /
-        ``index_key_level`` per-field tags (written by our
-        ``_write_pandas_frame``).  When absent — e.g. parquet files
-        produced by ``pandas.to_parquet``, Spark, or other tools —
-        falls back to pyarrow's ``b"pandas"`` JSON blob in the schema
-        metadata and extracts ``index_columns`` from it.  Both paths
-        promote tagged columns into the pandas index via ``set_index``
-        in level order.
-        """
-        table = self._read_arrow_table(options)
-        levels = _collect_index_levels(table.schema)
-
-        df = table.to_pandas()
-        if not levels:
-            return df
-
-        levels.sort()
-        ordered = [name for _, name in levels]
-        present = [n for n in ordered if n in df.columns]
-        if not present:
-            return df
-        df = df.set_index(present)
-        df.index.names = [
-            None if isinstance(n, str) and n.startswith(_INDEX_PLACEHOLDER_PREFIX)
-            else n
-            for n in df.index.names
-        ]
-        return df
+    # Pandas index round-trip (tag each index level on write, set_index
+    # on read) lives on the base :class:`Tabular` — Parquet and Arrow
+    # IPC (and every other tabular leaf) share one implementation.
 
     # ==================================================================
     # Native engine overrides — push reads to format-aware scanners

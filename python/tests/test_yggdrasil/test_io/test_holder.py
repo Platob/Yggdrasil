@@ -646,3 +646,73 @@ class TestRemoteWholeReadTopUp:
         s = _Remote()
         out = bytes(IO.read_mv(s, 10, 0))
         assert out == real[:10] and s.calls == 1
+
+
+class TestSchemaMutualizedIntoIOStats:
+    """The schema cache shares the single ``_stat_cached`` :class:`IOStats`.
+
+    ``collect_schema`` / ``_persist_schema`` read and write the schema
+    through ``_stat_cached.field`` (the ``_schema_cache`` property), so a
+    tabular's stat snapshot and its schema live in one object — without
+    the schema corrupting the stat predicates.
+    """
+
+    def _parquet_over_memory(self, mem):
+        from yggdrasil.io.parquet_file import ParquetFile
+
+        return ParquetFile(holder=mem, owns_holder=False)
+
+    def test_collect_schema_caches_in_stat_field(self):
+        import pyarrow as pa
+
+        mem = Memory()
+        self._parquet_over_memory(mem).write_arrow_table(
+            pa.table({"a": [1, 2], "b": ["x", "y"]})
+        )
+        leaf = self._parquet_over_memory(mem)
+        assert leaf._stat_cached is None  # cold before collect
+        schema = leaf.collect_schema()
+        assert leaf._stat_cached is not None
+        assert leaf._stat_cached.field is schema  # mutualized home
+        assert leaf.collect_schema() is schema  # second hit is the cache
+
+    def test_schema_only_entry_does_not_look_like_a_fresh_stat(self):
+        # A holder that only knows its schema (``_stat_cached.field`` set,
+        # ``_stat_cached_at == 0``) must NOT report a fresh stat — the
+        # stat predicates have to re-probe.
+        from yggdrasil.data.schema import Schema
+
+        mem = Memory()
+        leaf = self._parquet_over_memory(mem)
+        leaf._schema_cache = Schema.empty()  # property → _stat_cached.field
+        assert leaf._stat_cached is not None
+        assert leaf._stat_cached_at == 0.0
+        assert leaf._stat_cached_fresh() is None  # cold for stat purposes
+
+    def test_unpersist_schema_keeps_a_stat_snapshot(self):
+        from yggdrasil.data.schema import Schema
+        from yggdrasil.io.io_stats import IOStats, IOKind
+
+        mem = Memory()
+        leaf = self._parquet_over_memory(mem)
+        leaf._persist_stat_cache(IOStats(size=7, kind=IOKind.FILE))
+        leaf._schema_cache = Schema.empty()
+        assert leaf._stat_cached.field is not None
+        leaf._unpersist_schema()
+        # schema dropped, but the stat snapshot survives
+        assert leaf._stat_cached.field is None
+        assert leaf._stat_cached.size == 7
+        assert leaf._stat_cached_fresh() is not None
+
+    def test_persist_stat_cache_preserves_schema_across_refresh(self):
+        from yggdrasil.data.schema import Schema
+        from yggdrasil.io.io_stats import IOStats, IOKind
+
+        mem = Memory()
+        leaf = self._parquet_over_memory(mem)
+        leaf._schema_cache = Schema.empty()
+        carried = leaf._stat_cached.field
+        # A stat refresh (no schema of its own) must not drop the schema.
+        leaf._persist_stat_cache(IOStats(size=3, kind=IOKind.FILE))
+        assert leaf._stat_cached.field is carried
+        assert leaf._stat_cached.size == 3

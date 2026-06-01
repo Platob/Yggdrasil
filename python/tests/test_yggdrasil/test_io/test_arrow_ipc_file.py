@@ -589,3 +589,76 @@ class TestEmptyOverwriteWritesValidFile:
         reader = _ipc.open_file(pa.BufferReader(mem.to_bytes()))
         assert reader.schema.names == ["id", "amount"]
         assert reader.read_all().num_rows == 0
+
+
+class TestPandasIndexRoundTrip(__import__(
+    "yggdrasil.pandas.tests", fromlist=["PandasTestCase"],
+).PandasTestCase):
+    """ArrowIPCFile round-trips every non-default pandas index shape.
+
+    The shared base ``_write_pandas_frame`` tags each informative index
+    level on write and ``_read_pandas_frame`` promotes the tagged
+    columns back into the index on read — the same path ParquetFile
+    uses. Before the logic was unified the IPC leaf fell through to the
+    weaker ``any(name is not None)`` gate, which silently dropped every
+    fully-unnamed non-default index.
+    """
+
+    def _roundtrip(self, df):
+        mem = Memory()
+        ArrowIPCFile(holder=mem, owns_holder=False).write_pandas_frame(df)
+        return ArrowIPCFile(holder=mem, owns_holder=False).read_pandas_frame()
+
+    def test_default_range_index(self) -> None:
+        df = self.df({"a": [1, 2, 3]})
+        result = self._roundtrip(df)
+        self.assertFrameEqual(result, df, check_index=True)
+        assert isinstance(result.index, self.pd.RangeIndex)
+        assert result.index.start == 0
+
+    def test_non_default_range_index(self) -> None:
+        df = self.df({"a": [1, 2, 3]}, index=self.pd.RangeIndex(5, 8))
+        result = self._roundtrip(df)
+        self.assertFrameEqual(result, df, check_index=True)
+        assert list(result.index) == [5, 6, 7]
+
+    def test_named_index(self) -> None:
+        df = self.df({"a": [10, 20, 30]}, index=self.pd.Index([1, 2, 3], name="i"))
+        result = self._roundtrip(df)
+        self.assertFrameEqual(result, df, check_index=True)
+        assert result.index.name == "i"
+
+    def test_unnamed_non_range_index(self) -> None:
+        # The case the old base path dropped: an arbitrary unnamed label set.
+        df = self.df({"a": [1, 2, 3]}, index=[10, 20, 30])
+        result = self._roundtrip(df)
+        self.assertFrameEqual(result, df, check_index=True)
+        assert list(result.index) == [10, 20, 30]
+
+    def test_multi_index_named(self) -> None:
+        idx = self.pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 2), ("b", 1)], names=["k1", "k2"],
+        )
+        df = self.df({"v": [10, 20, 30]}, index=idx)
+        result = self._roundtrip(df)
+        self.assertFrameEqual(result, df, check_index=True)
+        assert isinstance(result.index, self.pd.MultiIndex)
+        assert result.index.names == ["k1", "k2"]
+
+    def test_multi_index_unnamed(self) -> None:
+        idx = self.pd.MultiIndex.from_tuples([("a", 1), ("b", 2)])
+        df = self.df({"v": [10, 20]}, index=idx)
+        result = self._roundtrip(df)
+        self.assertFrameEqual(result, df, check_index=True)
+        assert isinstance(result.index, self.pd.MultiIndex)
+        assert result.index.names == [None, None]
+
+    def test_local_path_roundtrip(self) -> None:
+        df = self.df({"a": [1, 2, 3]}, index=self.pd.RangeIndex(100, 103))
+        path = LocalPath(str(self.tmp_path / "indexed.arrow"))
+        with path.open("wb") as cursor:
+            cursor.write_pandas_frame(df)
+        with path.open("rb") as cursor:
+            result = cursor.read_pandas_frame()
+        self.assertFrameEqual(result, df, check_index=True)
+        assert list(result.index) == [100, 101, 102]

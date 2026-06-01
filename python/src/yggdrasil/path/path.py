@@ -76,13 +76,15 @@ class Path(IO, os.PathLike, ABC):
 
     scheme: ClassVar[str] = ""
 
-    STAT_CACHE_TTL: ClassVar["float | None"] = None
-    _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset()
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._stat_cached: IOStats | None = None
-        self._stat_cached_at: float = 0.0
+    # The stat-cache machinery (``STAT_CACHE_TTL`` / ``_stat_cached`` /
+    # ``_stat_cached_at`` slots, ``_stat_cached_fresh`` /
+    # ``_persist_stat_cache`` / the ``_touch_stat`` propagation, and the
+    # ``_TRANSIENT_STATE_ATTRS`` pickle filter) lives on the base
+    # :class:`~yggdrasil.io.holder.Holder` so every holder shares one
+    # IOStats snapshot mutated in :meth:`Holder._touch_stat`. Path only
+    # reads off it through the filesystem predicates below and overrides
+    # :attr:`STAT_CACHE_TTL` (e.g. :class:`RemotePath`) when a snapshot
+    # must not outlive the backend's mutation window.
 
     # ==================================================================
     # Construction / coercion
@@ -220,31 +222,11 @@ class Path(IO, os.PathLike, ABC):
     def size(self) -> int:
         # Fast path: a seeded :class:`IOStats` (from a listing entry
         # or a previous probe) skips the per-call backend round trip.
+        # ``_stat_cached_fresh`` lives on the base :class:`Holder`.
         cached = self._stat_cached_fresh()
         if cached is not None:
             return int(cached.size)
         return int(self._stat().size)
-
-    def _stat_cached_fresh(self) -> "IOStats | None":
-        """Return the cached :class:`IOStats` when still inside its TTL.
-
-        ``None`` when the slot is empty *or* the entry has expired
-        past :attr:`stat_cache_ttl`. Subclasses that always want a
-        fresh probe (e.g. test scaffolding) override
-        :attr:`stat_cache_ttl` to ``0`` so this method always returns
-        ``None``.
-        """
-        cached = self._stat_cached
-        if cached is None:
-            return None
-        ttl = self.STAT_CACHE_TTL
-        if ttl is None:
-            return cached
-        if ttl <= 0:
-            return None
-        if (time.monotonic() - self._stat_cached_at) <= ttl:
-            return cached
-        return None
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
         bio = self._bread(n, pos, Mode.READ_ONLY)
@@ -276,6 +258,10 @@ class Path(IO, os.PathLike, ABC):
             bio.truncate(n)
             bio.seek(0)
             self._bwrite(bio, 0, Mode.OVERWRITE)
+            # The backing is now ``n`` bytes — reflect it in the stat
+            # cache so a seeded entry (from a listing) doesn't keep
+            # reporting the pre-truncate size.
+            self._touch_stat(size=n)
             return n
         finally:
             bio.close()
@@ -283,6 +269,11 @@ class Path(IO, os.PathLike, ABC):
     def _clear(self) -> None:
         """:class:`Holder` primitive: drop the backing entirely (idempotent)."""
         self._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
+        # The backing is gone — a cached FILE/size snapshot would now lie.
+        # Drop it so the next probe re-checks the backend (and reports
+        # MISSING) instead of trusting the pre-clear state.
+        self._stat_cached = None
+        self._stat_cached_at = 0.0
 
     # ==================================================================
     # Filesystem surface — thin wrappers over the abstract hooks
@@ -314,20 +305,10 @@ class Path(IO, os.PathLike, ABC):
         s = self._stat()
         return float(s.mtime or 0.0) if s.kind != IOKind.MISSING else 0.0
 
-    def _persist_stat_cache(self, stats: IOStats) -> None:
-        """Pre-populate :attr:`_stat_cached` with a known :class:`IOStats`.
-
-        Useful for backends that learn metadata as a side-effect of a
-        listing (S3 ``ListObjectsV2`` returns size + mtime per object,
-        Databricks ``Files.list_directory_contents`` returns
-        ``is_directory`` + ``file_size``, ``os.scandir`` exposes
-        ``is_dir`` / ``is_file`` cheaply) or a read / write where the
-        response body's length IS the new size. The next
-        :meth:`size` / :meth:`exists` / :meth:`is_file` / :meth:`is_dir`
-        / :attr:`mtime` call collapses to a local hit.
-        """
-        self._stat_cached = stats
-        self._stat_cached_at = time.monotonic()
+    # ``_stat_cached_fresh`` / ``_persist_stat_cache`` and the
+    # ``_touch_stat`` write-propagation live on the base
+    # :class:`~yggdrasil.io.holder.Holder` — a Path is just a holder
+    # whose cached :class:`IOStats` carries a filesystem ``kind``.
 
     def invalidate_singleton(self, remove_global: bool = True) -> None:
         """Drop the cached :class:`IOStats` *and* pop self from
@@ -370,6 +351,19 @@ class Path(IO, os.PathLike, ABC):
 
     def mkdir(self, parents: bool = True, exist_ok: bool = True) -> "Path":
         self._mkdir(parents=parents, exist_ok=exist_ok)
+        # The path is now a directory. Refresh the stat cache to match —
+        # a slot left at MISSING (from an ``exists()`` probe taken before
+        # the create) would make a follow-up ``exists`` / ``is_dir``
+        # report the directory as absent until the entry aged out. Seed
+        # DIRECTORY directly so remote backends skip a re-probe round trip.
+        self._persist_stat_cache(
+            IOStats(
+                kind=IOKind.DIRECTORY,
+                size=0,
+                mtime=time.time(),
+                media_type=self.media_type,
+            )
+        )
         return self
 
     def unlink(self, missing_ok: bool = True, wait: WaitingConfigArg = True) -> None:
