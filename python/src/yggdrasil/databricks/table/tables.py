@@ -320,14 +320,17 @@ class Tables(DatabricksService):
         for (target_name, mode), items in groups.items():
             target = self[target_name]
             logger.info("loading %d file(s) into %s (%s)", len(items), target_name, mode)
+            # Each ``data`` is the uniform URL — reconstruct the Path once, then
+            # read the warehouse-facing path off it for the query.
+            paths = [DatabricksPath.from_(data, client=self.client) for data, _ in items]
             union = " UNION ALL ".join(
-                f"SELECT * FROM parquet.`{data}`" for data, _ in items
+                f"SELECT * FROM parquet.`{p.full_path()}`" for p in paths
             )
             target.async_insert(union, mode=mode, execute=True, wait=wait)
             # Clear consumed logs + data only after a successful load.
-            for data, log_file in items:
+            for (_, log_file), path in zip(items, paths):
                 _best_effort_unlink(log_file)
-                _best_effort_unlink(DatabricksPath.from_(data, client=self.client))
+                _best_effort_unlink(path)
             processed += len(items)
         return processed
 

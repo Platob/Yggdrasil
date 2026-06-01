@@ -3406,7 +3406,9 @@ class Table(DatabricksPath):
                     "op_id": op_id,
                     "target": self.full_name(),
                     "mode": mode_enum.name.lower(),
-                    "data": data_file.full_path(),
+                    # The project's uniform URL — round-trips through
+                    # ``Path.from_`` on the loader side, wherever the data lives.
+                    "data": data_file.to_url().to_string(),
                     "ts": time.time(),
                 }
             ).encode()

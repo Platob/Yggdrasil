@@ -72,11 +72,14 @@ class TestAsyncInsert:
         with pytest.raises(ValueError, match="match_by"):
             Table.async_insert(t, object(), mode="append", match_by=["id"])
 
-    def test_writes_parquet_to_staging_and_logs_its_path(self):
+    def test_writes_parquet_to_staging_and_logs_its_uniform_url(self):
         t = _table_mock()
         # data goes to the default tmp staging path
         data_file = MagicMock()
-        data_file.full_path.return_value = "/Volumes/c/s/t/.sql/tmp/tmp-1-ab.parquet"
+        # the log records the project's uniform URL (round-trippable)
+        data_file.to_url.return_value.to_string.return_value = (
+            "dbfs+volume:/c/s/t/.sql/tmp/tmp-1-ab.parquet"
+        )
         t.insert_volume_path.return_value = data_file
         # log dir
         logs_dir, log_file = MagicMock(), MagicMock()
@@ -91,12 +94,14 @@ class TestAsyncInsert:
         payload = json.loads(log_file.write_bytes.call_args[0][0])
         assert payload["target"] == "c.s.t"
         assert payload["mode"] == "append"
-        assert payload["data"] == "/Volumes/c/s/t/.sql/tmp/tmp-1-ab.parquet"
+        assert payload["data"] == "dbfs+volume:/c/s/t/.sql/tmp/tmp-1-ab.parquet"
 
     def test_string_source_is_read_then_staged(self):
         t = _table_mock()
         data_file = MagicMock()
-        data_file.full_path.return_value = "/Volumes/c/s/t/.sql/tmp/x.parquet"
+        data_file.to_url.return_value.to_string.return_value = (
+            "dbfs+volume:/c/s/t/.sql/tmp/x.parquet"
+        )
         t.insert_volume_path.return_value = data_file
         logs_dir, log_file = MagicMock(), MagicMock()
         logs_dir.__truediv__.return_value = log_file
@@ -208,10 +213,10 @@ def _service():
 def _log(op, *, target="c.s.t", mode="append"):
     f = MagicMock()
     f.name = f"{op}.json"
-    # the log records the data's full path (it can live anywhere)
+    # the log records the project's uniform URL for the staged data
     f.read_bytes.return_value = json.dumps(
         {"target": target, "mode": mode,
-         "data": f"/Volumes/c/s/t/.sql/tmp/{op}.parquet"}
+         "data": f"dbfs+volume:/c/s/t/.sql/tmp/{op}.parquet"}
     ).encode()
     return f
 
@@ -222,6 +227,23 @@ def _logs_dir(*entries):
     d.is_dir.return_value = True
     d.iterdir.return_value = list(entries)
     return d
+
+
+def _fake_databricks_from():
+    """``DatabricksPath.from_`` stand-in: maps a uniform URL to a mock path
+    whose ``full_path()`` is the ``/Volumes/...`` display form. Returns the
+    side_effect plus the per-URL cache so cleanup can be asserted."""
+    cache: dict = {}
+
+    def _from(url, **_kwargs):
+        if url not in cache:
+            m = MagicMock()
+            # dbfs+volume:/c/s/t/x.parquet → /Volumes/c/s/t/x.parquet
+            m.full_path.return_value = "/Volumes" + url.split(":", 1)[1]
+            cache[url] = m
+        return cache[url]
+
+    return _from, cache
 
 
 class TestTablesAsyncInsertLoader:
@@ -236,8 +258,9 @@ class TestTablesAsyncInsertLoader:
         log_a, log_b = _log("a"), _log("b")
         logs = _logs_dir(log_a, log_b)
         target = MagicMock()
+        from_fn, data_paths = _fake_databricks_from()
         with patch.object(Tables, "__getitem__", return_value=target), \
-             patch("yggdrasil.databricks.path.DatabricksPath.from_") as dp_from:
+             patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
             processed = svc.async_insert(logs, wait=False)
 
         assert processed == 2
@@ -245,14 +268,16 @@ class TestTablesAsyncInsertLoader:
         target.async_insert.assert_called_once()
         union = target.async_insert.call_args.args[0]
         assert "UNION ALL" in union
+        # the uniform URL is resolved to the warehouse-facing path for the query
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in union
         assert target.async_insert.call_args.kwargs["mode"] == "append"
         assert target.async_insert.call_args.kwargs["execute"] is True
-        # consumed logs + data cleaned up
+        # consumed logs + data (reconstructed from the uniform URL) cleaned up
         log_a.unlink.assert_called_once()
         log_b.unlink.assert_called_once()
-        assert dp_from.call_count == 2          # one staged-data path per op
+        data_paths["dbfs+volume:/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
+        data_paths["dbfs+volume:/c/s/t/.sql/tmp/b.parquet"].unlink.assert_called_once()
 
     def test_splits_by_mode(self):
         from yggdrasil.databricks.table.tables import Tables
