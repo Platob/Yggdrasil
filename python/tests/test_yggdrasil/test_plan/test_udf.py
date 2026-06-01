@@ -152,6 +152,7 @@ class TestSparkUDFRegistration:
     @pytest.fixture(scope="class")
     def spark(self):
         # Shared SparkTestCase session — never stopped (other modules share it).
+        pytest.importorskip("pyspark")
         from yggdrasil.spark.tests import _get_test_spark
         return _get_test_spark()
 
