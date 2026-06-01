@@ -653,40 +653,42 @@ class UCSchema(DatabricksPath):
         """
         # Idempotent: a successful read means it already exists — never
         # auto-create from a read, only here.
-        if self.read_infos(default=None) is not None:
-            return self
-
-        uc = self.client.workspace_client().schemas
-        logger.debug(
-            "Creating schema %r (storage_root=%s, missing_ok=%s)",
-            self, storage_root, missing_ok,
-        )
-        kwargs = dict(
-            catalog_name=self.catalog_name,
-            name=self.schema_name,
-            comment=comment,
-            properties=properties,
-            storage_root=storage_root,
-        )
-        try:
-            info = uc.create(**kwargs)
-        except Exception as exc:
-            low = str(exc).lower()
-            if missing_ok and "already exists" in low:
-                logger.debug(
-                    "Schema %r already exists — soft-resetting cache", self,
-                )
-                self._reset_cache()
-                return self
-            if "not exist" in low or "not found" in low:
-                # Parent catalog missing — create it and retry once.
-                logger.info("Schema %r create failed (%s); ensuring parent catalog", self, exc)
-                self.catalog.ensure_created()
+        if self.read_infos(default=None) is None:
+            uc = self.client.workspace_client().schemas
+            logger.debug(
+                "Creating schema %r (storage_root=%s, missing_ok=%s)",
+                self, storage_root, missing_ok,
+            )
+            kwargs = dict(
+                catalog_name=self.catalog_name,
+                name=self.schema_name,
+                comment=comment,
+                properties=properties,
+                storage_root=storage_root,
+            )
+            try:
                 info = uc.create(**kwargs)
-            else:
-                raise
-        object.__setattr__(self, "_infos", info)
-        object.__setattr__(self, "_infos_fetched_at", time.time())
+                object.__setattr__(self, "_infos", info)
+                object.__setattr__(self, "_infos_fetched_at", time.time())
+            except Exception as exc:
+                low = str(exc).lower()
+                if missing_ok and "already exists" in low:
+                    logger.debug(
+                        "Schema %r already exists — soft-resetting cache", self,
+                    )
+                    self._reset_cache()
+                elif "not exist" in low or "not found" in low:
+                    # Parent catalog missing — create it and retry once.
+                    logger.info("Schema %r create failed (%s); ensuring parent catalog", self, exc)
+                    self.catalog.ensure_created()
+                    info = uc.create(**kwargs)
+                    object.__setattr__(self, "_infos", info)
+                    object.__setattr__(self, "_infos_fetched_at", time.time())
+                else:
+                    raise
+        # Keep the path stat cache in lock-step with the now-current info so a
+        # follow-up exists() / is_dir() / stat() doesn't observe a stale MISSING.
+        self._persist_stat_cache(self._stat_uncached())
         return self
 
     def ensure_created(

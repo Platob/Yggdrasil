@@ -675,6 +675,7 @@ class Volume(DatabricksPath):
         ``volume_type="EXTERNAL"`` for an external volume.
         """
         if self.read_info(refresh=refresh, default=None) is not None:
+            self._persist_stat_cache(self._stat_uncached())
             return self
 
         uc = self.client.workspace_client().volumes
@@ -730,6 +731,9 @@ class Volume(DatabricksPath):
                 self._store_infos(uc.create(**kwargs))
             else:
                 raise
+        # Keep the path stat cache in lock-step with the now-current info so a
+        # follow-up exists() / is_dir() / stat() doesn't observe a stale MISSING.
+        self._persist_stat_cache(self._stat_uncached())
         return self
 
     def ensure_created(

@@ -58,7 +58,8 @@ def test_catalog_create_is_idempotent_and_has_no_parent():
     svc.client.base_url.host = "example.cloud.databricks.com"
     c = UCCatalog(service=svc, catalog_name="cat")
     uc = c.client.workspace_client().catalogs
-    with patch.object(UCCatalog, "read_infos", return_value=object()):
+    with patch.object(UCCatalog, "read_infos", return_value=object()), \
+         patch.object(UCCatalog, "_stat_uncached", return_value=MagicMock()):
         assert c.create() is c
     uc.create.assert_not_called()
 
@@ -92,7 +93,8 @@ def test_schema_create_then_create_again_does_not_reflood():
     s = _schema()
     uc = s.client.workspace_client().schemas
     uc.create.return_value = object()
-    with patch.object(UCSchema, "read_infos", side_effect=[None, object()]):
+    with patch.object(UCSchema, "read_infos", side_effect=[None, object()]), \
+         patch.object(UCSchema, "_stat_uncached", return_value=MagicMock()):
         s.create()
         s.create()
     uc.create.assert_called_once()

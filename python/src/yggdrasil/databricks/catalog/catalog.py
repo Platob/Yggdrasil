@@ -594,33 +594,34 @@ class UCCatalog(DatabricksPath, Singleton):
         """
         # Idempotent: a successful read means it already exists — never
         # auto-create from a read, only here.
-        if self.read_infos(default=None) is not None:
-            return self
-
-        uc = self.client.workspace_client().catalogs
-        logger.debug(
-            "Creating catalog %r (storage_root=%s, missing_ok=%s)",
-            self, storage_root, missing_ok,
-        )
-        try:
-            info = uc.create(
-                name=self.catalog_name,
-                comment=comment,
-                properties=properties,
-                storage_root=storage_root,
+        if self.read_infos(default=None) is None:
+            uc = self.client.workspace_client().catalogs
+            logger.debug(
+                "Creating catalog %r (storage_root=%s, missing_ok=%s)",
+                self, storage_root, missing_ok,
             )
-        except Exception as exc:
-            # A catalog is top-level — there are no parents to create — so
-            # the only soft outcome is a concurrent create.
-            if missing_ok and "already exists" in str(exc).lower():
-                logger.debug(
-                    "Catalog %r already exists — soft-resetting cache", self,
+            try:
+                info = uc.create(
+                    name=self.catalog_name,
+                    comment=comment,
+                    properties=properties,
+                    storage_root=storage_root,
                 )
-                self._reset_cache()
-                return self
-            raise
-        object.__setattr__(self, "_infos", info)
-        object.__setattr__(self, "_infos_fetched_at", time.time())
+                object.__setattr__(self, "_infos", info)
+                object.__setattr__(self, "_infos_fetched_at", time.time())
+            except Exception as exc:
+                # A catalog is top-level — there are no parents to create —
+                # so the only soft outcome is a concurrent create.
+                if missing_ok and "already exists" in str(exc).lower():
+                    logger.debug(
+                        "Catalog %r already exists — soft-resetting cache", self,
+                    )
+                    self._reset_cache()
+                else:
+                    raise
+        # Keep the path stat cache in lock-step with the now-current info so a
+        # follow-up exists() / is_dir() / stat() doesn't observe a stale MISSING.
+        self._persist_stat_cache(self._stat_uncached())
         return self
 
     def ensure_created(

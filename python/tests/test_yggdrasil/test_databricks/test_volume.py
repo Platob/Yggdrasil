@@ -312,6 +312,19 @@ class TestVolumesServiceCreate:
         client.schemas.schema.return_value.ensure_created.assert_not_called()
         workspace.volumes.create.assert_called_once()
 
+    def test_create_refreshes_stale_missing_stat(self, workspace, client):
+        # A prior probe cached the path stat as MISSING; create must refresh
+        # the stat cache (in lock-step with read info) so a follow-up
+        # is_dir()/exists() sees the volume — no stale MISSING.
+        workspace.volumes.read.side_effect = NotFound("Volume does not exist")
+        workspace.volumes.create.return_value = _info()
+        v = Volumes(client=client).volume(
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+        )
+        assert v.is_dir() is False          # MISSING stat cached from the probe
+        v.create()
+        assert v.is_dir() is True           # create refreshed the stat cache
+
 
 class TestVolumePathDelegation:
     """:class:`VolumePath` reads metadata via its :class:`Volume`
