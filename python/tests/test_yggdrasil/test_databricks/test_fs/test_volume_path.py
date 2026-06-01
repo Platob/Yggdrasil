@@ -1081,16 +1081,16 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.assert_not_called()
         assert workspace.files.upload.call_count == 2
 
-    def test_volume_missing_only_creates_volume(
+    def test_volume_missing_creates_volume_after_mkdir_fails(
         self, workspace, client, service
     ) -> None:
-        # Common case: catalog + schema already exist, only the volume
-        # is missing. Recovery routes through the idempotent
-        # :meth:`Volume.create`, whose own ``volumes.read`` reports the
-        # volume missing, so a single ``volumes.create`` lands. No parent
-        # ensure (the read names the volume, not the schema); the
-        # post-volume-create ``create_directory`` materialises the sub-dir.
+        # Recovery never goes straight to a volume create: it tries the parent
+        # ``create_directory`` first. That NotFounds because the volume is
+        # missing, so it creates the volume (a single ``volumes.create``; the
+        # read names the volume, not the schema, so no parent ensure) and
+        # retries the ``mkdir`` — two ``create_directory`` calls total.
         uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
+        create_dirs = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
 
         def upload(**_kwargs):
             r = uploads.pop(0)
@@ -1098,7 +1098,14 @@ class TestVolumeAutoCreate:
                 raise r
             return r
 
+        def create_directory(_path):
+            r = create_dirs.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
         workspace.files.upload.side_effect = upload
+        workspace.files.create_directory.side_effect = create_directory
         workspace.volumes.read.side_effect = NotFound(
             "Volume 'cat.sch.vol' does not exist"
         )
@@ -1110,14 +1117,11 @@ class TestVolumeAutoCreate:
         )
         p.write_bytes(b"payload")
 
-        # Volume created; parents untouched (the parent schema ensure is
-        # not triggered, since the read named the volume).
+        # mkdir tried first (fails), volume created, mkdir retried.
+        assert workspace.files.create_directory.call_count == 2
         client.schemas.schema.return_value.ensure_created.assert_not_called()
         workspace.catalogs.create.assert_not_called()
         workspace.schemas.create.assert_not_called()
-        workspace.files.create_directory.assert_called_once_with(
-            "/Volumes/cat/sch/vol/sub",
-        )
         vol_kwargs = workspace.volumes.create.call_args.kwargs
         assert vol_kwargs["catalog_name"] == "cat"
         assert vol_kwargs["schema_name"] == "sch"
@@ -1178,15 +1182,23 @@ class TestVolumeAutoCreate:
         client,
         service,
     ) -> None:
-        # ``Volume.create``'s first ``volumes.create`` NotFounds because the
-        # schema is missing → it ensures the parent schema (cascading to the
-        # catalog — see the schema tests) through the high-level
-        # ``client.schemas`` service and retries the create, which then lands.
+        # The parent ``create_directory`` is tried first; it NotFounds (volume
+        # missing) so the volume is created — and that ``volumes.create``
+        # itself NotFounds because the schema is missing, so it ensures the
+        # parent schema (cascading to the catalog — see the schema tests)
+        # through the high-level ``client.schemas`` service and retries.
         uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
+        create_dirs = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
         volume_creates = [NotFound("Schema does not exist"), _volume_info()]
 
         def upload(**_kwargs):
             r = uploads.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        def create_directory(_path):
+            r = create_dirs.pop(0)
             if isinstance(r, Exception):
                 raise r
             return r
@@ -1198,6 +1210,7 @@ class TestVolumeAutoCreate:
             return r
 
         workspace.files.upload.side_effect = upload
+        workspace.files.create_directory.side_effect = create_directory
         workspace.volumes.read.side_effect = NotFound(
             "Volume 'cat.sch.vol' does not exist"
         )
