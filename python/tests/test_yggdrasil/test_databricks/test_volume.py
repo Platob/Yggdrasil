@@ -277,24 +277,32 @@ class TestVolumesServiceCreate:
         workspace.schemas.create.assert_not_called()
         workspace.catalogs.create.assert_not_called()
 
-    def test_create_ensures_schema_when_read_says_schema_missing(self, workspace, client):
-        # The read NotFounds naming the schema → ensure the parent schema
-        # (which itself cascades to the catalog — see the schema tests) then
-        # create the volume. Parent creation routes through the high-level
-        # ``client.schemas`` service, so we assert at that seam.
-        workspace.volumes.read.side_effect = NotFound("Schema does not exist")
-        workspace.volumes.create.return_value = _info()
+    def test_create_ensures_parents_on_error_and_retries(self, workspace, client):
+        # The volume is missing (read NotFounds); the first ``volumes.create``
+        # then NotFounds because the schema is missing → ensure the parent
+        # schema (cascading to the catalog — see the schema tests) through the
+        # high-level ``client.schemas`` service, and retry the create.
+        workspace.volumes.read.side_effect = NotFound("Volume does not exist")
+        creates = [NotFound("Schema does not exist"), _info()]
+
+        def vol_create(**_kw):
+            r = creates.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        workspace.volumes.create.side_effect = vol_create
 
         v = Volumes(client=client).create(
             catalog_name="cat", schema_name="sch", volume_name="vol",
         )
         assert isinstance(v, Volume)
         client.schemas.schema.return_value.ensure_created.assert_called_once()
-        workspace.volumes.create.assert_called_once()
+        assert workspace.volumes.create.call_count == 2
 
-    def test_create_skips_parent_ensure_when_only_volume_missing(self, workspace, client):
-        # A read NotFound that doesn't name the schema means the parents are
-        # there — go straight to ``volumes.create``, no schema ensure.
+    def test_create_skips_parent_ensure_when_create_succeeds(self, workspace, client):
+        # Volume missing, parents present: the create lands first try, so no
+        # parent ensure and a single ``volumes.create``.
         workspace.volumes.read.side_effect = NotFound("Volume does not exist")
         workspace.volumes.create.return_value = _info()
 

@@ -1178,38 +1178,10 @@ class TestVolumeAutoCreate:
         client,
         service,
     ) -> None:
-        # The volume read reports the schema missing, so ``Volume.create``
-        # ensures the parent schema (which cascades to the catalog — see
-        # the schema tests) through the high-level ``client.schemas``
-        # service, then creates the volume.
-        uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
-
-        def upload(**_kwargs):
-            r = uploads.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
-
-        workspace.files.upload.side_effect = upload
-        workspace.volumes.read.side_effect = NotFound("Schema does not exist")
-        workspace.volumes.create.return_value = _volume_info()
-
-        p = VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin",
-            service=service,
-        )
-        p.write_bytes(b"payload")
-
-        client.schemas.schema.return_value.ensure_created.assert_called_once()
-        workspace.volumes.create.assert_called_once()
-
-    def test_volume_create_failure_falls_back_to_schema_ensure(
-        self, workspace, client, service
-    ) -> None:
-        # ``Volume.create``'s own ``volumes.create`` NotFounds because the
-        # schema is missing → recovery ensures the parent schema (cascading
-        # to the catalog) through ``client.schemas`` and retries the volume
-        # create, which then lands.
+        # ``Volume.create``'s first ``volumes.create`` NotFounds because the
+        # schema is missing → it ensures the parent schema (cascading to the
+        # catalog — see the schema tests) through the high-level
+        # ``client.schemas`` service and retries the create, which then lands.
         uploads = [NotFound("Volume 'cat.sch.vol' does not exist"), None]
         volume_creates = [NotFound("Schema does not exist"), _volume_info()]
 

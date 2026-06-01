@@ -592,6 +592,11 @@ class UCCatalog(DatabricksPath, Singleton):
             storage_root: External storage root URI (for external catalogs).
             missing_ok: Silently succeed if the catalog already exists.
         """
+        # Idempotent: a successful read means it already exists — never
+        # auto-create from a read, only here.
+        if self.read_infos(default=None) is not None:
+            return self
+
         uc = self.client.workspace_client().catalogs
         logger.debug(
             "Creating catalog %r (storage_root=%s, missing_ok=%s)",
@@ -604,16 +609,18 @@ class UCCatalog(DatabricksPath, Singleton):
                 properties=properties,
                 storage_root=storage_root,
             )
-            object.__setattr__(self, "_infos", info)
-            object.__setattr__(self, "_infos_fetched_at", time.time())
-        except DatabricksError as exc:
+        except Exception as exc:
+            # A catalog is top-level — there are no parents to create — so
+            # the only soft outcome is a concurrent create.
             if missing_ok and "already exists" in str(exc).lower():
                 logger.debug(
                     "Catalog %r already exists — soft-resetting cache", self,
                 )
                 self._reset_cache()
-            else:
-                raise
+                return self
+            raise
+        object.__setattr__(self, "_infos", info)
+        object.__setattr__(self, "_infos_fetched_at", time.time())
         return self
 
     def ensure_created(
@@ -623,15 +630,15 @@ class UCCatalog(DatabricksPath, Singleton):
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
     ) -> "UCCatalog":
-        """Create this catalog if it does not already exist, then return ``self``."""
-        if not self.exists():
-            self.create(
-                comment=comment,
-                properties=properties,
-                storage_root=storage_root,
-                missing_ok=True,
-            )
-        return self
+        """Create this catalog if it does not already exist, then return
+        ``self``. :meth:`create` is itself idempotent, so this is just a
+        named alias."""
+        return self.create(
+            comment=comment,
+            properties=properties,
+            storage_root=storage_root,
+            missing_ok=True,
+        )
 
     def delete(
         self,

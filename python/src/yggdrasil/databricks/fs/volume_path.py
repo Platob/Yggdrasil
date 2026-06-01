@@ -975,36 +975,17 @@ class VolumePath(DatabricksPath):
         return True
 
     def _ensure_volume(self) -> bool:
-        """Top-down create of the missing pieces of catalog / schema / volume.
+        """Create the missing volume (and any missing catalog / schema).
 
-        Routes the volume create through :meth:`Volume.create` so the
-        managed-volume-type default (``VolumeType.MANAGED`` enum, not
-        a bare ``"MANAGED"`` string the SDK rejects) lives in one
-        place. ``AlreadyExists`` is swallowed by ``missing_ok=True``;
-        if the volume create NotFounds because schema (or catalog) is
-        missing, falls through to :func:`_ensure_parents_for` to
-        materialise the parents before a single retry.
+        Routes through the idempotent :meth:`Volume.create`, which reads
+        first, applies the managed-volume-type default, swallows a
+        concurrent ``AlreadyExists`` (``missing_ok=True``), and — if the
+        create NotFounds because the schema (or, through it, the catalog)
+        is missing — creates the parents and retries once.
         """
         if self._split_volume() is None:
             return False
-        volume = self.volume
-
-        try:
-            volume.create(missing_ok=True)
-            return True
-        except Exception as exc:
-            if _looks_like_already_exists(exc):
-                return True
-            if not _looks_like_not_found(exc):
-                raise
-
-        self.schema.ensure_created()
-
-        try:
-            volume.create(missing_ok=True)
-        except Exception as exc:
-            if not _looks_like_already_exists(exc):
-                raise
+        self.volume.create(missing_ok=True)
         return True
 
     # ==================================================================

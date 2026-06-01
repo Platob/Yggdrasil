@@ -1,9 +1,9 @@
-"""Unit tests for :meth:`UCSchema.ensure_created` parent cascade (no cluster).
+"""Unit tests for idempotent, parent-ensuring ``create`` on UC schema/catalog.
 
-``ensure_created`` is the single seam the volume / volume-path auto-create
-recovery leans on to materialise missing parents, so it must ensure the parent
-**catalog** before creating the schema — one call brings up the whole
-catalog → schema chain.
+``create`` reads first (idempotent — a successful read means it exists, and
+reads never auto-create) and, on a not-found create error, materialises the
+missing parent and retries once. For a schema the parent is its catalog; a
+catalog is top-level, so it has no parent to create.
 """
 from __future__ import annotations
 
@@ -13,28 +13,51 @@ from yggdrasil.databricks.catalog.catalog import UCCatalog
 from yggdrasil.databricks.schema.schema import UCSchema
 
 
+class _Boom(Exception):
+    pass
+
+
 def _schema() -> UCSchema:
     svc = MagicMock()
     svc.client.base_url.host = "example.cloud.databricks.com"
     return UCSchema(service=svc, catalog_name="cat", schema_name="sch")
 
 
-def test_ensure_created_cascades_to_catalog_when_missing():
+def test_schema_create_is_idempotent_when_it_exists():
     s = _schema()
-    with patch.object(UCSchema, "exists", return_value=False), \
-         patch.object(UCSchema, "create") as create, \
+    uc = s.client.workspace_client().schemas
+    with patch.object(UCSchema, "read_infos", return_value=object()):
+        assert s.create() is s
+    uc.create.assert_not_called()
+
+
+def test_schema_create_ensures_catalog_on_not_found_and_retries():
+    s = _schema()
+    uc = s.client.workspace_client().schemas
+    uc.create.side_effect = [_Boom("Catalog does not exist"), object()]
+    with patch.object(UCSchema, "read_infos", return_value=None), \
          patch.object(UCCatalog, "ensure_created") as catalog_ensure:
-        assert s.ensure_created() is s
-    # catalog ensured first, then the schema created
+        assert s.create() is s
     catalog_ensure.assert_called_once()
-    create.assert_called_once()
+    assert uc.create.call_count == 2
 
 
-def test_ensure_created_is_noop_when_schema_exists():
+def test_schema_create_does_not_ensure_parent_when_create_succeeds():
     s = _schema()
-    with patch.object(UCSchema, "exists", return_value=True), \
-         patch.object(UCSchema, "create") as create, \
+    uc = s.client.workspace_client().schemas
+    uc.create.return_value = object()
+    with patch.object(UCSchema, "read_infos", return_value=None), \
          patch.object(UCCatalog, "ensure_created") as catalog_ensure:
-        assert s.ensure_created() is s
-    create.assert_not_called()
+        s.create()
     catalog_ensure.assert_not_called()
+    uc.create.assert_called_once()
+
+
+def test_catalog_create_is_idempotent_and_has_no_parent():
+    svc = MagicMock()
+    svc.client.base_url.host = "example.cloud.databricks.com"
+    c = UCCatalog(service=svc, catalog_name="cat")
+    uc = c.client.workspace_client().catalogs
+    with patch.object(UCCatalog, "read_infos", return_value=object()):
+        assert c.create() is c
+    uc.create.assert_not_called()

@@ -651,29 +651,42 @@ class UCSchema(DatabricksPath):
             storage_root: External storage root URI.
             missing_ok: Silently succeed if the schema already exists.
         """
+        # Idempotent: a successful read means it already exists — never
+        # auto-create from a read, only here.
+        if self.read_infos(default=None) is not None:
+            return self
+
         uc = self.client.workspace_client().schemas
         logger.debug(
             "Creating schema %r (storage_root=%s, missing_ok=%s)",
             self, storage_root, missing_ok,
         )
+        kwargs = dict(
+            catalog_name=self.catalog_name,
+            name=self.schema_name,
+            comment=comment,
+            properties=properties,
+            storage_root=storage_root,
+        )
         try:
-            info = uc.create(
-                catalog_name=self.catalog_name,
-                name=self.schema_name,
-                comment=comment,
-                properties=properties,
-                storage_root=storage_root,
-            )
-            object.__setattr__(self, "_infos", info)
-            object.__setattr__(self, "_infos_fetched_at", time.time())
-        except DatabricksError as exc:
-            if missing_ok and "already exists" in str(exc).lower():
+            info = uc.create(**kwargs)
+        except Exception as exc:
+            low = str(exc).lower()
+            if missing_ok and "already exists" in low:
                 logger.debug(
                     "Schema %r already exists — soft-resetting cache", self,
                 )
                 self._reset_cache()
+                return self
+            if "not exist" in low or "not found" in low:
+                # Parent catalog missing — create it and retry once.
+                logger.info("Schema %r create failed (%s); ensuring parent catalog", self, exc)
+                self.catalog.ensure_created()
+                info = uc.create(**kwargs)
             else:
                 raise
+        object.__setattr__(self, "_infos", info)
+        object.__setattr__(self, "_infos_fetched_at", time.time())
         return self
 
     def ensure_created(
@@ -683,19 +696,15 @@ class UCSchema(DatabricksPath):
         properties: Optional[Mapping[str, str]] = None,
         storage_root: str | None = None,
     ) -> "UCSchema":
-        """Create this schema (and its parent catalog) if missing, then return
-        ``self``. Ensuring the catalog first means a single ``ensure_created``
-        materialises the whole catalog → schema chain, so the volume
-        auto-create recovery only needs to ensure its schema."""
-        if not self.exists():
-            self.catalog.ensure_created()
-            self.create(
-                comment=comment,
-                properties=properties,
-                storage_root=storage_root,
-                missing_ok=True,
-            )
-        return self
+        """Create this schema (and any missing parent catalog) if it doesn't
+        exist, then return ``self``. :meth:`create` is itself idempotent and
+        ensures the parent on a not-found, so this is just a named alias."""
+        return self.create(
+            comment=comment,
+            properties=properties,
+            storage_root=storage_root,
+            missing_ok=True,
+        )
 
     def delete(
         self,

@@ -667,17 +667,15 @@ class Volume(DatabricksPath):
     ) -> "Volume":
         """Create this volume in Unity Catalog.
 
+        Idempotent — a successful read means it already exists (reads never
+        auto-create). On a not-found create error the missing parent schema
+        (and, through it, the catalog) is created and the create retried once.
+
         Defaults to a managed volume. Pass ``storage_location`` +
         ``volume_type="EXTERNAL"`` for an external volume.
         """
-        try:
-            _ = self.read_info(refresh=refresh)
+        if self.read_info(refresh=refresh, default=None) is not None:
             return self
-        except Exception as e:
-            message = str(e)
-
-            if "chema" in message and "not exist" in message:
-                self.schema.ensure_created()
 
         uc = self.client.workspace_client().volumes
 
@@ -720,9 +718,16 @@ class Volume(DatabricksPath):
         try:
             info = uc.create(**kwargs)
             self._store_infos(info)
-        except DatabricksError as exc:
-            if missing_ok and "already exists" in str(exc).lower():
+        except Exception as exc:
+            low = str(exc).lower()
+            if missing_ok and "already exists" in low:
                 self._reset_cache()
+            elif "not exist" in low or "not found" in low:
+                # Parent schema (and, through it, the catalog) missing —
+                # create the parents and retry the volume create once.
+                logger.info("Volume %r create failed (%s); ensuring parents", self, exc)
+                self.schema.ensure_created()
+                self._store_infos(uc.create(**kwargs))
             else:
                 raise
         return self
