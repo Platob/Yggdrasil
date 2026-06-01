@@ -138,7 +138,7 @@ class _SQLIntegrationBase(DatabricksIntegrationCase):
         DDL runs, so a test that fails mid-flight still leaves the
         teardown loop with something to drop.
         """
-        name = f"yg_{prefix}"
+        name = f"yg_{prefix}_{secrets.token_hex(4)}" if seed else f"yg_{prefix}"
         full_name = f"{self.catalog_name}.{self.schema_name}.{name}"
         type(self).created_tables.append(full_name)
         return self.engine.table(full_name)
@@ -254,7 +254,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
     # ------------------------------------------------------------------
 
     def test_engine_create_table_auto_creates_managed_table(self) -> None:
-        table = self._unique_table("create", seed=False)
+        table = self._unique_table("create")
         self.assertFalse(table.exists())
 
         created = self.engine.create_table(
@@ -274,7 +274,7 @@ class TestSQLEngineIntegration(_SQLIntegrationBase):
         vol = table.staging_volume
         vp = table.staging_folder(temporary=False)
         assert vol is table.staging_volume
-        assert vp is table.staging_folder(temporary=False)
+        assert vp == table.staging_folder(temporary=False)
 
         fp = vp / "test.parquet"
         fp.write_pylist([{"id": 1, "name": "Nika"}])

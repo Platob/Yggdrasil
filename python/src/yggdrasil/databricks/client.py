@@ -774,7 +774,15 @@ class DatabricksClient(Singleton, URLBased):
     from_parsed_url = from_url
 
     @classmethod
-    def from_(cls, obj: Any):
+    def from_(cls, obj: Any, *, default: Any = ...):
+        if obj is None:
+            if default is ...:
+                raise ValueError("Cannot build DatabricksClient from None")
+
+            if callable(default):
+                return default()
+            return default
+
         if isinstance(obj, cls):
             return obj
         elif isinstance(obj, URL):
