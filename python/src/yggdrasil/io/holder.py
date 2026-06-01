@@ -1430,6 +1430,7 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             return out
         if cursor:
             offset = self._pos
+        read_to_end = size < 0
         total = self.size
         offset = _resolve_pos(offset, total)
         if offset < 0 or offset > total:
@@ -1446,8 +1447,25 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             )
 
         out = self._read_mv(size, offset)
+        # A remote backend can learn the object's *true* (larger) size while
+        # serving a whole-object read — a stale / eventually-consistent stat
+        # (or a server that ignored the Range) undersized the request and
+        # truncated the body, e.g. a Parquet footer goes missing. For a read
+        # to the end, top up the tail from the now-fresh size so the caller
+        # still gets the complete object instead of a short buffer.
+        if read_to_end and offset == 0 and len(out) < self.size:
+            chunks, have = [bytes(out)], len(out)
+            fresh = self.size
+            while have < fresh:
+                more = self._read_mv(fresh - have, have)
+                if not len(more):
+                    break
+                chunks.append(bytes(more))
+                have += len(more)
+                fresh = self.size
+            out = memoryview(b"".join(chunks))
         if cursor:
-            self._pos = offset + size
+            self._pos = offset + len(out)
         return out
 
     def _read_mv(self, n: int, pos: int) -> memoryview:

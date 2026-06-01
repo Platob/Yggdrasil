@@ -586,3 +586,63 @@ class TestReserveCopyOnWrite:
         assert got.num_rows == 100
         # Re-read still works after the holder is otherwise touched.
         assert pf.read_arrow_table().num_rows == 100
+
+
+class TestRemoteWholeReadTopUp:
+    """A whole-object read must return the complete object even when a
+    stale / eventually-consistent stat undersizes the request (or a server
+    ignores the Range) — the read tops up the tail from the freshly-learned
+    size rather than handing back a truncated buffer (e.g. a Parquet footer
+    going missing)."""
+
+    def test_full_read_tops_up_a_truncated_remote_read(self) -> None:
+        from yggdrasil.io.holder import IO
+
+        real = bytes(range(256)) * 40        # 10240 bytes
+
+        class _StaleRemote(IO):              # no __slots__ → gets a __dict__
+            def __init__(self) -> None:
+                self._parent = None
+                self._pos = 0
+                self._believed = 16          # stale-small initial size
+                self.calls: list[tuple[int, int]] = []
+
+            @property
+            def size(self) -> int:
+                return self._believed
+
+            def _read_mv(self, n: int, pos: int) -> memoryview:
+                # Serving the read reveals the object's true (larger) size.
+                self._believed = len(real)
+                self.calls.append((n, pos))
+                return memoryview(real[pos:pos + n])
+
+        s = _StaleRemote()
+        out = bytes(IO.read_mv(s, -1, 0))
+        assert out == real                   # complete, not the 16-byte prefix
+        assert len(s.calls) >= 2             # initial short read + tail top-up
+
+    def test_explicit_prefix_read_is_not_topped_up(self) -> None:
+        # A bounded read (size >= 0) keeps its contract — only reads-to-end
+        # (size < 0) top up.
+        from yggdrasil.io.holder import IO
+
+        real = bytes(range(256))             # 256 bytes
+
+        class _Remote(IO):
+            def __init__(self) -> None:
+                self._parent = None
+                self._pos = 0
+                self.calls = 0
+
+            @property
+            def size(self) -> int:
+                return len(real)
+
+            def _read_mv(self, n: int, pos: int) -> memoryview:
+                self.calls += 1
+                return memoryview(real[pos:pos + n])
+
+        s = _Remote()
+        out = bytes(IO.read_mv(s, 10, 0))
+        assert out == real[:10] and s.calls == 1
