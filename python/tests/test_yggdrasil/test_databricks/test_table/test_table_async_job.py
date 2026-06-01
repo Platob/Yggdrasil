@@ -93,6 +93,30 @@ class TestAsyncInsert:
         assert payload["mode"] == "append"
         assert payload["data"] == "/Volumes/c/s/t/.sql/tmp/tmp-1-ab.parquet"
 
+    def test_string_source_is_read_then_staged(self):
+        t = _table_mock()
+        data_file = MagicMock()
+        data_file.full_path.return_value = "/Volumes/c/s/t/.sql/tmp/x.parquet"
+        t.insert_volume_path.return_value = data_file
+        logs_dir, log_file = MagicMock(), MagicMock()
+        logs_dir.__truediv__.return_value = log_file
+        src = MagicMock()
+        src.read_arrow_table.return_value = {"a": [1]}
+        with patch.object(TableJob, "logs_path", staticmethod(lambda tbl: logs_dir)), \
+             patch("yggdrasil.io.holder.IO.from_", return_value=src) as io_from:
+            Table.async_insert(t, "s3://b/data.parquet", mode="append")
+        io_from.assert_called_once_with("s3://b/data.parquet")
+        src.read_arrow_table.assert_called_once_with()
+        data_file.write_table.assert_called_once()
+
+    def test_execute_loads_synchronously_without_staging(self):
+        t = MagicMock()
+        out = Table.async_insert(t, "SELECT 1", mode="append", execute=True)
+        t.insert_into.assert_called_once()
+        assert t.insert_into.call_args.kwargs["mode"] == "append"
+        t.insert_volume_path.assert_not_called()      # no staging on execute
+        assert out is t.insert_into.return_value
+
 
 # --------------------------------------------------------------------------- #
 # TableJob.ensure (get-or-create with a file-arrival trigger)
@@ -174,144 +198,119 @@ class TestEnsure:
 
 
 # --------------------------------------------------------------------------- #
-# TableJob.run (aggregate logs → INSERT per (target, mode))
+# Tables.async_insert — the loader (driven by a log path; groups by table)
 # --------------------------------------------------------------------------- #
-class TestProcess:
-    def _wire_logs(self, table):
-        logs_dir = MagicMock()
-        table.staging_volume.path.side_effect = (
-            lambda sub, *a, **k: logs_dir if sub == LOGS_SUBDIR else MagicMock()
-        )
-        return logs_dir
+def _service():
+    from yggdrasil.databricks.table.tables import Tables
+    return Tables(client=MagicMock())
 
-    @staticmethod
-    def _log(op, *, target="c.s.t", mode="append"):
-        f = MagicMock()
-        f.name = f"{op}.json"
-        # the log records the data's full path (it can live anywhere)
-        f.read_bytes.return_value = json.dumps(
-            {"target": target, "mode": mode, "data": f"/Volumes/c/s/t/.sql/tmp/{op}.parquet"}
-        ).encode()
-        return f
 
+def _log(op, *, target="c.s.t", mode="append"):
+    f = MagicMock()
+    f.name = f"{op}.json"
+    # the log records the data's full path (it can live anywhere)
+    f.read_bytes.return_value = json.dumps(
+        {"target": target, "mode": mode,
+         "data": f"/Volumes/c/s/t/.sql/tmp/{op}.parquet"}
+    ).encode()
+    return f
+
+
+def _logs_dir(*entries):
+    d = MagicMock()
+    d.exists.return_value = True
+    d.is_dir.return_value = True
+    d.iterdir.return_value = list(entries)
+    return d
+
+
+class TestTablesAsyncInsertLoader:
     def test_no_logs_returns_zero(self):
-        t = _table_mock()
-        t.client.jobs = MagicMock()
-        logs_dir = self._wire_logs(t)
-        logs_dir.exists.return_value = False
-        assert TableJob(t).run() == 0
-        t.insert.assert_not_called()
+        logs = MagicMock()
+        logs.exists.return_value = False
+        assert _service().async_insert(logs) == 0
 
     def test_aggregates_same_group_into_one_insert(self):
-        t = _table_mock()
-        t.client.jobs = MagicMock()
-        logs_dir = self._wire_logs(t)
-        logs_dir.exists.return_value = True
-        log_a, log_b = self._log("a"), self._log("b")
-        logs_dir.iterdir.return_value = [log_a, log_b]
-
-        data_files: dict[str, MagicMock] = {}
-        with patch.object(
-            TableJob, "_data_file",
-            lambda self, p: data_files.setdefault(p, MagicMock()),
-        ):
-            processed = TableJob(t).run(wait=False)
+        from yggdrasil.databricks.table.tables import Tables
+        svc = _service()
+        log_a, log_b = _log("a"), _log("b")
+        logs = _logs_dir(log_a, log_b)
+        target = MagicMock()
+        with patch.object(Tables, "__getitem__", return_value=target), \
+             patch("yggdrasil.databricks.path.DatabricksPath.from_") as dp_from:
+            processed = svc.async_insert(logs, wait=False)
 
         assert processed == 2
-        t.insert.assert_called_once()
-        union = t.insert.call_args.args[0]
+        # one execute=True load per (target, mode) group, with the union query
+        target.async_insert.assert_called_once()
+        union = target.async_insert.call_args.args[0]
         assert "UNION ALL" in union
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
         assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in union
-        assert t.insert.call_args.kwargs["mode"] == "append"
-        # consumed logs + data cleaned up (data resolved from the logged path)
+        assert target.async_insert.call_args.kwargs["mode"] == "append"
+        assert target.async_insert.call_args.kwargs["execute"] is True
+        # consumed logs + data cleaned up
         log_a.unlink.assert_called_once()
         log_b.unlink.assert_called_once()
-        data_files["/Volumes/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
-        data_files["/Volumes/c/s/t/.sql/tmp/b.parquet"].unlink.assert_called_once()
-
-    def test_callable_runs_the_loader(self):
-        # TableJob is callable like a function — calling it runs the loader.
-        t = _table_mock()
-        t.client.jobs = MagicMock()
-        logs_dir = self._wire_logs(t)
-        logs_dir.exists.return_value = True
-        logs_dir.iterdir.return_value = [self._log("a")]
-
-        with patch.object(TableJob, "_data_file", lambda self, p: MagicMock()):
-            processed = TableJob(t)(wait=False)       # __call__ → run
-
-        assert processed == 1
-        t.insert.assert_called_once()
+        assert dp_from.call_count == 2          # one staged-data path per op
 
     def test_splits_by_mode(self):
-        t = _table_mock()
-        t.client.jobs = MagicMock()
-        logs_dir = self._wire_logs(t)
-        logs_dir.exists.return_value = True
-        logs_dir.iterdir.return_value = [
-            self._log("a", mode="append"),
-            self._log("b", mode="overwrite"),
-        ]
-
-        with patch.object(TableJob, "_data_file", lambda self, p: MagicMock()):
-            processed = TableJob(t).run()
-
+        from yggdrasil.databricks.table.tables import Tables
+        svc = _service()
+        logs = _logs_dir(_log("a", mode="append"), _log("b", mode="overwrite"))
+        target = MagicMock()
+        with patch.object(Tables, "__getitem__", return_value=target), \
+             patch("yggdrasil.databricks.path.DatabricksPath.from_"):
+            processed = svc.async_insert(logs)
         assert processed == 2
-        modes = {c.kwargs["mode"] for c in t.insert.call_args_list}
+        modes = {c.kwargs["mode"] for c in target.async_insert.call_args_list}
         assert modes == {"append", "overwrite"}      # one INSERT per mode
 
-
-# --------------------------------------------------------------------------- #
-# Tables.async_insert — service entry point the CLI delegates to
-# --------------------------------------------------------------------------- #
-class TestTablesAsyncInsert:
-    def _service(self):
+    def test_groups_by_target_table_from_logs(self):
+        # logs name their own target — the loader resolves each, no table arg.
         from yggdrasil.databricks.table.tables import Tables
-        return Tables(client=MagicMock())
+        svc = _service()
+        logs = _logs_dir(
+            _log("a", target="c.s.t1"), _log("b", target="c.s.t2"),
+        )
+        tables: dict[str, MagicMock] = {}
 
-    def test_reads_string_source_then_async_inserts(self):
-        from yggdrasil.databricks.table.tables import Tables
-        svc = self._service()
-        table = MagicMock()
-        arrow = object()
-        src = MagicMock()
-        src.read_arrow_table.return_value = arrow
-        with patch.object(Tables, "__getitem__", return_value=table), \
-             patch("yggdrasil.io.holder.IO.from_", return_value=src) as io_from:
-            out = svc.async_insert("c.s.t", "s3://b/data.parquet", mode="overwrite")
-        io_from.assert_called_once_with("s3://b/data.parquet")
-        src.read_arrow_table.assert_called_once_with()
-        table.insert.assert_called_once_with(arrow, wait=False, mode="overwrite")
-        table.async_job.assert_not_called()
-        assert out is table.insert.return_value
+        def getitem(self_, name):
+            return tables.setdefault(name, MagicMock())
 
-    def test_ensure_job_deploys_loader(self):
-        from yggdrasil.databricks.table.tables import Tables
-        svc = self._service()
-        table = MagicMock()
-        with patch.object(Tables, "__getitem__", return_value=table), \
-             patch("yggdrasil.io.holder.IO.from_", return_value=MagicMock()):
-            svc.async_insert("c.s.t", "data.parquet", ensure_job=True)
-        table.async_job.return_value.ensure.assert_called_once_with()
+        with patch.object(Tables, "__getitem__", getitem), \
+             patch("yggdrasil.databricks.path.DatabricksPath.from_"):
+            processed = svc.async_insert(logs)
 
-    def test_non_string_data_is_not_re_read(self):
-        from yggdrasil.databricks.table.tables import Tables
-        svc = self._service()
-        table = MagicMock()
-        data = object()
-        with patch.object(Tables, "__getitem__", return_value=table), \
-             patch("yggdrasil.io.holder.IO.from_") as io_from:
-            svc.async_insert("c.s.t", data, mode="append")
-        io_from.assert_not_called()
-        table.insert.assert_called_once_with(data, wait=False, mode="append")
+        assert processed == 2
+        assert set(tables) == {"c.s.t1", "c.s.t2"}
+        tables["c.s.t1"].async_insert.assert_called_once()
+        tables["c.s.t2"].async_insert.assert_called_once()
 
-    def test_table_instance_passed_through_without_lookup(self):
+    def test_single_log_file_path_string(self):
         from yggdrasil.databricks.table.tables import Tables
-        svc = self._service()
-        table = MagicMock(spec=Table)
-        with patch.object(Tables, "__getitem__") as getitem, \
-             patch("yggdrasil.io.holder.IO.from_"):
-            svc.async_insert(table, object(), mode="append")
-        getitem.assert_not_called()
-        table.insert.assert_called_once()
+        svc = _service()
+        log = _log("a")
+        log.exists.return_value = True
+        log.is_dir.return_value = False
+        target = MagicMock()
+        with patch.object(Tables, "__getitem__", return_value=target), \
+             patch("yggdrasil.databricks.path.DatabricksPath.from_",
+                   side_effect=lambda p, **k: log if p == "/logs/a.json" else MagicMock()):
+            processed = svc.async_insert("/logs/a.json")
+        assert processed == 1
+        target.async_insert.assert_called_once()
+
+
+class TestTableJobRunDelegates:
+    def test_run_delegates_to_service_loader(self):
+        t = _table_mock()
+        logs = MagicMock()
+        # logs_path(table) → staging_volume.path(LOGS_SUBDIR)
+        t.staging_volume.path.return_value = logs
+        t.service.async_insert.return_value = 7
+
+        out = TableJob(t).run(wait=False, limit=3)
+
+        t.service.async_insert.assert_called_once_with(logs, wait=False, limit=3)
+        assert out == 7

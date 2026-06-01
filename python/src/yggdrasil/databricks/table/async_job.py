@@ -22,10 +22,7 @@ skeleton's :meth:`definition`.
 """
 from __future__ import annotations
 
-import json
 import logging
-import time
-import uuid
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from yggdrasil.databricks.job.skeleton import Flow
@@ -157,73 +154,12 @@ class TableJob(Flow):
     def run(self, *, wait: Any = True, limit: Optional[int] = None) -> int:
         """Consume pending operation logs and load them into their targets.
 
-        Reads every JSON log under :meth:`logs_path`, groups by
-        ``(target, mode)``, builds one aggregated ``INSERT`` per group that
-        reads all the group's staged Parquet at once (``parquet.`…` UNION
-        ALL …``), runs it through ygg, then deletes the consumed logs + data.
-        Returns the number of operations processed.
+        Thin wrapper over :meth:`Tables.async_insert` — the loader reads every
+        JSON log under :meth:`logs_path` (each carries its own target / mode /
+        data path), groups by ``(target, mode)``, runs one aggregated
+        ``INSERT`` per group, then clears the consumed logs + data. Returns the
+        number of operations processed.
         """
-        table = self.table
-        logs_dir = self.logs_path(table)
-        logger.info("async loader: scanning %s", logs_dir.full_path())
-        if not logs_dir.exists():
-            logger.info("async loader: logs dir does not exist yet — nothing to do")
-            return 0
-
-        # Parse pending logs into (target, mode, data-path, log-path).
-        ops: list[tuple[str, str, str, Any]] = []
-        for log_file in logs_dir.iterdir():
-            if not str(log_file.name).endswith(".json"):
-                continue
-            try:
-                record = json.loads(bytes(log_file.read_bytes()))
-            except Exception:
-                logger.warning("skipping unreadable async log %s", log_file)
-                continue
-            ops.append((record["target"], record["mode"], record["data"], log_file))
-            if limit is not None and len(ops) >= limit:
-                break
-        if not ops:
-            logger.info("async loader: no pending operation logs")
-            return 0
-
-        groups: dict[tuple[str, str], list[tuple[str, Any]]] = {}
-        for target, mode, data, log_file in ops:
-            groups.setdefault((target, mode), []).append((data, log_file))
-        logger.info(
-            "async loader: %d operation(s) in %d group(s)", len(ops), len(groups)
+        return self.table.service.async_insert(
+            self.logs_path(self.table), wait=wait, limit=limit,
         )
-
-        processed = 0
-        for (target_name, mode), items in groups.items():
-            target = self._resolve_target(target_name)
-            logger.info("loading %d file(s) into %s (%s)", len(items), target_name, mode)
-            union = " UNION ALL ".join(
-                f"SELECT * FROM parquet.`{data}`" for data, _ in items
-            )
-            target.insert(union, mode=mode, wait=wait)
-            # Clear consumed logs + data only after a successful load.
-            for data, log_file in items:
-                _best_effort_unlink(log_file)
-                _best_effort_unlink(self._data_file(data))
-            processed += len(items)
-        return processed
-
-    def _resolve_target(self, full_name: str) -> "Table":
-        table = self.table
-        if table is not None and table.full_name() == full_name:
-            return table
-        return table.service[full_name]
-
-    def _data_file(self, path: str) -> Any:
-        """Reconstruct the staged-Parquet :class:`Path` from its logged path."""
-        from yggdrasil.databricks.path import DatabricksPath
-
-        return DatabricksPath.from_(path, client=self.table.client)
-
-
-def _best_effort_unlink(path: Any) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001 - cleanup is best-effort
-        logger.debug("async cleanup: failed to remove %s", path, exc_info=True)

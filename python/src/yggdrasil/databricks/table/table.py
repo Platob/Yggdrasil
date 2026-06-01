@@ -3344,8 +3344,10 @@ class Table(DatabricksPath):
         mode: Mode | str | None = None,
         match_by: Optional[list[str]] = None,
         cast_options: Optional[CastOptions] = None,
+        execute: bool = False,
+        wait: WaitingConfigArg = True,
         **kwargs: Any,
-    ) -> "VolumePath":
+    ) -> "VolumePath | Any":
         """Stage *data* as Parquet + drop a JSON operation log — no warehouse.
 
         Writes the rows to the table's **default tmp staging path**
@@ -3357,7 +3359,20 @@ class Table(DatabricksPath):
 
         Only ``OVERWRITE`` / ``APPEND`` with no ``match_by``; the data is staged
         with its own schema (the aggregating ``INSERT`` casts at load time).
+
+        ``execute=True`` flips this to the **loader** side: instead of staging,
+        it loads *data* into the table now (synchronous :meth:`insert_into`).
+        The file-arrival loader (:meth:`Tables.async_insert`) calls it this way
+        with the aggregated ``UNION ALL`` query for one ``(target, mode)`` group.
+        A path/URL *string* source is read into Arrow first, so a producer can
+        hand a file path directly.
         """
+        if execute:
+            return self.insert_into(
+                data, mode=mode, match_by=match_by,
+                cast_options=cast_options, wait=wait, **kwargs,
+            )
+
         import json as _json
 
         from yggdrasil.databricks.table.async_job import ASYNC_MODES, TableJob
@@ -3370,6 +3385,12 @@ class Table(DatabricksPath):
             )
         if match_by:
             raise ValueError("async insert (wait=False) does not support match_by")
+
+        if isinstance(data, str):
+            # A path/URL source — read it (format inferred) so the caller can
+            # stage a file without reading it themselves.
+            from yggdrasil.io.holder import IO
+            data = IO.from_(data).read_arrow_table()
 
         op_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         # Data goes to the default tmp staging path; the log carries its full

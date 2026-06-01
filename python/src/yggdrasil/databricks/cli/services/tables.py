@@ -32,6 +32,11 @@ class TablesCommand:
             help="Insert mode (default: append).",
         )
         ai.add_argument(
+            "--execute", action="store_true",
+            help="Load the staged drop immediately (synchronous) instead of "
+                 "leaving it for the file-arrival job.",
+        )
+        ai.add_argument(
             "--ensure-job", dest="ensure_job", action="store_true",
             help="Also get-or-create the file-arrival loader job so the drop "
                  "is picked up automatically.",
@@ -43,18 +48,22 @@ class TablesCommand:
     @classmethod
     def _async_insert(cls, args: Any, build_client: Any) -> int:
         client = build_client(args)
-        # All the work lives in the service — read source + async drop +
-        # optional loader-job deploy — so the CLI stays a thin shell.
-        log_file = client.tables.async_insert(
-            args.table_name,
-            args.data,
-            mode=args.mode,
-            ensure_job=args.ensure_job,
-        )
+        # Producer: Table.async_insert reads the path/URL source and stages a
+        # Parquet + drops a JSON op-log (full metadata) — the CLI stays thin.
+        table = client.tables[args.table_name]
+        log_file = table.async_insert(args.data, mode=args.mode)
         sys.stdout.write(f"async insert staged → {log_file.full_path()}\n")
-        if not args.ensure_job:
+
+        if args.execute:
+            # Loader only needs the log path — the log carries everything.
+            n = client.tables.async_insert(log_file.full_path(), wait=True)
+            sys.stdout.write(f"executed {n} pending operation(s)\n")
+        elif args.ensure_job:
+            table.async_job().ensure()
+            sys.stdout.write("loader job ready.\n")
+        else:
             sys.stdout.write(
-                "deploy the loader once with `--ensure-job` (or "
-                "`table.async_job().ensure()`) so the drop is picked up.\n"
+                "run with `--execute` to load now, or `--ensure-job` to let "
+                "the file-arrival job pick the drop up.\n"
             )
         return 0

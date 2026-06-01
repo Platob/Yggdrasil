@@ -40,6 +40,14 @@ __all__ = ["Tables"]
 logger = logging.getLogger(__name__)
 
 
+def _best_effort_unlink(path: Any) -> None:
+    """Remove *path* if present; cleanup failures are logged, never raised."""
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 - cleanup is best-effort
+        logger.debug("async cleanup: failed to remove %s", path, exc_info=True)
+
+
 class Tables(DatabricksService):
     """Collection-level service for Unity Catalog tables.
 
@@ -251,34 +259,77 @@ class Tables(DatabricksService):
 
     def async_insert(
         self,
-        table_name: "Table | str",
-        source: Any,
+        logs: Any,
         *,
-        mode: ModeLike = None,
-        ensure_job: bool = False,
-    ) -> Any:
-        """Stage *source* for an async (file-arrival) load into *table_name*.
+        wait: Any = True,
+        limit: int | None = None,
+    ) -> int:
+        """Execute the pending async inserts described by *logs*.
 
-        Resolves the target table (a :class:`Table` or dotted name), reads
-        *source* into Arrow when it's a path/URL string (format inferred — a
-        local path, a Volume, or ``s3://…``; anything else is treated as
-        already-tabular data), then routes through the async drop path
-        (:meth:`Table.insert` with ``wait=False``): a Parquet is staged and a
-        JSON operation log dropped under the table's ``.sql/async`` area for
-        the file-arrival loader. With ``ensure_job=True`` the loader job is
-        get-or-created so the drop is picked up automatically.
+        *logs* is a path to a JSON operation-log file or a directory of them
+        (a :class:`Path` or a path string). Each log carries the full
+        metadata — target table, mode, and the staged data's full path — so
+        the loader needs nothing else: it reads them, **groups by
+        ``(target, mode)``**, builds one aggregated ``INSERT`` per group
+        (``UNION ALL`` over the staged Parquet) and runs it via
+        :meth:`Table.async_insert` with ``execute=True``, then clears the
+        consumed logs + data. Returns the number of operations processed.
 
-        Returns the operation-log path. This is the single entry point the
-        ``ygg databricks table async_insert`` CLI delegates to.
+        This is the loader behind the file-arrival job and the
+        ``ygg databricks table async_insert --execute`` CLI.
         """
-        table = table_name if isinstance(table_name, Table) else self[table_name]
-        if isinstance(source, str):
-            from yggdrasil.io.holder import IO
-            source = IO.from_(source).read_arrow_table()
-        log_file = table.insert(source, wait=False, mode=mode)
-        if ensure_job:
-            table.async_job().ensure()
-        return log_file
+        import json
+
+        from yggdrasil.databricks.path import DatabricksPath
+
+        logs_path = (
+            DatabricksPath.from_(logs, client=self.client)
+            if isinstance(logs, str) else logs
+        )
+        if not logs_path.exists():
+            logger.info("async loader: %s does not exist — nothing to do", logs_path)
+            return 0
+
+        files = (
+            [f for f in logs_path.iterdir() if str(f.name).endswith(".json")]
+            if logs_path.is_dir() else [logs_path]
+        )
+
+        ops: list[tuple[str, str, str, Any]] = []
+        for log_file in files:
+            try:
+                record = json.loads(bytes(log_file.read_bytes()))
+            except Exception:
+                logger.warning("skipping unreadable async log %s", log_file)
+                continue
+            ops.append((record["target"], record["mode"], record["data"], log_file))
+            if limit is not None and len(ops) >= limit:
+                break
+        if not ops:
+            logger.info("async loader: no pending operation logs")
+            return 0
+
+        groups: dict[tuple[str, str], list[tuple[str, Any]]] = {}
+        for target, mode, data, log_file in ops:
+            groups.setdefault((target, mode), []).append((data, log_file))
+        logger.info(
+            "async loader: %d operation(s) in %d group(s)", len(ops), len(groups)
+        )
+
+        processed = 0
+        for (target_name, mode), items in groups.items():
+            target = self[target_name]
+            logger.info("loading %d file(s) into %s (%s)", len(items), target_name, mode)
+            union = " UNION ALL ".join(
+                f"SELECT * FROM parquet.`{data}`" for data, _ in items
+            )
+            target.async_insert(union, mode=mode, execute=True, wait=wait)
+            # Clear consumed logs + data only after a successful load.
+            for data, log_file in items:
+                _best_effort_unlink(log_file)
+                _best_effort_unlink(DatabricksPath.from_(data, client=self.client))
+            processed += len(items)
+        return processed
 
     def catalog(self, name: str | None = None) -> "UCCatalog":
         """Return a :class:`UCCatalog` using this service's client.
