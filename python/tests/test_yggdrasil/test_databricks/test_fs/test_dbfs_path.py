@@ -220,6 +220,22 @@ class TestWrite:
         }
         assert b"".join(sink) == b"abcdef"
 
+    def test_upload_rewinds_stream_parked_at_eof(self, workspace, client, service) -> None:
+        # Off-cluster parity with the VolumePath fix: a stream handed to
+        # _upload already at EOF must still stream the whole object through
+        # dbfs.open — the closure seek(0)s before reading.
+        import io
+
+        sink: list[bytes] = []
+        workspace.dbfs.open.return_value = StreamWriter(sink)
+        workspace.dbfs.get_status.side_effect = NotFound()
+
+        buf = io.BytesIO(b"payload-bytes")
+        buf.seek(0, io.SEEK_END)            # caller left the cursor at EOF
+        DBFSPath("/dbfs/eof", service=service)._upload(buf)
+
+        assert b"".join(sink) == b"payload-bytes"
+
     def test_pwrite_does_rmw(self, workspace, client, service) -> None:
         # Existing 5 bytes; pwrite at pos=1 splices in 'XX'.
         workspace.dbfs.get_status.return_value = SimpleNamespace(
