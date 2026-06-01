@@ -19,6 +19,14 @@ from yggdrasil.databricks.job import wheel
 _MARKER = "HELLO_FROM_WHEEL"
 
 
+def _whl_child(name: str, full_path: str) -> MagicMock:
+    """A listing child standing in for a workspace wheel path."""
+    child = MagicMock()
+    child.name = name
+    child.full_path.return_value = full_path
+    return child
+
+
 def _build_fake_wheel(tmp_path, monkeypatch) -> Path:
     """Really ``pip wheel`` a tiny dep-free project carrying a ``fake-job``
     console script that prints :data:`_MARKER`. Skips if no build backend."""
@@ -151,17 +159,78 @@ class TestWheel:
         py = (project / "pyproject.toml").read_text()
         assert 'name = "ygg"' in py and 'include = ["yggdrasil*"]' in py
 
-    def test_ensure_ygg_wheel_builds_the_ygg_distribution(self):
+    def test_ensure_ygg_wheel_builds_into_version_subdir_when_absent(self):
+        # No deployed bundle for the current version → build into the
+        # version-scoped subfolder of the shared wheel path.
         client = MagicMock()
-        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=["/ws/x.whl"]) as ew:
+        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=[]) as dw, \
+             patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=["/ws/x.whl"]) as ew:
             out = wheel.ensure_ygg_wheel(client, workspace_dir="/ws/job")
+        dw.assert_called_once_with(client, "ygg", "9.9", workspace_dir="/ws/job/9.9")
         ew.assert_called_once_with(
             client, "ygg",
-            workspace_dir="/ws/job",
+            workspace_dir="/ws/job/9.9",
             extras=("databricks",),
             requirements=("databricks-sdk",),
         )
         assert out == ["/ws/x.whl"]
+
+    def test_ensure_ygg_wheel_reuses_deployed_bundle(self):
+        # A bundle already deployed for the current version is reused — no build.
+        client = MagicMock()
+        deployed = ["/ws/job/9.9/ygg-9.9-py3-none-any.whl",
+                    "/ws/job/9.9/pyarrow-1-py3-none-any.whl"]
+        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=deployed), \
+             patch("yggdrasil.databricks.job.wheel.ensure_wheel") as ew:
+            out = wheel.ensure_ygg_wheel(client, workspace_dir="/ws/job")
+        ew.assert_not_called()
+        assert out == deployed
+
+    def test_ensure_ygg_wheel_rebuild_skips_reuse(self):
+        client = MagicMock()
+        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels") as dw, \
+             patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=["/ws/x.whl"]) as ew:
+            out = wheel.ensure_ygg_wheel(client, workspace_dir="/ws/job", rebuild=True)
+        dw.assert_not_called()                 # rebuild bypasses the reuse probe
+        ew.assert_called_once_with(
+            client, "ygg",
+            workspace_dir="/ws/job/9.9",
+            extras=("databricks",),
+            requirements=("databricks-sdk",),
+        )
+        assert out == ["/ws/x.whl"]
+
+    def test_deployed_wheels_present_and_partial(self):
+        # Present: the dist wheel for the version is there → all wheels returned.
+        client = MagicMock()
+        folder = MagicMock()
+        folder.exists.return_value = True
+        folder.iterdir.return_value = [
+            _whl_child("ygg-9.9-py3-none-any.whl", "/ws/9.9/ygg-9.9-py3-none-any.whl"),
+            _whl_child("pyarrow-1-py3-none-any.whl", "/ws/9.9/pyarrow-1-py3-none-any.whl"),
+            _whl_child("notes.txt", "/ws/9.9/notes.txt"),
+        ]
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_", return_value=folder):
+            out = wheel.deployed_wheels(client, "ygg", "9.9", workspace_dir="/ws/9.9")
+        assert out == ["/ws/9.9/ygg-9.9-py3-none-any.whl", "/ws/9.9/pyarrow-1-py3-none-any.whl"]
+
+        # Partial: dist wheel for the version missing (only deps) → treated as absent.
+        folder.iterdir.return_value = [
+            _whl_child("pyarrow-1-py3-none-any.whl", "/ws/9.9/pyarrow-1-py3-none-any.whl"),
+            _whl_child("ygg-9.8-py3-none-any.whl", "/ws/9.9/ygg-9.8-py3-none-any.whl"),
+        ]
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_", return_value=folder):
+            assert wheel.deployed_wheels(client, "ygg", "9.9", workspace_dir="/ws/9.9") == []
+
+    def test_deployed_wheels_missing_dir(self):
+        client = MagicMock()
+        folder = MagicMock()
+        folder.exists.return_value = False
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_", return_value=folder):
+            assert wheel.deployed_wheels(client, "ygg", "9.9", workspace_dir="/ws/9.9") == []
 
     def test_build_wheel_produces_a_real_wheel(self, tmp_path, monkeypatch):
         """Isolated, offline end-to-end: a synthesized dep-free project is really

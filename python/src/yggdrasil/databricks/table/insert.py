@@ -1156,14 +1156,24 @@ def _best_effort_unlink(path: Any) -> None:
         logger.debug("async cleanup: failed to remove %s", path, exc_info=True)
 
 
-def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
+def ensure_async_job(
+    table: "Table", *, client: Any = None, rebuild: bool = False,
+) -> Any:
     """Get-or-create the file-arrival loader job for *table*, return the Job.
 
-    Creates the watched ``logs/`` dir, builds + uploads the full ygg wheel
-    (:func:`~yggdrasil.databricks.job.wheel.ensure_ygg_wheel`), and upserts a
-    serverless job whose single python-wheel task runs ``ygg databricks table
-    execute_async_insert --logs <dir>`` when a log lands. Any stale job
-    watching the same logs dir is pruned so a single job owns the trigger.
+    **Get** — when a job with the same name already exists it is returned
+    untouched: no wheel build, no upsert, no prune. A steady-state call is
+    therefore cheap. Pass ``rebuild=True`` to force the create path and refresh
+    the deployment (re-resolve the wheel, re-upsert the job).
+
+    **Create** — provisions the watched ``logs/`` dir, resolves the full ygg
+    wheel bundle for the current version
+    (:func:`~yggdrasil.databricks.job.wheel.ensure_ygg_wheel` — reusing an
+    already-deployed bundle when present, else building + uploading it to the
+    shared workspace wheel path), and upserts a serverless job whose single
+    python-wheel task runs ``ygg databricks table execute_async_insert --logs
+    <dir>`` when a log lands. Any stale job watching the same logs dir is pruned
+    so a single job owns the trigger.
     """
     from databricks.sdk.service.compute import Environment
     from databricks.sdk.service.jobs import (
@@ -1177,8 +1187,19 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
     from yggdrasil.databricks.job.skeleton import ensure_console_logging
     from yggdrasil.databricks.job.wheel import ensure_ygg_wheel
 
-    ensure_console_logging()  # surface the deploy CRUD interactively
     client = client or table.client
+    name = job_name(table)
+
+    if not rebuild:
+        existing = client.jobs.get(name=name, default=None)
+        if existing is not None:
+            logger.info(
+                "async job %r already deployed (id=%s) — reusing",
+                name, getattr(existing, "job_id", None),
+            )
+            return existing
+
+    ensure_console_logging()  # surface the deploy CRUD interactively
 
     # The trigger watches the logs dir — create it first so Databricks accepts
     # the URL (and the first drop lands cleanly).
@@ -1186,9 +1207,8 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
     logger.info("async job: ensuring logs dir %s", logs.full_path())
     logs.mkdir(parents=True, exist_ok=True)
 
-    wheels = ensure_ygg_wheel(client)
+    wheels = ensure_ygg_wheel(client, rebuild=rebuild)
 
-    name = job_name(table)
     logger.info("create-or-update async job %r", name)
     job = client.jobs.create_or_update(
         name=name,

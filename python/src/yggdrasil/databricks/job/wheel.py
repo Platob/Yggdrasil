@@ -32,15 +32,24 @@ __all__ = [
     "build_wheel",
     "upload_wheel",
     "ensure_wheel",
+    "deployed_wheels",
     "ensure_ygg_wheel",
 ]
 
-#: Root for workspace wheels — one subfolder per job to keep each self-contained.
+#: Root for workspace wheels — one subfolder per version to keep each bundle
+#: self-contained (and so a deploy can reuse an existing version's bundle).
 WORKSPACE_WHL_DIR = "/Workspace/Shared/.ygg/whl"
 
 
 def _norm(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _norm_version(version: str) -> str:
+    """Collapse a version to a comparison key tolerant of wheel-filename
+    escaping (``.``, ``_``, ``+`` all become ``-``) so ``0.8.45`` matches the
+    ``0.8.45`` component of ``ygg-0.8.45-py3-none-any.whl``."""
+    return re.sub(r"[^a-z0-9]+", "-", version.lower())
 
 
 def distribution_for(package: str) -> str:
@@ -198,15 +207,78 @@ def ensure_wheel(
     return [upload_wheel(client, w, workspace_dir=workspace_dir) for w in wheels]
 
 
-def ensure_ygg_wheel(client: Any, *, workspace_dir: str = WORKSPACE_WHL_DIR) -> list[str]:
-    """Build the **full ygg wheel** — the live ``yggdrasil`` package with its
-    ``[databricks]`` dependencies **plus the latest ``databricks-sdk``** — and
-    upload every produced wheel to *workspace_dir*; return their workspace
-    paths. The bundle a serverless job installs by path (no index) to run the
-    ``ygg`` CLI on the cluster."""
+def deployed_wheels(
+    client: Any,
+    dist: str,
+    version: str,
+    *,
+    workspace_dir: str,
+) -> list[str]:
+    """Workspace paths of a wheel bundle already deployed for *dist* *version*
+    under *workspace_dir*, or ``[]`` when none is present.
+
+    The bundle counts as present only when *dist*'s own wheel for *version* is
+    there — a directory holding just the dependency wheels (a never-built or
+    half-finished upload) is treated as absent so the caller rebuilds. Every
+    ``.whl`` in the directory is returned, since :func:`build_wheel` drops the
+    distribution wheel and its transitive deps side by side."""
+    from yggdrasil.databricks.path import DatabricksPath
+
+    folder = DatabricksPath.from_(workspace_dir, client=client)
+    if not folder.exists():
+        return []
+
+    paths: list[str] = []
+    has_dist = False
+    want_dist, want_version = _norm(dist), _norm_version(version)
+    for child in folder.iterdir():
+        name = str(child.name)
+        if not name.endswith(".whl"):
+            continue
+        paths.append(child.full_path())
+        parts = name[:-4].split("-")  # drop ".whl"; <dist>-<version>-<tags...>
+        if (
+            len(parts) >= 2
+            and _norm(parts[0]) == want_dist
+            and _norm_version(parts[1]) == want_version
+        ):
+            has_dist = True
+    return paths if has_dist else []
+
+
+def ensure_ygg_wheel(
+    client: Any,
+    *,
+    workspace_dir: str = WORKSPACE_WHL_DIR,
+    rebuild: bool = False,
+) -> list[str]:
+    """Get-or-build the **full ygg wheel** bundle for the current version.
+
+    The live ``yggdrasil`` package with its ``[databricks]`` dependencies
+    **plus the latest ``databricks-sdk``**, deployed under a version-scoped
+    subfolder of *workspace_dir* (``.../whl/<version>/``). On the first call for
+    a version the bundle is built (:func:`build_wheel`) and uploaded; later
+    calls find that deployed bundle (:func:`deployed_wheels`) and reuse it
+    rather than rebuilding. Pass ``rebuild=True`` to force a fresh build (e.g.
+    after a dev edit that doesn't bump the version). Returns the workspace
+    wheel paths a serverless job installs by path (no index) to run the ``ygg``
+    CLI on the cluster."""
+    version = ilmd.version("ygg")
+    version_dir = f"{workspace_dir.rstrip('/')}/{version}"
+
+    if not rebuild:
+        existing = deployed_wheels(client, "ygg", version, workspace_dir=version_dir)
+        if existing:
+            logger.info(
+                "reusing deployed ygg %s wheel bundle at %s (%d wheels)",
+                version, version_dir, len(existing),
+            )
+            return existing
+        logger.info("no ygg %s wheel bundle at %s — building", version, version_dir)
+
     return ensure_wheel(
         client, "ygg",
-        workspace_dir=workspace_dir,
+        workspace_dir=version_dir,
         extras=("databricks",),
         requirements=("databricks-sdk",),
     )

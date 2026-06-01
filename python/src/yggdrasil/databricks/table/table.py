@@ -2862,18 +2862,21 @@ class Table(DatabricksPath):
     # async insert — drop Parquet + an operation log; a file-arrival job loads
     # =========================================================================
 
-    def async_job(self) -> Any:
+    def async_job(self, *, rebuild: bool = False) -> Any:
         """Get-or-create the file-arrival loader job for this table; return it.
 
-        Builds + uploads the full ygg wheel and upserts a serverless job that
-        watches ``.sql/async/logs`` and aggregates the operation logs
-        ``insert(..., wait=False)`` drops into one load per target (an
-        OVERWRITE supersedes everything staged before it).
+        An existing job is returned as-is; otherwise one is created — resolving
+        the full ygg wheel bundle for the current version (reusing an
+        already-deployed bundle when present, else building + uploading it) and
+        upserting a serverless job that watches ``.sql/async/logs`` and
+        aggregates the operation logs ``insert(..., wait=False)`` drops into one
+        load per target (an OVERWRITE supersedes everything staged before it).
+        Pass ``rebuild=True`` to force a redeploy.
         See :func:`~yggdrasil.databricks.table.insert.ensure_async_job`.
         """
         from yggdrasil.databricks.table.insert import ensure_async_job
 
-        return ensure_async_job(self)
+        return ensure_async_job(self, rebuild=rebuild)
 
     def arrow_insert(
         self,

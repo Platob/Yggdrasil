@@ -424,6 +424,7 @@ class TestEnsureAsyncJob:
         t = _table_mock()
         jobs = MagicMock()
         t.client.jobs = jobs
+        jobs.get.return_value = None   # no existing job → create path
         created = MagicMock()
         created.job_id = 42
         jobs.create_or_update.return_value = created
@@ -468,6 +469,7 @@ class TestEnsureAsyncJob:
         t = _table_mock()
         jobs = MagicMock()
         t.client.jobs = jobs
+        jobs.get.return_value = None   # no existing job → create path
         created = MagicMock()
         created.job_id = 99
         jobs.create_or_update.return_value = created
@@ -491,6 +493,48 @@ class TestEnsureAsyncJob:
         stale.delete.assert_called_once()      # orphan on the shared trigger removed
         keep.delete.assert_not_called()
         other.delete.assert_not_called()
+
+    def test_get_returns_existing_job_without_building(self):
+        # Get-or-create: an existing job short-circuits — no wheel build, no
+        # upsert, no logs-dir provisioning.
+        from yggdrasil.databricks.table.insert import ensure_async_job
+
+        t = _table_mock()
+        jobs = MagicMock()
+        t.client.jobs = jobs
+        existing = MagicMock()
+        existing.job_id = 7
+        jobs.get.return_value = existing
+
+        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ew:
+            job = ensure_async_job(t)
+
+        assert job is existing
+        jobs.get.assert_called_once_with(name="[YGG][ASYNC] c.s.t", default=None)
+        ew.assert_not_called()                 # no wheel build on the get path
+        jobs.create_or_update.assert_not_called()
+        t.staging_volume.path.return_value.mkdir.assert_not_called()
+
+    def test_rebuild_forces_create_path_even_when_job_exists(self):
+        # rebuild=True skips the get short-circuit and re-deploys.
+        from yggdrasil.databricks.table.insert import ensure_async_job
+
+        t = _table_mock()
+        jobs = MagicMock()
+        t.client.jobs = jobs
+        jobs.get.return_value = MagicMock(job_id=7)   # would short-circuit if consulted
+        created = MagicMock(job_id=8)
+        jobs.create_or_update.return_value = created
+        t.staging_volume.path.return_value.full_path.return_value = "/Volumes/c/s/t/.sql/async/logs"
+        jobs.list.return_value = []
+
+        with patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel", return_value=["w.whl"]) as ew:
+            job = ensure_async_job(t, rebuild=True)
+
+        assert job is created
+        jobs.get.assert_not_called()           # rebuild bypasses the get
+        ew.assert_called_once_with(t.client, rebuild=True)
+        jobs.create_or_update.assert_called_once()
 
 
 # --------------------------------------------------------------------------- #
