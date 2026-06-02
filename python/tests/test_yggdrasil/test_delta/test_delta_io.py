@@ -111,6 +111,57 @@ class TestModes(DeltaTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Per-file statistics — must match what Databricks/Spark writes
+# ---------------------------------------------------------------------------
+
+
+class TestAddFileStats(DeltaTestCase):
+    def _first_add_stats(self, d):
+        import json
+        log = d.path / "_delta_log" / "00000000000000000000.json"
+        for line in log.read_text().splitlines():
+            if not line.strip():
+                continue
+            action = json.loads(line)
+            if "add" in action and action["add"].get("stats"):
+                return json.loads(action["add"]["stats"])
+        raise AssertionError("no add action with stats in the commit")
+
+    def test_stats_shape_matches_databricks(self) -> None:
+        # Booleans get nullCount but NOT min/max — Spark/Databricks skip
+        # min/max for boolean (and binary); we mirror that. tightBounds is
+        # emitted explicitly (no deletion vectors → exact bounds).
+        d = self.delta_io()
+        d.write_arrow_table(self.pa.table({
+            "n": self.pa.array([1, 2, 3], type=self.pa.int64()),
+            "s": self.pa.array(["a", "b", "c"], type=self.pa.string()),
+            "x": self.pa.array([1.5, 2.5, 3.5], type=self.pa.float64()),
+            "flag": self.pa.array([True, False, True], type=self.pa.bool_()),
+        }))
+        stats = self._first_add_stats(d)
+
+        self.assertEqual(stats["numRecords"], 3)
+        self.assertIs(stats["tightBounds"], True)
+        # nullCount covers every scalar column, booleans included.
+        self.assertEqual(set(stats["nullCount"]), {"n", "s", "x", "flag"})
+        # min/max only for orderable columns — never the boolean.
+        self.assertEqual(set(stats["minValues"]), {"n", "s", "x"})
+        self.assertEqual(set(stats["maxValues"]), {"n", "s", "x"})
+        self.assertEqual(stats["minValues"]["n"], 1)
+        self.assertEqual(stats["maxValues"]["s"], "c")
+
+    def test_all_boolean_table_has_nullcount_no_minmax(self) -> None:
+        d = self.delta_io()
+        d.write_arrow_table(self.pa.table({
+            "flag": self.pa.array([True, None, False], type=self.pa.bool_()),
+        }))
+        stats = self._first_add_stats(d)
+        self.assertEqual(stats["nullCount"], {"flag": 1})
+        self.assertNotIn("minValues", stats)
+        self.assertNotIn("maxValues", stats)
+
+
+# ---------------------------------------------------------------------------
 # Time-travel
 # ---------------------------------------------------------------------------
 

@@ -821,14 +821,25 @@ def _collect_stats(batches: "list[pa.RecordBatch]") -> "Optional[str]":
 
     for field in schema:
         t = field.type
-        if not (pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_string(t)
-                or pa.types.is_large_string(t) or pa.types.is_date(t) or pa.types.is_timestamp(t)
-                or pa.types.is_decimal(t) or pa.types.is_boolean(t)):
+        # ``nullCount`` is recorded for every scalar leaf column (booleans
+        # included); ``minValues`` / ``maxValues`` only for *orderable* types.
+        # Databricks / Spark deliberately skip min/max for boolean and binary
+        # (they carry no useful data-skipping bounds), so emitting them would
+        # diverge from a Databricks-written commit.
+        orderable = (
+            pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_string(t)
+            or pa.types.is_large_string(t) or pa.types.is_date(t)
+            or pa.types.is_timestamp(t) or pa.types.is_decimal(t)
+        )
+        if not (orderable or pa.types.is_boolean(t)):
             continue
-        col_min = col_max = None; col_nulls = 0
+        col_nulls = sum(batch.column(field.name).null_count for batch in batches)
+        null_counts[field.name] = col_nulls
+        if not orderable:
+            continue  # boolean → nullCount only, no min/max
+        col_min = col_max = None
         for batch in batches:
             col = batch.column(field.name)
-            col_nulls += col.null_count
             if col.null_count == len(col): continue
             try:
                 mm = pc.min_max(col)
@@ -838,12 +849,14 @@ def _collect_stats(batches: "list[pa.RecordBatch]") -> "Optional[str]":
             except Exception: continue
         if col_min is not None: min_vals[field.name] = _sv(col_min)
         if col_max is not None: max_vals[field.name] = _sv(col_max)
-        null_counts[field.name] = col_nulls
 
     stats: dict[str, Any] = {"numRecords": total_rows}
+    if null_counts: stats["nullCount"] = null_counts
+    # No deletion vectors on a freshly-written file → bounds are exact, which
+    # Databricks records explicitly as ``tightBounds: true``.
+    stats["tightBounds"] = True
     if min_vals: stats["minValues"] = min_vals
     if max_vals: stats["maxValues"] = max_vals
-    if null_counts: stats["nullCount"] = null_counts
     return ygg_json.dumps(stats, separators=(",", ":"), to_bytes=False)
 
 
