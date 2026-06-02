@@ -1,6 +1,6 @@
 {
   "name": "@platob/yggdrasil",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Yggdrasil for JS/TS — the cross-compatible twin of the Python yggdrasil package, optimized for JS. Mirrors the Python module surface (enums, url, path, data typing, io) so backend (Python) and frontend (JS) speak one contract for high-performance communication, leveraging Apache Arrow and polars (and later Spark).",
   "type": "module",
   "main": "./dist/index.js",
