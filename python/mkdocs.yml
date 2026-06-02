@@ -194,7 +194,8 @@ nav:
           - volume: modules/databricks/volume/README.md
           - warehouse: modules/databricks/warehouse/README.md
           - cluster: modules/databricks/cluster/README.md
-          - ai (Vector Search): modules/databricks/ai/README.md
+          - ai (Vector Search + Model Serving): modules/databricks/ai/README.md
+          - genie (conversational analytics + agent): modules/databricks/genie/README.md
       - Storage & Databases:
           - aws: modules/aws/README.md
           - delta: modules/delta/README.md

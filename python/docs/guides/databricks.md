@@ -23,6 +23,9 @@ c = DatabricksClient(host="https://<workspace>", token="<token>")
 | `c.dbfs_path(...)` | DBFS / Volumes / Workspace files | `c.dbfs_path("dbfs:/tmp/a.txt")` |
 | `c.secrets` | Scope/secret CRUD | `c.secrets.create_secret("scope/key", "value")` |
 | `c.iam` | Users/groups (workspace or account) | `c.iam.users.current_user` |
+| `c.ai.serving` | Model Serving — LLMs, agents, external models | `c.ai.serving.endpoint("databricks-claude-sonnet-4").chat("Hi!").text` |
+| `c.ai.vector_search` | Vector Search endpoints + indexes | `c.ai.vector_search.endpoint("rag").ensure_created()` |
+| `c.genie` | Genie conversational analytics + agent | `c.genie.ask("top customers by revenue")` |
 
 ## Authentication
 
@@ -179,6 +182,84 @@ list(iam.groups.list(name="data-engineering", limit=5))
 iam.groups.delete(grp)
 ```
 
+## AI: Model Serving
+
+`c.ai.serving` fronts LLMs, Mosaic AI agents, foundation models, and
+external models behind stable endpoints. Built-in foundation models are
+query-only — no create step:
+
+```python
+serving = c.ai.serving
+
+# Chat / completions / embeddings against a foundation model
+serving.endpoint("databricks-meta-llama-3-3-70b-instruct").chat(
+    "Summarise the CAP theorem in one sentence.", max_tokens=128,
+).text
+
+serving.endpoint("databricks-gte-large-en").embed(["hello", "world"]).embeddings
+
+# Serve an external LLM (keys ride a secret reference, never plaintext)
+serving.endpoint("gpt-4o").serve_openai(
+    "gpt-4o", api_key_secret="llm/openai_key", wait=True,
+)
+
+# Serve a Unity Catalog model / agent
+serving.endpoint("rag-agent").serve_uc_model("main.agents.rag", 3, wait=True)
+```
+
+Defaults lean maximal (scale-to-zero, AI Gateway usage tracking,
+inference-table capture). See [databricks/ai](../modules/databricks/ai/README.md).
+
+## AI: Vector Search
+
+```python
+vs = c.ai.vector_search
+vs.endpoint("rag").ensure_created(wait=True)
+vs.index("main.rag.docs").query(query_text="how do I bake bread?", columns=["id", "text"])
+```
+
+## Genie: conversational analytics + agent
+
+Ask questions in plain English; get the answer, the SQL, and the result
+as Arrow / Polars / pandas. A self-driving agent turns one goal into a
+multi-turn investigation.
+
+```python
+from dataclasses import replace
+c.genie.defaults = replace(c.genie.defaults, space_id="01ef…")
+
+answer = c.genie.ask("How many renewable sites are there?")
+answer.text          # "There are 967 renewable sites…"
+answer.sql           # the generated SQL
+answer.to_polars()   # the result as a DataFrame
+
+# Let the agent act on its own
+run = c.genie.agent().run("top 3 sites by installed capacity")
+print(run.summary())
+```
+
+See [databricks/genie](../modules/databricks/genie/README.md).
+
+## CLI
+
+The `ygg databricks` sub-command wraps these services for the terminal:
+
+```bash
+ygg databricks warehouses list
+ygg databricks clusters list
+ygg databricks genie spaces
+ygg databricks genie ask "How many renewable sites are there?" --space 01ef…
+ygg databricks genie agent "top 3 sites by capacity" --space 01ef…
+```
+
+The autonomous Genie agent also ships as a dedicated console script:
+
+```bash
+ygg-genie --space 01ef… "why did Q3 revenue dip?"      # agent mode
+ygg-genie --space 01ef… --ask "top 5 customers"        # one-shot
+YGG_GENIE_SPACE=01ef… ygg-genie                         # interactive REPL
+```
+
 ## Troubleshooting
 
 - **401 / 403** — verify host + token, and whether you need workspace vs account scope.
@@ -195,3 +276,5 @@ iam.groups.delete(grp)
 - [databricks/workspaces](../modules/databricks/workspaces/README.md), [fs](../modules/databricks/fs/README.md)
 - [databricks/secrets](../modules/databricks/secrets/README.md), [iam](../modules/databricks/iam/README.md)
 - [databricks/account](../modules/databricks/account/README.md)
+- [databricks/ai](../modules/databricks/ai/README.md) — Model Serving + Vector Search
+- [databricks/genie](../modules/databricks/genie/README.md) — conversational analytics + agent

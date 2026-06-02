@@ -126,6 +126,9 @@ with ExecutionContext(cluster=cluster) as ctx:
 | `client.dbfs_path(...)` | DBFS/Volumes path operations | `client.dbfs_path("dbfs:/tmp/a.txt")` |
 | `client.secrets` | Scope/secret CRUD helpers | `client.secrets.create_secret("scope/key", "value")` |
 | `client.iam` | Users/groups in workspace/account scope | `client.iam.users.current_user` |
+| `client.ai.serving` | Model Serving (LLMs, agents, external models) | `client.ai.serving.endpoint("databricks-claude-sonnet-4").chat("Hi!").text` |
+| `client.ai.vector_search` | Vector Search endpoints + indexes | `client.ai.vector_search.endpoint("rag").ensure_created()` |
+| `client.genie` | Genie conversational analytics + agent | `client.genie.ask("top customers by revenue")` |
 
 ---
 
@@ -150,3 +153,5 @@ with ExecutionContext(cluster=cluster) as ctx:
 - [secrets](secrets/README.md)
 - [iam](iam/README.md)
 - [account](account/README.md)
+- [ai](ai/README.md) — Model Serving + Vector Search
+- [genie](genie/README.md) — conversational analytics + agent
