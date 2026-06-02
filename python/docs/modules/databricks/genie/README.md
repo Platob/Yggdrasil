@@ -14,6 +14,14 @@ from yggdrasil.databricks import DatabricksClient
 genie = DatabricksClient().genie
 ```
 
+![ygg-genie console](ygg-genie.png)
+
+*A live `ygg-genie` session: the banner shows the active space and the
+autonomous planner; a Genie ask returns an answer + SQL + result table; a
+raw `/sql` runs on the warehouse; and `/agent` drives a fully-autonomous
+investigation (the `databricks-claude-sonnet-4` planner decides each step,
+Genie executes the SQL).*
+
 ## One-liner
 
 ```python
@@ -130,14 +138,24 @@ answer.thumbs_down(comment="wrong table")
 
 ## The autonomous agent
 
-`GenieAgent` turns a single goal into a multi-turn investigation. It opens
-a conversation and, whenever Genie answers with clarifying *suggested
-questions* instead of a concrete data answer, it **picks one and keeps
-going on its own** — until it lands a query-backed answer, hits a failure,
-runs out of suggestions, or exhausts its turn budget.
+`GenieAgent` turns a single goal into a multi-turn investigation, driven
+by one of two brains:
+
+- **Planner brain — fully autonomous.** Give it a `planner` (a Model
+  Serving LLM) and the agent asks that LLM what to ask Genie next, given
+  the goal and the transcript so far, looping until the LLM says the goal
+  is answered. This closes the loop across two Databricks AI services: the
+  serving LLM *reasons*, Genie *executes* the SQL, the agent *observes*
+  the result.
+- **Heuristic brain — no LLM.** With no planner, the agent follows
+  Genie's own *suggested questions* until it lands a query-backed answer.
 
 ```python
-run = client.genie.agent(space_id="01ef…").run("why did Q3 revenue dip?")
+# Fully autonomous: an LLM plans, Genie executes
+run = client.genie.agent(
+    space_id="01ef…",
+    planner="databricks-claude-sonnet-4",   # any chat serving endpoint
+).run("why did Q3 revenue dip?")
 
 print(run.summary())     # full transcript of every turn
 print(run.text)          # the agent's final word
@@ -156,10 +174,27 @@ Tunables:
 ```python
 agent = client.genie.agent(
     space_id="01ef…",
+    planner=True,             # True → the default endpoint ($YGG_GENIE_PLANNER,
+                              #   default "databricks-claude-sonnet-4")
+                              # or a str endpoint name, or a callable
+                              #   (AgentRun) -> next question | None
     max_turns=6,              # how far it will drive (default 4)
-    follow_suggestions=True,  # set False to stop after the first answer
+    follow_suggestions=True,  # heuristic mode: stop after the first answer if False
 )
 run = agent.run("break down churn by plan")
+```
+
+A custom planner is any callable that, given the run so far, returns the
+next question (or `None` to stop) — handy for deterministic policies or a
+different reasoning model:
+
+```python
+def planner(run):
+    if run.data_answer is not None:
+        return None                       # got data → done
+    return "show me the breakdown by month"
+
+client.genie.agent(space_id="01ef…", planner=planner).run("revenue trend")
 ```
 
 `AgentRun` resolves the final answer for you:
@@ -220,24 +255,41 @@ num_renewable_sites
 967
 ```
 
-## CLI — `ygg-genie` (standalone agent)
+## CLI — `ygg-genie` (rich console)
 
-A dedicated console script focused on the autonomous agent. The space id
-falls back to `$YGG_GENIE_SPACE`.
+A Claude-CLI-style terminal: a branded logo, a live spinner while Genie
+thinks, answers in rounded panels, and results in bordered tables. It
+drives the *whole* Databricks surface from one prompt — not just Genie.
 
 ```bash
-# Agent mode (default): drive a multi-turn investigation, print the transcript
+# Agent mode (default): autonomous investigation, printed transcript
 ygg-genie --space 01ef… "why did Q3 revenue dip?"
 
-# One-shot ask (no autonomous follow-ups)
+# Fully autonomous with an LLM planner
+ygg-genie --space 01ef… --planner databricks-claude-sonnet-4 "explain churn"
+
+# One-shot ask (no follow-ups)
 ygg-genie --space 01ef… --ask "top 5 customers by revenue"
 
-# Deeper investigation
-ygg-genie --space 01ef… --max-turns 6 "break down churn by plan"
-
-# Interactive REPL — /agent <goal>, /new, /quit
+# Interactive console
 YGG_GENIE_SPACE=01ef… ygg-genie
 ```
+
+Inside the interactive console:
+
+| Input | Action |
+|---|---|
+| `<text>` | ask Genie in the current conversation |
+| `/agent <goal>` | run the autonomous agent (LLM planner + Genie) |
+| `/sql <query>` | run raw SQL on the warehouse, rendered as a table |
+| `/tables [c.s]` | `SHOW TABLES` in a schema |
+| `/catalogs` | `SHOW CATALOGS` |
+| `/warehouses` | list SQL warehouses |
+| `/spaces` · `/use <#\|id>` | list and switch Genie spaces |
+| `/new` · `/help` · `/quit` | reset · help · leave |
+
+The planner LLM defaults to `$YGG_GENIE_PLANNER`
+(`databricks-claude-sonnet-4`); the space to `$YGG_GENIE_SPACE`.
 
 Both CLIs accept the shared Databricks client flags (`--host` / `--token`
 / `--profile` / …) and fall back to the standard `DATABRICKS_*`

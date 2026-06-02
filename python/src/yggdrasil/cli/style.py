@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import itertools
 import os
+import re
 import sys
 import threading
 import time
+from typing import Any, Sequence
 
 _CSI = "\033["
 _RESET = f"{_CSI}0m"
@@ -127,6 +129,12 @@ _LOGOS: dict[str, tuple[str, ...]] = {
         r" \ \ / // __/ __||   \| _ ) |/ // __|",
         "  \\ V /| (_ | (_ | |) | _ \\ ' < \\__ \\",
         r"   |_|  \___|\___||___/|___/_|\_\|___/",
+    ),
+    "GENIE": (
+        r"  ___ ___ _  _ ___ ___ ",
+        r" / __| __| \| |_ _| __|",
+        r"| (_ | _|| .` || || _| ",
+        r" \___|___|_|\_|___|___|",
     ),
 }
 
@@ -283,3 +291,67 @@ def step(text: str) -> None: out(event("▸", text, _CORAL) + "\n")
 def ok(text: str) -> None:   out(event("✓", text, _GREEN) + "\n")
 def warn(text: str) -> None: out(event("▲", text, _AMBER) + "\n")
 def fail(text: str) -> None: out(event("✗", text, _RED) + "\n")
+
+
+# -- boxes: panels and tables ----------------------------------------------
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible_len(text: str) -> int:
+    """Length of ``text`` ignoring ANSI SGR escapes."""
+    return len(_ANSI_RE.sub("", text))
+
+
+def _pad(text: str, width: int) -> str:
+    """Right-pad ``text`` to ``width`` visible columns (ANSI-aware)."""
+    return text + " " * max(0, width - _visible_len(text))
+
+
+def panel(body: str, *, title: str = "", width: int = 0, color: str = _CORAL) -> str:
+    """A rounded box around ``body`` with an optional colored ``title``.
+
+    ``body`` may contain newlines and inline ANSI; the border is dim and
+    the title wears ``color``.
+    """
+    lines = body.split("\n")
+    inner = max([_visible_len(ln) for ln in lines] + [_visible_len(title) + 2, width - 4])
+    top = f"╭─ {_esc(color, title)} " + "─" * (inner - _visible_len(title) - 2) + "╮" if title \
+        else "╭" + "─" * (inner + 2) + "╮"
+    rows = [f"{dim('│')} {_pad(ln, inner)} {dim('│')}" for ln in lines]
+    bottom = "╰" + "─" * (inner + 2) + "╯"
+    return "\n".join(["  " + dim(top)] + ["  " + r for r in rows] + ["  " + dim(bottom)])
+
+
+def table(headers: "Sequence[str]", rows: "Sequence[Sequence[Any]]", *, max_rows: int = 0) -> str:
+    """A bordered table — bold/brand headers, dim borders, padded cells.
+
+    Cells are stringified; values are not ANSI-styled so the column widths
+    stay exact. Pass ``max_rows`` to cap the body (a footer notes the rest).
+    """
+    cols = [str(h) for h in headers]
+    body = [[str(c) for c in r] for r in rows]
+    shown = body[:max_rows] if max_rows and len(body) > max_rows else body
+    widths = [
+        max([_visible_len(cols[i])] + [_visible_len(r[i]) for r in shown if i < len(r)])
+        for i in range(len(cols))
+    ]
+
+    def _row(cells: "Sequence[str]", *, header: bool = False) -> str:
+        out_cells = []
+        for i, w in enumerate(widths):
+            cell = cells[i] if i < len(cells) else ""
+            out_cells.append(bold(brand(_pad(cell, w))) if header else _pad(cell, w))
+        return f"{dim('│')} " + f" {dim('│')} ".join(out_cells) + f" {dim('│')}"
+
+    bar = lambda l, m, r: dim(l + m.join("─" * (w + 2) for w in widths) + r)  # noqa: E731
+    lines = [
+        "  " + bar("╭", "┬", "╮"),
+        "  " + _row(cols, header=True),
+        "  " + bar("├", "┼", "┤"),
+    ]
+    lines += ["  " + _row(r) for r in shown]
+    lines.append("  " + bar("╰", "┴", "╯"))
+    if max_rows and len(body) > max_rows:
+        lines.append("  " + muted(f"… {len(body) - max_rows} more rows"))
+    return "\n".join(lines)

@@ -8,12 +8,20 @@ dispatch + handler wiring is exercised without a live workspace.
 from __future__ import annotations
 
 import io
+import re
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.cli import main as dbks_main
 from yggdrasil.cli.databricks.genie import main as genie_main
+
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def _strip(text: str) -> str:
+    """Drop ANSI SGR escapes so assertions match on plain content."""
+    return _ANSI.sub("", text)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +125,9 @@ class TestGenieCliBehaviour(unittest.TestCase):
 
     def test_ygg_genie_agent_default_mode(self):
         run = MagicMock()
-        run.summary.return_value = "Goal: g"
+        goal_turn = MagicMock(autonomous=False, question="why the dip?")
+        goal_turn.answer = _answer(text="Revenue fell on lower volume.")
+        run.turns = [goal_turn]
         run.data_answer = None
         agent = MagicMock()
         agent.run.return_value = run
@@ -127,8 +137,29 @@ class TestGenieCliBehaviour(unittest.TestCase):
         with redirect_stdout(buf):
             rc = genie_main(["--space", "sp-1", "why the dip?"])
         self.assertEqual(rc, 0)
-        self.client.genie.agent.assert_called_once_with(space_id="sp-1", max_turns=4)
-        self.assertIn("Goal: g", buf.getvalue())
+        # planner defaults to None (heuristic) when --planner is omitted.
+        self.client.genie.agent.assert_called_once_with(
+            space_id="sp-1", planner=None, max_turns=4,
+        )
+        agent.run.assert_called_once_with("why the dip?")
+        out = _strip(buf.getvalue())
+        self.assertIn("why the dip?", out)
+        self.assertIn("Revenue fell on lower volume.", out)
+
+    def test_ygg_genie_planner_flag_threads_through(self):
+        run = MagicMock(turns=[], data_answer=None)
+        agent = MagicMock()
+        agent.run.return_value = run
+        self.client.genie.agent.return_value = agent
+
+        with redirect_stdout(io.StringIO()):
+            rc = genie_main([
+                "--space", "sp-1", "--planner", "databricks-claude-sonnet-4", "explain churn",
+            ])
+        self.assertEqual(rc, 0)
+        self.client.genie.agent.assert_called_once_with(
+            space_id="sp-1", planner="databricks-claude-sonnet-4", max_turns=4,
+        )
 
     def test_ygg_genie_one_shot_ask(self):
         self.client.genie.ask.return_value = _answer(text="42", failed=False)
@@ -137,7 +168,7 @@ class TestGenieCliBehaviour(unittest.TestCase):
             rc = genie_main(["--space", "sp-1", "--ask", "the answer?"])
         self.assertEqual(rc, 0)
         self.client.genie.ask.assert_called_once_with("the answer?", space_id="sp-1")
-        self.assertIn("42", buf.getvalue())
+        self.assertIn("42", _strip(buf.getvalue()))
 
     def test_ygg_genie_requires_space(self):
         # No --space and no env → exit code 2.
@@ -147,6 +178,49 @@ class TestGenieCliBehaviour(unittest.TestCase):
             os.environ.pop("YGG_GENIE_SPACE", None)
             rc = genie_main(["why the dip?"])
         self.assertEqual(rc, 2)
+
+
+# ---------------------------------------------------------------------------
+# Interactive console (GenieConsole) — driven with scripted input
+# ---------------------------------------------------------------------------
+
+
+class TestGenieConsole(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = MagicMock()
+        self.client.genie.space.return_value.title = "Sales"
+
+    def _run(self, lines: list[str]) -> str:
+        from yggdrasil.cli.databricks.genie import GenieConsole
+
+        console = GenieConsole(self.client, "sp-1")
+        buf = io.StringIO()
+        with redirect_stdout(buf), patch("builtins.input", side_effect=lines):
+            console.run()
+        return _strip(buf.getvalue())
+
+    def test_help_then_quit(self):
+        out = self._run(["/help", "/quit"])
+        self.assertIn("/agent", out)
+        self.assertIn("/sql", out)
+
+    def test_sql_command_runs_sql(self):
+        import pyarrow as pa
+
+        self.client.sql.execute.return_value.to_arrow_table.return_value = pa.table(
+            {"n": [1, 2]}
+        )
+        out = self._run(["/sql SELECT 1", "/quit"])
+        self.client.sql.execute.assert_called_once_with("SELECT 1")
+        self.assertIn("n", out)
+
+    def test_plain_text_asks_genie(self):
+        ans = _answer(text="Revenue is up.")
+        self.client.genie.space.return_value.start_conversation.return_value = (
+            MagicMock(), ans,
+        )
+        out = self._run(["how is revenue?", "/quit"])
+        self.assertIn("Revenue is up.", out)
 
 
 if __name__ == "__main__":  # pragma: no cover

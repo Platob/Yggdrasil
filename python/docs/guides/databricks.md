@@ -233,10 +233,16 @@ answer.text          # "There are 967 renewable sites…"
 answer.sql           # the generated SQL
 answer.to_polars()   # the result as a DataFrame
 
-# Let the agent act on its own
-run = c.genie.agent().run("top 3 sites by installed capacity")
+# Let the agent act on its own — an LLM plans, Genie executes
+run = c.genie.agent(planner="databricks-claude-sonnet-4").run(
+    "top 3 sites by installed capacity"
+)
 print(run.summary())
 ```
+
+The rich `ygg-genie` console drives Genie, raw SQL, catalogs, and the
+autonomous agent from one prompt — see
+[databricks/genie](../modules/databricks/genie/README.md#cli-ygg-genie-rich-console).
 
 See [databricks/genie](../modules/databricks/genie/README.md).
 

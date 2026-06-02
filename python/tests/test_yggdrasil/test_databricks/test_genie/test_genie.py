@@ -8,7 +8,7 @@ mocked SDK calls.
 from __future__ import annotations
 
 from dataclasses import replace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from databricks.sdk.errors import NotFound
 from databricks.sdk.service.dashboards import (
@@ -461,3 +461,91 @@ class TestAgent(GenieTestCase):
         run = self.genie.agent(follow_suggestions=False, max_turns=4).run("sales")
         self.assertEqual(len(run.turns), 1)
         self.genie_api.create_message_and_wait.assert_not_called()
+
+    def test_agent_callable_planner_drives_until_done(self):
+        # A callable planner returns the next question, then None (= done).
+        self.genie_api.start_conversation_and_wait.return_value = _message(
+            attachments=[_text_attachment("opening")],
+        )
+        self.genie_api.create_message_and_wait.return_value = _message(
+            message_id="msg-2", attachments=[_query_attachment("SELECT 1")],
+        )
+        seen = []
+
+        def planner(run):
+            seen.append(len(run.turns))
+            return "drill deeper" if len(run.turns) < 2 else None
+
+        run = self.genie.agent(planner=planner, max_turns=5).run("goal")
+        self.assertEqual(len(run.turns), 2)
+        self.assertTrue(run.turns[1].autonomous)
+        self.assertEqual(run.turns[1].question, "drill deeper")
+        self.assertEqual(seen, [1, 2])
+
+
+class TestAgentLLMPlanner(GenieTestCase):
+    """The fully-autonomous planner brain: a Model Serving LLM picks each step."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.genie.defaults = replace(self.genie.defaults, space_id="space-1")
+        self.serving_api = self.workspace_client.serving_endpoints
+
+    def _planner_reply(self, text: str):
+        from databricks.sdk.service.serving import (
+            ChatMessage,
+            ChatMessageRole,
+            QueryEndpointResponse,
+            V1ResponseChoiceElement,
+        )
+
+        return QueryEndpointResponse(
+            choices=[V1ResponseChoiceElement(
+                index=0,
+                message=ChatMessage(role=ChatMessageRole.ASSISTANT, content=text),
+            )],
+        )
+
+    def test_llm_planner_asks_then_stops_on_done(self):
+        self.genie_api.start_conversation_and_wait.return_value = _message(
+            attachments=[_text_attachment("opening answer")],
+        )
+        self.genie_api.create_message_and_wait.return_value = _message(
+            message_id="msg-2", attachments=[_query_attachment("SELECT 1")],
+        )
+        # Planner: first decide a follow-up, then say DONE.
+        self.serving_api.query.side_effect = [
+            self._planner_reply("break it down by region"),
+            self._planner_reply("DONE"),
+        ]
+
+        run = self.genie.agent(
+            planner="databricks-claude-sonnet-4", max_turns=5,
+        ).run("explain sales")
+
+        self.assertEqual(len(run.turns), 2)
+        self.assertEqual(run.turns[1].question, "break it down by region")
+        self.assertTrue(run.turns[1].autonomous)
+        # The planner LLM was queried against the serving endpoint.
+        first_call = self.serving_api.query.call_args_list[0]
+        self.assertEqual(first_call.kwargs["name"], "databricks-claude-sonnet-4")
+
+    def test_agent_true_planner_uses_default_endpoint(self):
+        from yggdrasil.databricks.genie.agent import DEFAULT_PLANNER_ENDPOINT
+
+        agent = self.genie.agent(planner=True)
+        self.assertEqual(agent.planner, DEFAULT_PLANNER_ENDPOINT)
+
+    def test_llm_planner_strips_bullet_prefix(self):
+        self.genie_api.start_conversation_and_wait.return_value = _message(
+            attachments=[_text_attachment("opening")],
+        )
+        self.genie_api.create_message_and_wait.return_value = _message(
+            message_id="msg-2", attachments=[_query_attachment("SELECT 1")],
+        )
+        self.serving_api.query.side_effect = [
+            self._planner_reply("- what about EMEA?\nsome trailing chatter"),
+            self._planner_reply("DONE"),
+        ]
+        run = self.genie.agent(planner="ep", max_turns=4).run("goal")
+        self.assertEqual(run.turns[1].question, "what about EMEA?")
