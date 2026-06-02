@@ -27,6 +27,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "WORKSPACE_PYPI_DIR",
     "WORKSPACE_WHL_DIR",
     "SERVERLESS_ENVIRONMENT_VERSION",
     "serverless_environment_version",
@@ -40,9 +41,18 @@ __all__ = [
     "ygg_environment",
 ]
 
-#: Root for workspace wheels — one subfolder per version to keep each bundle
-#: self-contained (and so a deploy can reuse an existing version's bundle).
-WORKSPACE_WHL_DIR = "/Workspace/Shared/.ygg/whl"
+#: Root of the workspace's PyPI-like wheel registry. Each distribution gets a
+#: folder under it holding its version binaries (wheel / egg / …) — a flat,
+#: PEP 503 "simple index"-style layout shared across the workspace::
+#:
+#:     /Workspace/Shared/pypi/<dist>/<dist>-<version>-py3-none-any.whl
+#:
+#: A new version drops alongside the others under the dist folder (no isolated
+#: per-version subdir), so the registry is browsable and reusable like an index.
+WORKSPACE_PYPI_DIR = "/Workspace/Shared/pypi"
+
+#: Back-compat alias — the registry root (was an isolated ``.ygg/whl`` path).
+WORKSPACE_WHL_DIR = WORKSPACE_PYPI_DIR
 
 #: Latest serverless environment version — the fallback when the local Python
 #: isn't one we map to an older runtime.
@@ -55,11 +65,11 @@ def serverless_environment_version() -> str:
 
     Matching matters twice over: a locally-built ygg wheel installs cleanly, and
     Python UDFs run (Spark Connect requires the client and server to share a
-    minor Python version). Mapping: 3.10 → ``"0"``, 3.11 → ``"2"``, anything
+    minor Python version). Mapping: 3.10 → ``"1"``, 3.11 → ``"2"``, anything
     else → the latest :data:`SERVERLESS_ENVIRONMENT_VERSION` (``"5"``)."""
     minor = sys.version_info[1]
     if minor == 10:
-        return "0"
+        return "1"
     if minor == 11:
         return "2"
     return SERVERLESS_ENVIRONMENT_VERSION
@@ -310,17 +320,18 @@ def deployed_wheels(
 def ensure_ygg_wheel(
     client: Any,
     *,
-    workspace_dir: str = WORKSPACE_WHL_DIR,
+    workspace_dir: str = WORKSPACE_PYPI_DIR,
     rebuild: bool = False,
 ) -> list[str]:
     """Get-or-build the **pure-python ygg wheel** for the current version.
 
     Builds *only* the live ``yggdrasil`` package as a ``py3-none-any`` wheel
-    (``pip wheel --no-deps``) — no platform-specific dependency wheels — deployed
-    under a version-scoped subfolder of *workspace_dir* (``.../whl/<version>/``).
-    On the first call for a version the wheel is built and uploaded; later calls
-    find and reuse it (:func:`deployed_wheels`). Pass ``rebuild=True`` to force
-    a fresh build.
+    (uv ``build --wheel``) — no platform-specific dependency wheels — and deploys
+    it into the PyPI-like registry under *workspace_dir*, in the distribution's
+    own folder (``<workspace_dir>/ygg/ygg-<version>-py3-none-any.whl``) alongside
+    any other versions. On the first call for a version the wheel is built and
+    uploaded; later calls find and reuse it (:func:`deployed_wheels`). Pass
+    ``rebuild=True`` to force a fresh build.
 
     Returns the workspace path of the ygg wheel — a serverless job installs it
     **by path** while resolving the runtime dependencies (see
@@ -328,20 +339,21 @@ def ensure_ygg_wheel(
     platform-correct builds rather than wheels bundled from the deploying host
     (which a different serverless platform / python can't install)."""
     version = ilmd.version("ygg")
-    version_dir = f"{workspace_dir.rstrip('/')}/{version}"
+    # PyPI-like: one folder per distribution; versions are distinct files in it.
+    dist_dir = f"{workspace_dir.rstrip('/')}/ygg"
 
     if not rebuild:
         existing = deployed_wheels(
-            client, "ygg", version, workspace_dir=version_dir, dist_only=True,
+            client, "ygg", version, workspace_dir=dist_dir, dist_only=True,
         )
         if existing:
-            logger.info("reusing deployed ygg %s wheel at %s", version, version_dir)
+            logger.info("reusing deployed ygg %s wheel at %s", version, dist_dir)
             return existing
-        logger.info("no ygg %s wheel at %s — building", version, version_dir)
+        logger.info("no ygg %s wheel at %s — building", version, dist_dir)
 
     return ensure_wheel(
         client, "ygg",
-        workspace_dir=version_dir,
+        workspace_dir=dist_dir,
         extras=("databricks",),
         no_deps=True,
     )
@@ -381,7 +393,7 @@ def ygg_environment(
     environment_key: str = "default",
     environment_version: "str | None" = None,
     rebuild: bool = False,
-    workspace_dir: str = WORKSPACE_WHL_DIR,
+    workspace_dir: str = WORKSPACE_PYPI_DIR,
 ) -> Any:
     """The serverless ``JobEnvironment`` for the **versioned ygg image**.
 

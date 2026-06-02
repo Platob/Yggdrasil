@@ -1158,19 +1158,21 @@ class DatabricksClient(Singleton, URLBased):
         """Get-or-create the **versioned pure-python ygg wheel** in this workspace.
 
         A pinned, per-version image of the ``ygg`` package (CLI included), built
-        ``--no-deps`` as a ``py3-none-any`` wheel and deployed under
-        ``/Workspace/Shared/.ygg/whl/<version>/``. The first call for a version
-        builds + uploads it; later calls find and reuse it. Pass ``rebuild=True``
-        to force a fresh build. Returns the wheel's workspace path — a serverless
-        job installs it by path while resolving the runtime dependencies from
-        the index (see :meth:`ygg_environment`), so they land as platform-correct
-        builds rather than wheels bundled from this host.
+        ``--no-deps`` (via uv) as a ``py3-none-any`` wheel and deployed into the
+        workspace's PyPI-like registry under the distribution's folder
+        (``/Workspace/Shared/pypi/ygg/ygg-<version>-py3-none-any.whl``), alongside
+        any other versions. The first call for a version builds + uploads it;
+        later calls find and reuse it. Pass ``rebuild=True`` to force a fresh
+        build. Returns the wheel's workspace path — a serverless job installs it
+        by path while resolving the runtime dependencies from the index (see
+        :meth:`ygg_environment`), so they land as platform-correct builds rather
+        than wheels bundled from this host.
         """
-        from yggdrasil.databricks.job.wheel import ensure_ygg_wheel, WORKSPACE_WHL_DIR
+        from yggdrasil.databricks.job.wheel import ensure_ygg_wheel, WORKSPACE_PYPI_DIR
 
         return ensure_ygg_wheel(
             self,
-            workspace_dir=workspace_dir or WORKSPACE_WHL_DIR,
+            workspace_dir=workspace_dir or WORKSPACE_PYPI_DIR,
             rebuild=rebuild,
         )
 

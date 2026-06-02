@@ -155,8 +155,8 @@ class TestFlow:
 
         client = MagicMock()
         wheels = [
-            "/Workspace/Shared/.ygg/whl/ygg-demo/ygg-9.9-py3-none-any.whl",
-            "/Workspace/Shared/.ygg/whl/ygg-demo/databricks_sdk-1.2.3-py3-none-any.whl",
+            "/Workspace/Shared/pypi/ygg-demo/ygg-9.9-py3-none-any.whl",
+            "/Workspace/Shared/pypi/ygg-demo/databricks_sdk-1.2.3-py3-none-any.whl",
         ]
         with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheels) as ew:
             deployed = demo.deploy(client)
@@ -165,7 +165,7 @@ class TestFlow:
         # and ship them as workspace wheels — no index install
         assert ew.call_count == 1
         assert ew.call_args.args[1] == demo.wheel_package()     # (client, package, ...)
-        assert ew.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/.ygg/whl/ygg-demo"
+        assert ew.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/pypi/ygg-demo"
         assert ew.call_args.kwargs["extras"] == ("databricks",)
         assert ew.call_args.kwargs["requirements"] == ("databricks-sdk",)
         kwargs = client.jobs.create_or_update.call_args.kwargs

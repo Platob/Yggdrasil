@@ -104,7 +104,7 @@ class TestWheel:
         with patch("yggdrasil.databricks.path.DatabricksPath") as DP:
             DP.from_.return_value = path
             dest = wheel.upload_wheel(client, wf)
-        assert dest == "/Workspace/Shared/.ygg/whl/ygg-1.2.3-py3-none-any.whl"
+        assert dest == "/Workspace/Shared/pypi/ygg-1.2.3-py3-none-any.whl"
         DP.from_.assert_called_once_with(dest, client=client)
         path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
         path.write_bytes.assert_called_once_with(b"WHEELBYTES")
@@ -198,11 +198,11 @@ class TestWheel:
              patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=["/ws/x.whl"]) as ew:
             out = wheel.ensure_ygg_wheel(client, workspace_dir="/ws/job")
         dw.assert_called_once_with(
-            client, "ygg", "9.9", workspace_dir="/ws/job/9.9", dist_only=True,
+            client, "ygg", "9.9", workspace_dir="/ws/job/ygg", dist_only=True,
         )
         ew.assert_called_once_with(
             client, "ygg",
-            workspace_dir="/ws/job/9.9",
+            workspace_dir="/ws/job/ygg",
             extras=("databricks",),
             no_deps=True,
         )
@@ -217,7 +217,7 @@ class TestWheel:
              patch("yggdrasil.databricks.job.wheel.ensure_wheel") as ew:
             out = wheel.ensure_ygg_wheel(client, workspace_dir="/ws/job")
         dw.assert_called_once_with(
-            client, "ygg", "9.9", workspace_dir="/ws/job/9.9", dist_only=True,
+            client, "ygg", "9.9", workspace_dir="/ws/job/ygg", dist_only=True,
         )
         ew.assert_not_called()
         assert out == deployed
@@ -231,7 +231,7 @@ class TestWheel:
         dw.assert_not_called()                 # rebuild bypasses the reuse probe
         ew.assert_called_once_with(
             client, "ygg",
-            workspace_dir="/ws/job/9.9",
+            workspace_dir="/ws/job/ygg",
             extras=("databricks",),
             no_deps=True,
         )
@@ -296,7 +296,7 @@ class TestWheel:
     def test_serverless_environment_version_maps_python(self):
         import sys
         from unittest.mock import patch as _patch
-        cases = {(3, 10): "0", (3, 11): "2", (3, 12): "5", (3, 13): "5"}
+        cases = {(3, 10): "1", (3, 11): "2", (3, 12): "5", (3, 13): "5"}
         for (maj, minr), expected in cases.items():
             with _patch.object(sys, "version_info", (maj, minr, 0)):
                 assert wheel.serverless_environment_version() == expected
