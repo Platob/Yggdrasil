@@ -349,6 +349,43 @@ class TestArrowProjection:
         expected_names = set(RESPONSE_SCHEMA.to_arrow_schema().names)
         assert set(batch.schema.names) == expected_names
 
+    def test_to_pandas_restores_named_index(self) -> None:
+        # A Parquet body written by pandas carries the index in the
+        # b"pandas" schema metadata; Response.to_pandas should rebuild it
+        # rather than leaving the index level as a plain column.
+        import io
+
+        pd = pytest.importorskip("pandas")
+        df = pd.DataFrame({"v": [10, 20, 30]}, index=pd.Index([1, 2, 3], name="pk"))
+        buf = io.BytesIO()
+        df.to_parquet(buf)
+        resp = _make_response(
+            body=buf.getvalue(),
+            headers={"Content-Type": "application/vnd.apache.parquet"},
+        )
+        out = resp.to_pandas()
+        assert out.index.name == "pk"
+        assert list(out.index) == [1, 2, 3]
+        assert "pk" not in out.columns
+
+    def test_to_pandas_restores_multi_index(self) -> None:
+        import io
+
+        pd = pytest.importorskip("pandas")
+        idx = pd.MultiIndex.from_tuples(
+            [("a", 1), ("b", 2), ("c", 3)], names=["k1", "k2"],
+        )
+        df = pd.DataFrame({"v": [10, 20, 30]}, index=idx)
+        buf = io.BytesIO()
+        df.to_parquet(buf)
+        resp = _make_response(
+            body=buf.getvalue(),
+            headers={"Content-Type": "application/vnd.apache.parquet"},
+        )
+        out = resp.to_pandas()
+        assert isinstance(out.index, pd.MultiIndex)
+        assert out.index.names == ["k1", "k2"]
+
     def test_out_of_range_received_at_does_not_crash_read(self) -> None:
         # A corrupt/legacy cache cell can hold a timestamp int64 outside
         # Python's datetime range; reading the batch must not raise

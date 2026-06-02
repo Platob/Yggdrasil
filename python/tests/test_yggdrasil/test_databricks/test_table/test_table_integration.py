@@ -72,6 +72,8 @@ __all__ = [
     "TestTableViewIntegration",
     "TestTableStoragePathIntegration",
     "TestTableAsyncInsertIntegration",
+    "TestTableAsyncInsertLogPathIntegration",
+    "TestTablePandasIndexIntegration",
 ]
 
 
@@ -735,13 +737,13 @@ class TestTableStoragePathIntegration(_TableFixture):
 
 @pytest.mark.integration
 class TestTableAsyncInsertIntegration(_TableFixture):
-    """``insert(wait=False)`` drop → loader aggregate-load round-trip.
+    """``Table.stage_insert`` drop → loader aggregate-load round-trip.
 
-    ``stage_async_insert`` stages the Parquet to the table's tmp path and drops
-    a JSON operation log (no warehouse statement); ``load_async`` then reads the
-    log, builds one aggregated load per ``(target, mode)`` group, loads it, and
-    clears the consumed log + data. The loader is driven directly — the live
-    file-arrival job (``Table.async_job()``) is not exercised here.
+    :meth:`Table.stage_insert` stages the Parquet to the table's tmp path and
+    drops a JSON operation log (no warehouse statement); ``load_async`` then
+    reads the log, builds one aggregated load per ``(target, mode)`` group,
+    loads it, and clears the consumed log + data. The loader is driven directly
+    — the live file-arrival job (``Table.async_job()``) is not exercised here.
     """
 
     table_prefix = "yg_async"
@@ -753,9 +755,7 @@ class TestTableAsyncInsertIntegration(_TableFixture):
         self.table.insert(_sample_data().slice(0, 0), mode=Mode.OVERWRITE)
 
     def test_async_overwrite_replaces_rows(self) -> None:
-        from yggdrasil.databricks.table.insert import (
-            load_async, logs_path, stage_async_insert,
-        )
+        from yggdrasil.databricks.table.insert import load_async, logs_path
 
         try:
             self.table.insert(_sample_data(), mode=Mode.APPEND)
@@ -769,7 +769,7 @@ class TestTableAsyncInsertIntegration(_TableFixture):
             "amount": pa.array([9.5], type=pa.float64()),
         })
         try:
-            stage_async_insert(self.table, overwrite_rows, mode=Mode.OVERWRITE)
+            self.table.stage_insert(overwrite_rows, mode=Mode.OVERWRITE)
         except (DatabricksError, PermissionDenied) as exc:
             self._skip(exc, "async insert failed")
 
@@ -777,14 +777,39 @@ class TestTableAsyncInsertIntegration(_TableFixture):
         self.assertEqual(self._count(), 1)
 
     def test_async_rejects_merge_mode(self) -> None:
-        from yggdrasil.databricks.table.insert import stage_async_insert
         with self.assertRaises(ValueError):
-            stage_async_insert(self.table, _sample_data(), mode=Mode.MERGE)
+            self.table.stage_insert(_sample_data(), mode=Mode.MERGE)
+
+    def test_stage_insert_check_job_creates_loader_job(self) -> None:
+        # ``check_job=True`` must get-or-create the file-arrival loader job so
+        # the staged data can be picked up. We verify the job exists, then drive
+        # the load inline (the real scheduled job is never triggered/polled).
+        from yggdrasil.databricks.table.insert import load_async, logs_path
+
+        try:
+            log_path = self.table.stage_insert(
+                _sample_data(), mode=Mode.APPEND, check_job=True,
+            )
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "Cannot stage async insert / create loader job")
+
+        # The loader job exists now — fetch it through the public surface.
+        try:
+            job = self.table.async_job()
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "Test identity cannot create / read jobs")
+        self.assertIsNotNone(job)
+        self.assertTrue(log_path.exists())
+
+        # Drive the load inline to confirm the staged rows actually land —
+        # we never trigger or poll the live scheduled job.
+        load_async(self.client.tables, logs_path(self.table), wait=True)
+        self.assertEqual(self._count(), 3)
 
 
 @pytest.mark.integration
 class TestTableAsyncInsertLogPathIntegration(_TableFixture):
-    """Isolated log-path lifecycle for ``stage_async_insert`` → ``load_async``.
+    """Isolated log-path lifecycle for ``Table.stage_insert`` → ``load_async``.
 
     Carved out of :class:`TestTableAsyncInsertIntegration` onto its own
     throw-away table (``yg_async_log``) so the full drop-log →
@@ -803,11 +828,11 @@ class TestTableAsyncInsertLogPathIntegration(_TableFixture):
 
     def test_async_drop_then_loader_appends(self) -> None:
         from yggdrasil.databricks.table.insert import (
-            DatabricksTableInsert, load_async, logs_path, stage_async_insert,
+            DatabricksTableInsert, load_async, logs_path,
         )
 
         try:
-            log_path = stage_async_insert(self.table, _sample_data(), mode=Mode.APPEND)
+            log_path = self.table.stage_insert(_sample_data(), mode=Mode.APPEND)
         except (DatabricksError, PermissionDenied) as exc:
             self._skip(exc, "async insert needs volume write access")
 
@@ -833,3 +858,61 @@ class TestTableAsyncInsertLogPathIntegration(_TableFixture):
         data_path.invalidate_singleton()
         self.assertFalse(log_path.exists())
         self.assertFalse(data_path.exists())
+
+
+@pytest.mark.integration
+class TestTablePandasIndexIntegration(_TableFixture):
+    """Pandas DataFrame index survives a live Volume Parquet round-trip.
+
+    A Delta table flattens any pandas index into plain columns — the index
+    layout (``b"pandas"`` metadata) doesn't survive a table insert. So the
+    end-to-end index restoration is proven where it actually lives: a Parquet
+    file written to the table's staging Volume and read back through the
+    Tabular read path (:meth:`VolumePath.read_pandas_frame`), which rebuilds
+    the index from the pandas schema metadata.
+    """
+
+    table_prefix = "yg_pandas_idx"
+
+    def test_named_and_multi_index_round_trip_via_volume_parquet(self) -> None:
+        pd = pytest.importorskip("pandas")
+
+        try:
+            self.table.staging_volume.ensure_created()
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "Cannot create staging volume")
+
+        # Single named index.
+        single = pd.DataFrame(
+            {"v": [10, 20, 30]}, index=pd.Index([1, 2, 3], name="pk"),
+        )
+        path = self.table.insert_volume_path(temporary=False)
+        try:
+            with path.open("wb", media_type=MediaTypes.PARQUET) as cursor:
+                cursor.write_pandas_frame(single)
+            with path.open("rb", media_type=MediaTypes.PARQUET) as cursor:
+                restored = cursor.read_pandas_frame()
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "Cannot write/read staging Parquet")
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertEqual(restored.index.name, "pk")
+        self.assertEqual(list(restored.index), [1, 2, 3])
+        self.assertNotIn("pk", restored.columns)
+
+        # Two-level MultiIndex.
+        idx = pd.MultiIndex.from_tuples(
+            [("a", 1), ("b", 2), ("c", 3)], names=["k1", "k2"],
+        )
+        multi = pd.DataFrame({"v": [10, 20, 30]}, index=idx)
+        path2 = self.table.insert_volume_path(temporary=False)
+        try:
+            with path2.open("wb", media_type=MediaTypes.PARQUET) as cursor:
+                cursor.write_pandas_frame(multi)
+            with path2.open("rb", media_type=MediaTypes.PARQUET) as cursor:
+                restored2 = cursor.read_pandas_frame()
+        finally:
+            path2.unlink(missing_ok=True)
+        self.assertIsInstance(restored2.index, pd.MultiIndex)
+        self.assertEqual(list(restored2.index.names), ["k1", "k2"])
+        self.assertEqual(list(restored2.index), [("a", 1), ("b", 2), ("c", 3)])

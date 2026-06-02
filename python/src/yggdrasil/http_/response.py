@@ -1209,11 +1209,33 @@ class HTTPResponse(IO):  # IO inherits Tabular
         lazy: bool = False,
         **media_options: Any,
     ) -> "pd.DataFrame":
-        return self.to_arrow_table(
-            parse=parse,
-            lazy=lazy,
-            **media_options,
-        ).to_pandas()
+        table = self.to_arrow_table(parse=parse, lazy=lazy, **media_options)
+        df = table.to_pandas()
+
+        # If the payload came from a pandas-written Parquet / Arrow-IPC file
+        # (or carries yggdrasil's index tags), restore the DataFrame index
+        # instead of leaving the index levels as plain columns. Same restore
+        # the Tabular read path does — share the level-collection helper so
+        # the ``b"pandas"`` / ``index_key`` parse lives in one place.
+        from yggdrasil.io.tabular.base import (
+            _INDEX_PLACEHOLDER_PREFIX,
+            _collect_index_levels,
+        )
+
+        levels = _collect_index_levels(table.schema)
+        if not levels:
+            return df
+        levels.sort()
+        present = [name for _, name in levels if name in df.columns]
+        if not present:
+            return df
+        df = df.set_index(present)
+        df.index.names = [
+            None if isinstance(n, str) and n.startswith(_INDEX_PLACEHOLDER_PREFIX)
+            else n
+            for n in df.index.names
+        ]
+        return df
 
     # ------------------------------------------------------------------
     # Arrow / Spark deserialization

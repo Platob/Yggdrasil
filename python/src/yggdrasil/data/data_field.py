@@ -162,6 +162,32 @@ def _strip_internal_metadata(
     return out or None
 
 
+def _pandas_index_levels(blob: "bytes | str | dict | None") -> "dict[str, int]":
+    """Parse pandas' ``b"pandas"`` schema-metadata blob into ``{name: level}``.
+
+    pandas writes its index layout into the pyarrow ``b"pandas"`` JSON
+    blob under ``index_columns``. Entries are either a column name
+    (a real, materialised index level) or a dict descriptor (a
+    ``RangeIndex`` — no column, regenerated on read). We only care
+    about the string entries; the dict descriptors are skipped. The
+    returned position is the level order within the (possibly multi-)
+    index.
+
+    Accepts the raw ``bytes`` / ``str`` JSON, an already-parsed
+    ``dict``, or ``None`` (returns ``{}``). Single source of truth for
+    the parse that ``Field.check_pandas_metadata`` and the Arrow-level
+    tabular read/write helpers all share.
+    """
+    if not blob:
+        return {}
+    pmeta = blob if isinstance(blob, dict) else json_module.loads(blob)
+    return {
+        entry: pos
+        for pos, entry in enumerate(pmeta.get("index_columns", ()))
+        if isinstance(entry, str)
+    }
+
+
 def _render_spark_column_sql(column: "Any") -> "str | None":
     """Pull the SQL expression string off a ``pyspark.sql.Column``.
 
@@ -1605,6 +1631,45 @@ class Field(BaseChildrenFields):
             result._unset_tag_value(b"index_key_level")
         return result
 
+    def check_pandas_metadata(self, source: Any = None) -> "Field":
+        """Stamp pandas index tags onto child fields from a ``b"pandas"`` blob.
+
+        pandas carries its DataFrame index layout in the pyarrow
+        ``b"pandas"`` schema metadata (``index_columns``). This reads
+        that blob and marks each matching child as an index level via
+        :meth:`with_index_key`, so a struct-shaped Field round-trips the
+        index when it later rebuilds a DataFrame.
+
+        ``source`` is whatever carries the blob — a ``pa.Schema``, a
+        ``pa.Table``, raw ``bytes`` / ``str`` JSON, or an already-parsed
+        ``dict``. When omitted, falls back to ``self.metadata[b"pandas"]``
+        (which :meth:`from_arrow_schema` preserves). Mutates and returns
+        ``self`` for chaining; a no-op when there's no blob or no string
+        index columns.
+
+        # PARITY: Python/pandas-only. The TS port has no pandas
+        # counterpart, so there is no mirror for this method.
+        """
+        blob: "bytes | str | dict | None"
+        if source is None:
+            blob = (self.metadata or {}).get(b"pandas")
+        elif isinstance(source, pa.Table):
+            blob = (source.schema.metadata or {}).get(b"pandas")
+        elif isinstance(source, pa.Schema):
+            blob = (source.metadata or {}).get(b"pandas")
+        else:
+            blob = source
+
+        levels = _pandas_index_levels(blob)
+        if not levels:
+            return self
+
+        for child in self.fields:
+            level = levels.get(child.name)
+            if level is not None:
+                child.with_index_key(True, level=level, inplace=True)
+        return self
+
     # ==================================================================
     # Builders — `with_*` mutators, `copy`, `merge_with`, `autotag`
     # ==================================================================
@@ -2655,25 +2720,11 @@ class Field(BaseChildrenFields):
 
         if isinstance(obj, pd.DataFrame):
             table = pa.Table.from_pandas(obj)
-            raw_meta = (table.schema.metadata or {}).get(b"pandas")
-            index_levels: dict[str, int] = {}
-            if raw_meta:
-                from yggdrasil.pickle import json as ygg_json
-                pmeta = ygg_json.loads(raw_meta)
-                index_levels = {
-                    e: pos
-                    for pos, e in enumerate(pmeta.get("index_columns", ()))
-                    if isinstance(e, str)
-                }
-            struct_field = cls.from_arrow_schema(
-                table.schema.remove_metadata(),
-            )
-            if index_levels:
-                for child in struct_field.fields:
-                    level = index_levels.get(child.name)
-                    if level is not None:
-                        child.with_index_key(True, level=level, inplace=True)
-            return struct_field
+            # Drop the metadata off the schema we build the struct from
+            # (the dtype-json round-trip lives elsewhere), then stamp the
+            # index tags back on from the original ``b"pandas"`` blob.
+            struct_field = cls.from_arrow_schema(table.schema.remove_metadata())
+            return struct_field.check_pandas_metadata(table.schema)
 
         if isinstance(obj, pd.Series):
             nullable = bool(obj.isna().any())
