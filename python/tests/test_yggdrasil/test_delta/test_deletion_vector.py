@@ -11,6 +11,7 @@ from yggdrasil.delta.deletion_vector import (
     decode_deletion_vector,
     mask_batch_with_dv,
 )
+from yggdrasil.io.delta.deletion_vector import _encode_dv_payload
 from yggdrasil.delta.tests import DeltaTestCase
 
 
@@ -24,6 +25,37 @@ class TestSimpleDecoder(DeltaTestCase):
         )
         out = _decode_payload(payload)
         self.assertEqual(sorted(out), rows)
+
+
+class TestDatabricksRoaringDV(DeltaTestCase):
+    """Decode the portable RoaringBitmap format Databricks actually writes.
+
+    Databricks serialises even a single-row DV as a roaring bitmap with the
+    *no-run* cookie (0x303a), which always carries the per-container offset
+    header. The decoder used to skip that header only for >= 4 containers, so
+    a one-container DV misread the 4-byte offset (16) as the deleted index.
+    """
+
+    # A real DV payload captured from a Databricks ``DELETE`` that marks local
+    # row-index 1 as deleted: magic 1681511377, one high bucket, no-run cookie,
+    # one array container, offset header = 16, value = 1.
+    _DBX_PAYLOAD = bytes.fromhex(
+        "d1d339640100000000000000000000003a3000000100000000000000100000000100"
+    )
+
+    def test_decodes_real_databricks_single_row_dv(self) -> None:
+        self.assertEqual(_decode_payload(self._DBX_PAYLOAD), {1})
+
+    def test_roaring_round_trip_across_container_counts(self) -> None:
+        # >4096 rows forces the roaring envelope (≤4096 uses the simple list);
+        # spread over several 16-bit containers so the offset header matters.
+        rows = sorted({i * 7 for i in range(5000)})
+        self.assertEqual(sorted(_decode_payload(_encode_dv_payload(rows))), rows)
+
+    def test_roaring_single_container_round_trip(self) -> None:
+        # All values in one 16-bit container — the previously-broken shape.
+        rows = sorted(range(0, 9000, 2))  # 4500 evens, all < 65536
+        self.assertEqual(sorted(_decode_payload(_encode_dv_payload(rows))), rows)
 
 
 class TestMaskBatch(DeltaTestCase):

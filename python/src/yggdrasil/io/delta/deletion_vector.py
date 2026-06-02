@@ -57,7 +57,13 @@ def _read_portable_roaring(buf: memoryview, pos: int) -> "tuple[Set[int], int]":
     for _ in range(n_containers):
         k, cm1 = struct.unpack_from("<HH", buf, pos); pos += 4
         key_card.append((k, cm1 + 1))
-    if n_containers >= 4: pos += 4 * n_containers
+    # Per the RoaringBitmap portable spec, the per-container offset header is
+    # present unless the *run* cookie is used with fewer than 4 containers —
+    # i.e. always for the no-run cookie (12346, what Databricks writes). The
+    # old `n_containers >= 4` test skipped it only for big bitmaps, so a
+    # single-container Databricks DV had its 4-byte offset misread as the
+    # first deleted value (e.g. 16 instead of the real index).
+    if (not has_runs) or n_containers >= 4: pos += 4 * n_containers
     out: Set[int] = set()
     for idx, (key, card) in enumerate(key_card):
         high = key << 16
@@ -145,9 +151,13 @@ def _encode_dv_payload(row_ids: Iterable[int]) -> bytes:
                 bm = [0] * 1024
                 for v in vals: bm[v >> 6] |= (1 << (v & 63))
                 cdata.append(b"".join(struct.pack("<Q", w) for w in bm))
-        if nc >= 4:
-            hs = 4 + 4 + 4 * nc + 4 * nc; cum = 0
-            for c in cdata: pr += struct.pack("<I", hs + cum); cum += len(c)
+        # No-run cookie (12346) always carries the per-container offset
+        # header — emit it unconditionally so the bytes match what Databricks
+        # / the reference RoaringBitmap writer produce (and what our decoder
+        # now expects). Header = cookie(4) + size(4) + keyscard(4·nc) +
+        # offsets(4·nc); each offset is the byte position of its container.
+        hs = 4 + 4 + 4 * nc + 4 * nc; cum = 0
+        for c in cdata: pr += struct.pack("<I", hs + cum); cum += len(c)
         for c in cdata: pr += c
         buf += pr
     return bytes(buf)

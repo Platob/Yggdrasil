@@ -112,7 +112,11 @@ class DeltaFolder(Folder):
                  fresh: bool = False) -> Snapshot:
         if version is not None:
             return Snapshot.from_log(self._log, version)
-        if not fresh and self._snapshot is not None:
+        if fresh:
+            # Genuinely re-list the log (bust the cached listing + S3 ls TTL)
+            # so commits written out-of-band since the last read are seen.
+            self._log.invalidate()
+        elif self._snapshot is not None:
             return self._snapshot
         self._snapshot = Snapshot.from_log(self._log, None)
         return self._snapshot

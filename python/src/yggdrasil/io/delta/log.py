@@ -48,6 +48,18 @@ class DeltaLog:
     def invalidate(self) -> None:
         self._last_checkpoint = None
         self._listing = None
+        # Also drop any backing directory-listing cache so a re-list sees
+        # commits written since (e.g. the S3 ``ls_cache`` TTL). Without this a
+        # ``snapshot(fresh=True)`` after an out-of-band write (another writer
+        # committed v+1) replays the stale listing and misses it. No-op for
+        # local paths. Prefix-keyed invalidation doesn't match the bucket's
+        # tuple cache keys, so clear the whole (short-TTL) ls cache.
+        bucket = getattr(self.log_path, "s3_bucket", None)
+        if bucket is not None:
+            try:
+                bucket.invalidate_ls_cache()
+            except Exception:  # noqa: BLE001 - cache busting is best-effort
+                pass
 
     def extend_listing(self, *names: str) -> None:
         if self._listing is None: return
