@@ -92,7 +92,10 @@ _RETRYABLE_ERROR_CODES: frozenset[str] = frozenset({
 })
 
 _RETRYABLE_ELAPSED_LIMIT: float = 120.0
-_RETRYABLE_ITERATION_LIMIT: int = 3
+# Enough attempts for several writers contending on the same rows
+# (overlapping Delta MERGEs) to serialize under the jittered backoff the
+# awaitable retry now applies; bounded by the 120s elapsed budget.
+_RETRYABLE_ITERATION_LIMIT: int = 8
 
 def _empty_arrow_batches(arrow_schema: pa.Schema) -> Iterator[pa.RecordBatch]:
     """Yield a single zero-row :class:`pa.RecordBatch` matching *arrow_schema*.
@@ -788,6 +791,16 @@ class WarehouseStatementResult(StatementResult):
             self._response = None
             self._unpersist_schema()
         return super().start(reset=reset, wait=wait, raise_error=raise_error)
+
+    def _retry_backoff(self, wait, start: float) -> float:
+        """Jittered exponential backoff between retryable re-submits.
+
+        Warehouse conflicts (``DELTA_CONCURRENT_APPEND`` from several
+        writers MERGE-ing the same rows) are resolved by serialization —
+        retrying in lockstep just re-collides. Stagger with full jitter so
+        concurrent writers spread out and commit one after another.
+        """
+        return self._jittered_backoff(self._attempts, wait, start)
 
     def cancel(
         self,
