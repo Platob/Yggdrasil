@@ -2097,7 +2097,15 @@ class DatabricksClient(Singleton, URLBased):
 
             deps = ["ygg", *ygg_runtime_dependencies(), *deps]
 
-        mode = "serverless" if self.is_serverless_compute else "classic"
+        # Compute target: an explicit cluster (arg or ``cluster_id``) → classic;
+        # otherwise serverless (the modern default — Spark Connect serverless
+        # needs no compute id, just ``.serverless(True)``).
+        explicit_cluster = cluster if cluster is not None else self.cluster_id
+        serverless = (
+            explicit_cluster in (None, "serverless")
+            or self.is_serverless_compute
+        )
+        mode = "serverless" if serverless else "classic"
         LOGGER.debug(
             "Resolving Spark Connect dependencies for %r (mode=%s, deps=%r)",
             self,
@@ -2107,11 +2115,14 @@ class DatabricksClient(Singleton, URLBased):
         registry_obj = self._resolve_registry(registry, cache_dir=cache_dir)
         specs, _remotes = registry_obj.publish_many(deps, check_public=check_public)
 
-        cluster = self.cluster_id if cluster is None else cluster
+        if not serverless and explicit_cluster not in (None, "serverless"):
+            resolved = self.clusters.get_or_create(explicit_cluster)
+            self.cluster_id = resolved.cluster_id
 
-        if cluster is not None and cluster != "serverless":
-            cluster = self.clusters.get_or_create(cluster)
-            self.cluster_id = cluster.cluster_id
+        # gRPC (Spark Connect's transport) reads its own root certs and ignores
+        # SSL_CERT_FILE / REQUESTS_CA_BUNDLE — point it at the same CA bundle the
+        # SDK trusts so the TLS handshake succeeds behind a corporate proxy.
+        self._ensure_grpc_ca_bundle()
 
         LOGGER.debug(
             "Creating Spark Connect session %r (mode=%s, cluster_id=%r, "
@@ -2122,30 +2133,34 @@ class DatabricksClient(Singleton, URLBased):
             self.serverless_compute_id,
             len(specs),
         )
-        builder = self._spark_connect_builder()
+        builder = self._spark_connect_builder(serverless=serverless)
 
-        if self.is_serverless_compute:
-            env = self._build_databricks_env(install_specs=specs)
-            if env is not None:
-                builder = builder.withEnvironment(env)
-            session = builder.getOrCreate()
+        # Serverless can take a declarative environment when databricks-connect
+        # supports it; otherwise (and for classic compute) attach the local
+        # wheels as ``addArtifacts(pyfile=True)``. Public pip specs then rely on
+        # the runtime already providing them.
+        env = self._build_databricks_env(install_specs=specs) if serverless else None
+        if env is not None:
+            session = builder.withEnvironment(env).getOrCreate()
         else:
-            # Classic compute — the cluster won't read the
-            # environment, so attach the local wheels as
-            # ``addArtifacts(pyfile=True)`` instead.
             session = builder.getOrCreate()
             local_paths = [
                 spec[len("local:") :] for spec in specs if spec.startswith("local:")
             ]
-            if local_paths:
-                LOGGER.debug(
-                    "Attaching wheel artifacts to Spark Connect session %r "
-                    "(count=%d, paths=%r)",
-                    self,
-                    len(local_paths),
-                    local_paths,
-                )
-                session.addArtifacts(*local_paths, pyfile=True)
+            for path in local_paths:
+                # Best-effort: some databricks-connect builds reject ``.whl`` via
+                # addArtifacts ("file format is not supported"). Don't let an
+                # un-attachable artifact sink an otherwise-usable session — log
+                # and continue (the runtime / job environment may already provide
+                # it; on a job the active session is reused with no attach at all).
+                try:
+                    session.addArtifacts(path, pyfile=True)
+                    LOGGER.debug("Attached artifact %s to %r", path, self)
+                except Exception as exc:  # noqa: BLE001 - attach is best-effort
+                    LOGGER.warning(
+                        "Could not attach %s to the Spark Connect session (%s); "
+                        "the runtime must already provide it", path, exc,
+                    )
 
         LOGGER.info(
             "Created Spark Connect session %r (mode=%s, install_specs=%d)",
@@ -2155,17 +2170,29 @@ class DatabricksClient(Singleton, URLBased):
         )
         return self._bind_spark_session(session)
 
-    def _spark_connect_builder(self):
+    def _spark_connect_builder(self, *, serverless: bool):
         """The Databricks Connect session builder, configured for this client.
 
-        Prefers ``builder.sdkConfig(workspace_config)`` so the session reuses the
-        exact resolved host + credentials. Newer ``databricks-connect`` rejects
+        Serverless targets build with ``.serverless(True)``; Spark Connect
+        serverless needs no compute id. ``.serverless(...)`` is a *connection
+        parameter*, which the builder forbids alongside ``.sdkConfig(...)``, so
+        the auth is set explicitly — the PAT (``host`` + ``token``) when this
+        client carries one, otherwise databricks-connect resolves it from the
+        environment / profile.
+
+        Classic (cluster) targets reuse the resolved SDK config via
+        ``.sdkConfig(workspace_config)``. Newer databricks-connect rejects
         ``sdkConfig`` when connection parameters are *also* discoverable from the
         environment / a profile (``"sdkConfig must not be set when connection
         parameters are explicitly configured"``) — in that case fall back to the
-        parameter-free builder, which reads the same auth from the environment /
-        profile (and the serverless / cluster target with it)."""
+        parameter-free builder, which reads the same auth itself."""
         from databricks.connect import DatabricksSession
+
+        if serverless:
+            builder = DatabricksSession.builder.serverless(True)
+            if self.host and self.token:
+                builder = builder.host(self.host).token(self.token)
+            return builder
 
         try:
             return DatabricksSession.builder.sdkConfig(self.workspace_config)
@@ -2177,6 +2204,32 @@ class DatabricksClient(Singleton, URLBased):
                 "environment/profile-configured builder instead", exc,
             )
             return DatabricksSession.builder
+
+    @staticmethod
+    def _ensure_grpc_ca_bundle() -> None:
+        """Point gRPC at the SDK's CA bundle so Spark Connect's TLS handshake
+        trusts the same roots the SDK does — including a corporate proxy's CA.
+
+        gRPC (Spark Connect's transport) reads ``GRPC_DEFAULT_SSL_ROOTS_FILE_PATH``
+        and ignores ``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE``, so behind a
+        TLS-intercepting proxy the handshake fails with ``CERTIFICATE_VERIFY_FAILED``
+        even though the SDK/warehouse path works. Set it (once, only if unset)
+        from the system CA bundle, falling back to ``certifi``. No-op when
+        already configured."""
+        if os.environ.get("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"):
+            return
+        for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            path = os.environ.get(var)
+            if path and os.path.exists(path):
+                os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = path
+                LOGGER.debug("gRPC root certs ← %s (%s)", path, var)
+                return
+        try:
+            import certifi
+
+            os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = certifi.where()
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
 
     def _bind_spark_session(self, session: "Any") -> "Any":
         """Stash ``self`` on *session* as ``ygg_client`` and return it.
@@ -2243,7 +2296,16 @@ class DatabricksClient(Singleton, URLBased):
         if not install_specs:
             return None
 
-        from databricks.connect import DatabricksEnv
+        try:
+            from databricks.connect import DatabricksEnv
+        except ImportError:
+            # Newer databricks-connect dropped the declarative ``DatabricksEnv``;
+            # the caller falls back to attaching local wheels via addArtifacts.
+            LOGGER.debug(
+                "databricks-connect has no DatabricksEnv — deps will be attached "
+                "as artifacts instead of a declarative environment",
+            )
+            return None
 
         env = DatabricksEnv()
         env = env.withDependencies(list(install_specs))

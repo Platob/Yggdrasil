@@ -89,8 +89,14 @@ def mocked_builder(monkeypatch):
     """
     session = MagicMock(name="SparkSession")
     builder = MagicMock(name="Builder")
+    # Keep the fluent chain on the same builder mock regardless of which
+    # connection setters the code calls (sdkConfig for classic; serverless +
+    # host + token for serverless).
     builder.sdkConfig.return_value = builder
     builder.withEnvironment.return_value = builder
+    builder.serverless.return_value = builder
+    builder.host.return_value = builder
+    builder.token.return_value = builder
     builder.getOrCreate.return_value = session
 
     env_instances: list = []
@@ -425,36 +431,68 @@ class TestServerlessBranch:
 
 
 class TestSparkConnectBuilder:
-    """``_spark_connect_builder`` — sdkConfig with a fallback for newer
-    databricks-connect that rejects it alongside env/profile connection."""
+    """``_spark_connect_builder`` — serverless uses ``.serverless(True)`` + auth;
+    classic uses sdkConfig with a fallback for newer databricks-connect that
+    rejects it alongside env/profile connection."""
 
-    def test_uses_sdkconfig_when_accepted(
+    def test_serverless_uses_serverless_and_explicit_auth(
         self, serverless_client, mocked_builder, stubbed_workspace_config,
     ) -> None:
         builder, _session, _env, _envs = mocked_builder
-        out = serverless_client._spark_connect_builder()
+        out = serverless_client._spark_connect_builder(serverless=True)
+        builder.serverless.assert_called_once_with(True)
+        # serverless can't take sdkConfig — auth is set explicitly from the PAT
+        builder.host.assert_called_once_with(serverless_client.host)
+        builder.token.assert_called_once_with(serverless_client.token)
+        builder.sdkConfig.assert_not_called()
+        assert out is builder
+
+    def test_classic_uses_sdkconfig_when_accepted(
+        self, classic_client, mocked_builder, stubbed_workspace_config,
+    ) -> None:
+        builder, _session, _env, _envs = mocked_builder
+        out = classic_client._spark_connect_builder(serverless=False)
         builder.sdkConfig.assert_called_once()
+        builder.serverless.assert_not_called()
         assert out is builder.sdkConfig.return_value
 
-    def test_falls_back_to_plain_builder_on_sdkconfig_conflict(
-        self, serverless_client, mocked_builder, stubbed_workspace_config,
+    def test_classic_falls_back_to_plain_builder_on_sdkconfig_conflict(
+        self, classic_client, mocked_builder, stubbed_workspace_config,
     ) -> None:
         builder, _session, _env, _envs = mocked_builder
         builder.sdkConfig.side_effect = Exception(
             "sdkConfig must not be set when connection parameters are "
             "explicitly configured."
         )
-        out = serverless_client._spark_connect_builder()
-        # falls back to the parameter-free builder (env/profile auth)
-        assert out is builder
+        out = classic_client._spark_connect_builder(serverless=False)
+        assert out is builder           # parameter-free builder (env/profile auth)
 
-    def test_other_builder_errors_propagate(
-        self, serverless_client, mocked_builder, stubbed_workspace_config,
+    def test_classic_other_builder_errors_propagate(
+        self, classic_client, mocked_builder, stubbed_workspace_config,
     ) -> None:
         builder, _session, _env, _envs = mocked_builder
         builder.sdkConfig.side_effect = RuntimeError("network down")
         with pytest.raises(RuntimeError, match="network down"):
-            serverless_client._spark_connect_builder()
+            classic_client._spark_connect_builder(serverless=False)
+
+
+class TestGrpcCaBundle:
+    def test_sets_grpc_roots_from_ssl_cert_file(self, monkeypatch, tmp_path):
+        ca = tmp_path / "ca.crt"
+        ca.write_text("-----BEGIN CERTIFICATE-----\n")
+        monkeypatch.delenv("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", raising=False)
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca))
+        from yggdrasil.databricks.client import DatabricksClient
+        DatabricksClient._ensure_grpc_ca_bundle()
+        import os
+        assert os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] == str(ca)
+
+    def test_does_not_override_existing(self, monkeypatch):
+        monkeypatch.setenv("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "/already/set.pem")
+        from yggdrasil.databricks.client import DatabricksClient
+        DatabricksClient._ensure_grpc_ca_bundle()
+        import os
+        assert os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] == "/already/set.pem"
 
 
 class TestClassicBranch:
