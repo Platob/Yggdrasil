@@ -1044,7 +1044,7 @@ class DatabricksPath(RemotePath, DatabricksResource):
         """
         if cursor:
             offset = self._pos
-        if size < 0 and offset == 0 and self._wbuf is None:
+        if size < 0 and offset == 0 and self._scratch is None:
             # ``FileNotFoundError`` propagates — semantics match the
             # base ``Holder.read_mv`` which would raise on a stat
             # probe against a missing object. An in-flight write buffer

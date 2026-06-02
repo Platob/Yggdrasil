@@ -509,7 +509,7 @@ class S3Path(ExploreUrlRepr, RemotePath):
         # An in-flight write buffer takes precedence — defer to RemotePath.
         if cursor:
             offset = self._pos
-        if size < 0 and offset == 0 and self._wbuf is None:
+        if size < 0 and offset == 0 and self._scratch is None:
             out = self._read_mv(-1, 0)
             if cursor:
                 self._pos = len(out)

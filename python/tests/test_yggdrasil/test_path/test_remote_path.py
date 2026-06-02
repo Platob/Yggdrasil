@@ -181,6 +181,19 @@ class TestRemoteReadWrite:
         p.write_mv(memoryview(b"second"), 0, overwrite=True)
         assert bytes(p.read_mv(-1, 0)) == b"second"
 
+    def test_read_byte_range(self) -> None:
+        p = _make("/rw/ranged.bin")
+        p.write_bytes(bytes(range(256)))
+        # Explicit window — exactly the requested bytes, opened or not.
+        assert bytes(self._make_fresh("/rw/ranged.bin").read_byte_range(10, 5)) == bytes(range(10, 15))
+        assert bytes(self._make_fresh("/rw/ranged.bin").read_byte_range(250)) == bytes(range(250, 256))
+
+    @staticmethod
+    def _make_fresh(path: str):
+        p = _make(path)
+        p.invalidate_singleton()
+        return p
+
     def test_read_missing_raises(self) -> None:
         # Whole-blob contract: the backend primitive raises on a missing
         # object (no silent empty-buffer swallow).

@@ -196,16 +196,18 @@ class RemotePath(Path):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # Whole-blob write buffer for an *acquired* window (``with path:`` /
-        # ``path.open("wb")``). ``None`` means no buffered writes; a
-        # ``bytearray`` accumulates the object's bytes so successive writes
-        # (and the ``truncate(0)`` an ``open("wb")`` does on acquire)
-        # coalesce into a *single* upload on :meth:`flush` / release instead
-        # of one PUT per ``write()``. Un-acquired writes skip the buffer and
-        # upload straight through. Guard the singleton re-init so a second
-        # constructor call on a cached container path can't strand a buffer.
-        if not hasattr(self, "_wbuf"):
-            self._wbuf: "bytearray | None" = None
+        # Disk scratch for an *acquired* write window (``with path:`` /
+        # ``path.open("wb")``). ``None`` means no buffered writes; otherwise a
+        # temp :class:`LocalPath` that successive writes (and the
+        # ``truncate(0)`` an ``open("wb")`` does on acquire) splice into, so
+        # the window coalesces into a *single* streamed upload on
+        # :meth:`flush` / release instead of one PUT per ``write()`` — and the
+        # bytes page through the OS file cache rather than piling up whole in
+        # process memory. Un-acquired writes skip the scratch and upload
+        # straight through. Guard the singleton re-init so a second constructor
+        # call on a cached container path can't strand a scratch handle.
+        if not hasattr(self, "_scratch"):
+            self._scratch: "Any | None" = None
 
     # ------------------------------------------------------------------
     # Backing-shape predicates
@@ -266,13 +268,48 @@ class RemotePath(Path):
         ``_INSTANCES`` entry — see :meth:`Path.invalidate_singleton`.
 
         A mutation just ran, so the cached metadata is no longer
-        authoritative; the next read re-probes the backend. Drops any
-        un-flushed write buffer (callers must :meth:`flush` first to keep
+        authoritative; the next read re-probes the backend. Discards any
+        un-flushed write scratch (callers must :meth:`flush` first to keep
         pending writes).
         """
-        self._wbuf = None
+        self._discard_scratch()
         super().invalidate_singleton(remove_global=remove_global)
         self._unpersist_schema()
+
+    # ------------------------------------------------------------------
+    # Acquired-window write scratch — disk paging, single streamed commit
+    # ------------------------------------------------------------------
+    def _ensure_scratch(self, *, seed: bool):
+        """Lazily mint the acquired-window scratch — a temp :class:`LocalPath`
+        writes splice into. When *seed*, download the existing object into it
+        (one GET, streamed to disk) so positional / append writes preserve the
+        prior content; otherwise start empty. Subclasses with a cheaper local
+        staging surface (e.g. a cluster-mounted volume) may override."""
+        if self._scratch is not None:
+            return self._scratch
+        from yggdrasil.io.base import _mint_spill_path
+        from yggdrasil.path.local_path import LocalPath
+
+        scratch = LocalPath(str(_mint_spill_path("yggwb", 3600)))
+        if seed:
+            try:
+                existing = self._read_mv(-1, 0)
+            except FileNotFoundError:
+                existing = b""
+            if len(existing):
+                scratch.write_bytes(bytes(existing), overwrite=True)
+        self._scratch = scratch
+        return scratch
+
+    def _discard_scratch(self) -> None:
+        """Drop the scratch and reclaim its temp file (no upload)."""
+        scratch = self._scratch
+        self._scratch = None
+        if scratch is not None:
+            try:
+                scratch.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
 
     def _touch_stat(
         self,
@@ -359,6 +396,24 @@ class RemotePath(Path):
 
         return _ctx()
 
+    def read_byte_range(self, offset: int, length: int = -1) -> memoryview:
+        """Read exactly *length* bytes from *offset* — a ranged backend fetch.
+
+        The explicit byte-range surface for tabular / format readers that
+        want a specific window (a Parquet footer, an Arrow IPC block) without
+        snapshotting the whole object. Works whether the holder is opened or
+        not: an in-flight write scratch is served from disk, otherwise the
+        subclass :meth:`_read_mv` issues a ranged GET on backends that
+        support it. ``length < 0`` reads to EOF.
+
+        An explicit non-negative window goes straight to :meth:`_read_mv` —
+        no ``self.size`` (HEAD) bounds probe, so a footer fetch is a single
+        ranged GET. A short read near EOF is the caller's to interpret.
+        """
+        if offset >= 0 and length >= 0 and self._scratch is None:
+            return self._read_mv(length, offset)
+        return self.read_mv(length, offset)
+
     def read_mv(
         self,
         size: int = -1,
@@ -366,33 +421,21 @@ class RemotePath(Path):
         *,
         cursor: bool = False,
     ) -> memoryview:
-        """Read — served from the acquired write buffer when one is in
+        """Read — served from the acquired write scratch when one is in
         flight, otherwise straight through to the backend.
 
-        Inside an acquired window with un-flushed writes the buffer is the
-        authoritative view (read-after-write within the handle); without a
-        buffer this is the base :class:`Holder` read over the subclass
-        :meth:`_read_mv`.
+        Inside an acquired window with un-flushed writes the scratch file is
+        the authoritative view (read-after-write within the handle); without
+        a scratch this is the base :class:`Holder` read over the subclass
+        :meth:`_read_mv` (ranged where the backend supports it).
         """
-        if self._parent is not None or self._wbuf is None:
+        if self._parent is not None or self._scratch is None:
             return super().read_mv(size, offset, cursor=cursor)
-        from yggdrasil.io.holder import _resolve_pos
-
-        buf = self._wbuf
-        total = len(buf)
         if cursor:
             offset = self._pos
-        offset = _resolve_pos(offset, total)
-        if offset < 0 or offset > total:
-            raise ValueError(
-                f"Offset {offset} is out of bounds for "
-                f"{type(self).__name__} of size {total}"
-            )
-        if size < 0:
-            size = total - offset
-        out = memoryview(bytes(buf[offset:offset + size]))
+        out = self._scratch.read_mv(size, offset)
         if cursor:
-            self._pos = offset + len(out)
+            self._pos = offset + len(out) if offset >= 0 else self._scratch.size
         return out
 
     def write_mv(
@@ -405,7 +448,7 @@ class RemotePath(Path):
         update_stat: bool = True,
         cursor: bool = False,
     ) -> int:
-        """Whole-blob write — direct upload when closed, buffered when open.
+        """Whole-blob write — direct upload when closed, disk-paged when open.
 
         - **Closed (un-acquired).** A whole-object overwrite from the start
           (``offset == 0``, ``overwrite``, no cursor; what
@@ -415,9 +458,9 @@ class RemotePath(Path):
           :class:`Holder` splice (download, splice, re-upload via
           :meth:`_write_mv`).
         - **Open (acquired** — ``with path:`` / ``path.open("wb")``**).**
-          The write lands in an in-memory buffer so successive ``write()``
-          calls coalesce; :meth:`flush` / release commits the whole object
-          in one upload.
+          The write splices into a temp-file scratch (paging through the OS
+          cache, not piling up in memory); :meth:`flush` / release streams
+          the scratch to the backend in one upload.
         """
         if self._parent is not None:
             return super().write_mv(
@@ -431,29 +474,16 @@ class RemotePath(Path):
         n = len(data)
 
         if self._acquired:
-            # Buffered window: splice into the in-flight object, commit on flush.
-            if offset == 0 and overwrite:
-                # Whole-object replace — no need to read the prior content.
-                buf = bytearray(bytes(data))
-            else:
-                buf = self._wbuf
-                if buf is None:
-                    # First positional / append write of the window with no
-                    # acquire-time truncate (``open("ab")`` / ``open("rb+")``):
-                    # seed from the existing object so the splice preserves it.
-                    try:
-                        buf = bytearray(self._read_mv(-1, 0))
-                    except FileNotFoundError:
-                        buf = bytearray()
-                end = offset + n
-                if len(buf) < end:
-                    buf.extend(b"\x00" * (end - len(buf)))
-                buf[offset:end] = bytes(data)
-                if overwrite:
-                    del buf[end:]
-            self._wbuf = buf
+            # Disk-paged window: splice into the scratch, commit on flush.
+            # A whole-object overwrite at 0 needn't preserve prior bytes, so
+            # it never seeds; positional / append seeds from the backend once.
+            whole = offset == 0 and overwrite
+            scratch = self._ensure_scratch(seed=not whole)
+            if whole:
+                scratch.truncate(0)
+            scratch.write_mv(memoryview(bytes(data)), offset, overwrite=overwrite)
             if update_stat:
-                self._touch_stat(size=len(buf))
+                self._touch_stat(size=int(scratch.size))
             if cursor:
                 self._pos = offset + n
             return n
@@ -480,7 +510,7 @@ class RemotePath(Path):
         ArrowIPCFile, etc.) route through this after the format encoder
         finishes so the encoded bytes go straight to the remote object
         without intermediate copies. Whole-object replace: any in-flight
-        write buffer is superseded.
+        write scratch is superseded.
         """
         if isinstance(payload, (bytes, bytearray)):
             data = payload
@@ -488,7 +518,7 @@ class RemotePath(Path):
             data = bytes(payload)
         else:
             data = bytes(memoryview(payload))
-        self._wbuf = None
+        self._discard_scratch()
         self._upload(data)
         self._touch_stat(size=len(data))
         return len(data)
@@ -542,11 +572,10 @@ class RemotePath(Path):
         """Resize the object to exactly *n* bytes.
 
         - **Acquired** (the ``open("wb")`` truncate-on-acquire, and
-          explicit truncates inside a ``with``): resize the in-flight
-          buffer; the commit happens once on :meth:`flush`. An empty
-          ``truncate(0)`` therefore costs no PUT until release — and
-          ``open("wb")`` immediately followed by a write coalesces to a
-          single upload.
+          explicit truncates inside a ``with``): resize the disk scratch;
+          the commit happens once on :meth:`flush`. An empty ``truncate(0)``
+          therefore costs no PUT until release — and ``open("wb")``
+          immediately followed by a write coalesces to a single upload.
         - **Closed**: a whole-object upload — ``truncate(0)`` PUTs an
           empty object; ``truncate(n > 0)`` downloads, slices /
           zero-extends, re-uploads.
@@ -554,20 +583,8 @@ class RemotePath(Path):
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
         if self._acquired:
-            if n == 0:
-                buf = bytearray()
-            else:
-                buf = self._wbuf
-                if buf is None:
-                    try:
-                        buf = bytearray(self._read_mv(-1, 0))
-                    except FileNotFoundError:
-                        buf = bytearray()
-                if len(buf) >= n:
-                    del buf[n:]
-                else:
-                    buf.extend(b"\x00" * (n - len(buf)))
-            self._wbuf = buf
+            scratch = self._ensure_scratch(seed=n > 0)
+            scratch.truncate(n)
             self._touch_stat(size=n)
             return n
         if n == 0:
@@ -587,23 +604,35 @@ class RemotePath(Path):
         return n
 
     def flush(self) -> None:
-        """Commit the acquired write buffer to the backend in one upload.
+        """Commit the acquired write scratch to the backend in one upload.
 
-        The single PUT that an ``open("wb")`` window produces — every
-        ``write()`` since acquire splices into the buffer, and this drains
-        it. A no-op when nothing was buffered. ``with path.open("wb"):
-        pass`` still materialises an empty object (the acquire-time
-        ``truncate(0)`` seeded an empty buffer).
+        The single (streamed) PUT that an ``open("wb")`` window produces —
+        every ``write()`` since acquire spliced into the disk scratch, and
+        this drains it. The scratch streams off disk (bounded memory) on
+        backends that support it; others read it back for the SDK's
+        whole-object upload. A no-op when nothing was buffered.
+        ``with path.open("wb"): pass`` still materialises an empty object
+        (the acquire-time ``truncate(0)`` seeded an empty scratch).
         """
-        if self._wbuf is not None:
-            payload = bytes(self._wbuf)
-            self._wbuf = None
-            self._upload(payload)
-            self._touch_stat(size=len(payload))
+        scratch = self._scratch
+        if scratch is not None:
+            self._scratch = None
+            try:
+                size = int(scratch.size)
+                if self.SUPPORTS_STREAMING_UPLOAD:
+                    self._upload_stream(scratch)
+                else:
+                    self._upload(scratch.read_bytes())
+                self._touch_stat(size=size)
+            finally:
+                try:
+                    scratch.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
         super().flush()
 
     def _release(self) -> None:
-        """Flush the acquired write buffer before the standard release.
+        """Flush the acquired write scratch before the standard release.
 
         Called from :meth:`close` (explicit) and :meth:`__del__` (GC). A
         failed flush at GC time is logged and swallowed — never raise from
