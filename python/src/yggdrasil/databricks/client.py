@@ -1951,7 +1951,7 @@ class DatabricksClient(Singleton, URLBased):
 
     @property
     def ai(self) -> "DatabricksAI":
-        """Databricks AI umbrella service (vector search today, serving/registry next).
+        """Databricks AI umbrella service (vector search + model serving).
 
         Reach the concrete services through it::
 
@@ -1959,6 +1959,10 @@ class DatabricksClient(Singleton, URLBased):
             client.ai.vector_search.index("main.rag.docs").query(
                 query_text="…", columns=["id", "text"],
             )
+            client.ai.serving.endpoint("gpt-4o").serve_openai(
+                "gpt-4o", api_key_secret="llm/openai_key",
+            )
+            client.ai.serving.endpoint("databricks-claude-sonnet-4").chat("Hi!").text
         """
         cached = self.__dict__.get("_ai")
         if cached is not None:

@@ -154,14 +154,21 @@ class DatabricksTestCase(unittest.TestCase):
         from yggdrasil.databricks.cluster import service as _cs
         from yggdrasil.databricks.compute import instance_pool as _ip
         from yggdrasil.databricks.schema.schema import UCSchema
+        from yggdrasil.databricks.sql.engine import SQLEngine
         from yggdrasil.databricks.table.table import Table
         from yggdrasil.databricks.volume.volume import Volume
 
         # Drop singleton caches so each test gets a fresh client +
         # fresh per-resource state; otherwise mutations on
         # ``client.<service>.defaults`` or cached ``_infos`` /
-        # columns bleed across tests.
+        # columns bleed across tests. ``SQLEngine`` is keyed by
+        # ``(client, catalog, schema, warehouse)`` and the client compares
+        # *by value*, so a fresh client with the same params would
+        # otherwise reuse a stale engine bound to the previous test's
+        # client — which leaks ``client.sql.client`` / ``.sql.ai`` identity
+        # across modules.
         DatabricksClient._INSTANCES.clear()
+        SQLEngine._INSTANCES.clear()
         UCCatalog._INSTANCES.clear()
         UCSchema._INSTANCES.clear()
         Table._INSTANCES.clear()
