@@ -6,6 +6,8 @@ Subcommands::
     ygg databricks warehouses list/get/create/delete
     ygg databricks table async_insert --table-name … --data …
     ygg databricks table execute_insert --logs … | --log-file …
+    ygg databricks optimizer run --repo /Workspace/Shared/monteleq
+    ygg databricks optimizer deploy --repo /Workspace/Shared/monteleq --interval 6
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ from typing import Any, Optional, Sequence
 
 from .services import (
     ClustersCommand,
+    OptimizerCommand,
     TablesCommand,
     WarehousesCommand,
 )
@@ -55,6 +58,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     subparsers = parser.add_subparsers(dest="command")
     ClustersCommand.register(subparsers)
+    OptimizerCommand.register(subparsers)
     TablesCommand.register(subparsers)
     WarehousesCommand.register(subparsers)
 
