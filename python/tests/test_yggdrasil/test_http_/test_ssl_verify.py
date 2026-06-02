@@ -20,7 +20,11 @@ import warnings
 import pytest
 
 from yggdrasil.http_.exceptions import InsecureRequestWarning
-from yggdrasil.http_.session import HTTPSession, _make_ssl_context
+from yggdrasil.http_.session import (
+    HTTPSession,
+    _make_ssl_context,
+    _TLS_VERIFY_FAILED_HOSTS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -30,8 +34,12 @@ from yggdrasil.http_.session import HTTPSession, _make_ssl_context
 @pytest.fixture(autouse=True)
 def _fresh_singletons():
     HTTPSession._INSTANCES.clear()
+    # The TLS-failure memo is process-wide; clear it so one test's cert
+    # failure (host 127.0.0.1) doesn't make the next skip verification.
+    _TLS_VERIFY_FAILED_HOSTS.clear()
     yield
     HTTPSession._INSTANCES.clear()
+    _TLS_VERIFY_FAILED_HOSTS.clear()
 
 
 @pytest.fixture(scope="module")

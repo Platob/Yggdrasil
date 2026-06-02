@@ -231,6 +231,15 @@ def _floor_connect_timeout(timeout: Optional[float]) -> float:
     return timeout
 
 
+#: Hosts whose TLS certificate failed verification once in this process. New
+#: connections to them start with ``verify=False`` instead of re-attempting the
+#: doomed handshake, failing, and retrying per request — important when many
+#: short-lived sessions hit the same host (e.g. S3 reads behind a clock-skewed
+#: or intercepting cert). Process-scoped and best-effort; the GIL makes the
+#: set add/membership atomic enough without a lock.
+_TLS_VERIFY_FAILED_HOSTS: "set[str]" = set()
+
+
 def _make_ssl_context(verify: "bool | str | pathlib.Path") -> ssl.SSLContext:
     """Build an :class:`ssl.SSLContext` from a ``verify`` argument.
 
@@ -939,7 +948,14 @@ class HTTPSession(Session):
         proxy = self._resolve_proxy_for(scheme, host)
 
         if scheme == "https":
-            ssl_ctx: ssl.SSLContext = _make_ssl_context(self.verify)
+            verify = self.verify
+            # A host that already failed cert verification this process won't
+            # verify now either — skip straight to ``verify=False`` rather than
+            # repeating the handshake-fail-disable-retry dance on every fresh
+            # session/connection.
+            if verify is not False and host in _TLS_VERIFY_FAILED_HOSTS:
+                verify = False
+            ssl_ctx: ssl.SSLContext = _make_ssl_context(verify)
 
             if proxy is not None:
                 try:
@@ -1280,6 +1296,11 @@ class HTTPSession(Session):
                         current_request.url, msg,
                     )
                     self.verify = False
+                    # Remember the host process-wide so later sessions skip the
+                    # doomed verification instead of repeating this dance.
+                    host = getattr(current_request.url, "host", None)
+                    if host:
+                        _TLS_VERIFY_FAILED_HOSTS.add(host)
                     self.clear_connections()
                     continue
                 raise SSLError(msg) from exc
