@@ -396,6 +396,11 @@ class TestTableSchemaEvolutionIntegration(_TableFixture):
         self.table.with_column(new_col)
         self.assertIsNotNone(self.table.column(new_col.name, raise_error=False))
         # Tidy up so the next test starts from the canonical 3-column shape.
+        # DROP COLUMN needs Delta column mapping mode 'name'; enable it first.
+        self._sql(
+            f"ALTER TABLE {self.table.full_name(safe=True)} "
+            f"SET TBLPROPERTIES ('delta.columnMapping.mode' = 'name')"
+        )
         self._sql(
             f"ALTER TABLE {self.table.full_name(safe=True)} "
             f"DROP COLUMN `{new_col.name}`"

@@ -175,6 +175,7 @@ INFOS_TTL: float = 300.0
 # after a successful INSERT is dangerous, and OPTIMIZE/VACUUM are best-effort.
 from yggdrasil.databricks.table.insert import (  # noqa: E402
     ALIAS_TMPSRC as _ALIAS_TMPSRC,
+    ASYNC_ROOT,
     DatabricksTableInsert,
     make_sql_insert,
     make_sql_select,
@@ -1681,6 +1682,13 @@ class Table(DatabricksPath):
 
         second_phase.extend(type_statements)
         if drop_names:
+            # DROP COLUMN on a Delta table requires column mapping mode
+            # 'name'. Enable it first (idempotent — a no-op when already on)
+            # so the drop in the second phase is supported.
+            first_phase.append(
+                f"{alter_table} SET TBLPROPERTIES "
+                f"('delta.columnMapping.mode' = 'name')"
+            )
             second_phase.append(
                 f"{alter_table} DROP COLUMNS "
                 + "(" + ", ".join(f"`{n}`" for n in drop_names) + ")"
@@ -1727,7 +1735,12 @@ class Table(DatabricksPath):
         if self.exists():
             data_source_format = self.infos.data_source_format
 
-            if mode == Mode.OVERWRITE and data_source_format == DataSourceFormat.DELTA:
+            if or_replace:
+                # Explicit replace: fall through to the CREATE OR REPLACE
+                # TABLE path below, resetting the table in place regardless
+                # of mode.
+                pass
+            elif mode == Mode.OVERWRITE and data_source_format == DataSourceFormat.DELTA:
                 pass
             elif mode == Mode.OVERWRITE:
                 self.delete(wait=True, missing_ok=True)
@@ -1746,7 +1759,7 @@ class Table(DatabricksPath):
                 comment=comment,
                 missing_ok=missing_ok,
                 properties=properties,
-                or_replace=mode == Mode.OVERWRITE and table_type == TableType.MANAGED,
+                or_replace=or_replace or (mode == Mode.OVERWRITE and table_type == TableType.MANAGED),
                 record_ygg_properties=record_ygg_properties,
             )
         else:
@@ -2858,8 +2871,19 @@ class Table(DatabricksPath):
     def staging_folder(
         self,
         temporary: bool = False,
+        *,
+        async_write: bool = False,
     ) -> VolumePath:
-        """Return the staging folder for this table."""
+        """Return a staging folder for this table under its staging volume.
+
+        ``async_write=True`` returns the durable async-insert staging area
+        (``<staging_volume>/.sql/async/insert``) that sits alongside the
+        file-arrival op-logs (``.sql/async/logs``); it is never temporary.
+        Otherwise returns the transient ``<staging_volume>/.sql/tmp``
+        scratch folder, honoring *temporary*.
+        """
+        if async_write:
+            return self.staging_volume.path(f"{ASYNC_ROOT}/insert", temporary=False)
         return self.staging_volume.path(".sql/tmp", temporary=temporary)
 
     def insert_volume_path(
