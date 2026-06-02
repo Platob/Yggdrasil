@@ -218,3 +218,99 @@ class TestDataSkipping(DeltaTestCase):
         # OR must not yield a binding bound — either branch could match.
         c = _extract_range_constraints((col("id") > 5) | (col("id") < 1))
         self.assertIsNone(c)
+
+
+class TestClusteringAwarePruning(DeltaTestCase):
+    """Liquid-clustering metadata strengthens (and never weakens) pruning.
+
+    A ``CLUSTER BY`` table written through DeltaFolder must stamp the
+    ``delta.clustering`` domain-metadata so ``Snapshot.clustering_columns``
+    round-trips, always stat the clustering columns even past the indexed-col
+    cap, and prune files on a clustering-column predicate — identical results
+    to a full scan, fewer files opened.
+    """
+
+    def _clustered_table(self, *, region_col_position_last: bool = False):
+        from yggdrasil.io.delta import DeltaOptions
+        d = self.delta_io("clustered")
+        opts = DeltaOptions(mode=self.Mode.APPEND, cluster_by=("region",))
+        # Three single-file commits, each a disjoint region — clustering
+        # co-locates rows by region, which is exactly what we simulate by
+        # giving each file one region value.
+        for region, ids in (("ap", [1, 2]), ("eu", [10, 11]), ("us", [100, 101])):
+            d.write_arrow_batches(self.pa.table({
+                "id": self.pa.array(ids, self.pa.int64()),
+                "region": self.pa.array([region] * len(ids), self.pa.string()),
+                "v": self.pa.array(["x"] * len(ids), self.pa.string()),
+            }).to_batches(), options=opts)
+        return d
+
+    @property
+    def Mode(self):
+        from yggdrasil.enums import Mode
+        return Mode
+
+    def test_cluster_by_round_trips_via_domain_metadata(self) -> None:
+        d = self._clustered_table()
+        snap = d.snapshot(fresh=True)
+        self.assertEqual(snap.clustering_columns, ["region"])
+        # The writer feature + reader/writer versions Databricks requires.
+        self.assertIn("clustering", snap.protocol.writer_features)
+        self.assertIn("domainMetadata", snap.protocol.writer_features)
+        self.assertGreaterEqual(snap.protocol.min_writer_version, 7)
+
+    def test_clustering_column_past_cap_still_stat(self) -> None:
+        # A clustering column beyond the indexed-col cap must still be
+        # stat'd — that's the stat the pruner leans on.
+        import json
+        from yggdrasil.io.delta import DeltaOptions
+        d = self.delta_io("wide")
+        # 3 leading cols + region as the 4th; cap at 2 drops cols 2,3 but
+        # region (clustering) is kept regardless.
+        tbl = self.pa.table({
+            "a": self.pa.array([1], self.pa.int64()),
+            "b": self.pa.array([2], self.pa.int64()),
+            "c": self.pa.array([3], self.pa.int64()),
+            "region": self.pa.array(["eu"], self.pa.string()),
+        })
+        d.write_arrow_batches(tbl.to_batches(), options=DeltaOptions(
+            mode=self.Mode.APPEND, cluster_by=("region",), stats_num_indexed_cols=2))
+        snap = d.snapshot(fresh=True)
+        stats = json.loads(next(iter(snap.active_files.values())).stats)
+        self.assertIn("region", stats["minValues"])  # past the cap, still stat'd
+        self.assertNotIn("c", stats["minValues"])     # past the cap, dropped
+
+    def test_clustering_predicate_prunes_files(self) -> None:
+        import yggdrasil.io.delta.delta_folder as df
+        from yggdrasil.execution.expr import col
+        from yggdrasil.io.delta import DeltaOptions
+        d = self._clustered_table()
+
+        seen = {}
+        orig = df._data_skip_adds
+        def _spy(snap, adds, predicate):
+            kept = list(orig(snap, adds, predicate))
+            seen["kept"] = len(kept)
+            return iter(kept)
+        df._data_skip_adds = _spy
+        try:
+            out = d.read_arrow_table(
+                options=DeltaOptions(predicate=col("region") == "us"))
+        finally:
+            df._data_skip_adds = orig
+
+        # Pruned to the single 'us' file; result equals a full-scan filter.
+        self.assertEqual(seen["kept"], 1)
+        self.assertEqual(sorted(out.column("id").to_pylist()), [100, 101])
+        self.assertEqual(set(out.column("region").to_pylist()), {"us"})
+
+    def test_clustering_pruning_matches_full_scan(self) -> None:
+        from yggdrasil.execution.expr import col
+        from yggdrasil.io.delta import DeltaOptions
+        d = self._clustered_table()
+        pruned = d.read_arrow_table(
+            options=DeltaOptions(predicate=col("region") == "eu"))
+        full = d.read_arrow_table()
+        manual = [i for i, r in zip(full.column("id").to_pylist(),
+                                    full.column("region").to_pylist()) if r == "eu"]
+        self.assertEqual(sorted(pruned.column("id").to_pylist()), sorted(manual))

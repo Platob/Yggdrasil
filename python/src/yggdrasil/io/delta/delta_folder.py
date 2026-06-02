@@ -33,10 +33,10 @@ from yggdrasil.io.delta.deletion_vector import (
     DeletionVector, decode_deletion_vector, encode_inline_deletion_vector,
     mask_batch_with_dv, write_uuid_deletion_vector,
 )
-from yggdrasil.io.delta.log import DeltaLog
+from yggdrasil.io.delta.log import DeltaLog, LogSegment
 from yggdrasil.io.delta.protocol import (
     AddFile, CommitInfo, DeltaAction, DeletionVectorDescriptor,
-    Metadata, Protocol, RemoveFile, Txn,
+    DomainMetadata, Metadata, Protocol, RemoveFile, Txn,
 )
 from yggdrasil.io.delta.schema_codec import (
     arrow_schema_to_spark_json, spark_json_to_arrow_schema,
@@ -53,7 +53,55 @@ logger = logging.getLogger(__name__)
 
 
 class ConcurrentDeltaCommitError(RuntimeError):
-    """Raised when retries are exhausted on a Delta commit version race."""
+    """Raised on a Delta commit version race that can't be rebased.
+
+    Two distinct causes, both surfaced through this one type:
+
+    - **Logical conflict** — a concurrent writer touched the same files
+      this operation depends on (e.g. two overwrites, or an append that
+      raced a delete of a file we rewrote). Delta's protocol says these
+      operations don't commute, so the loser must abort and let the
+      caller decide. Carries :attr:`conflict` describing what clashed.
+    - **Exhausted retries** — the version kept advancing under us faster
+      than we could rebase. Carries ``conflict=None``.
+    """
+
+    def __init__(self, message: str, *, conflict: "Optional[str]" = None) -> None:
+        super().__init__(message)
+        self.conflict = conflict
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _CommitPlan:
+    """Describes a write operation's intent for optimistic-concurrency rebase.
+
+    The retry loop uses this to decide, on a version collision, whether the
+    already-written data files can simply be *rebased* onto the new HEAD
+    (cheap — just renumber the commit) or whether a concurrent writer
+    created a genuine logical conflict that must abort.
+
+    Fields:
+
+    - ``build_actions`` — builds the action list against a base snapshot.
+      Called once up front (attempt 0) and again only when a rebuild is
+      forced (a real data-dependent operation that lost its base).
+    - ``is_blind_append`` — the operation only *adds* files and reads
+      nothing (plain APPEND). Concurrent appends commute under the Delta
+      protocol, so a blind append never logically conflicts: on collision
+      we keep the same AddFiles and bump the version.
+    - ``read_file_paths`` — AddFile paths the operation read or depends on
+      remaining present (the files UPSERT/DELETE/OVERWRITE rewrote). If a
+      concurrent commit *removed* any of these, our rewrite is based on a
+      stale view → conflict.
+    - ``removes_all`` — the operation logically removes the entire table
+      snapshot it saw (OVERWRITE). Any concurrent add/remove is a conflict
+      because the overwrite's "replace everything I saw" no longer holds.
+    """
+
+    build_actions: "Callable[[Snapshot], list[DeltaAction]]"
+    is_blind_append: bool
+    read_file_paths: "frozenset[str]" = frozenset()
+    removes_all: bool = False
 
 
 _INLINE_DV_MAX_ROWS = 4096
@@ -78,6 +126,19 @@ class DeltaOptions(FolderOptions):
     commit_retry_max_delay: float = 1.0
     collect_stats: bool = True
     target_file_size: int = 128 * 1024 * 1024
+    #: Columns to liquid-cluster the table by. Stamped into the
+    #: ``delta.clustering`` domain-metadata + the ``clustering`` writer
+    #: feature on create, and always given per-file stats (so the
+    #: clustering-aware pruner can lean on them). Mirrors Databricks
+    #: ``CREATE TABLE … CLUSTER BY (...)``.
+    cluster_by: "Optional[tuple[str, ...]]" = None
+    #: Cap on how many leading columns get per-file min/max stats —
+    #: matches Databricks' ``delta.dataSkippingNumIndexedCols`` (32 by
+    #: default). Clustering columns are always stat'd regardless of where
+    #: they fall in the schema, because a predicate on a clustering column
+    #: is the one that actually prunes (co-located rows ⇒ tight per-file
+    #: ranges ⇒ most files excluded).
+    stats_num_indexed_cols: int = 32
 
 
 class DeltaFolder(Folder):
@@ -280,12 +341,33 @@ class DeltaFolder(Folder):
                     min_r, min_w = max(min_r, 3), max(min_w, 7)
                     if "deletionVectors" not in rf: rf.append("deletionVectors")
                     if "deletionVectors" not in wf: wf.append("deletionVectors")
+                cluster_cols = tuple(options.cluster_by or ())
+                if cluster_cols:
+                    # ``clustering`` is a writer-only feature gated on
+                    # ``domainMetadata`` (where the cluster keys live) and
+                    # reader/writer 3/7 — exactly what real Databricks
+                    # stamps for ``CLUSTER BY``. Without these a 1/2 table
+                    # can't legally carry a domainMetadata action.
+                    min_r, min_w = max(min_r, 3), max(min_w, 7)
+                    for feat in ("clustering", "domainMetadata"):
+                        if feat not in wf: wf.append(feat)
                 actions.append(Protocol(min_reader_version=min_r, min_writer_version=min_w,
                                         reader_features=rf, writer_features=wf))
                 actions.append(Metadata(id=str(uuid.uuid4()),
                                         schema_string=arrow_schema_to_spark_json(target_schema),
                                         partition_columns=partition_columns,
                                         created_time=int(time.time() * 1000)))
+                if cluster_cols:
+                    # Mirror Databricks' physical shape: each key is its own
+                    # single-element column path. ``Snapshot.clustering_columns``
+                    # flattens these back to dotted names.
+                    actions.append(DomainMetadata(
+                        domain="delta.clustering",
+                        configuration=ygg_json.dumps(
+                            {"clusteringColumns": [[c] for c in cluster_cols],
+                             "domainName": "delta.clustering"},
+                            separators=(",", ":"), to_bytes=False),
+                    ))
             elif action is Mode.OVERWRITE and materialized:
                 actions.append(Metadata(id=snap.metadata.id,
                                         schema_string=arrow_schema_to_spark_json(target_schema),
@@ -305,8 +387,16 @@ class DeltaFolder(Folder):
             actions.append(self._build_commit_info(options=options, mode=action))
             return actions
 
+        if action is Mode.OVERWRITE:
+            plan = _CommitPlan(build_actions=build, is_blind_append=False,
+                               read_file_paths=frozenset(snap.active_files.keys()),
+                               removes_all=True)
+        else:
+            # APPEND / IGNORE / ERROR_IF_EXISTS that reach here only add
+            # files — a blind append that commutes with any concurrent write.
+            plan = _CommitPlan(build_actions=build, is_blind_append=True)
         self._with_commit_retry(build_actions=build, cleanup=None,
-                                options=options, initial_snap=snap)
+                                options=options, initial_snap=snap, plan=plan)
 
     def _commit_upsert(self, materialized: "list[pa.RecordBatch]", *,
                        options: DeltaOptions, initial_snap: Snapshot) -> None:
@@ -376,28 +466,89 @@ class DeltaFolder(Folder):
                 except Exception: pass
             rewrite_state["current"] = []
 
+        # UPSERT reads + rewrites the files matching the incoming keys. On a
+        # collision the rebaser re-scans against the rival's new files (so a
+        # key landing in a concurrently-added file is still matched) and only
+        # fails if the rival removed a file we also rewrote.
+        plan = _CommitPlan(
+            build_actions=build, is_blind_append=False,
+            read_file_paths=frozenset(initial_snap.active_files.keys()),
+        )
         self._with_commit_retry(build_actions=build, cleanup=cleanup,
-                                options=options, initial_snap=initial_snap)
+                                options=options, initial_snap=initial_snap, plan=plan)
 
     def _with_commit_retry(self, *, build_actions: "Callable[[Snapshot], list[DeltaAction]]",
                            cleanup: "Optional[Callable[[], None]]",
-                           options: DeltaOptions, initial_snap: Snapshot) -> None:
+                           options: DeltaOptions, initial_snap: Snapshot,
+                           plan: "Optional[_CommitPlan]" = None) -> None:
+        """Optimistic-concurrency commit loop with rebase-on-conflict.
+
+        Attempt 0 builds the action set against ``initial_snap`` and tries an
+        atomic create at ``version+1``. If that version was taken by a
+        concurrent writer we **rebase** instead of blindly redoing the write:
+
+        - We read exactly the actions the rival committed between our base
+          version and the new HEAD and ask Delta's conflict rules whether
+          they commute with ours (:meth:`_rebase_actions`).
+        - A *blind append* always commutes — concurrent appends are
+          independent, so we keep the same already-written AddFiles and just
+          renumber the commit at the new HEAD. No re-read, no rewrite.
+        - A data-dependent op (UPSERT / OVERWRITE / DELETE) commutes only
+          when the rival didn't touch the files we read; if it did, that's a
+          genuine logical conflict and we raise straight away rather than
+          burning the whole retry budget. When it *does* commute but our
+          rewrite needs to see the rival's new files (it doesn't, for the
+          rewrite-in-place ops we model), we rebuild against the new HEAD.
+
+        ``ConcurrentDeltaCommitError`` is reserved for true logical
+        conflicts and exhausted retries.
+        """
         max_retries = max(0, int(options.commit_max_retries or 0))
         backoff = float(options.commit_retry_backoff or 0.0)
         jitter = float(options.commit_retry_jitter or 0.0)
         max_delay = float(options.commit_retry_max_delay or 0.0)
 
+        # Base snapshot + the actions we want to land, built once. ``plan`` is
+        # None for the back-compat callers (delete path) — they fall back to
+        # the rebuild-every-attempt behaviour.
+        base_snap = initial_snap
+        pending_actions: "Optional[list[DeltaAction]]" = (
+            build_actions(base_snap) if plan is not None else None
+        )
+
         for attempt in range(max_retries + 1):
-            snap = initial_snap if attempt == 0 else self.snapshot(fresh=True)
+            if attempt == 0:
+                snap = base_snap
+                actions = pending_actions if pending_actions is not None else build_actions(snap)
+            elif plan is not None:
+                # Rebase the already-built actions onto the fresh HEAD.
+                snap = self.snapshot(fresh=True)
+                actions = self._rebase_actions(
+                    plan=plan, pending=pending_actions,  # type: ignore[arg-type]
+                    base_snap=base_snap, head_snap=snap, cleanup=cleanup,
+                    options=options,
+                )
+                if actions is None:
+                    # Commutes but needs a rebuild against the new HEAD.
+                    if cleanup is not None:
+                        cleanup()
+                    actions = build_actions(snap)
+                    pending_actions = actions
+                base_snap = snap
+            else:
+                snap = self.snapshot(fresh=True)
+                actions = build_actions(snap)
             next_version = (snap.version + 1) if snap.metadata is not None else 0
             try:
-                self._commit_atomic(next_version, build_actions(snap))
+                self._commit_atomic(next_version, actions)
             except FileExistsError:
-                if cleanup is not None:
+                if plan is None and cleanup is not None:
                     cleanup()
                 self._log.invalidate()
                 self._snapshot = None
                 if attempt == max_retries:
+                    if plan is not None and cleanup is not None:
+                        cleanup()
                     raise ConcurrentDeltaCommitError(
                         f"Failed to commit at {self.path!s} after {attempt + 1} attempts.")
                 if attempt > 0 and backoff > 0:
@@ -418,6 +569,102 @@ class DeltaFolder(Folder):
                                            size=size, kind=options.checkpoint_kind,
                                            sidecar_files=sidecar_files)
             return
+
+    def _winning_actions(self, base_version: int, head_version: int) -> "list[DeltaAction]":
+        """Replay only the commits a rival landed in ``(base, head]``.
+
+        These are the "winning" commits we lost the race to — we read their
+        Add/Remove footprint to decide whether our pending commit still
+        commutes. We replay each commit JSON individually (no checkpoint
+        collapse) so we see the exact per-commit actions, not a merged view.
+        """
+        out: "list[DeltaAction]" = []
+        for v in range(base_version + 1, head_version + 1):
+            seg = LogSegment(version=v, checkpoint_version=v - 1,
+                             checkpoint_files=(),
+                             commit_files=(self._log.log_path / format_commit_name(v),))
+            out.extend(self._log.replay(seg))
+        return out
+
+    def _rebase_actions(self, *, plan: "_CommitPlan", pending: "list[DeltaAction]",
+                        base_snap: Snapshot, head_snap: Snapshot,
+                        cleanup: "Optional[Callable[[], None]]",
+                        options: DeltaOptions) -> "Optional[list[DeltaAction]]":
+        """Decide how to land *pending* onto the advanced *head_snap*.
+
+        Returns the (possibly unchanged) action list to commit at the new
+        HEAD when our op commutes with the rival's, ``None`` to signal "needs
+        a rebuild against the new HEAD", or raises
+        :class:`ConcurrentDeltaCommitError` on a genuine logical conflict.
+
+        Conflict rules follow the Delta optimistic-concurrency protocol:
+
+        - *Blind append* (``is_blind_append``): always commutes. Concurrent
+          appends are independent — neither reads nor removes the other's
+          files — so we keep the same AddFiles and just commit at the new
+          version. This is the hot path (N writers all appending).
+        - *Overwrite* (``removes_all``): the operation's contract is "replace
+          everything I saw". If a rival added or removed any file after our
+          base, that contract is void → conflict.
+        - *Rewrite-in-place* (UPSERT / non-DV DELETE, via
+          ``read_file_paths``): conflicts only if the rival *removed* a file
+          we also rewrote/removed (double-remove of the same file is a
+          write-write conflict) or removed a file we read. Otherwise the
+          rival only added new files we never inspected, so our rewrite is
+          still valid against them and we commute — but our own RemoveFiles
+          must still be present at HEAD, which they are (we only removed files
+          that existed at base and the rival didn't touch), so we keep the
+          actions as-is.
+        """
+        winning = self._winning_actions(base_snap.version, head_snap.version)
+        rival_adds = {a.path for a in winning if isinstance(a, AddFile)}
+        rival_removes = {a.path for a in winning if isinstance(a, RemoveFile)}
+
+        if plan.is_blind_append:
+            logger.debug(
+                "DeltaFolder rebase at %r: blind append commutes past %d rival commit(s) "
+                "(+%d/-%d files), landing at v%d",
+                self.path, head_snap.version - base_snap.version,
+                len(rival_adds), len(rival_removes), head_snap.version + 1,
+            )
+            return pending
+
+        if plan.removes_all:
+            if rival_adds or rival_removes:
+                raise ConcurrentDeltaCommitError(
+                    f"Concurrent commit at {self.path!s} changed files under an "
+                    f"OVERWRITE (rival added {len(rival_adds)}, removed "
+                    f"{len(rival_removes)}); the overwrite's snapshot is stale.",
+                    conflict="overwrite-vs-concurrent-write",
+                )
+            return pending
+
+        # Rewrite-in-place (UPSERT / non-DV DELETE). A rival removing a file
+        # we also removed is an unambiguous write-write conflict — both
+        # writers tried to supersede the same data, and committing ours would
+        # silently lose the rival's edit (or double-remove). Abort.
+        our_removes = {a.path for a in pending if isinstance(a, RemoveFile)}
+        clash = (plan.read_file_paths & rival_removes) | (our_removes & rival_removes)
+        if clash:
+            raise ConcurrentDeltaCommitError(
+                f"Concurrent commit at {self.path!s} removed {len(clash)} file(s) "
+                f"this operation also rewrote/removed; the merge would lose a write.",
+                conflict="rewrite-vs-concurrent-remove",
+            )
+        # The rival only *added* files (or removed files we never touched).
+        # Those new files may contain keys our UPSERT must match, so we can't
+        # blindly reuse the base-version action set — rebuild the rewrite
+        # against the new HEAD (signalled by returning None). Cheaper than a
+        # full redo only when there's no conflict, and correct.
+        if rival_adds or rival_removes:
+            logger.debug(
+                "DeltaFolder rebase at %r: rewrite re-scans against %d new rival "
+                "commit(s) (+%d/-%d files) before landing at v%d",
+                self.path, head_snap.version - base_snap.version,
+                len(rival_adds), len(rival_removes), head_snap.version + 1,
+            )
+            return None
+        return pending
 
     # ==================================================================
     # Helpers
@@ -484,7 +731,11 @@ class DeltaFolder(Folder):
                 size=int(file_path.size),
                 modification_time=int(time.time() * 1000),
                 data_change=True,
-                stats=_collect_stats(payload_batches) if getattr(options, "collect_stats", True) else None,
+                stats=(_collect_stats(
+                    payload_batches,
+                    cluster_by=options.cluster_by,
+                    num_indexed_cols=options.stats_num_indexed_cols,
+                ) if getattr(options, "collect_stats", True) else None),
             )
 
     def _build_commit_info(
@@ -542,6 +793,17 @@ class DeltaFolder(Folder):
                     mv = mv[n:]
             finally:
                 os.close(fd)
+            return
+
+        # On S3, use a conditional create-if-absent (``If-None-Match: *``) so
+        # the commit is genuinely atomic: two writers racing for the same
+        # version both attempt the PUT, exactly one gets 200 and the other a
+        # 412 → FileExistsError → rebase. A plain ``exists()``-then-``put``
+        # has a TOCTOU window that loses writes under contention.
+        http = getattr(getattr(commit_path, "s3_bucket", None), "http", None)
+        key = getattr(commit_path, "key", None)
+        if http is not None and key is not None:
+            http.put(key, body, content_type="application/json", if_none_match=True)
             return
 
         if commit_path.exists():
@@ -848,11 +1110,36 @@ def _delta_physical_batch(batch: pa.RecordBatch) -> pa.RecordBatch:
     return pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields))
 
 
-def _collect_stats(batches: "list[pa.RecordBatch]") -> "Optional[str]":
+def _collect_stats(batches: "list[pa.RecordBatch]", *,
+                   cluster_by: "Optional[Iterable[str]]" = None,
+                   num_indexed_cols: int = 32) -> "Optional[str]":
+    """Collect Delta data-skipping stats for *batches*.
+
+    Databricks only indexes the leading ``delta.dataSkippingNumIndexedCols``
+    columns (32 by default) — stat'ing a 500-column table in full bloats
+    every commit for skips that rarely fire. We mirror that cap, *but*
+    clustering columns are always stat'd even when they fall past the cut:
+    liquid clustering co-locates rows by those columns, so a per-file
+    min/max on a clustering column is tight (a file holds a small,
+    contiguous slice of the key space) and a predicate on it excludes most
+    files. A min/max on an arbitrary unclustered column is loose — the
+    values are scattered across every file — so it rarely prunes anything.
+    Spending the stat budget on clustering columns is where the skip win
+    actually comes from.
+    """
     if not batches: return None
     total_rows = sum(b.num_rows for b in batches)
     schema = batches[0].schema
     min_vals, max_vals, null_counts = {}, {}, {}
+
+    cluster_set = {c for c in (cluster_by or ())}
+    cap = max(0, int(num_indexed_cols))
+    # Leading-N indexed columns plus every clustering column, regardless of
+    # position. A clustering column past the cap still earns its stat.
+    indexed_names: "set[str]" = set()
+    for i, f in enumerate(schema):
+        if i < cap or f.name in cluster_set:
+            indexed_names.add(f.name)
 
     def _sv(val: Any, t: pa.DataType) -> Any:
         # Delta data-skipping compares stats *as JSON strings* against the
@@ -876,6 +1163,8 @@ def _collect_stats(batches: "list[pa.RecordBatch]") -> "Optional[str]":
         return val
 
     for field in schema:
+        if field.name not in indexed_names:
+            continue
         t = field.type
         if not (pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_string(t)
                 or pa.types.is_large_string(t) or pa.types.is_date(t) or pa.types.is_timestamp(t)
@@ -987,13 +1276,55 @@ def _extract_range_constraints(predicate: "Predicate") -> "Optional[dict[str, li
     return out or None
 
 
+def _bound_excludes(lo: Any, hi: Any, bounds: "list[tuple[str, Any]]") -> bool:
+    """True when min/max ``[lo, hi]`` can't satisfy any of *bounds* (joined by AND).
+
+    A single unsatisfiable bound is enough to exclude the file — the
+    constraints are ANDed, so one provably-empty range kills the file.
+    """
+    for op, val in bounds:
+        try:
+            if op == "=":
+                if val < lo or val > hi:
+                    return True
+            elif op == ">":
+                if hi <= val:
+                    return True
+            elif op == ">=":
+                if hi < val:
+                    return True
+            elif op == "<":
+                if lo >= val:
+                    return True
+            elif op == "<=":
+                if lo > val:
+                    return True
+            elif op == "in":
+                if all(v < lo or v > hi for v in val):
+                    return True
+        except TypeError:
+            # Mixed/incomparable types — keep the file.
+            continue
+    return False
+
+
 def _stats_exclude_file(add: AddFile, constraints: "dict[str, list[tuple[str, Any]]]",
-                        skippable: "frozenset[str]") -> bool:
+                        skippable: "frozenset[str]",
+                        cluster_cols: "tuple[str, ...]" = ()) -> bool:
     """True when *add*'s per-column min/max stats prove it holds no matching row.
 
     Conservative: any missing stat / un-comparable value / unknown op leaves
     the file in. Only columns in *skippable* (numeric + string, where the
     JSON stat value compares directly to the predicate literal) participate.
+
+    *cluster_cols* (in cluster-key order) are checked **first** and
+    short-circuit: liquid clustering co-locates rows by those keys, so each
+    file holds a small, contiguous slice of the clustering key-space and its
+    min/max on a clustering column is tight. A predicate on a clustering
+    column is therefore the one most likely to exclude a file, and proving it
+    empty lets us skip without touching any other column's stats. Pruning on
+    an arbitrary unclustered column rarely fires — its values are scattered
+    across every file, so almost every file's [min, max] spans the literal.
     """
     if not add.stats:
         return False
@@ -1003,36 +1334,27 @@ def _stats_exclude_file(add: AddFile, constraints: "dict[str, list[tuple[str, An
         return False
     mins = stats.get("minValues") or {}
     maxs = stats.get("maxValues") or {}
-    for col, bounds in constraints.items():
+
+    # Clustering keys first (in key order) — tightest bounds, most likely to
+    # exclude, and short-circuiting saves work on the wide unclustered tail.
+    ordered_cols: "list[str]" = []
+    seen: "set[str]" = set()
+    for col in cluster_cols:
+        if col in constraints and col not in seen:
+            ordered_cols.append(col); seen.add(col)
+    for col in constraints:
+        if col not in seen:
+            ordered_cols.append(col); seen.add(col)
+
+    for col in ordered_cols:
         if col not in skippable:
             continue
         lo = mins.get(col)
         hi = maxs.get(col)
         if lo is None or hi is None:
             continue
-        for op, val in bounds:
-            try:
-                if op == "=":
-                    if val < lo or val > hi:
-                        return True
-                elif op == ">":
-                    if hi <= val:
-                        return True
-                elif op == ">=":
-                    if hi < val:
-                        return True
-                elif op == "<":
-                    if lo >= val:
-                        return True
-                elif op == "<=":
-                    if lo > val:
-                        return True
-                elif op == "in":
-                    if all(v < lo or v > hi for v in val):
-                        return True
-            except TypeError:
-                # Mixed/incomparable types — keep the file.
-                continue
+        if _bound_excludes(lo, hi, constraints[col]):
+            return True
     return False
 
 
@@ -1051,27 +1373,35 @@ def _data_skip_adds(snap: Snapshot, adds: "Iterable[AddFile]",
     target_schema = (spark_json_to_arrow_schema(snap.schema_string)
                      if snap.schema_string else None)
     partition_columns = set(snap.partition_columns)
+    cluster_cols = tuple(snap.clustering_columns)
     skippable: set[str] = set()
     if target_schema is not None:
         for f in target_schema:
             if f.name in partition_columns:
                 continue
             if (pa.types.is_integer(f.type) or pa.types.is_floating(f.type)
-                    or pa.types.is_string(f.type) or pa.types.is_large_string(f.type)):
+                    or pa.types.is_string(f.type) or pa.types.is_large_string(f.type)
+                    or pa.types.is_date(f.type) or pa.types.is_timestamp(f.type)
+                    or pa.types.is_decimal(f.type)):
                 skippable.add(f.name)
     frozen = frozenset(skippable)
     if not frozen:
         yield from adds
         return
+    # Only carry clustering keys the predicate actually constrains and that we
+    # can compare against stats — those drive the short-circuit in
+    # ``_stats_exclude_file``.
+    active_cluster = tuple(c for c in cluster_cols if c in constraints and c in frozen)
     kept = skipped = 0
     for add in adds:
-        if _stats_exclude_file(add, constraints, frozen):
+        if _stats_exclude_file(add, constraints, frozen, active_cluster):
             skipped += 1
             continue
         kept += 1
         yield add
     if skipped:
         logger.debug(
-            "DeltaFolder data-skipping at %r: kept %d file(s), skipped %d via stats",
-            snap.table_root, kept, skipped,
+            "DeltaFolder data-skipping at %r: kept %d file(s), skipped %d via stats "
+            "(clustering keys in predicate: %r)",
+            snap.table_root, kept, skipped, list(active_cluster),
         )

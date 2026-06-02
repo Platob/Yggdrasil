@@ -223,9 +223,28 @@ class S3HttpClient:
             headers["Range"] = f"bytes={start}-"
         return self._check(self._send("GET", key, headers=headers), key)
 
-    def put(self, key: str, body: bytes, *, content_type: "str | None" = None) -> S3Response:
+    def put(self, key: str, body: bytes, *, content_type: "str | None" = None,
+            if_none_match: bool = False) -> S3Response:
+        """``PUT`` an object.
+
+        ``if_none_match=True`` sends ``If-None-Match: *`` so the PUT only
+        succeeds if the key does **not** already exist — S3's atomic
+        create-if-absent (GA since late 2024). A losing writer gets HTTP 412
+        ``PreconditionFailed``, which we surface as :class:`FileExistsError`.
+        This is what makes a Delta commit JSON race genuinely atomic on
+        object storage (two writers contending for the same version: exactly
+        one wins, the other rebases) — the local-FS path uses ``O_EXCL`` for
+        the same guarantee.
+        """
         headers = {"Content-Type": content_type} if content_type else {}
-        return self._check(self._send("PUT", key, headers=headers, body=body), key, ok=(200, 201))
+        if if_none_match:
+            headers["If-None-Match"] = "*"
+        resp = self._send("PUT", key, headers=headers, body=body)
+        if if_none_match and resp.status == 412:
+            code, message = _parse_error(resp.content)
+            raise FileExistsError(f"S3 object {key!r} already exists "
+                                  f"(If-None-Match: {code or 'PreconditionFailed'})")
+        return self._check(resp, key, ok=(200, 201))
 
     def delete(self, key: str) -> None:
         self._check(self._send("DELETE", key), key, ok=(200, 204))

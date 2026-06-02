@@ -31,6 +31,9 @@ _REQUIRES_LIVE: frozenset[str] = frozenset({
     "bench_databricks_insert_staging",
     "bench_warehouse_fetch",
     "bench_io_remote",
+    # Heavy contention sweep; ``--live`` hits an external Databricks Delta
+    # table on S3 (needs creds + external-location CREATE grant). Opt in.
+    "bench_delta_concurrency",
 })
 
 

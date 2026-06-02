@@ -48,6 +48,53 @@ class Snapshot:
         return list(self.metadata.partition_columns) if self.metadata else []
 
     @property
+    def clustering_columns(self) -> "List[str]":
+        """Liquid-clustering columns for this table, in cluster-key order.
+
+        Databricks records liquid clustering in a ``domainMetadata``
+        action under the ``delta.clustering`` domain — *not* in
+        ``metaData.partitionColumns`` (a clustered table is unpartitioned).
+        The domain config looks like::
+
+            {"clusteringColumns": [["region"], ["id"]],
+             "domainName": "delta.clustering"}
+
+        where each entry is a *physical column path* (a list, to address
+        nested struct fields). We flatten each path with ``.`` so a
+        top-level column ``region`` surfaces as ``"region"`` and a nested
+        ``addr.zip`` as ``"addr.zip"`` — the same dotted name the read
+        predicate uses.
+
+        Older / non-Databricks writers sometimes stamp the columns in
+        ``metaData.configuration['delta.clusteringColumns']`` as a
+        comma-joined string instead; we accept that shape as a fallback so
+        a table written either way reports the same key. Returns ``[]`` when
+        the table isn't clustered.
+        """
+        dm = self.domain_metadata.get("delta.clustering")
+        if dm is not None and dm.configuration:
+            try:
+                cfg = _json.loads(dm.configuration)
+            except Exception:
+                cfg = None
+            if isinstance(cfg, Mapping):
+                cols = cfg.get("clusteringColumns")
+                if isinstance(cols, list):
+                    out: "List[str]" = []
+                    for entry in cols:
+                        if isinstance(entry, (list, tuple)):
+                            out.append(".".join(str(p) for p in entry))
+                        elif entry is not None:
+                            out.append(str(entry))
+                    if out:
+                        return out
+        if self.metadata is not None:
+            raw = self.metadata.configuration.get("delta.clusteringColumns")
+            if raw:
+                return [c.strip() for c in str(raw).split(",") if c.strip()]
+        return []
+
+    @property
     def schema_string(self) -> str:
         return self.metadata.schema_string if self.metadata else ""
 
