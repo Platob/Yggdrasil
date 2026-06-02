@@ -143,6 +143,15 @@ class TestVolumeCallEfficiency(VolumeFsCase):
         self.assertIn("d1.bin", names)
         self.assertEqual(calls.get("GET"), 1, dict(calls))
 
+    def test_unlink_is_one_stat_one_delete(self) -> None:
+        self._fresh("u.bin").write_bytes(b"x")
+        p = self._fresh("u.bin")
+        with self._count() as calls:
+            p.unlink()
+        # One kind-probe (file vs dir) then the delete — no second re-stat.
+        self.assertEqual(calls.get("DELETE"), 1, dict(calls))
+        self.assertLessEqual(calls.get("HEAD", 0), 1, dict(calls))
+
 
 class TestVolumeTabular(VolumeFsCase):
     """Tabular content + call counts: a whole-file table write is one PUT,

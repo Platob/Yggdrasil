@@ -386,7 +386,15 @@ class Path(IO, os.PathLike, ABC):
                 f"{self.full_path()!r} is a directory — use ``remove()`` "
                 "for the recursive-delete path; ``unlink`` is files-only."
             )
-        return self.remove(missing_ok=missing_ok, wait=wait, recursive=False)
+        # We've just established the kind; delete the file directly rather
+        # than routing through ``remove()`` (which would re-clear the cache
+        # and re-stat — a wasted backend round trip on remote paths).
+        if kind == IOKind.MISSING:
+            if not missing_ok:
+                raise FileNotFoundError(f"{self.full_path()!r} does not exist")
+            return
+        self._remove_file(missing_ok=missing_ok, wait=WaitingConfig.from_(wait))
+        self.invalidate_singleton()
 
     def remove(
         self,
