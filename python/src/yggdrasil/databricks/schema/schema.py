@@ -729,6 +729,137 @@ class UCSchema(DatabricksPath):
         self._reset_cache(invalidate_cache=True)
         return self
 
+    # ── clone ───────────────────────────────────────────────────────────────────
+
+    def clone(
+        self,
+        target: "str | UCSchema | None" = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        deep: bool = True,
+        replace: bool = False,
+        include_views: bool = True,
+        name: str | None = None,
+        max_workers: int | None = None,
+    ) -> dict[str, str]:
+        """Clone every child of this schema into *target*, in parallel.
+
+        The target schema (and any missing parent catalog) is created first,
+        then each child table / view is cloned concurrently with
+        ``CREATE TABLE IF NOT EXISTS … CLONE`` semantics: a child already
+        present in the target is **skipped** (left untouched), a missing one is
+        **created**. Pass ``replace=True`` to ``CREATE OR REPLACE`` every child
+        instead (overwriting same-named targets). One child's failure is
+        recorded and never aborts the rest of the batch.
+
+        Args:
+            target:        Destination schema — a :class:`UCSchema`, a
+                           ``"catalog.schema"`` / ``"schema"`` dotted name, or
+                           ``None`` when *catalog_name* / *schema_name* are
+                           passed explicitly. A bare name reuses this schema's
+                           catalog.
+            catalog_name:  Target catalog override (defaults to this schema's).
+            schema_name:   Target schema override.
+            deep:          DEEP clone (independent copy) vs SHALLOW (metadata
+                           only, shares the source's files).
+            replace:       ``CREATE OR REPLACE`` each child rather than skip the
+                           ones that already exist.
+            include_views: Also clone view-shaped children (re-emitting their
+                           definition); ``False`` clones only tables.
+            name:          Optional child-name filter (exact or glob) — clone a
+                           subset.
+            max_workers:   Thread-pool size for the fan-out (defaults to the
+                           child count, capped at 16).
+
+        Returns:
+            ``{table_name: status}`` where status is ``"created"``,
+            ``"skipped"`` (already present), or ``"failed: <error>"``.
+        """
+        import concurrent.futures as cf
+
+        # Resolve the destination catalog / schema from whichever form the
+        # caller passed (UCSchema, dotted string, or explicit kwargs).
+        if isinstance(target, UCSchema):
+            target_catalog, target_schema = target.catalog_name, target.schema_name
+        else:
+            parsed_catalog = parsed_schema = None
+            if target:
+                parts = [p.strip().strip("`") for p in str(target).split(".") if p.strip()]
+                if len(parts) == 1:
+                    parsed_schema = parts[0]
+                elif len(parts) == 2:
+                    parsed_catalog, parsed_schema = parts
+                else:
+                    raise ValueError(
+                        f"clone target {target!r} must be a 'schema' or "
+                        f"'catalog.schema' name."
+                    )
+            target_catalog = catalog_name or parsed_catalog or self.catalog_name
+            target_schema = schema_name or parsed_schema
+        if not target_schema:
+            raise ValueError(
+                "clone needs a target schema — pass target='catalog.schema' / "
+                "'schema', a UCSchema, or schema_name=."
+            )
+        if target_catalog == self.catalog_name and target_schema == self.schema_name:
+            raise ValueError(
+                f"Cannot clone {self.full_name()} onto itself — choose a "
+                f"different target catalog/schema."
+            )
+
+        tgt = (
+            target
+            if isinstance(target, UCSchema)
+            else type(self)(
+                service=self.service,
+                catalog_name=target_catalog,
+                schema_name=target_schema,
+                path_prefix=self.path_prefix,
+            )
+        )
+        tgt.ensure_created(comment=f"clone of {self.full_name()}")
+
+        # ``list_tables`` pre-stores each child's SchemaInfo, so ``is_view`` is
+        # free here — no extra round-trip to filter views out.
+        children = [
+            child for child in self.tables(name=name)
+            if include_views or not child.is_view
+        ]
+        if not children:
+            logger.info("clone %s → %s: no children to copy", self, tgt)
+            return {}
+
+        def _clone_one(src: "Table") -> tuple[str, str]:
+            dst = tgt.table(src.table_name)
+            try:
+                if not replace and dst.exists():
+                    return src.table_name, "skipped"
+                src.clone(target=dst, deep=deep, replace=replace, missing_ok=not replace)
+                return src.table_name, "created"
+            except Exception as exc:  # noqa: BLE001 — collect, don't abort the batch
+                logger.warning(
+                    "clone %s → %s failed: %s", src.full_name(), dst.full_name(), exc,
+                )
+                return src.table_name, f"failed: {exc}"
+
+        workers = max_workers or min(len(children), 16)
+        results: dict[str, str] = {}
+        with cf.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="ygg-schema-clone",
+        ) as pool:
+            for table_name, status in pool.map(_clone_one, children):
+                results[table_name] = status
+
+        created = sum(s == "created" for s in results.values())
+        skipped = sum(s == "skipped" for s in results.values())
+        failed = sum(s.startswith("failed") for s in results.values())
+        logger.info(
+            "cloned %s → %s: %d created, %d skipped, %d failed",
+            self.full_name(), tgt.full_name(), created, skipped, failed,
+        )
+        return results
+
     # ── tags ──────────────────────────────────────────────────────────────────
 
     @property
