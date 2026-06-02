@@ -47,7 +47,7 @@ from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
-from yggdrasil.enums.mode import ModeLike
+from yggdrasil.enums.mode import Mode, ModeLike
 from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.path import Path
@@ -739,6 +739,7 @@ class UCSchema(DatabricksPath):
         schema_name: str | None = None,
         deep: bool = True,
         replace: bool = False,
+        mode: Any = ...,
         include_views: bool = True,
         name: str | None = None,
         max_workers: int | None = None,
@@ -764,7 +765,14 @@ class UCSchema(DatabricksPath):
             deep:          DEEP clone (independent copy) vs SHALLOW (metadata
                            only, shares the source's files).
             replace:       ``CREATE OR REPLACE`` each child rather than skip the
-                           ones that already exist.
+                           ones that already exist. Shorthand for
+                           ``mode=Mode.OVERWRITE``; ignored when *mode* is set.
+            mode:          Existence policy forwarded to **every** sub-clone
+                           (overrides *replace* when given): ``OVERWRITE`` /
+                           ``TRUNCATE`` overwrite same-named targets, ``IGNORE``
+                           skips the ones already present, ``ERROR_IF_EXISTS``
+                           records a failure for each clash. Left unset
+                           (``...``), the policy is derived from *replace*.
             include_views: Also clone view-shaped children (re-emitting their
                            definition); ``False`` clones only tables.
             name:          Optional child-name filter (exact or glob) — clone a
@@ -777,6 +785,23 @@ class UCSchema(DatabricksPath):
             ``"skipped"`` (already present), or ``"failed: <error>"``.
         """
         import concurrent.futures as cf
+
+        # One existence policy drives the whole fan-out: an explicit ``mode``
+        # wins, otherwise ``replace`` picks OVERWRITE (replace) vs IGNORE (skip
+        # what's already there — the default). It's forwarded to every
+        # sub-clone so the batch is uniform.
+        if mode is ...:
+            sub_mode = Mode.OVERWRITE if replace else Mode.IGNORE
+        else:
+            sub_mode = Mode.from_(mode)
+            if sub_mode not in (
+                Mode.OVERWRITE, Mode.TRUNCATE, Mode.IGNORE, Mode.ERROR_IF_EXISTS,
+            ):
+                raise ValueError(
+                    f"clone mode must be OVERWRITE/TRUNCATE, IGNORE, or "
+                    f"ERROR_IF_EXISTS — got {sub_mode.name}."
+                )
+        skip_existing = sub_mode is Mode.IGNORE
 
         # Resolve the destination catalog / schema from whichever form the
         # caller passed (UCSchema, dotted string, or explicit kwargs).
@@ -833,9 +858,9 @@ class UCSchema(DatabricksPath):
         def _clone_one(src: "Table") -> tuple[str, str]:
             dst = tgt.table(src.table_name)
             try:
-                if not replace and dst.exists():
+                if skip_existing and dst.exists():
                     return src.table_name, "skipped"
-                src.clone(target=dst, deep=deep, replace=replace, missing_ok=not replace)
+                src.clone(target=dst, deep=deep, mode=sub_mode)
                 return src.table_name, "created"
             except Exception as exc:  # noqa: BLE001 — collect, don't abort the batch
                 logger.warning(

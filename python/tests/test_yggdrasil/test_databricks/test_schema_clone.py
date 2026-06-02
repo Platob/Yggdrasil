@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.schema.schema import UCSchema
+from yggdrasil.enums.mode import Mode
 
 
 def _child(name: str, *, exists: bool = False, is_view: bool = False) -> MagicMock:
@@ -64,9 +65,9 @@ def test_clone_creates_missing_and_skips_present():
     a.clone.assert_called_once()
     c.clone.assert_called_once()
     b.clone.assert_not_called()
-    # missing-create path uses IF NOT EXISTS (missing_ok=True, replace=False)
+    # default (replace=False) forwards IGNORE — skip-if-exists — to sub-clones
     _, kwargs = a.clone.call_args
-    assert kwargs["missing_ok"] is True and kwargs["replace"] is False
+    assert kwargs["mode"] is Mode.IGNORE
 
 
 def test_clone_replace_overwrites_even_when_present():
@@ -78,7 +79,7 @@ def test_clone_replace_overwrites_even_when_present():
         result = src.clone(schema_name="dst", replace=True)
     assert result == {"a": "created"}
     _, kwargs = a.clone.call_args
-    assert kwargs["replace"] is True and kwargs["missing_ok"] is False
+    assert kwargs["mode"] is Mode.OVERWRITE
 
 
 def test_clone_excludes_views_when_requested():
@@ -103,6 +104,41 @@ def test_clone_records_per_child_failure_without_aborting():
     assert result["good"] == "created"
     assert result["bad"].startswith("failed: ")
     good.clone.assert_called_once()
+
+
+def test_clone_mode_overrides_replace_and_forwards_to_sub_clones():
+    # mode=OVERWRITE wins even with replace=False, and is set on every sub-clone.
+    a = _child("a")
+    src, tgt, children = _schema_with_children([a], target_present={"a"})
+    with patch.object(UCSchema, "tables", return_value=iter(children)), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch.object(UCSchema, "table", side_effect=tgt.table):
+        result = src.clone(schema_name="dst", mode=Mode.OVERWRITE)
+    # OVERWRITE never skips an existing target — it overwrites it.
+    assert result == {"a": "created"}
+    _, kwargs = a.clone.call_args
+    assert kwargs["mode"] is Mode.OVERWRITE
+
+
+def test_clone_mode_ignore_skips_existing():
+    a, b = _child("a"), _child("b")
+    src, tgt, children = _schema_with_children([a, b], target_present={"a"})
+    with patch.object(UCSchema, "tables", return_value=iter(children)), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch.object(UCSchema, "table", side_effect=tgt.table):
+        result = src.clone(schema_name="dst", mode="ignore")  # string mode-like
+    assert result == {"a": "skipped", "b": "created"}
+    a.clone.assert_not_called()
+    assert b.clone.call_args.kwargs["mode"] is Mode.IGNORE
+
+
+def test_clone_unsupported_mode_rejected():
+    src, _tgt, _children = _schema_with_children([])
+    try:
+        src.clone(schema_name="dst", mode=Mode.APPEND)
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "clone mode must be" in str(exc)
 
 
 def test_clone_onto_itself_is_rejected():
