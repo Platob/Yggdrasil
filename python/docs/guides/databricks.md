@@ -240,10 +240,6 @@ run = c.genie.agent(planner="databricks-claude-sonnet-4").run(
 print(run.summary())
 ```
 
-The rich `ygg-genie` console drives Genie, raw SQL, catalogs, and the
-autonomous agent from one prompt — see
-[databricks/genie](../modules/databricks/genie/README.md#cli-ygg-genie-rich-console).
-
 See [databricks/genie](../modules/databricks/genie/README.md).
 
 ## CLI
@@ -255,16 +251,15 @@ ygg databricks warehouses list
 ygg databricks clusters list
 ygg databricks genie spaces
 ygg databricks genie ask "How many renewable sites are there?" --space 01ef…
-ygg databricks genie agent "top 3 sites by capacity" --space 01ef…
+ygg databricks genie agent "top 3 sites by capacity" --space 01ef… \
+    --planner databricks-claude-sonnet-4
+ygg databricks genie console --space 01ef…              # interactive
 ```
 
-The autonomous Genie agent also ships as a dedicated console script:
-
-```bash
-ygg-genie --space 01ef… "why did Q3 revenue dip?"      # agent mode
-ygg-genie --space 01ef… --ask "top 5 customers"        # one-shot
-YGG_GENIE_SPACE=01ef… ygg-genie                         # interactive REPL
-```
+`ygg databricks genie` is a rich, Claude-CLI-style console — it drives
+Genie, raw SQL, catalogs, warehouses, and the autonomous agent from one
+prompt. See
+[databricks/genie](../modules/databricks/genie/README.md#cli-ygg-databricks-genie).
 
 ## Troubleshooting
 

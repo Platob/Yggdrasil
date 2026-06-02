@@ -4,7 +4,7 @@ Conversational analytics over Databricks **Genie** — ask questions in
 plain English, get back a natural-language answer, the SQL Genie
 generated, and the result materialised as Arrow / Polars / pandas. Plus a
 self-driving **agent** that turns a single goal into a multi-turn
-investigation, and two CLIs (`ygg databricks genie …` and `ygg-genie`).
+investigation, and a rich `ygg databricks genie` console.
 
 Reached through the single client entrypoint:
 
@@ -14,13 +14,13 @@ from yggdrasil.databricks import DatabricksClient
 genie = DatabricksClient().genie
 ```
 
-![ygg-genie console](ygg-genie.png)
+![ygg databricks genie console](ygg-genie.png)
 
-*A live `ygg-genie` session: the banner shows the active space and the
-autonomous planner; a Genie ask returns an answer + SQL + result table; a
-raw `/sql` runs on the warehouse; and `/agent` drives a fully-autonomous
-investigation (the `databricks-claude-sonnet-4` planner decides each step,
-Genie executes the SQL).*
+*A live `ygg databricks genie console` session: the banner shows the
+active space and the autonomous planner; a Genie ask returns an answer +
+SQL + result table; a raw `/sql` runs on the warehouse; and `/agent`
+drives a fully-autonomous investigation (the `databricks-claude-sonnet-4`
+planner decides each step, Genie executes the SQL).*
 
 ## One-liner
 
@@ -225,7 +225,9 @@ runs it, and summarises. Override per call: `space.ask("…", wait=60)`.
 
 ## CLI — `ygg databricks genie`
 
-The dispatcher sub-command:
+A Claude-CLI-style console: a branded logo, a live spinner while Genie
+thinks, answers in rounded panels, and results in bordered tables. It
+drives the *whole* Databricks surface from one prompt — not just Genie.
 
 ```bash
 # List spaces
@@ -234,45 +236,14 @@ ygg databricks genie spaces
 # One-shot ask (space id or $YGG_GENIE_SPACE)
 ygg databricks genie ask "How many renewable sites are there?" --space 01f133…
 
-# Let the agent drive an investigation
-ygg databricks genie agent "top 3 sites by capacity" --space 01f133… --max-turns 3
-
-# Interactive conversation
-ygg databricks genie repl --space 01f133…
-```
-
-Example `ask` output:
-
-```text
-There are **967** renewable sites according to the data provided.
-
-SQL:
-SELECT COUNT(DISTINCT `id`) AS num_renewable_sites
-FROM `trading_tgp_dev`.`src_site_register`.`raw_ren_sites`
-WHERE `id` IS NOT NULL;
-
-num_renewable_sites
-967
-```
-
-## CLI — `ygg-genie` (rich console)
-
-A Claude-CLI-style terminal: a branded logo, a live spinner while Genie
-thinks, answers in rounded panels, and results in bordered tables. It
-drives the *whole* Databricks surface from one prompt — not just Genie.
-
-```bash
-# Agent mode (default): autonomous investigation, printed transcript
-ygg-genie --space 01ef… "why did Q3 revenue dip?"
-
-# Fully autonomous with an LLM planner
-ygg-genie --space 01ef… --planner databricks-claude-sonnet-4 "explain churn"
-
-# One-shot ask (no follow-ups)
-ygg-genie --space 01ef… --ask "top 5 customers by revenue"
+# Autonomous agent (heuristic, or fully autonomous with an LLM planner)
+ygg databricks genie agent "top 3 sites by capacity" --space 01f133…
+ygg databricks genie agent "explain churn" --space 01f133… \
+    --planner databricks-claude-sonnet-4
 
 # Interactive console
-YGG_GENIE_SPACE=01ef… ygg-genie
+ygg databricks genie console --space 01f133…
+YGG_GENIE_SPACE=01f133… ygg databricks genie console
 ```
 
 Inside the interactive console:
@@ -289,10 +260,9 @@ Inside the interactive console:
 | `/new` · `/help` · `/quit` | reset · help · leave |
 
 The planner LLM defaults to `$YGG_GENIE_PLANNER`
-(`databricks-claude-sonnet-4`); the space to `$YGG_GENIE_SPACE`.
-
-Both CLIs accept the shared Databricks client flags (`--host` / `--token`
-/ `--profile` / …) and fall back to the standard `DATABRICKS_*`
+(`databricks-claude-sonnet-4`); the space to `$YGG_GENIE_SPACE`. The
+command accepts the shared Databricks client flags (`--host` / `--token`
+/ `--profile` / …) and falls back to the standard `DATABRICKS_*`
 environment variables.
 
 ## API reference
