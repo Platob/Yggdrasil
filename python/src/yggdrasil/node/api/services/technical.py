@@ -68,8 +68,14 @@ def _rsi(price: np.ndarray, period: int = 14) -> np.ndarray:
 
 
 def _ema(arr: np.ndarray, span: int) -> np.ndarray:
-    """Standard EMA (span-parameterised, alpha = 2/(span+1)) via polars EWM Rust kernel."""
-    return pl.Series(arr).ewm_mean(span=span, adjust=False, ignore_nulls=True).to_numpy().astype(float)
+    """Standard EMA (alpha = 2/(span+1)) via polars' EWM Rust kernel.
+
+    NaN (e.g. from a Float64 cast of a null price) is mapped to a polars null so
+    ``ignore_nulls=True`` carries the prior EMA forward instead of poisoning the
+    whole recurrence — matching a hand-rolled NaN-skipping EMA loop."""
+    s = pl.Series(arr)
+    s = pl.select(pl.when(s.is_nan()).then(None).otherwise(s).alias("x")).to_series()
+    return s.ewm_mean(span=span, adjust=False, ignore_nulls=True).to_numpy().astype(float)
 
 
 def _sma(arr: np.ndarray, period: int) -> np.ndarray:
