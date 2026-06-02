@@ -59,9 +59,14 @@ class IOStats:
       bytes). ``None`` when no honest answer is available; never
       guess :class:`MimeTypes.OCTET_STREAM` here — let the caller
       decide.
+    - ``metadata`` — free-form backend metadata as a flat
+      ``dict[str, str]`` (S3 response + ``x-amz-meta-*`` headers,
+      Databricks Files headers, ETag, version id, …). ``None`` when the
+      backend exposes nothing extra; a single home for "everything else
+      the backend told us" without subclassing :class:`IOStats`.
 
-    Backends with richer metadata (ETag, content-type, owner…) should
-    subclass and extend rather than cram extras into ``mode``.
+    Backends with richer metadata (ETag, content-type, owner…) populate
+    :attr:`metadata` rather than cramming extras into ``mode``.
     """
 
     size: int = 0
@@ -69,6 +74,7 @@ class IOStats:
     kind: IOKind = IOKind.MISSING
     mode: int = 0
     media_type: "Optional[MediaType]" = None
+    metadata: "Optional[dict[str, str]]" = None
     #: Cached tabular schema (a :class:`yggdrasil.data.Field` /
     #: ``StructField``), or ``None`` when unknown. Lets the stat
     #: snapshot double as the schema cache — a listing / probe that
@@ -85,7 +91,8 @@ class IOStats:
     def __repr__(self):
         dt_ = datetime.datetime.fromtimestamp(self.mtime, datetime.timezone.utc).isoformat()
         field = "" if self.field is None else f" field={self.field!r}"
-        return f"<IOStats size={self.size} mtime={dt_!r} kind={self.kind.name} mode={self.mode} media_type={self.media_type!r}{field}>"
+        meta = "" if not self.metadata else f" metadata={self.metadata!r}"
+        return f"<IOStats size={self.size} mtime={dt_!r} kind={self.kind.name} mode={self.mode} media_type={self.media_type!r}{meta}{field}>"
 
     def __str__(self):
         return repr(self)
@@ -151,6 +158,7 @@ class IOStats:
         kind: Any = ...,
         mode: Any = ...,
         media_type: Any = ...,
+        metadata: Any = ...,
         field: Any = ...,
     ) -> "IOStats":
         """Return a fresh :class:`IOStats` with selected fields overridden.
@@ -166,6 +174,7 @@ class IOStats:
             kind=self.kind if kind is ... else kind,
             mode=self.mode if mode is ... else mode,
             media_type=self.media_type if media_type is ... else media_type,
+            metadata=self.metadata if metadata is ... else metadata,
             field=self.field if field is ... else field,
         )
 
@@ -177,6 +186,7 @@ class IOStats:
         kind: Any = ...,
         mode: Any = ...,
         media_type: Any = ...,
+        metadata: Any = ...,
         field: Any = ...,
         inplace: bool = False,
     ) -> "IOStats":
@@ -195,6 +205,7 @@ class IOStats:
                 kind=kind,
                 mode=mode,
                 media_type=media_type,
+                metadata=metadata,
                 field=field,
             )
         if size is not ...:
@@ -207,6 +218,8 @@ class IOStats:
             self.mode = mode
         if media_type is not ...:
             self.media_type = media_type
+        if metadata is not ...:
+            self.metadata = metadata
         if field is not ...:
             self.field = field
         return self

@@ -5,9 +5,10 @@
 constructs a :class:`yggdrasil.io.holder.Holder` /
 :class:`yggdrasil.io.path.path.Path` from an HTTP URL lands here
 instead of falling back to :class:`Memory`. The holder primitives
-(:meth:`_bread`, :meth:`_bwrite`) issue real requests through an
-attached :class:`HTTPSession`; :meth:`_stat_uncached` does a HEAD
-probe for ``Content-Length`` / ``Last-Modified`` / ``Content-Type``.
+(:meth:`_read_mv` ranged GET, :meth:`_upload` whole-resource PUT) issue
+real requests through an attached :class:`HTTPSession`;
+:meth:`_stat_uncached` does a HEAD probe for ``Content-Length`` /
+``Last-Modified`` / ``Content-Type``.
 
 There is no filesystem surface (HTTP has no directory listing),
 so :meth:`_ls`, :meth:`_mkdir`, :meth:`_remove_dir` raise.
@@ -23,8 +24,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar, Iterator
 
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
-from yggdrasil.enums import Mode, Scheme
-from yggdrasil.io.holder import IO
+from yggdrasil.enums import Scheme
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.path import RemotePath
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
@@ -162,28 +162,27 @@ class HTTPPath(RemotePath):
     # Read / write — GET / PUT
     # ==================================================================
 
-    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
-        del mode  # HTTP is read-only on this hook; mode is informational
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        """Ranged GET → ``memoryview``. ``n < 0`` reads to EOF."""
+        if n == 0:
+            return memoryview(b"")
         from .request import HTTPRequest
 
         headers: dict[str, str] = {}
-        if pos > 0 or (n is not None and n >= 0):
-            end = "" if n is None or n < 0 else str(pos + n - 1)
+        if pos > 0 or n >= 0:
+            end = "" if n < 0 else str(pos + n - 1)
             headers["Range"] = f"bytes={pos}-{end}"
 
         req = HTTPRequest.prepare("GET", self.url, headers=headers or None)
         resp = self.session.send(req)
-        return IO(resp.content, copy=False, media_type=resp.media_type)
+        return memoryview(resp.content or b"")
 
-    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
-        del pos, mode  # HTTP PUT is whole-resource; positional writes
-                       # would require multipart support the server may
-                       # not advertise. Whole-resource semantics match
-                       # the way :meth:`Path.truncate` already round-trips
-                       # the buffer for whole-file backends.
+    def _upload(self, content: bytes) -> int:
+        """Whole-resource PUT. HTTP has no positional write — the body
+        replaces the resource (matching the whole-blob remote contract)."""
         from .request import HTTPRequest
 
-        body = data.to_bytes()
+        body = bytes(content)
         req = HTTPRequest.prepare("PUT", self.url, body=body)
         resp = self.session.send(req)
         if resp.status_code >= 400:

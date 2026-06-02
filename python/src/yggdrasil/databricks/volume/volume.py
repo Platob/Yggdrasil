@@ -373,6 +373,14 @@ class Volume(DatabricksPath):
         # drop the cached Path so the next call resolves against the
         # fresh URL.
         self._storage_path = None
+        # A successful info fetch proves the volume exists — seed the stat
+        # cache (a volume is directory-like) in the same beat so a follow-up
+        # ``exists`` / ``stat`` / ``is_dir`` reuses it instead of re-probing.
+        # Build the IOStats inline (not via ``_stat_uncached``, which routes
+        # back through ``read_info`` → here and would recurse).
+        self._persist_stat_cache(
+            IOStats(kind=IOKind.DIRECTORY, media_type=MediaTypes.DIRECTORY)
+        )
         return info
 
     def _reset_cache(self) -> None:
@@ -381,6 +389,10 @@ class Volume(DatabricksPath):
         self._storage_path = None
         self._catalog = None
         self._schema = None
+        # The info and the stat snapshot describe the same object — drop
+        # them together so a re-probe after a delete / rebind is honest.
+        self._stat_cached = None
+        self._stat_cached_at = 0.0
 
     def clear(self) -> "Volume":
         """Public alias for :meth:`_reset_cache`; returns ``self``."""
@@ -883,6 +895,13 @@ class Volume(DatabricksPath):
 
     def _ls(self, recursive: bool = False, *, singleton_ttl: Any = False) -> Iterator["VolumePath"]:
         pass
+
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a Unity Catalog volume, not a positional "
+            f"byte buffer. Navigate to a file via ``volume.path('<sub/path>')`` "
+            f"and read that instead."
+        )
 
     def full_path(self) -> str:
         return f"/Volumes/{self.catalog_name}/{self.schema_name}/{self.volume_name}"

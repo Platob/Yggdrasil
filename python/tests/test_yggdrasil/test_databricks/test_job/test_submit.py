@@ -9,6 +9,9 @@ runs are not backed by a persisted job, so the handle has no ``job_id``.
 """
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
+from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.jobs import NotebookTask, SubmitTask
 
 from yggdrasil.databricks.job.run import JobRun
@@ -19,6 +22,11 @@ class TestJobsSubmit(DatabricksTestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        # Force a mocked workspace client regardless of the environment: when
+        # DATABRICKS_HOST is set, the base case hands back a *real* client, but
+        # this is a pure unit test of the submit wiring against the SDK boundary.
+        self.workspace_client = MagicMock(spec=WorkspaceClient)
+        object.__setattr__(self.client, "_workspace_client", self.workspace_client)
         JobRun._INSTANCES.clear()
         self.workspace_client.jobs.submit.return_value.run_id = 555
         # submit() fetches the run right after submission so the handle

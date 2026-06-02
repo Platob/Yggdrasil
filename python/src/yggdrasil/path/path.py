@@ -3,7 +3,7 @@
 A :class:`Path` is a byte holder addressed by a URL. The holder
 contract (:meth:`read_mv` / :meth:`write_mv` / :meth:`reserve` /
 :meth:`truncate` / :meth:`clear` / :attr:`size`) routes through two
-whole-file primitives — :meth:`_bread` / :meth:`_bwrite` — that
+positional primitives — :meth:`_read_mv` / :meth:`_write_mv` — that
 subclasses override. There is no buffering at this layer; callers
 that want to coalesce wrap the path in
 :class:`yggdrasil.io.holder.IO`.
@@ -16,8 +16,8 @@ Subclasses implement seven hooks:
 - :meth:`_mkdir`            — create directory
 - :meth:`_remove_file`      — unlink one file
 - :meth:`_remove_dir`       — rmtree
-- :meth:`_bread`            — positional read → :class:`IO`
-- :meth:`_bwrite`           — positional write ← :class:`IO`
+- :meth:`_read_mv`          — positional read → :class:`memoryview`
+- :meth:`_write_mv`         — positional write ← :class:`memoryview`
 
 The pure-path API (parts, name, parent, suffix, joinpath, …)
 delegates straight to :class:`URL` — :class:`Path` adds no parsing
@@ -61,10 +61,10 @@ class Path(IO, os.PathLike, ABC):
 
     1. **Holder I/O** — :meth:`read_mv` / :meth:`write_mv` /
        :meth:`truncate` / :meth:`clear` / :attr:`size` route through
-       :meth:`_bread` / :meth:`_bwrite`. Whole-file by default;
-       backends with native positional I/O (LocalPath via
-       ``os.pread``/``os.pwrite``) override the holder primitives
-       directly.
+       :meth:`_read_mv` / :meth:`_write_mv`. Backends with native
+       positional I/O (LocalPath via ``os.pread``/``os.pwrite``)
+       override these directly; whole-blob backends (RemotePath) splice
+       via a download / re-upload.
     2. **Filesystem** — :meth:`stat`, :meth:`exists`, :meth:`is_file`,
        :meth:`is_dir`, :meth:`iterdir`, :meth:`mkdir`, :meth:`unlink`,
        :meth:`remove`. All thin wrappers over the abstract hooks.
@@ -198,24 +198,27 @@ class Path(IO, os.PathLike, ABC):
         """Remove the directory at this path."""
 
     @abstractmethod
-    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
-        """Positional read → fresh :class:`IO`. ``n < 0`` → to EOF.
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        """Positional read → :class:`memoryview`. ``n < 0`` → to EOF.
 
-        Caller owns the returned buffer (must close it). Whole-file
-        backends materialize the full payload and slice.
+        Receives a non-negative, in-range ``(n, pos)`` from
+        :meth:`read_mv` (bounds + negative-index normalization happen
+        there). Whole-blob backends materialize the object and slice;
+        positional backends (LocalPath) read the window directly. A
+        missing object raises :class:`FileNotFoundError`.
         """
 
     @abstractmethod
-    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
+    def _write_mv(self, data: memoryview, pos: int) -> int:
         """Splice *data* at *pos* on the backing. Returns bytes written.
 
-        ``mode`` carries disposition (OVERWRITE / APPEND /
-        ERROR_IF_EXISTS) for backends that need it on every call;
-        positional backends honour caller intent regardless.
+        Positional backends write the window in place; whole-blob
+        backends (RemotePath) read-modify-write the object. Size
+        management and dirty-marking happen in :meth:`write_mv`.
         """
 
     # ==================================================================
-    # Holder primitives — built on _bread / _bwrite
+    # Holder primitives — built on _read_mv / _write_mv
     # ==================================================================
 
     @property
@@ -228,43 +231,53 @@ class Path(IO, os.PathLike, ABC):
             return int(cached.size)
         return int(self._stat().size)
 
-    def _read_mv(self, n: int, pos: int) -> memoryview:
-        bio = self._bread(n, pos, Mode.READ_ONLY)
-        try:
-            return memoryview(bio.to_bytes())
-        finally:
-            bio.close()
+    def _stat_cached_fresh(self) -> "IOStats | None":
+        """Return the cached :class:`IOStats` when still inside its TTL.
 
-    def _write_mv(self, data: memoryview, pos: int) -> int:
-        scratch = IO(bytes(data))
-        scratch.open()
-        try:
-            return self._bwrite(scratch, pos, Mode.OVERWRITE)
-        finally:
-            scratch.close()
+        ``None`` when the slot is empty *or* the entry has expired
+        past :attr:`stat_cache_ttl`. Subclasses that always want a
+        fresh probe (e.g. test scaffolding) override
+        :attr:`stat_cache_ttl` to ``0`` so this method always returns
+        ``None``.
+        """
+        cached = self._stat_cached
+        if cached is None:
+            return None
+        ttl = self.STAT_CACHE_TTL
+        if ttl is None:
+            return cached
+        if ttl <= 0:
+            return None
+        if (time.monotonic() - self._stat_cached_at) <= ttl:
+            return cached
+        return None
 
     def reserve(self, n: int) -> None:
         """No-op by default — files have no separate capacity layer."""
         del n
 
     def truncate(self, n: int) -> int:
+        """Resize to exactly *n* bytes via read-modify-write.
+
+        The generic whole-file fallback: download, slice / zero-extend,
+        re-write. Backends with a native resize (LocalPath
+        ``os.ftruncate``, RemotePath's single upload) override this.
+        """
         if n < 0:
             raise ValueError(f"truncate size must be >= 0, got {n!r}")
         current = self.size
         if n == current:
             return n
-        bio = self._bread(-1, 0, Mode.READ_ONLY)
-        try:
-            bio.truncate(n)
-            bio.seek(0)
-            self._bwrite(bio, 0, Mode.OVERWRITE)
-            # The backing is now ``n`` bytes — reflect it in the stat
-            # cache so a seeded entry (from a listing) doesn't keep
-            # reporting the pre-truncate size.
-            self._touch_stat(size=n)
-            return n
-        finally:
-            bio.close()
+        existing = bytes(self._read_mv(current, 0)) if current > 0 else b""
+        if n <= len(existing):
+            payload = existing[:n]
+        else:
+            payload = existing + b"\x00" * (n - len(existing))
+        self._write_mv(memoryview(payload), 0)
+        # The backing is now ``n`` bytes — reflect it in the stat cache so a
+        # seeded entry (from a listing) doesn't keep reporting the old size.
+        self._touch_stat(size=n)
+        return n
 
     def _clear(self) -> None:
         """:class:`Holder` primitive: drop the backing entirely (idempotent)."""
@@ -387,7 +400,15 @@ class Path(IO, os.PathLike, ABC):
                 f"{self.full_path()!r} is a directory — use ``remove()`` "
                 "for the recursive-delete path; ``unlink`` is files-only."
             )
-        return self.remove(missing_ok=missing_ok, wait=wait, recursive=False)
+        # We've just established the kind; delete the file directly rather
+        # than routing through ``remove()`` (which would re-clear the cache
+        # and re-stat — a wasted backend round trip on remote paths).
+        if kind == IOKind.MISSING:
+            if not missing_ok:
+                raise FileNotFoundError(f"{self.full_path()!r} does not exist")
+            return
+        self._remove_file(missing_ok=missing_ok, wait=WaitingConfig.from_(wait))
+        self.invalidate_singleton()
 
     def remove(
         self,

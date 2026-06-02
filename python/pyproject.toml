@@ -79,6 +79,13 @@ databricks = [
   "databricks-sdk>=0.107",
 ]
 
+# AWS / S3. The S3Path data plane is pure-HTTP (SigV4), but credential
+# resolution + the refreshable-credentials provider (incl. Databricks-vended
+# temporary volume/table credentials) ride botocore.
+aws = [
+  "boto3>=1.34",
+]
+
 pickle = [
   "cloudpickle",
   "dill>=0.4",

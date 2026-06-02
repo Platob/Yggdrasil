@@ -336,11 +336,10 @@ class WorkspacePyPIRegistry:
                 <package>-<other-version>-py3-none-any.whl
                 ...
 
-    ``base_path`` defaults to
-    ``/Workspace/Users/<me>/.ygg/pypi/simple`` so a single-user
-    install Just Works without an admin first; pass an explicit
-    workspace path (``/Workspace/Shared/...``) to share across a
-    team.
+    ``base_path`` defaults to the shared ``/Workspace/Shared/pypi`` — the same
+    workspace-wide index the serverless job image deploys to — so the Spark
+    Connect path and the job image reuse one registry. Pass an explicit
+    workspace path for a private / per-user root.
 
     :meth:`publish` is the entry point. It classifies the dep,
     builds a wheel locally when needed, uploads it to the
@@ -362,7 +361,11 @@ class WorkspacePyPIRegistry:
     base_path: "WorkspacePath" = field(default=None)  # type: ignore[assignment]
     local_cache: _LocalPath = field(default=None)  # type: ignore[assignment]
 
-    DEFAULT_BASE: ClassVar[str] = "/Workspace/Users/<me>/.ygg/pypi/simple"
+    #: Shared workspace registry root — the same PyPI-like index the ygg image
+    #: deploys to (``yggdrasil.databricks.job.wheel.WORKSPACE_PYPI_DIR``), so the
+    #: Spark Connect path and the serverless job image share one workspace-wide
+    #: index. Pass an explicit ``base_path`` for a private / per-user root.
+    DEFAULT_BASE: ClassVar[str] = "/Workspace/Shared/pypi"
 
     def __post_init__(self) -> None:
         from yggdrasil.databricks.fs.workspace_path import WorkspacePath
@@ -529,23 +532,39 @@ class WorkspacePyPIRegistry:
         )
 
     def _pip_wheel(self, info: DependencyInfo) -> _LocalPath:
-        """Run ``pip wheel`` and return the produced file."""
-        with tempfile.TemporaryDirectory(prefix="ygg-pip-wheel-") as raw:
+        """Build the project wheel (no deps) and return the produced file.
+
+        Prefers **uv** (``uv build --wheel`` from the source tree — no separate
+        pip needed); falls back to ``pip wheel <name> --no-deps`` when uv isn't
+        on PATH or the dep has no local source directory."""
+        with tempfile.TemporaryDirectory(prefix="ygg-build-wheel-") as raw:
             outdir = _LocalPath(raw)
-            cmd = [
-                sys.executable, "-m", "pip", "wheel", info.name,
-                "--no-deps", "-w", str(outdir),
-            ]
-            try:
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-                stderr = getattr(exc, "stderr", "") or str(exc)
-                raise _WheelBuildError(stderr) from exc
+
+            built_via_uv = False
+            if info.source is not None and info.source.is_dir():
+                try:
+                    subprocess.run(
+                        ["uv", "build", "--wheel", "--out-dir", str(outdir),
+                         str(info.source)],
+                        check=True, capture_output=True, text=True,
+                    )
+                    built_via_uv = True
+                except FileNotFoundError:
+                    pass  # uv not installed — fall through to pip
+                except subprocess.CalledProcessError as exc:
+                    stderr = getattr(exc, "stderr", "") or str(exc)
+                    raise _WheelBuildError(stderr) from exc
+
+            if not built_via_uv:
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "pip", "wheel", info.name,
+                         "--no-deps", "-w", str(outdir)],
+                        check=True, capture_output=True, text=True,
+                    )
+                except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                    stderr = getattr(exc, "stderr", "") or str(exc)
+                    raise _WheelBuildError(stderr) from exc
 
             wheels = sorted(outdir.glob("*.whl"))
             if not wheels:

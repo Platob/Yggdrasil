@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -166,6 +167,30 @@ class Awaitable(ABC):
         wc = WaitingConfig.from_(wait)
         return self._wait(wc, raise_error=raise_error)
 
+    def _retry_backoff(self, wait: "WaitingConfig", start: float) -> float:
+        """Seconds to sleep before re-submitting a retryable failure.
+
+        Zero by default — most awaitables retry promptly. Subclasses whose
+        retries contend (e.g. a warehouse statement hitting
+        ``DELTA_CONCURRENT_APPEND`` under N concurrent writers) override
+        this with a jittered backoff so retries don't collide in lockstep.
+        """
+        del wait, start
+        return 0.0
+
+    @staticmethod
+    def _jittered_backoff(
+        attempts: int, wait: "WaitingConfig", start: float, *, cap: float = 5.0,
+    ) -> float:
+        """Exponential backoff with full jitter, bounded by *cap* and the
+        remaining wait budget — the building block subclasses use in
+        :meth:`_retry_backoff`."""
+        backoff = min(0.1 * (2 ** max(0, attempts - 1)), cap)
+        backoff += random.uniform(0.0, backoff or 0.1)
+        if wait.timeout > 0:
+            backoff = min(backoff, max(0.0, wait.timeout - (time.time() - start)))
+        return max(0.0, backoff)
+
     def _wait(
         self,
         wait: WaitingConfig,
@@ -200,6 +225,9 @@ class Awaitable(ABC):
                             "%s retry %d: %s",
                             type(self).__name__, self._attempts, self.error,
                         )
+                        delay = self._retry_backoff(wait, start)
+                        if delay > 0:
+                            time.sleep(delay)
                         self.start(reset=True, wait=False)
                         iteration = 0
                         continue
@@ -311,6 +339,9 @@ class Awaitable(ABC):
                             "%s retry %d: %s",
                             type(self).__name__, self._attempts, self.error,
                         )
+                        delay = self._retry_backoff(wait, start)
+                        if delay > 0:
+                            time.sleep(delay)
                         self.start(reset=True, wait=False)
                         iteration = 0
                         continue

@@ -247,6 +247,7 @@ class TestSparkCoalesce(SparkTestCase):
         )
 
     def test_partition_count_le_default_parallelism(self) -> None:
+        self.skip_if_spark_connect()   # sparkContext / rdd are JVM-only
         partitions = {
             f"p{i}": [{"id": i, "value": f"v{i}"}]
             for i in range(20)

@@ -2384,10 +2384,18 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         offset: int = 0,
         *,
         size: int = -1,
-        overwrite: bool = False,
+        overwrite: "bool | None" = None,
         cursor: bool = False,
     ) -> int:
         """Splice ``data`` at ``offset``. Returns bytes written.
+
+        ``overwrite`` defaults to ``None`` → **resolved**: a whole-content write
+        from the start (``offset == 0``, ``size == -1``, no cursor) replaces the
+        object (pathlib ``write_bytes`` truncate semantics), so a whole-blob
+        remote backend does it in a *single* PUT instead of a stat + read-page +
+        upload read-modify-write. A positional / cursor / size-capped write is a
+        splice that preserves the rest, so it resolves to ``False``. Pass an
+        explicit ``True`` / ``False`` to force either.
 
         ``size`` caps the byte count written — ``size=-1``
         (default) writes the entire source; ``size>=0`` writes at
@@ -2413,6 +2421,8 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         :meth:`_write_mv`, :meth:`_write_stream`, and / or
         :meth:`_write_holder` rather than this dispatch.
         """
+        if overwrite is None:
+            overwrite = offset == 0 and size == -1 and not cursor
         if isinstance(data, str):
             data = data.encode("utf-8")
         if isinstance(data, IO):
@@ -3429,7 +3439,15 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         """
         holder = self._parent if self._parent is not None else self
         if not append and getattr(holder, "SUPPORTS_STREAMING_UPLOAD", False):
-            return holder._upload_stream(source)
+            n = holder._upload_stream(source)
+            # A streaming commit replaces the whole object — supersede any
+            # acquire-time write scratch (e.g. the empty scratch an
+            # ``open("wb")`` truncate seeds) so the release flush doesn't
+            # clobber the streamed bytes with it.
+            discard = getattr(holder, "_discard_scratch", None)
+            if discard is not None:
+                discard()
+            return n
         return self._commit_format_payload(source.read_bytes(), append=append)
 
     def _commit_format_payload(

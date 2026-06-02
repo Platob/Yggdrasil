@@ -1041,65 +1041,19 @@ class DatabricksPath(RemotePath, DatabricksResource):
         Whole-file shape (``n < 0`` and ``pos == 0``) skips the size
         probe entirely. Partial / positional reads keep the base
         bounds check so out-of-range windows still raise.
-
-        Buffered state (dirty pages from an in-flight write, or a
-        cached buffered tip) routes through the page-cache path on
-        :class:`RemotePath` instead — the dirty pages aren't on the
-        backend yet, and the fast path would silently miss them.
         """
         if cursor:
             offset = self._pos
-        buffered = self._page_size is not None and (
-            self._dirty_pages or self._buffered_size is not None
-        )
-        if size < 0 and offset == 0 and not buffered:
+        if size < 0 and offset == 0 and self._scratch is None:
             # ``FileNotFoundError`` propagates — semantics match the
             # base ``Holder.read_mv`` which would raise on a stat
-            # probe against a missing object. The :meth:`_bread`
-            # fallback (used by base ``Path`` methods like
-            # :meth:`truncate`) is the only place that swallows it
-            # into an empty buffer.
+            # probe against a missing object. An in-flight write buffer
+            # takes precedence — defer to RemotePath's buffer-aware read.
             out = self._read_mv(-1, 0)
             if cursor:
                 self._pos = len(out)
             return out
         return super().read_mv(size, offset, cursor=cursor)
-
-    def _bread(self, n: int, pos: int, mode):  # pragma: no cover - thin shim
-        """Fallback whole-file read into a fresh :class:`IO`.
-
-        Aggressive path: ``n`` is forwarded straight to :meth:`_read_mv`,
-        which handles ``n < 0`` as "read to EOF". The previous version
-        gated this on a ``_stat()`` probe to compute the size — that's
-        one extra round trip per ``read_bytes`` / Arrow open on every
-        Databricks surface, and the backends each download the whole
-        object anyway. Catching :class:`FileNotFoundError` on the real
-        call gives the same "missing → empty buffer" semantics without
-        the precondition.
-        """
-        from yggdrasil.io.holder import IO
-
-        del mode
-        if n == 0:
-            return IO()
-        try:
-            data = bytes(self._read_mv(n, pos))
-        except FileNotFoundError:
-            data = b""
-        return IO(data)
-
-    def _bwrite(self, data, pos: int, mode) -> int:  # pragma: no cover
-        """Fallback whole-file write from a :class:`IO`."""
-        del mode
-        if hasattr(data, "to_bytes"):
-            payload = data.to_bytes()
-        elif hasattr(data, "read"):
-            payload = data.read()
-        else:
-            payload = bytes(data)
-        if not payload:
-            return 0
-        return self._write_mv(memoryview(payload), pos)
 
     # ------------------------------------------------------------------
     # Fast whole-file write — no stat / resize / truncate overhead

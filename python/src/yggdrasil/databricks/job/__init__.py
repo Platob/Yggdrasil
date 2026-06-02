@@ -7,6 +7,7 @@ single run with the :class:`Awaitable` lifecycle (wait, cancel, repair).
 :class:`JobTask` provides per-task introspection within a run.
 """
 
+from .dag import JobDag, JobDagNode
 from .job import Job
 from .run import JobRun, JobTask
 from .service import Jobs, JobRuns
@@ -27,6 +28,8 @@ __all__ = [
     "Flow",
     "Future",
     "Job",
+    "JobDag",
+    "JobDagNode",
     "JobRun",
     "JobRuns",
     "Jobs",

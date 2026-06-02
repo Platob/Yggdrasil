@@ -127,6 +127,13 @@ def _whole_batch_polars(df: "pl.DataFrame") -> "pl.DataFrame":
 
 class TestDatasetApplySignatures(SparkTestCase):
 
+    def setUp(self) -> None:
+        super().setUp()
+        # Every test here runs a user function on the cluster (apply / map /
+        # parallelize) — needs Python UDFs, which a Spark Connect session only
+        # supports with a matching client/server Python minor version.
+        self.skip_if_no_udf()
+
     def test_single_arg_dynamic_to_typed(self) -> None:
         dyn = SparkDataset.from_iterable(range(5), spark_session=self.spark)
         out = dyn.apply(_single_arg, _OUT_SCHEMA)

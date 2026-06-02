@@ -44,7 +44,6 @@ caches your service uses.
 """
 from __future__ import annotations
 
-import os
 import unittest
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
@@ -68,12 +67,15 @@ def _import_sdk():
 class DatabricksTestCase(unittest.TestCase):
     """Base class for Databricks service / resource unit tests."""
 
-    #: Workspace host used for the synthetic client.
-    HOST: str = os.getenv("DATABRICKS_HOST", "https://test.databricks.net")
+    #: Workspace host used for the synthetic client. A fixed placeholder —
+    #: deliberately **not** read from ``DATABRICKS_HOST`` so a unit test run
+    #: stays hermetic (mock-only) even when live credentials are exported.
+    #: Real-call coverage lives in :class:`DatabricksIntegrationCase`.
+    HOST: str = "https://test.databricks.net"
 
     #: Service-account / PAT placeholder used to satisfy ``DatabricksClient``
     #: at construction time. No real authentication is ever performed.
-    TOKEN: str = os.getenv("DATABRICKS_TOKEN", "fake-pat-not-a-secret")
+    TOKEN: str = "fake-pat-not-a-secret"
 
     #: Default Unity catalog name handed to tests that need a three-part
     #: identifier without caring which catalog they target. Override on the
@@ -94,20 +96,14 @@ class DatabricksTestCase(unittest.TestCase):
 
         WorkspaceClient, AccountClient = _import_sdk()
 
-        env = os.getenv("DATABRICKS_HOST")
-
-        if env:
-            self.client = DatabricksClient(host=env)
-            self.workspace_client = self.client.workspace_client()
-            self.account_client = MagicMock(spec=AccountClient)
-            self.workspace_config = self.client.workspace_config
-            self.account_config = MagicMock()
-        else:
-            self.client = DatabricksClient(host=self.HOST, token=self.TOKEN, auth_type="pat")
-            self.workspace_client = MagicMock(spec=WorkspaceClient)
-            self.account_client = MagicMock(spec=AccountClient)
-            self.workspace_config = MagicMock()
-            self.account_config = MagicMock()
+        # Always mock — unit tests never touch a live workspace, even when
+        # ``DATABRICKS_HOST`` / ``DATABRICKS_TOKEN`` are exported (those drive
+        # the integration suite, not this one).
+        self.client = DatabricksClient(host=self.HOST, token=self.TOKEN, auth_type="pat")
+        self.workspace_client = MagicMock(spec=WorkspaceClient)
+        self.account_client = MagicMock(spec=AccountClient)
+        self.workspace_config = MagicMock()
+        self.account_config = MagicMock()
 
         self._clear_databricks_caches()
 

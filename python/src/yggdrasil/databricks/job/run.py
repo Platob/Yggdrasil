@@ -12,7 +12,7 @@ state within a run.
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TYPE_CHECKING
 
 from databricks.sdk.service.jobs import (
     Run as SDKRun,
@@ -29,6 +29,9 @@ from yggdrasil.url import URL
 
 from .service import JobRuns, _is_numeric
 from ..resource import DatabricksResource
+
+if TYPE_CHECKING:
+    from .dag import JobDag
 
 __all__ = ["JobRun", "JobTask"]
 
@@ -261,7 +264,28 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
         raw_tasks = d.tasks if d else None
         if not raw_tasks:
             return []
-        return [JobTask(t) for t in raw_tasks]
+        return [JobTask(t, run=self) for t in raw_tasks]
+
+    def task(self, key: str) -> "JobTask | None":
+        """The awaitable :class:`JobTask` for *key*, or ``None`` if absent.
+
+        ``run.task("ingest").wait()`` blocks until that single task reaches a
+        terminal state (by polling this run)."""
+        for t in self.tasks:
+            if t.task_key == key:
+                return t
+        return None
+
+    def dag(self) -> "JobDag":
+        """The run's task graph with live per-task state — see
+        :class:`~yggdrasil.databricks.job.dag.JobDag`."""
+        from .dag import JobDag
+
+        d = self.details
+        return JobDag.from_tasks(
+            (d.tasks if d else None) or (),
+            state_of=lambda t: _resolve_state(t.state),
+        )
 
     # ------------------------------------------------------------------ #
     # Output
@@ -270,6 +294,83 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
     def output(self) -> Any:
         sdk = self.client.workspace_client().jobs
         return sdk.get_run_output(run_id=self.run_id)
+
+    def results(self) -> dict[str, Any]:
+        """Best-effort per-task output: ``task_key`` → SDK ``RunOutput``.
+
+        One ``get_run_output`` call per task run id; tasks whose output can't be
+        fetched (no id yet, or an output-less task type) are simply omitted. The
+        run must be waited on first for outputs to be meaningful."""
+        sdk = self.client.workspace_client().jobs
+        out: dict[str, Any] = {}
+        for t in self.tasks:
+            task_run_id = t.run_id
+            if task_run_id is None:
+                continue
+            try:
+                out[t.task_key] = sdk.get_run_output(run_id=task_run_id)
+            except Exception:  # noqa: BLE001 - best-effort per-task output
+                continue
+        return out
+
+    def task_output(self, key: str) -> Any | None:
+        """SDK ``RunOutput`` for the task *key* (or ``None``)."""
+        t = self.task(key)
+        return t.output() if t is not None else None
+
+    def logs(self, task_key: str | None = None) -> Any:
+        """Captured console output. With *task_key*, that task's log text; without
+        it, a ``{task_key: log text}`` map across all tasks (``None`` entries for
+        tasks with no fetchable output)."""
+        if task_key is not None:
+            t = self.task(task_key)
+            return t.logs if t is not None else None
+        return {t.task_key: t.logs for t in self.tasks}
+
+    @property
+    def stdout(self) -> str:
+        """Every task's captured stdout, each section prefixed by its task key —
+        a single string ready to print when debugging."""
+        parts: list[str] = []
+        for t in self.tasks:
+            log = t.logs
+            if log:
+                parts.append(f"===== [{t.task_key}] stdout =====\n{log.rstrip()}")
+        return "\n".join(parts)
+
+    @property
+    def stderr(self) -> str:
+        """Every failed task's error trace, each prefixed by its task key."""
+        parts: list[str] = []
+        for t in self.tasks:
+            err = t.stderr
+            if err:
+                parts.append(f"===== [{t.task_key}] stderr =====\n{err.rstrip()}")
+        return "\n".join(parts)
+
+    def debug(self) -> str:
+        """A human-readable dump — run state, the task DAG, and each task's
+        state + stdout + stderr — for eyeballing or pasting into a bug report.
+
+        One ``get_run_output`` call per task, so call it on a terminal run."""
+        lines = [f"JobRun {self.run_id} — {self.state.name}"]
+        if self.state_message:
+            lines.append(f"  {self.state_message}")
+        lines += ["", self.dag().render(), ""]
+        for t in self.tasks:
+            lines.append(f"----- [{t.task_key}] {t.state.name} -----")
+            out = t.output()
+            log = getattr(out, "logs", None) if out is not None else None
+            if log:
+                lines.append(log.rstrip())
+            err = (
+                (getattr(out, "error_trace", None) or getattr(out, "error", None))
+                if out is not None else None
+            )
+            if err:
+                lines.append("-- stderr --")
+                lines.append(err.rstrip())
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
     # Awaitable contract
@@ -341,16 +442,27 @@ class JobRun(Singleton, DatabricksResource, Awaitable):
 # ---------------------------------------------------------------------------
 
 
-class JobTask:
-    """Read-only wrapper around a single task within a job run."""
+class JobTask(Awaitable):
+    """A single task within a job run — an awaitable handle.
 
-    __slots__ = ("_raw",)
+    Built from a run's task list with a back-reference to the parent
+    :class:`JobRun`, so :meth:`wait` (the :class:`Awaitable` contract) polls the
+    run until *this* task reaches a terminal state. Constructed without a parent
+    (``run=None``) it's a static read-only snapshot of the task at build time.
 
-    def __init__(self, raw: SDKRunTask):
+    The ``is_done`` / ``is_succeeded`` / ``is_failed`` / ``wait`` / ``cancel``
+    surface comes from :class:`Awaitable`; :attr:`state` tracks the last polled
+    task state. A task can't be cancelled in isolation — :meth:`_cancel` cancels
+    the whole parent run.
+    """
+
+    def __init__(self, raw: SDKRunTask, run: "JobRun | None" = None):
         self._raw = raw
+        self._run = run
+        self._state = _resolve_state(raw.state)
 
     def __repr__(self) -> str:
-        return f"JobTask({self.task_key!r}, state={self.state})"
+        return f"JobTask({self.task_key!r}, state={self._state})"
 
     @property
     def raw(self) -> SDKRunTask:
@@ -361,7 +473,13 @@ class JobTask:
         return self._raw.task_key
 
     @property
+    def run(self) -> "JobRun | None":
+        """The parent run this task belongs to (``None`` for a snapshot)."""
+        return self._run
+
+    @property
     def run_id(self) -> int | None:
+        """This task's own run id (used to fetch its output)."""
         return self._raw.run_id
 
     @property
@@ -373,13 +491,14 @@ class JobTask:
         return self._raw.state
 
     @property
-    def state(self) -> State:
-        return _resolve_state(self._raw.state)
-
-    @property
     def state_message(self) -> str | None:
         rs = self._raw.state
         return rs.state_message if rs else None
+
+    @property
+    def result_state(self) -> RunResultState | None:
+        rs = self._raw.state
+        return rs.result_state if rs else None
 
     @property
     def start_time_ms(self) -> int | None:
@@ -399,21 +518,80 @@ class JobTask:
         return ms / 1000.0 if ms is not None else None
 
     @property
-    def is_done(self) -> bool:
-        return self.state.is_done
-
-    @property
-    def is_succeeded(self) -> bool:
-        return self.state.is_succeeded
-
-    @property
-    def is_failed(self) -> bool:
-        return self.state.is_failed
-
-    @property
     def description(self) -> str | None:
         return self._raw.description
 
     @property
     def cluster_instance(self):
         return self._raw.cluster_instance
+
+    # ------------------------------------------------------------------ #
+    # Output / logs — for debugging a run
+    # ------------------------------------------------------------------ #
+
+    def output(self) -> Any | None:
+        """SDK ``RunOutput`` for this task's run (logs / error / notebook
+        result), or ``None`` when there's no parent run or run id yet, or the
+        task type produces no fetchable output."""
+        if self._run is None or self._raw.run_id is None:
+            return None
+        sdk = self._run.client.workspace_client().jobs
+        try:
+            return sdk.get_run_output(run_id=self._raw.run_id)
+        except Exception:  # noqa: BLE001 - output fetch is best-effort
+            return None
+
+    @property
+    def logs(self) -> str | None:
+        """Captured console output (Databricks merges stdout + stderr into one
+        ``logs`` stream). ``None`` when unavailable."""
+        out = self.output()
+        return getattr(out, "logs", None) if out is not None else None
+
+    #: Alias — Databricks captures the task's console *stdout* in ``logs``.
+    stdout = logs
+
+    @property
+    def stderr(self) -> str | None:
+        """The failure detail — the error traceback, falling back to the error
+        message. ``None`` for a task that didn't error."""
+        out = self.output()
+        if out is None:
+            return None
+        return getattr(out, "error_trace", None) or getattr(out, "error", None)
+
+    @property
+    def error_message(self) -> str | None:
+        """Short error message for a failed task (no traceback)."""
+        out = self.output()
+        return getattr(out, "error", None) if out is not None else None
+
+    # ------------------------------------------------------------------ #
+    # Awaitable contract — poll the parent run for this task's state
+    # ------------------------------------------------------------------ #
+
+    def _start(self) -> None:
+        """Tasks start when their run starts — nothing to trigger here."""
+
+    def _poll(self) -> None:
+        if self._run is None:
+            self._state = _resolve_state(self._raw.state)
+            return
+        self._run.refresh()
+        for t in (self._run.details.tasks or ()):
+            if t.task_key == self.task_key:
+                self._raw = t
+                break
+        self._state = _resolve_state(self._raw.state)
+
+    def _error_for_status(self) -> BaseException | None:
+        msg = self.state_message or f"Task {self.task_key!r} failed"
+        return RuntimeError(
+            f"Task {self.task_key!r} failed ({self.result_state}): {msg}"
+        )
+
+    def _cancel(self) -> None:
+        if self._run is not None:
+            self._run.cancel(wait=False, raise_error=False)
+        self._state = State.CANCELED
+        self._sleeper.set()

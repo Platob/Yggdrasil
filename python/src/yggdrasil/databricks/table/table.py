@@ -350,6 +350,30 @@ YGG_SCHEMA_FIELD_PREFIX = "ygg.schema["
 YGG_SCHEMA_FIELD_SUFFIX = "]"
 
 
+def _sql_literal(value: Any) -> "str | None":
+    """Render *value* as a SQL literal for an ``IN`` list, or ``None`` when it
+    can't be safely rendered (``NULL`` — which ``IN`` wouldn't match anyway — or
+    an unsupported type). Used to inline partition values into a MERGE filter."""
+    import datetime
+    import decimal
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return "'" + value.isoformat() + "'"
+    return None
+
+
 def _ygg_schema_key(name: str) -> str:
     """Build the ``ygg.schema[<name>]`` TBLPROPERTIES key for a field."""
     return f"{YGG_SCHEMA_FIELD_PREFIX}{name}{YGG_SCHEMA_FIELD_SUFFIX}"
@@ -527,12 +551,6 @@ class Table(DatabricksPath):
                 f"URL {url} has too many parts to resolve against a Table "
                 f"(got {n}, expected 1-4)."
             )
-
-    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
-        raise NotImplementedError("Table is a read-only resource")
-
-    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
-        raise NotImplementedError("Table is a read-only resource")
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents, exist_ok
@@ -1220,6 +1238,16 @@ class Table(DatabricksPath):
             Column.from_api(table=self, infos=col_info)
             for col_info in (infos.columns or [])
         ]
+        # A successful info fetch proves the table exists — seed the stat
+        # cache in the same beat (built inline to avoid recursing through
+        # ``_stat_uncached`` → ``read_infos`` → here) so a follow-up
+        # ``exists`` / ``stat`` reuses it.
+        self._persist_stat_cache(
+            IOStats(
+                kind=IOKind.DIRECTORY,
+                media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_TABLE,
+            )
+        )
         logger.debug(
             "Stored info for table %r (id=%s, columns=%d, type=%s)",
             self, getattr(infos, "table_id", None),
@@ -2627,20 +2655,24 @@ class Table(DatabricksPath):
         staged Parquet + a JSON operation log are written under the table's
         ``.sql/async`` area and a file-arrival job (:meth:`async_job`)
         aggregates and loads them later — no warehouse statement runs here.
-        Only ``OVERWRITE`` / ``APPEND`` with no ``match_by`` qualify; anything
-        else (or a query / Spark source) falls through to the normal
-        synchronous path.
+        ``OVERWRITE`` / ``APPEND`` (no keys) and ``MERGE`` / ``UPSERT`` (with
+        ``match_by`` keys) qualify; anything else (or a query / Spark source)
+        falls through to the normal synchronous path.
         """
         from yggdrasil.databricks.table.insert import ASYNC_MODES, stage_async_insert
 
+        mode_enum = Mode.from_(mode, default=Mode.APPEND)
+        keyed = mode_enum in (Mode.MERGE, Mode.UPSERT)
+        async_supported = (mode_enum in ASYNC_MODES and not match_by) or (
+            keyed and match_by
+        )
         if (
             wait is False
-            and not match_by
-            and Mode.from_(mode, default=Mode.APPEND) in ASYNC_MODES
+            and async_supported
             and not isinstance(data, (PreparedStatement, StatementResult))
             and not PreparedStatement.looks_like_query(data)
         ):
-            return stage_async_insert(self, data, mode=mode, **kwargs)
+            return stage_async_insert(self, data, mode=mode, match_by=match_by, **kwargs)
         return self.insert_into(
             data,
             mode=mode,
@@ -2803,18 +2835,21 @@ class Table(DatabricksPath):
     # async insert — drop Parquet + an operation log; a file-arrival job loads
     # =========================================================================
 
-    def async_job(self) -> Any:
+    def async_job(self, *, rebuild: bool = False) -> Any:
         """Get-or-create the file-arrival loader job for this table; return it.
 
-        Builds + uploads the full ygg wheel and upserts a serverless job that
-        watches ``.sql/async/logs`` and aggregates the operation logs
-        ``insert(..., wait=False)`` drops into one load per target (an
-        OVERWRITE supersedes everything staged before it).
+        An existing job is returned as-is; otherwise one is created — resolving
+        the full ygg wheel bundle for the current version (reusing an
+        already-deployed bundle when present, else building + uploading it) and
+        upserting a serverless job that watches ``.sql/async/logs`` and
+        aggregates the operation logs ``insert(..., wait=False)`` drops into one
+        load per target (an OVERWRITE supersedes everything staged before it).
+        Pass ``rebuild=True`` to force a redeploy.
         See :func:`~yggdrasil.databricks.table.insert.ensure_async_job`.
         """
         from yggdrasil.databricks.table.insert import ensure_async_job
 
-        return ensure_async_job(self)
+        return ensure_async_job(self, rebuild=rebuild)
 
     def arrow_insert(
         self,
@@ -2928,6 +2963,7 @@ class Table(DatabricksPath):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
+        partition_filters: Optional[list[str]] = None,
     ) -> "StatementBatch | Tabular | None":
         """Insert into this table using Spark.
 
@@ -3037,6 +3073,7 @@ class Table(DatabricksPath):
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
                 safe_merge=safe_merge,
+                partition_filters=partition_filters,
             )
 
         retry_cfg = _resolve_retry(retry)
@@ -3142,6 +3179,27 @@ class Table(DatabricksPath):
         if location is None:
             return None
         return self.aws().s3.path(location)
+
+    def delta(self) -> "DeltaFolder":
+        """Return a :class:`~yggdrasil.io.delta.DeltaFolder` over this table's
+        backing storage — the native Delta read/write surface.
+
+        Built from :meth:`storage_path` so the folder (and every parquet /
+        ``_delta_log`` child it resolves) inherits the table's
+        temporary-credential :class:`AWSClient`; constructing a DeltaFolder
+        from the bare URI string would drop those creds. Lets callers read
+        (``tbl.delta().read_arrow_table()``) or commit
+        (``tbl.delta().write_arrow_table(t, mode=Mode.APPEND)``) straight
+        against the transaction log, bypassing the warehouse.
+        """
+        from yggdrasil.io.delta import DeltaFolder
+
+        path = self.storage_path()
+        if path is None:
+            raise FileNotFoundError(
+                f"{self!r} has no resolvable storage_location for a DeltaFolder."
+            )
+        return DeltaFolder(path=path)
 
     def aws(
         self,

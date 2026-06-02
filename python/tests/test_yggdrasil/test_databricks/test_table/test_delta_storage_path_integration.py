@@ -1,52 +1,31 @@
-"""Integration benchmark: SQL warehouse vs direct DeltaFolder over the storage path.
+"""Cross-engine Delta interop: yggdrasil :class:`DeltaFolder` ⇄ Databricks SQL.
 
-A Databricks-managed Delta table is, on disk, a folder of parquet files
-plus a ``_delta_log`` transaction log. Two ways to read it:
+A Databricks Delta table is, on disk, a folder of parquet files plus a
+``_delta_log`` transaction log. This suite drives **both** engines against
+the *same* table to prove the native yggdrasil Delta protocol is
+byte-compatible with Databricks:
 
-1. **SQL warehouse path** — the canonical route. ``SELECT * FROM ...``
-   over a serverless / pro warehouse, payload comes back as Arrow via
-   the statement-result stream. Drives all of Databricks' compute
-   features (auth, caching, photon-vectorised execution, row-level
-   security, etc.) but pays one warehouse round trip per query.
+* **SQL writes → DeltaFolder reads.** Seed rows via the SQL/arrow insert,
+  then read them back by pointing :class:`DeltaFolder` at the table's
+  cloud :attr:`storage_location` (resolved through Unity Catalog temporary
+  table credentials) — full scan + partition-pruned + row-filtered.
+* **DeltaFolder writes → SQL reads.** Append rows by committing to the
+  ``_delta_log`` directly through :class:`DeltaFolder`, then ``REFRESH`` +
+  ``SELECT`` over the warehouse and confirm Databricks sees them.
 
-2. **Direct storage read via** :class:`yggdrasil.io.delta.DeltaFolder`
-   — point :class:`DeltaFolder` at the table's :attr:`storage_location`
-   (an S3 / ABFS / GCS URI vended by Unity Catalog's temporary table
-   credentials API) and open the parquet files directly. Skips the
-   warehouse entirely and lets the predicate AST +
-   ``extract_partition_filters`` drive partition pruning at the file
-   level — same machinery the local-only delta tests exercise.
+Provisioning + skip rules
+-------------------------
 
-This file is **not** a microbenchmark — it's a correctness suite that
-*also* prints wall-clock timings so a reviewer can see whether the
-direct read is competitive with the warehouse on this workspace /
-network. The numbers come back annotated with row counts and file
-counts so they're comparable across runs.
-
-Skip rules
-----------
-
-The whole module is gated by :class:`DatabricksIntegrationCase` —
-:envvar:`DATABRICKS_HOST` must be set. Additionally:
-
-- Reading the storage path requires temporary table credentials
-  (managed tables only on most clouds, AWS-only on some). The fixture
-  skips cleanly with :class:`unittest.SkipTest` when those creds can't
-  be vended.
-
-Cleanup
--------
-
-The fixture creates one per-class throw-away table named
-``yg_delta_path_<hex>`` partitioned by ``region``, inserts seed rows
-in one shot, and drops the table cascade-style in ``tearDownClass``.
+Gated by :class:`DatabricksIntegrationCase` (needs ``DATABRICKS_HOST``).
+The table is created in an owned, throw-away ``ygg_integration_<hex>``
+schema (via :meth:`scratch_schema`) under ``trading_tgp_dev`` so the
+EXTERNAL USE SCHEMA grant that temporary-credential vending needs can be
+self-granted; without it (non-AWS workspace, no grant) the suite skips.
+The schema is dropped through the :meth:`safe_drop_schema` guard.
 """
-
 from __future__ import annotations
 
-import os
 import secrets
-import time
 import unittest
 from typing import Any, ClassVar
 
@@ -58,389 +37,170 @@ from yggdrasil.data import Field
 from yggdrasil.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
-from yggdrasil.databricks.table.table import Table
 from yggdrasil.io.delta import DeltaFolder, DeltaOptions
 from yggdrasil.execution.expr import col as expr_col
 
 from .. import DatabricksIntegrationCase
 
 
-__all__ = ["TestDeltaStoragePathBenchmark"]
+__all__ = ["TestDeltaSqlInterop"]
 
 
-# ---------------------------------------------------------------------------
-# Fixture helpers
-# ---------------------------------------------------------------------------
+REGIONS = ("us", "eu", "uk", "ap")
+SEED_ROWS = 2000
 
 
-REGIONS = ("us", "eu", "uk", "ap", "br", "ca", "fr", "de")
-
-
-def _resolve_catalog() -> str:
-    name = os.environ.get(
-        "DATABRICKS_INTEGRATION_CATALOG", "trading",
-    ).strip()
-    if not name:
-        raise unittest.SkipTest(
-            "DATABRICKS_INTEGRATION_CATALOG is empty — set it to a "
-            "catalog the test identity has CREATE TABLE on."
-        )
-    return name
-
-
-def _resolve_schema() -> str:
-    name = os.environ.get(
-        "DATABRICKS_INTEGRATION_SCHEMA", "unittest",
-    ).strip()
-    if not name:
-        raise unittest.SkipTest(
-            "DATABRICKS_INTEGRATION_SCHEMA is empty — set it to a "
-            "schema the test identity has CREATE TABLE on."
-        )
-    return name
-
-
-def _resolve_rows() -> int:
-    """Row count for the seeded table.
-
-    Pulled from :envvar:`DATABRICKS_DELTA_BENCH_ROWS` so a developer
-    can crank it up locally without editing the test. Default 5_000
-    keeps the CI cost small while still giving the SQL vs storage
-    comparison meaningful signal.
-    """
-    raw = os.environ.get("DATABRICKS_DELTA_BENCH_ROWS", "5000")
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        raise unittest.SkipTest(
-            f"DATABRICKS_DELTA_BENCH_ROWS={raw!r} is not an integer."
-        )
-
-
-def _seed_table_arrow(rows: int) -> pa.Table:
-    """Two columns + a partition column, deterministic so reads diff cleanly."""
-    return pa.table(
-        {
-            "id": pa.array(range(rows), type=pa.int64()),
-            "region": pa.array(
-                [REGIONS[i % len(REGIONS)] for i in range(rows)], type=pa.string(),
-            ),
-            "val": pa.array(
-                [f"row-{i}" for i in range(rows)], type=pa.string(),
-            ),
-        }
-    )
+def _seed(rows: int, *, start: int = 0) -> pa.Table:
+    return pa.table({
+        "id": pa.array(range(start, start + rows), type=pa.int64()),
+        "region": pa.array(
+            [REGIONS[i % len(REGIONS)] for i in range(start, start + rows)],
+            type=pa.string(),
+        ),
+        "val": pa.array([f"row-{i}" for i in range(start, start + rows)], type=pa.string()),
+    })
 
 
 def _partitioned_schema() -> Schema:
     s = Schema()
     s.with_field(Field(name="id", dtype=Int64Type(), nullable=False))
-    s.with_field(
-        Field(name="region", dtype=StringType()).with_partition_by(True)
-    )
+    s.with_field(Field(name="region", dtype=StringType()).with_partition_by(True))
     s.with_field(Field(name="val", dtype=StringType()))
     return s
 
 
-def _time_block(fn) -> tuple[Any, float]:
-    """Run *fn* once, return ``(result, elapsed_seconds)``."""
-    t0 = time.perf_counter()
-    result = fn()
-    return result, time.perf_counter() - t0
-
-
-def _fmt_seconds(secs: float) -> str:
-    if secs < 1e-3:
-        return f"{secs * 1e6:.1f} us"
-    if secs < 1:
-        return f"{secs * 1e3:.1f} ms"
-    return f"{secs:.3f} s"
-
-
-# ---------------------------------------------------------------------------
-# Test class
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.integration
-class TestDeltaStoragePathBenchmark(DatabricksIntegrationCase):
-    """Round-trip a partitioned Delta table and compare read paths.
+class TestDeltaSqlInterop(DatabricksIntegrationCase):
+    """Round-trip a partitioned Delta table through both engines."""
 
-    One table seeded per class — the test methods run in a fresh
-    workspace state but share the same data so each comparison
-    isn't biased by per-test write overhead.
-    """
-
-    catalog_name: ClassVar[str]
-    schema_name: ClassVar[str]
-    table_name: ClassVar[str]
-    table: ClassVar[Table]
-    rows: ClassVar[int]
-    seed: ClassVar[pa.Table]
-    storage_path: ClassVar[Any] = None  # yggdrasil Path
+    schema: ClassVar
+    table: ClassVar
+    full: ClassVar[str]
+    storage: ClassVar[Any]
 
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.catalog_name = _resolve_catalog()
-        cls.schema_name = _resolve_schema()
-        cls.table_name = f"yg_delta_path_{secrets.token_hex(4)}"
-        full_name = f"{cls.catalog_name}.{cls.schema_name}.{cls.table_name}"
-        cls.rows = _resolve_rows()
-        cls.seed = _seed_table_arrow(cls.rows)
-
+        cls.schema = cls.scratch_schema()
+        name = f"yg_delta_{secrets.token_hex(4)}"
+        cls.full = f"{cls.INTEGRATION_CATALOG}.{cls.schema.schema_name}.{name}"
+        # An EXTERNAL Delta table at a writable location under the workspace's
+        # registered external location. EXTERNAL (not managed) is required for
+        # the DeltaFolder-write → SQL-read direction: UC only vends READ_WRITE
+        # temporary credentials for external tables (managed tables vend READ,
+        # so a direct ``_delta_log`` commit would 403).
+        cls.location = cls.client.default_storage_location(
+            f"ygg_integration/delta/{name}_{secrets.token_hex(4)}"
+        )
         try:
-            cls.table = cls.client.tables.table(full_name)
-            cls.table.ensure_created(_partitioned_schema())
-        except (DatabricksError, PermissionDenied) as exc:
+            cls.table = cls.client.tables.table(cls.full)
+            # Create the EXTERNAL Delta table via SQL DDL with an explicit
+            # LOCATION — Databricks initialises the ``_delta_log`` there and
+            # registers it as external (so READ_WRITE temp creds are vended).
+            cls.client.sql.execute(
+                f"CREATE TABLE {cls.table.full_name(safe=True)} "
+                f"(`id` BIGINT NOT NULL, `region` STRING, `val` STRING) "
+                f"USING DELTA PARTITIONED BY (`region`) "
+                f"LOCATION '{cls.location}'"
+            )
+            # SQL/arrow write — partitioned by region (one parquet per region).
+            cls.table.arrow_insert(_seed(SEED_ROWS), mode=Mode.APPEND)
+            # Resolve the cloud storage path (temporary table credentials —
+            # EXTERNAL USE SCHEMA self-granted on the owned scratch schema).
+            cls.storage = cls.table.storage_path()
+        except (DatabricksError, PermissionDenied, NotFound, NotImplementedError) as exc:
+            cls.safe_drop_schema(cls.schema)
             raise unittest.SkipTest(
-                f"Cannot create table {full_name}: {exc}. Override "
-                f"DATABRICKS_INTEGRATION_CATALOG / "
-                f"DATABRICKS_INTEGRATION_SCHEMA with a writable target."
+                f"cannot provision / resolve storage for {cls.full}: {exc}"
             ) from exc
-
-        # One-shot insert — partitioned by region, so the warehouse
-        # lands one parquet per region. The Arrow stage handles the
-        # cast to the table schema.
-        try:
-            cls.table.arrow_insert(cls.seed, mode=Mode.APPEND)
-        except (DatabricksError, PermissionDenied) as exc:
-            cls._safe_drop_table()
-            raise unittest.SkipTest(
-                f"Cannot insert seed rows into {full_name}: {exc}."
-            ) from exc
-
-        # Resolve the table's underlying cloud storage path. Skip the
-        # whole benchmark when temporary-table-credentials aren't
-        # available (Azure / GCP on workspaces that don't implement
-        # the AWS-style flow, or identities without the grant).
-        try:
-            cls.storage_path = cls.table.storage_path()
-        except NotImplementedError as exc:
-            cls._safe_drop_table()
-            raise unittest.SkipTest(
-                f"storage_location not implemented on this workspace: {exc}."
-            )
-        except (DatabricksError, PermissionDenied) as exc:
-            cls._safe_drop_table()
-            raise unittest.SkipTest(
-                f"Cannot resolve storage_location (likely non-AWS): {exc}."
-            )
-        except Exception as exc:
-            cls._safe_drop_table()
-            raise unittest.SkipTest(
-                f"storage_location unavailable: {exc}."
-            )
+        except Exception as exc:  # noqa: BLE001 — any storage-resolve failure skips
+            cls.safe_drop_schema(cls.schema)
+            raise unittest.SkipTest(f"storage_location unavailable: {exc}") from exc
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls._safe_drop_table()
-        super().tearDownClass()
-
-    @classmethod
-    def _safe_drop_table(cls) -> None:
-        table = getattr(cls, "table", None)
-        if table is None:
-            return
         try:
-            table.delete(missing_ok=True)
-        except Exception:
-            pass
+            # External-table data outlives DROP TABLE — purge the S3 location
+            # while the table's temporary credentials are still vendable.
+            storage = getattr(cls, "storage", None)
+            if storage is not None:
+                try:
+                    storage.remove(recursive=True, missing_ok=True)
+                except Exception:
+                    pass
+            table = getattr(cls, "table", None)
+            if table is not None:
+                try:
+                    table.delete(missing_ok=True)
+                except Exception:
+                    pass
+        finally:
+            cls.safe_drop_schema(getattr(cls, "schema", None))
+            super().tearDownClass()
 
-    # ------------------------------------------------------------------
-    # Helpers — both readers, normalised to a sorted pylist for diffing.
-    # ------------------------------------------------------------------
+    # -- helpers -------------------------------------------------------
+    def _delta(self) -> DeltaFolder:
+        # Built from the creds-carrying storage Path (Table.delta()), not a
+        # re-parsed URI string — otherwise the S3 reads have no credentials.
+        return self.table.delta()
 
-    def _read_via_sql(self, where: str | None = None) -> pa.Table:
-        """Warehouse SQL ``SELECT *`` (with optional ``WHERE``)."""
-        full = self.table.full_name(safe=True)
-        sql = f"SELECT id, region, val FROM {full}"
+    def _sql(self, where: "str | None" = None) -> pa.Table:
+        sql = f"SELECT id, region, val FROM {self.table.full_name(safe=True)}"
         if where:
             sql += f" WHERE {where}"
         return self.client.sql.execute(sql).to_arrow_table()
 
-    def _read_via_storage(
-        self,
-        *,
-        predicate: Any = None,
-        prune_values: Any = None,
-    ) -> pa.Table:
-        """Direct :class:`DeltaFolder` read over the table's storage URI."""
-        delta_io = DeltaFolder(path=str(self.storage_path.full_path()))
-        opts = DeltaOptions(
-            predicate=predicate, prune_values=prune_values,
-        )
-        return delta_io.read_arrow_table(options=opts)
-
-    def _normalised(self, table: pa.Table) -> list[dict]:
-        """Sort rows by ``id`` so the two readers' outputs compare."""
+    @staticmethod
+    def _sorted(table: pa.Table) -> list:
         if table.num_rows == 0:
             return []
         idx = pa.compute.sort_indices(table, sort_keys=[("id", "ascending")])
         return table.take(idx).to_pylist()
 
-    # ------------------------------------------------------------------
-    # Tests — each asserts correctness *and* logs timings.
-    # ------------------------------------------------------------------
-
+    # -- SQL writes → DeltaFolder reads --------------------------------
     def test_storage_path_exposes_delta_log(self) -> None:
-        """Every Delta table has a ``_delta_log`` directory.
-
-        Pins the contract that ``Table.storage_path()`` returns a
-        directory containing the transaction log alongside the
-        parquet data files. The test reaches for ``storage_path()``
-        (not ``storage_location()``) so the canonical name stays the
-        one tests + docs surface.
-        """
-        root = self.table.storage_path()
-        children = [c.name for c in root.iterdir()]
+        children = [c.name for c in self.storage.iterdir()]
         self.assertIn("_delta_log", children)
 
-    def test_full_scan_round_trip(self) -> None:
-        """Full table scan: SQL vs direct storage read return same rows."""
-        sql_table, sql_secs = _time_block(lambda: self._read_via_sql())
-        store_table, store_secs = _time_block(lambda: self._read_via_storage())
+    def test_sql_write_deltafolder_full_scan(self) -> None:
+        # Both engines read the *same* table — assert they agree (rather than
+        # a fixed count, since another test may have appended rows). At least
+        # the seeded rows are present.
+        sql = self._sql()
+        store = self._delta().read_arrow_table()
+        self.assertGreaterEqual(sql.num_rows, SEED_ROWS)
+        self.assertEqual(sql.num_rows, store.num_rows)
+        self.assertEqual(self._sorted(sql), self._sorted(store))
 
-        # Sanity — both paths returned all seeded rows.
-        self.assertEqual(sql_table.num_rows, self.rows)
-        self.assertEqual(store_table.num_rows, self.rows)
-        # Content matches (sorted by id since file order isn't stable).
-        self.assertEqual(
-            self._normalised(sql_table), self._normalised(store_table),
+    def test_deltafolder_partition_pushdown(self) -> None:
+        store = self._delta().read_arrow_table(
+            options=DeltaOptions(predicate=(expr_col("region") == "us")),
         )
+        sql = self._sql(where="region = 'us'")
+        self.assertEqual(store.num_rows, sql.num_rows)
+        self.assertTrue(all(r == "us" for r in store.column("region").to_pylist()))
+        self.assertEqual(self._sorted(sql), self._sorted(store))
 
-        self._report(
-            "full-scan",
-            sql_secs=sql_secs, sql_rows=sql_table.num_rows,
-            store_secs=store_secs, store_rows=store_table.num_rows,
-        )
+    def test_deltafolder_partition_and_row_filter(self) -> None:
+        half = SEED_ROWS // 2
+        store = self._delta().read_arrow_table(options=DeltaOptions(
+            predicate=((expr_col("region") == "eu") & (expr_col("id") > half)),
+        ))
+        sql = self._sql(where=f"region = 'eu' AND id > {half}")
+        self.assertEqual(self._sorted(sql), self._sorted(store))
 
-    def test_partition_filter_round_trip(self) -> None:
-        """``region == 'us'``: warehouse + storage produce the same subset.
+    # -- DeltaFolder writes → SQL reads (the interop direction) --------
+    def test_deltafolder_write_sql_read(self) -> None:
+        """Append rows by committing to the ``_delta_log`` through yggdrasil,
+        then confirm the warehouse reads them — proves yggdrasil's Delta
+        writes are Databricks-readable."""
+        extra = _seed(400, start=SEED_ROWS)  # ids 2000..2399, partitioned
+        self._delta().refresh().write_arrow_table(extra, mode=Mode.APPEND)
 
-        On the storage side, the predicate routes through
-        :func:`extract_partition_filters` — the parquet files for
-        non-``us`` partitions never open.
-        """
-        sql_table, sql_secs = _time_block(
-            lambda: self._read_via_sql(where="region = 'us'")
-        )
-        store_table, store_secs = _time_block(
-            lambda: self._read_via_storage(
-                predicate=(expr_col("region") == "us"),
-            )
-        )
-
-        expected = sum(
-            1 for i in range(self.rows)
-            if REGIONS[i % len(REGIONS)] == "us"
-        )
-
-        self.assertEqual(sql_table.num_rows, expected)
-        self.assertEqual(store_table.num_rows, expected)
-        self.assertEqual(
-            self._normalised(sql_table), self._normalised(store_table),
-        )
-        self.assertTrue(
-            all(r == "us" for r in store_table.column("region").to_pylist())
-        )
-
-        self._report(
-            "partition-eq",
-            sql_secs=sql_secs, sql_rows=sql_table.num_rows,
-            store_secs=store_secs, store_rows=store_table.num_rows,
-        )
-
-    def test_or_chain_round_trip(self) -> None:
-        """``region == us | == eu | == uk``: OR-of-EQ on the same column.
-
-        ``extract_partition_filters`` walks the OR and unions the per-
-        operand value sets, so partition pruning still resolves the
-        accepted values without an explicit ``is_in`` rewrite.
-        Warehouse runs the equivalent ``IN`` clause.
-        """
-        target = ("us", "eu", "uk")
-        sql_where = "region IN ('us', 'eu', 'uk')"
-        predicate = (
-            (expr_col("region") == "us")
-            | (expr_col("region") == "eu")
-            | (expr_col("region") == "uk")
-        )
-
-        sql_table, sql_secs = _time_block(
-            lambda: self._read_via_sql(where=sql_where)
-        )
-        store_table, store_secs = _time_block(
-            lambda: self._read_via_storage(predicate=predicate)
-        )
-
-        expected_set = set(target)
-        self.assertEqual(sql_table.num_rows, store_table.num_rows)
-        self.assertEqual(
-            self._normalised(sql_table), self._normalised(store_table),
-        )
-        self.assertTrue(
-            set(store_table.column("region").to_pylist()).issubset(expected_set)
-        )
-
-        self._report(
-            "or-collapse-3-values",
-            sql_secs=sql_secs, sql_rows=sql_table.num_rows,
-            store_secs=store_secs, store_rows=store_table.num_rows,
-        )
-
-    def test_partition_and_row_filter_round_trip(self) -> None:
-        """``region == 'us' AND id > N/2``: file prune + row filter together.
-
-        The partition extractor pins ``region = us`` (file prune);
-        the row-level predicate ``id > N/2`` runs as a
-        ``pyarrow.compute`` filter on each batch. Warehouse runs the
-        full ``WHERE`` server-side.
-        """
-        half = self.rows // 2
-        sql_table, sql_secs = _time_block(
-            lambda: self._read_via_sql(
-                where=f"region = 'us' AND id > {half}"
-            )
-        )
-        store_table, store_secs = _time_block(
-            lambda: self._read_via_storage(
-                predicate=(
-                    (expr_col("region") == "us") & (expr_col("id") > half)
-                ),
-            )
-        )
-
-        self.assertEqual(sql_table.num_rows, store_table.num_rows)
-        self.assertEqual(
-            self._normalised(sql_table), self._normalised(store_table),
-        )
-
-        self._report(
-            "partition+row",
-            sql_secs=sql_secs, sql_rows=sql_table.num_rows,
-            store_secs=store_secs, store_rows=store_table.num_rows,
-        )
-
-    # ------------------------------------------------------------------
-    # Reporting — printed to capsys so ``pytest -s`` surfaces a table.
-    # ------------------------------------------------------------------
-
-    def _report(
-        self,
-        label: str,
-        *,
-        sql_secs: float,
-        sql_rows: int,
-        store_secs: float,
-        store_rows: int,
-    ) -> None:
-        speedup = (sql_secs / store_secs) if store_secs > 0 else float("inf")
-        # ``print`` so ``pytest -s`` shows the bench line. The test
-        # itself only asserts correctness — timings are informational.
-        print(
-            f"\n[delta-storage-bench] {label:<24s}  "
-            f"sql={_fmt_seconds(sql_secs)} ({sql_rows} rows)  "
-            f"storage={_fmt_seconds(store_secs)} ({store_rows} rows)  "
-            f"speedup={speedup:.2f}x"
-        )
+        # Invalidate Databricks' cached snapshot, then read just the new ids.
+        self.client.sql.execute(f"REFRESH TABLE {self.table.full_name(safe=True)}")
+        got = self._sql(where=f"id >= {SEED_ROWS}")
+        self.assertEqual(got.num_rows, 400)
+        self.assertEqual(self._sorted(got), extra.to_pylist())
+        # Total now reflects both writers.
+        self.assertEqual(self._sql().num_rows, SEED_ROWS + 400)

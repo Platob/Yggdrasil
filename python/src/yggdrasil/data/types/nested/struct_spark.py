@@ -167,7 +167,13 @@ def cast_spark_tabular(
 ) -> "psql.DataFrame":
     spark = spark_sql_module()
 
-    if not isinstance(data, spark.DataFrame):
+    from yggdrasil.lazy_imports import spark_dataframe_classes
+
+    # Accept both the classic ``pyspark.sql.DataFrame`` and the Spark Connect
+    # ``pyspark.sql.connect.dataframe.DataFrame`` (what a Databricks Connect
+    # serverless session returns from ``spark.sql(...)``) — on PySpark ≤3.5 the
+    # two are parallel, non-subclassing implementations.
+    if not isinstance(data, spark_dataframe_classes()):
         raise TypeError(f"Unsupported tabular type: {type(data)!r}")
 
     if not options.need_cast(data, check_names=True):

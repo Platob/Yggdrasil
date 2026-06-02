@@ -5,10 +5,24 @@ The single seam every remote backend (S3, Databricks, future Azure
 ``is_remote_path = True``, the other two ``False``. Concrete
 subclasses no longer reimplement these.
 
-Subclasses implement :meth:`_stat_uncached`; the base wraps it via
+Subclasses implement :meth:`_stat_uncached` (the metadata probe),
+:meth:`_read_mv` (a positional / ranged GET) and :meth:`_upload` (an
+atomic whole-object PUT). The base wraps the stat probe via
 :meth:`_stat` and stores the result on ``self._stat_cached``.
-Mutating ops (writes, deletes) must call :meth:`invalidate_singleton`
-so follow-up reads see fresh metadata. Sister of
+
+I/O model — **whole-blob, no page cache.** A read pulls the requested
+window straight through the subclass :meth:`_read_mv` (ranged where the
+backend supports it, whole-object otherwise); a write replaces the whole
+object via :meth:`_upload`. There is no inner buffering layer: callers
+that want to coalesce small writes wrap the path in
+:class:`yggdrasil.io.holder.IO`. Large Arrow/Parquet writes still stream
+— when a backend advertises :attr:`SUPPORTS_STREAMING_UPLOAD` the encode
+spills to a temp file and :meth:`_upload_stream` pushes it in bounded
+chunks; large reads can range-read via :meth:`arrow_random_access_file`
+when :attr:`SUPPORTS_RANGED_RANDOM_ACCESS` is set.
+
+Mutating ops (writes, deletes) call :meth:`invalidate_singleton` so
+follow-up reads see fresh metadata. Sister of
 :class:`yggdrasil.io.fs.local_path.LocalPath`: same :class:`Holder`
 substrate, different backing.
 """
@@ -18,11 +32,10 @@ from __future__ import annotations
 import logging
 import time
 from abc import abstractmethod
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.io.io_stats import IOKind, IOStats
-from yggdrasil.path.memory import Memory
 from yggdrasil.path.path import Path
 
 __all__ = ["RemotePath"]
@@ -39,13 +52,6 @@ __all__ = ["RemotePath"]
 #: the entry immediately via :meth:`invalidate_singleton`; this TTL only
 #: governs how long a *read*-populated snapshot is trusted.
 _STAT_CACHE_TTL: float = 60.0
-
-#: Default page size for the inner read/write buffer. A 4 MiB grain
-#: matches Parquet row-group / Arrow IPC chunk sizes — one page covers
-#: a typical footer or batch, so the first read populates exactly one
-#: page and follow-up reads against the same region collapse to
-#: in-process slicing.
-_DEFAULT_BUFFER_SIZE: int = 4 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -113,10 +119,11 @@ class RemotePath(Path):
     """Abstract :class:`Holder` for network-backed backends.
 
     Subclasses pick a ``scheme`` (``s3``, ``dbfs``, …), implement the
-    five :class:`Holder` primitives against their network client, and
-    override :meth:`_stat_uncached` for the metadata probe. Everything
-    else (predicate pins, stat caching, singleton identity caching)
-    is inherited from this base.
+    filesystem hooks plus :meth:`_read_mv` (ranged / whole-object GET)
+    and :meth:`_upload` (atomic whole-object PUT) against their network
+    client, and override :meth:`_stat_uncached` for the metadata probe.
+    Everything else (predicate pins, stat caching, whole-blob read /
+    write, optional streaming) is inherited from this base.
 
     ``RemotePath`` leaves the :class:`Singleton` machinery
     **deactivated** (``_SINGLETON_TTL = ...``), the same as
@@ -144,21 +151,6 @@ class RemotePath(Path):
     # remote backends pay round-trip stat probes and want a window
     # that beats credential / consistency drift.
     STAT_CACHE_TTL: ClassVar["float | None"] = _STAT_CACHE_TTL
-
-    # Default page size for the inner buffered-page cache. ``None``
-    # disables paging entirely; an int / ByteUnit / size string sets
-    # the per-page grain. Subclasses with a hard backend-imposed
-    # block size (e.g. an SDK that only supports whole-object PUTs
-    # below a certain threshold) can pin their own default here.
-    DEFAULT_BUFFER_SIZE: ClassVar["int | None"] = _DEFAULT_BUFFER_SIZE
-
-    # Above this committed size, :meth:`_cache_after_upload` skips
-    # pouring the just-written payload into the page cache: it would
-    # double the memory for bytes unlikely to be re-read immediately,
-    # and any later read fetches the page from the backend on demand
-    # (ranged, where supported). Small writes still warm the cache for a
-    # cheap read-after-write.
-    MAX_CACHE_AFTER_UPLOAD_BYTES: ClassVar[int] = 8 * 1024 * 1024
 
     # Backends whose :meth:`_read_mv` genuinely range-reads (only the
     # requested window crosses the wire — S3 GetObject Range, the
@@ -202,99 +194,20 @@ class RemotePath(Path):
         max_size=10_000,
     )
 
-    # ------------------------------------------------------------------
-    # Inner buffered-page cache — reduces remote round trips for
-    # repeated reads against the same byte ranges, batches partial
-    # writes into a single backend PUT on :meth:`flush` / release.
-    # ------------------------------------------------------------------
-
-    def __init__(
-        self,
-        *args: Any,
-        page_size: Any = ...,
-        buffersize: Any = ...,
-        **kwargs: Any,
-    ) -> None:
-        """Wire the page-buffer state alongside the standard :class:`Path` init.
-
-        ``page_size`` accepts an int (bytes), a
-        :class:`~yggdrasil.enums.byteunit.ByteUnit` member, or a
-        size string (``"4 MB"``). ``None`` disables paging and routes
-        every read/write straight through to the subclass primitives.
-        Omitting the kwarg uses :attr:`DEFAULT_BUFFER_SIZE`.
-
-        ``buffersize`` is a deprecated alias for ``page_size``. When
-        both are supplied, ``page_size`` wins.
-
-        Singleton-aware: a re-init on a cached instance preserves the
-        pages already in flight so a second constructor call doesn't
-        silently lose dirty buffered writes from the first.
-        """
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        if hasattr(self, "_page_size"):
-            # Singleton re-init: keep pages + dirty markers from the
-            # original construction so a second ``RemotePath(...)`` call
-            # against the same key doesn't strand pending writes.
-            return
-        # Resolve deprecated ``buffersize`` alias: ``page_size`` wins
-        # when both are supplied; ``buffersize`` is accepted silently
-        # so existing callers keep working.
-        effective = page_size if page_size is not ... else buffersize
-        self._page_size: Optional[int] = self._normalize_page_size(effective)
-        # Lazy: only allocate the dict when paging actually fires.
-        self._pages: Optional[ExpiringDict[int, Memory]] = None
-        self._dirty_pages: set[int] = set()
-        # Tracks the logical size while buffered writes outrun what
-        # the backend has committed. ``None`` means "ask the backend"
-        # via the normal stat-cache path.
-        self._buffered_size: Optional[int] = None
-
-    @classmethod
-    def _normalize_page_size(cls, value: Any) -> Optional[int]:
-        if value is ...:
-            value = cls.DEFAULT_BUFFER_SIZE
-        if value is None:
-            return None
-        # Plain non-negative ``int`` covers the default buffer size and
-        # every realistic caller (``page_size=4 * 1024 * 1024``,
-        # ``page_size=None``, ``page_size=...``). Bypass the
-        # ``ByteUnit.parse_size`` round trip — five isinstance probes
-        # plus a function-call frame — when we already have the
-        # canonical type. ``bool`` is an ``int`` subclass; reject it
-        # before the fast path so ``page_size=True`` still raises.
-        if type(value) is int:
-            if value < 0:
-                raise ValueError(
-                    f"page_size must be a non-negative byte count "
-                    f"(int / ByteUnit / size string / None), got {value!r}"
-                )
-            return value if value > 0 else None
-        from yggdrasil.enums.byteunit import ByteUnit
-
-        try:
-            n = ByteUnit.parse_size(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"page_size must be a non-negative byte count "
-                f"(int / ByteUnit / size string / None), got {value!r}"
-            ) from exc
-        return n if n > 0 else None
-
-    @property
-    def page_size(self) -> Optional[int]:
-        """Page size for buffered reads/writes, or ``None`` when disabled."""
-        return self._page_size
-
-    def _ensure_pages(self) -> "ExpiringDict[int, Memory]":
-        if self._pages is None:
-            # Pages share the stat cache's TTL: a backend object that's
-            # been quiet for a minute is the same horizon at which a
-            # cached size / mtime is no longer trusted. No ``max_size``
-            # — dirty pages must not be evicted under the caller's feet;
-            # callers manage memory via explicit :meth:`flush` /
-            # :meth:`invalidate_singleton`.
-            self._pages = ExpiringDict(default_ttl=self.STAT_CACHE_TTL)
-        return self._pages
+        # Disk scratch for an *acquired* write window (``with path:`` /
+        # ``path.open("wb")``). ``None`` means no buffered writes; otherwise a
+        # temp :class:`LocalPath` that successive writes (and the
+        # ``truncate(0)`` an ``open("wb")`` does on acquire) splice into, so
+        # the window coalesces into a *single* streamed upload on
+        # :meth:`flush` / release instead of one PUT per ``write()`` — and the
+        # bytes page through the OS file cache rather than piling up whole in
+        # process memory. Un-acquired writes skip the scratch and upload
+        # straight through. Guard the singleton re-init so a second constructor
+        # call on a cached container path can't strand a scratch handle.
+        if not hasattr(self, "_scratch"):
+            self._scratch: "Any | None" = None
 
     # ------------------------------------------------------------------
     # Backing-shape predicates
@@ -332,7 +245,7 @@ class RemotePath(Path):
     def _stat(self) -> IOStats:
         """Cached :class:`IOStats` probe.
 
-        Entries expire after :attr:`stat_cache_ttl` seconds — past
+        Entries expire after :attr:`STAT_CACHE_TTL` seconds — past
         the budget we re-issue :meth:`_stat_uncached` instead of
         handing back a stale snapshot. On miss (or expiry),
         delegates to :meth:`_stat_uncached` and stores the fresh
@@ -354,42 +267,88 @@ class RemotePath(Path):
         """Drop this path's cached :class:`IOStats`, schema, and
         ``_INSTANCES`` entry — see :meth:`Path.invalidate_singleton`.
 
-        Also clears the inner page cache: a mutation just ran, so the
-        bytes the pages held are no longer authoritative. Dirty pages
-        are dropped on the floor — callers must :meth:`flush` before
-        invalidating if they want pending writes to survive.
+        A mutation just ran, so the cached metadata is no longer
+        authoritative; the next read re-probes the backend. Discards any
+        un-flushed write scratch (callers must :meth:`flush` first to keep
+        pending writes).
         """
-        if self._pages is not None:
-            self._pages.clear()
-        self._dirty_pages.clear()
-        self._buffered_size = None
+        self._discard_scratch()
         super().invalidate_singleton(remove_global=remove_global)
         self._unpersist_schema()
 
     # ------------------------------------------------------------------
+    # Acquired-window write scratch — disk paging, single streamed commit
+    # ------------------------------------------------------------------
+    def _ensure_scratch(self, *, seed: bool):
+        """Lazily mint the acquired-window scratch — a temp :class:`LocalPath`
+        writes splice into. When *seed*, download the existing object into it
+        (one GET, streamed to disk) so positional / append writes preserve the
+        prior content; otherwise start empty. Subclasses with a cheaper local
+        staging surface (e.g. a cluster-mounted volume) may override."""
+        if self._scratch is not None:
+            return self._scratch
+        from yggdrasil.io.base import _mint_spill_path
+        from yggdrasil.path.local_path import LocalPath
+
+        scratch = LocalPath(str(_mint_spill_path("yggwb", 3600)))
+        if seed:
+            try:
+                existing = self._read_mv(-1, 0)
+            except FileNotFoundError:
+                existing = b""
+            if len(existing):
+                scratch.write_bytes(bytes(existing), overwrite=True)
+        self._scratch = scratch
+        return scratch
+
+    def _discard_scratch(self) -> None:
+        """Drop the scratch and reclaim its temp file (no upload)."""
+        scratch = self._scratch
+        self._scratch = None
+        if scratch is not None:
+            try:
+                scratch.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+
+    def _touch_stat(
+        self,
+        *,
+        size: "int | None" = None,
+        mtime: "float | None" = None,
+        media_type: Any = None,
+    ) -> None:
+        """Post-write metadata update, kept consistent for remote paths.
+
+        :class:`Holder._touch_stat` only updates the holder-owned ``_size``, but
+        a remote path reads :attr:`size` / :attr:`exists` from the **stat
+        cache** — so after a write the cache would stay stale (e.g. ``MISSING``
+        from a pre-write probe). Mirror the new size / media type into the stat
+        cache (creating it, or flipping it to ``FILE``) so a follow-up
+        ``size`` / ``exists`` reflects the write without a re-stat round trip.
+        """
+        super()._touch_stat(size=size, mtime=mtime, media_type=media_type)
+        cached = self._stat_cached
+        if cached is None or cached.kind == IOKind.MISSING:
+            self._persist_stat_cache(
+                IOStats(
+                    size=int(size) if size is not None else 0,
+                    kind=IOKind.FILE,
+                    mtime=mtime if mtime is not None else time.time(),
+                    media_type=media_type if media_type is not None else self.media_type,
+                )
+            )
+            return
+        if size is not None:
+            cached.size = int(size)
+        cached.mtime = mtime if mtime is not None else time.time()
+        if media_type is not None:
+            cached.media_type = media_type
+        self._persist_stat_cache(cached)
+
+    # ------------------------------------------------------------------
     # Resize is a no-op on remote backends — the upload IS the resize
     # ------------------------------------------------------------------
-
-    def _bread(self, n: int, pos: int, mode) -> "IO":
-        from yggdrasil.io.holder import IO
-        del mode
-        if n == 0:
-            return IO()
-        try:
-            data = bytes(self._read_mv(n, pos))
-        except FileNotFoundError:
-            data = b""
-        return IO(data)
-
-    def _bwrite(self, data, pos: int, mode) -> int:
-        del mode
-        if hasattr(data, "to_bytes"):
-            payload = data.to_bytes()
-        elif hasattr(data, "read"):
-            payload = data.read()
-        else:
-            payload = bytes(data)
-        return self._write_mv(memoryview(payload), pos)
 
     def resize(self, n: int) -> int:
         """No-op for remote-backend paths.
@@ -406,82 +365,8 @@ class RemotePath(Path):
         return n
 
     # ==================================================================
-    # Buffered read / write — page cache over backend ``_read_mv`` /
-    # ``_write_mv``. Public ``read_mv`` / ``write_mv`` route through
-    # here when :attr:`page_size` is set; subclass primitives still do
-    # the actual network calls, just one per page miss instead of one
-    # per logical access.
+    # Whole-blob read / write — straight through the subclass primitives
     # ==================================================================
-
-    def _effective_total(self) -> int:
-        """Logical byte count, including buffered writes.
-
-        Prefer the buffered-write tip when set; fall back to the
-        subclass's ``size`` accessor (which may itself be a stat-cache
-        probe) otherwise.
-        """
-        if self._buffered_size is not None:
-            return self._buffered_size
-        return int(self.size)
-
-    def _stamp_buffered_size(self, new_total: int) -> None:
-        """Reflect a buffered write into the stat cache.
-
-        Buffered writes don't go to the backend until :meth:`flush`,
-        but follow-up :meth:`size` / :meth:`exists` / :meth:`is_file`
-        calls must observe the post-write state — subclasses (S3Path,
-        VolumePath, ...) shadow :attr:`size` with their own stat-cache
-        reads, so we keep the cache itself in sync rather than fighting
-        the property override.
-        """
-        self._buffered_size = new_total
-        cached = self._stat_cached
-        now = time.time()
-        if cached is None or cached.kind == IOKind.MISSING:
-            self._persist_stat_cache(
-                IOStats(
-                    size=new_total,
-                    kind=IOKind.FILE,
-                    mtime=now,
-                    media_type=self.media_type,
-                )
-            )
-            return
-        cached.size = new_total
-        cached.mtime = now
-        self._persist_stat_cache(cached)
-
-    def _cache_after_upload(self, content: bytes, size: int) -> None:
-        """Populate the page cache with committed content after upload.
-
-        Called after a successful ``_upload`` so that a subsequent
-        read on the same instance hits the local cache instead of
-        re-downloading. Also sets ``_buffered_size`` to the committed
-        size and clears dirty markers — the backend is now
-        authoritative for these bytes.
-        """
-        self._buffered_size = size
-        self._dirty_pages.clear()
-        if self._page_size is None or size == 0:
-            return
-        # Large payload: drop any stale pages and skip the per-page copy.
-        # ``_buffered_size`` keeps ``size`` authoritative; a later read of
-        # an un-cached page falls through to ``_fetch_page`` →
-        # ``_read_mv`` (ranged), so this stays correct — just uncached.
-        if size > self.MAX_CACHE_AFTER_UPLOAD_BYTES:
-            self._ensure_pages().clear()
-            return
-        page_size = self._page_size
-        pages = self._ensure_pages()
-        pages.clear()
-        n_pages = (size + page_size - 1) // page_size
-        for idx in range(n_pages):
-            start = idx * page_size
-            end = min(start + page_size, size)
-            chunk = content[start:end]
-            buf = bytearray(page_size)
-            buf[: len(chunk)] = chunk
-            pages.set(idx, Memory.from_bytearray(buf, size=len(chunk)))
 
     def arrow_random_access_file(self):
         """Yield a pyarrow random-access file backed by ranged ``_read_mv``.
@@ -511,6 +396,24 @@ class RemotePath(Path):
 
         return _ctx()
 
+    def read_byte_range(self, offset: int, length: int = -1) -> memoryview:
+        """Read exactly *length* bytes from *offset* — a ranged backend fetch.
+
+        The explicit byte-range surface for tabular / format readers that
+        want a specific window (a Parquet footer, an Arrow IPC block) without
+        snapshotting the whole object. Works whether the holder is opened or
+        not: an in-flight write scratch is served from disk, otherwise the
+        subclass :meth:`_read_mv` issues a ranged GET on backends that
+        support it. ``length < 0`` reads to EOF.
+
+        An explicit non-negative window goes straight to :meth:`_read_mv` —
+        no ``self.size`` (HEAD) bounds probe, so a footer fetch is a single
+        ranged GET. A short read near EOF is the caller's to interpret.
+        """
+        if offset >= 0 and length >= 0 and self._scratch is None:
+            return self._read_mv(length, offset)
+        return self.read_mv(length, offset)
+
     def read_mv(
         self,
         size: int = -1,
@@ -518,29 +421,21 @@ class RemotePath(Path):
         *,
         cursor: bool = False,
     ) -> memoryview:
-        if self._page_size is None or self._parent is not None:
-            return super().read_mv(size, offset, cursor=cursor)
-        from yggdrasil.io.holder import _resolve_pos
+        """Read — served from the acquired write scratch when one is in
+        flight, otherwise straight through to the backend.
 
+        Inside an acquired window with un-flushed writes the scratch file is
+        the authoritative view (read-after-write within the handle); without
+        a scratch this is the base :class:`Holder` read over the subclass
+        :meth:`_read_mv` (ranged where the backend supports it).
+        """
+        if self._parent is not None or self._scratch is None:
+            return super().read_mv(size, offset, cursor=cursor)
         if cursor:
             offset = self._pos
-        total = self._effective_total()
-        offset = _resolve_pos(offset, total)
-        if offset < 0 or offset > total:
-            raise ValueError(
-                f"Offset {offset} is out of bounds for "
-                f"{type(self).__name__} of size {total}"
-            )
-        if size < 0:
-            size = total - offset
-        if size < 0 or offset + size > total:
-            raise ValueError(
-                f"Range [{offset}, {offset + size}) is out of bounds for "
-                f"{type(self).__name__} of size {total}"
-            )
-        out = self._paged_read(size, offset) if size > 0 else memoryview(b"")
+        out = self._scratch.read_mv(size, offset)
         if cursor:
-            self._pos = offset + size
+            self._pos = offset + len(out) if offset >= 0 else self._scratch.size
         return out
 
     def write_mv(
@@ -553,96 +448,69 @@ class RemotePath(Path):
         update_stat: bool = True,
         cursor: bool = False,
     ) -> int:
-        if self._page_size is None or self._parent is not None:
-            return super().write_mv(
-                data,
-                offset,
-                size=size,
-                overwrite=overwrite,
-                update_stat=update_stat,
-                cursor=cursor,
-            )
-        from yggdrasil.io.holder import _resolve_pos
+        """Whole-blob write — direct upload when closed, disk-paged when open.
 
-        if cursor:
-            offset = self._pos
+        - **Closed (un-acquired).** A whole-object overwrite from the start
+          (``offset == 0``, ``overwrite``, no cursor; what
+          ``write_bytes(...)`` resolves to) is a *single* :meth:`_upload`,
+          no stat probe, no read-modify-write — the atomic PUT replaces the
+          object. Positional / partial writes defer to the base
+          :class:`Holder` splice (download, splice, re-upload via
+          :meth:`_write_mv`).
+        - **Open (acquired** — ``with path:`` / ``path.open("wb")``**).**
+          The write splices into a temp-file scratch (paging through the OS
+          cache, not piling up in memory); :meth:`flush` / release streams
+          the scratch to the backend in one upload.
+        """
+        if self._parent is not None:
+            return super().write_mv(
+                data, offset, size=size, overwrite=overwrite,
+                update_stat=update_stat, cursor=cursor,
+            )
         if size >= 0 and len(data) > size:
             data = data[:size]
-        if overwrite and offset == 0:
-            total = 0
-            self._stamp_buffered_size(0)
-        else:
-            total = self._effective_total()
-        offset = _resolve_pos(offset, total)
-        if offset < 0:
-            raise ValueError(
-                f"Offset {offset} is out of bounds for "
-                f"{type(self).__name__} of size {total}"
-            )
+        if cursor:
+            offset = self._pos
         n = len(data)
-        end = offset + n
-        if n == 0:
-            if overwrite and end < total:
-                self._discard_pages_past(end)
-                self._stamp_buffered_size(end)
-                if update_stat:
-                    self.mark_dirty()
-            if cursor:
-                self._pos = offset
-            return 0
-        # Whole-object overwrite outside a buffered ``with`` block: the
-        # paged path would copy ``data`` into page buffers and ``flush``
-        # would copy them straight back out for the upload. Skip both
-        # round trips and stream the payload to the backend once — the
-        # same end state ``flush`` produces (_upload + _cache_after_upload),
-        # minus two large copies. Inside an acquire we keep buffering so
-        # successive writes still coalesce.
-        if overwrite and offset == 0 and not self._acquired:
-            payload = bytes(data)
-            self._upload(payload)
-            self._cache_after_upload(payload, n)
+
+        if self._acquired:
+            # Disk-paged window: splice into the scratch, commit on flush.
+            # A whole-object overwrite at 0 needn't preserve prior bytes, so
+            # it never seeds; positional / append seeds from the backend once.
+            whole = offset == 0 and overwrite
+            scratch = self._ensure_scratch(seed=not whole)
+            if whole:
+                scratch.truncate(0)
+            scratch.write_mv(memoryview(bytes(data)), offset, overwrite=overwrite)
             if update_stat:
-                self._touch_stat(size=n)
+                self._touch_stat(size=int(scratch.size))
             if cursor:
-                self._pos = n
+                self._pos = offset + n
             return n
 
-        new_total = end if overwrite else max(total, end)
-        self._paged_write(memoryview(data), offset)
-        if overwrite and new_total < total:
-            self._discard_pages_past(new_total)
-        elif not overwrite:
-            # The stat probe can lie on some backends (e.g. a Volumes
-            # directory-heuristic miss reports a file as size 0); the
-            # page we just loaded carries the real tail. Stretch
-            # ``new_total`` so the trailing bytes survive the flush.
-            tail = self._actual_tail()
-            if tail > new_total:
-                new_total = tail
-        self._stamp_buffered_size(new_total)
-        if update_stat:
-            self.mark_dirty()
-        if cursor:
-            self._pos = end
-        # Outside an explicit acquire (``with path:`` /
-        # ``path.open(owns_holder=True)``) there's no release hook to
-        # flush on, so the closed-state direct-write contract still
-        # demands the bytes land on the backend before this call
-        # returns. The page cache still serves follow-up reads via
-        # :meth:`_paged_read`.
-        if not self._acquired:
-            self.flush()
-        return n
+        if offset == 0 and overwrite:
+            payload = bytes(data)
+            self._upload(payload)
+            if update_stat:
+                self._touch_stat(size=len(payload))
+            if cursor:
+                self._pos = len(payload)
+            return len(payload)
+        return super().write_mv(
+            data, offset, size=size, overwrite=overwrite,
+            update_stat=update_stat, cursor=False,
+        )
 
     def write_arrow_io(self, payload: "Any") -> int:
         """Commit an Arrow-encoded payload directly to the backend.
 
         Accepts a ``pa.Buffer``, ``bytes``, ``bytearray``, or
         ``memoryview`` and uploads it in one backend call — no
-        page buffer, no truncate, no stat probe. Tabular IO files
-        (ParquetFile, ArrowIPCFile, etc.) route through this after
-        the format encoder finishes so the encoded bytes go straight
-        to the remote object without intermediate copies.
+        truncate, no stat probe. Tabular IO files (ParquetFile,
+        ArrowIPCFile, etc.) route through this after the format encoder
+        finishes so the encoded bytes go straight to the remote object
+        without intermediate copies. Whole-object replace: any in-flight
+        write scratch is superseded.
         """
         if isinstance(payload, (bytes, bytearray)):
             data = payload
@@ -650,6 +518,7 @@ class RemotePath(Path):
             data = bytes(payload)
         else:
             data = bytes(memoryview(payload))
+        self._discard_scratch()
         self._upload(data)
         self._touch_stat(size=len(data))
         return len(data)
@@ -659,27 +528,12 @@ class RemotePath(Path):
 
         Accepts a materialised ``bytes`` payload and writes it as the
         entire object in one round trip. Returns the byte count.
-        Called by :meth:`flush` and :meth:`_write_mv` (``pos == 0``).
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement _upload(content)."
         )
 
-    def _note_streamed_upload(self, size: int) -> None:
-        """Post-streaming-upload bookkeeping — :meth:`_cache_after_upload`
-        minus the byte copy.
-
-        Makes the committed *size* authoritative (so a follow-up read on the
-        same instance doesn't see the pre-write ``_buffered_size`` and conclude
-        the object is empty) and drops any stale pages so a later read falls
-        through to a ranged backend fetch.
-        """
-        self._buffered_size = size
-        self._dirty_pages.clear()
-        if self._pages is not None:
-            self._pages.clear()
-
-    def _upload_stream(self, source: "Holder") -> int:
+    def _upload_stream(self, source: "Any") -> int:
         """Upload *source* (a seekable, sized Holder) as the whole object.
 
         Default: materialise *source* and defer to :meth:`_upload` — keeps
@@ -714,178 +568,80 @@ class RemotePath(Path):
         self._upload(payload)
         return n
 
+    def truncate(self, n: int) -> int:
+        """Resize the object to exactly *n* bytes.
+
+        - **Acquired** (the ``open("wb")`` truncate-on-acquire, and
+          explicit truncates inside a ``with``): resize the disk scratch;
+          the commit happens once on :meth:`flush`. An empty ``truncate(0)``
+          therefore costs no PUT until release — and ``open("wb")``
+          immediately followed by a write coalesces to a single upload.
+        - **Closed**: a whole-object upload — ``truncate(0)`` PUTs an
+          empty object; ``truncate(n > 0)`` downloads, slices /
+          zero-extends, re-uploads.
+        """
+        if n < 0:
+            raise ValueError(f"truncate size must be >= 0, got {n!r}")
+        if self._acquired:
+            scratch = self._ensure_scratch(seed=n > 0)
+            scratch.truncate(n)
+            self._touch_stat(size=n)
+            return n
+        if n == 0:
+            self._upload(b"")
+            self._touch_stat(size=0)
+            return 0
+        try:
+            existing = bytes(self._read_mv(-1, 0))
+        except FileNotFoundError:
+            existing = b""
+        if len(existing) >= n:
+            payload = existing[:n]
+        else:
+            payload = existing + b"\x00" * (n - len(existing))
+        self._upload(payload)
+        self._touch_stat(size=n)
+        return n
+
     def flush(self) -> None:
-        """Commit dirty buffered pages to the backend in one upload."""
-        if self._dirty_pages:
-            size = self._effective_total()
-            payload = bytes(self._paged_read(size, 0)) if size > 0 else b""
-            self._upload(payload)
-            self._cache_after_upload(payload, len(payload))
+        """Commit the acquired write scratch to the backend in one upload.
+
+        The single (streamed) PUT that an ``open("wb")`` window produces —
+        every ``write()`` since acquire spliced into the disk scratch, and
+        this drains it. The scratch streams off disk (bounded memory) on
+        backends that support it; others read it back for the SDK's
+        whole-object upload. A no-op when nothing was buffered.
+        ``with path.open("wb"): pass`` still materialises an empty object
+        (the acquire-time ``truncate(0)`` seeded an empty scratch).
+        """
+        scratch = self._scratch
+        if scratch is not None:
+            self._scratch = None
+            try:
+                size = int(scratch.size)
+                if self.SUPPORTS_STREAMING_UPLOAD:
+                    self._upload_stream(scratch)
+                else:
+                    self._upload(scratch.read_bytes())
+                self._touch_stat(size=size)
+            finally:
+                try:
+                    scratch.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
         super().flush()
 
     def _release(self) -> None:
-        """Flush dirty pages before the standard release.
+        """Flush the acquired write scratch before the standard release.
 
-        Called from :meth:`close` (explicit) and :meth:`__del__` (GC).
-        A failed flush at GC time is logged and swallowed — never
-        raise from ``__del__`` per :class:`Disposable`.
+        Called from :meth:`close` (explicit) and :meth:`__del__` (GC). A
+        failed flush at GC time is logged and swallowed — never raise from
+        ``__del__`` per :class:`Disposable`.
         """
         try:
             self.flush()
         except Exception as exc:
             logger.warning(
-                "Buffered flush failed during release of %r: %s",
-                self,
-                exc,
+                "Buffered flush failed during release of %r: %s", self, exc,
             )
         super()._release()
-
-    def truncate(self, n: int) -> int:
-        """Page-buffered truncate for the ``truncate(0)`` overwrite prelude.
-
-        ``truncate(0)`` clears the page cache and stamps the logical
-        size without a network call — the subsequent write + flush
-        replaces the object atomically. ``truncate(n > 0)`` falls
-        through to the base read-modify-write path.
-        """
-        if n < 0:
-            raise ValueError(f"truncate size must be >= 0, got {n!r}")
-        if n == 0 and self._page_size is not None:
-            # Already known-empty (a prior truncate / empty write stamped
-            # the buffered tip to 0): nothing to discard or re-stamp.
-            # Uses only the locally-cached size — never a backend probe.
-            if self._buffered_size == 0:
-                return 0
-            if self._pages is not None:
-                self._discard_pages_past(0)
-            self._stamp_buffered_size(0)
-            self._touch_stat(size=0)
-            return 0
-        return super().truncate(n)
-
-
-
-    # ------------------------------------------------------------------
-    # Page-level helpers
-    # ------------------------------------------------------------------
-
-    def _paged_read(self, n: int, pos: int) -> memoryview:
-        page_size = self._page_size
-        pages = self._ensure_pages()
-        first_page = pos // page_size
-        last_page = (pos + n - 1) // page_size
-        if first_page == last_page:
-            page = pages.get(first_page)
-            if page is None:
-                page = self._fetch_page(first_page)
-                pages.set(first_page, page)
-            page_start = first_page * page_size
-            local = pos - page_start
-            return memoryview(bytes(page._buf[local : local + n]))
-        out = bytearray(n)
-        out_pos = 0
-        end = pos + n
-        for page_idx in range(first_page, last_page + 1):
-            page = pages.get(page_idx)
-            if page is None:
-                page = self._fetch_page(page_idx)
-                pages.set(page_idx, page)
-            page_start = page_idx * page_size
-            slice_start = max(pos, page_start) - page_start
-            slice_end = min(end, page_start + page_size) - page_start
-            take = slice_end - slice_start
-            out[out_pos : out_pos + take] = page._buf[slice_start:slice_end]
-            out_pos += take
-        return memoryview(bytes(out))
-
-    def _fetch_page(self, page_idx: int) -> Memory:
-        """Load one page from the backend via the subclass primitive.
-
-        Asks for ``page_size`` bytes and trusts the response length —
-        backends that downloads the whole object (Databricks Volumes)
-        return what they have; ranged backends (S3) cap at EOF on
-        their own. A missing object surfaces as an empty page.
-        """
-        page_size = self._page_size
-        page_offset = page_idx * page_size
-        try:
-            chunk = bytes(self._read_mv(page_size, page_offset))
-        except FileNotFoundError:
-            return Memory.from_bytearray(bytearray(page_size), size=0)
-        if not chunk:
-            return Memory.from_bytearray(bytearray(page_size), size=0)
-        buf = bytearray(page_size)
-        n = min(len(chunk), page_size)
-        buf[:n] = chunk[:n]
-        return Memory.from_bytearray(buf, size=n)
-
-    def _paged_write(self, data: memoryview, offset: int) -> None:
-        page_size = self._page_size
-        pages = self._ensure_pages()
-        n = len(data)
-        end = offset + n
-        first_page = offset // page_size
-        last_page = (end - 1) // page_size
-        src_pos = 0
-        backend_total = Path.size.fget(self)  # type: ignore[attr-defined]
-        for page_idx in range(first_page, last_page + 1):
-            page_start = page_idx * page_size
-            page = pages.get(page_idx)
-            slice_start = max(offset, page_start) - page_start
-            slice_end = min(end, page_start + page_size) - page_start
-            take = slice_end - slice_start
-            page_backend_len = min(
-                page_size,
-                max(0, backend_total - page_start),
-            )
-            if page is None:
-                # Avoid the backend hit when the write fully covers
-                # both this page's slot and any backend tail past the
-                # write — there's nothing to preserve.
-                if slice_start == 0 and slice_end >= page_backend_len:
-                    page = Memory.from_bytearray(bytearray(page_size), size=slice_end)
-                else:
-                    page = self._fetch_page(page_idx)
-                pages.set(page_idx, page)
-            if page._size < slice_end:
-                page._size = slice_end
-            page._buf[slice_start:slice_end] = data[src_pos : src_pos + take]
-            src_pos += take
-            self._dirty_pages.add(page_idx)
-            # Re-stamp with no expiry so a dirty page can't TTL out
-            # from under a pending flush.
-            pages.set(page_idx, page, ttl=None)
-
-    def _actual_tail(self) -> int:
-        """Largest logical byte index any loaded page reports.
-
-        The page cache learns the file's real tail as a side effect of
-        :meth:`_fetch_page` — backends that download whole objects
-        regardless of the requested range surface their true size on
-        the loaded :class:`Memory`, even when :meth:`_stat` lies about
-        it. Walk the live pages and report the max ``page_start +
-        page._size`` so partial writes don't truncate the unread tail.
-        """
-        if self._pages is None:
-            return 0
-        page_size = self._page_size
-        tail = 0
-        for key in list(self._pages.keys()):
-            page = self._pages.get(key)
-            if page is None:
-                continue
-            candidate = key * page_size + page._size
-            if candidate > tail:
-                tail = candidate
-        return tail
-
-    def _discard_pages_past(self, end: int) -> None:
-        if self._pages is None:
-            return
-        page_size = self._page_size
-        # Index of the first page that lies entirely past ``end``.
-        cutoff = (end + page_size - 1) // page_size
-        for key in list(self._pages.keys()):
-            if key >= cutoff:
-                self._pages.pop(key, None)
-                self._dirty_pages.discard(key)
