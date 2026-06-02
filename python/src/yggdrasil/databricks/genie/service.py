@@ -21,7 +21,9 @@ default ``space_id`` once and stop repeating it::
 """
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 
 from yggdrasil.databricks.service import DatabricksService
@@ -45,6 +47,34 @@ __all__ = ["Genie"]
 
 
 LOGGER = logging.getLogger(__name__)
+
+#: Local cache mapping ``host|catalog|schema|title`` → default space id, so
+#: :meth:`Genie.ensure_default_space` reuses the same space across processes
+#: without depending on Databricks' eventually-consistent space listing.
+_DEFAULT_SPACE_CACHE = Path.home() / ".ygg" / "genie.json"
+
+
+def _read_default_space(key: str) -> Optional[str]:
+    """Return the cached default-space id for ``key``, or ``None``."""
+    try:
+        return json.loads(_DEFAULT_SPACE_CACHE.read_text()).get(key)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_default_space(key: str, space_id: str) -> None:
+    """Persist ``space_id`` for ``key`` (best-effort — a read-only home is fine)."""
+    try:
+        _DEFAULT_SPACE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        try:
+            data = json.loads(_DEFAULT_SPACE_CACHE.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data[key] = space_id
+        _DEFAULT_SPACE_CACHE.write_text(json.dumps(data, indent=2))
+    except OSError as exc:  # pragma: no cover - depends on FS perms
+        LOGGER.debug("Could not write Genie default-space cache: %s", exc)
 
 
 class Genie(DatabricksService):
@@ -212,20 +242,35 @@ class Genie(DatabricksService):
     ) -> GenieSpace:
         """Return a default Genie space, creating it on first use.
 
-        If a space already exists with the default title it is reused;
-        otherwise one is created over ``tables`` (or up to 25 tables
-        discovered in the catalog/schema — Genie caps a space at 30). Lets
-        ``client.genie.ask(...)`` work out of the box without a pre-built
-        space. Reuse is best-effort: Databricks' space listing is
-        eventually consistent, so a just-created space can be briefly
-        invisible — pin the returned id (e.g. ``$YGG_GENIE_SPACE``) for
-        stable reuse.
+        Resolution order: a locally cached id for this
+        ``host|catalog|schema|title`` (verified to still exist), then a space
+        with the default title, then create one over ``tables`` (or up to 25
+        tables discovered in the catalog/schema — Genie caps a space at 30).
+        The local cache (``~/.ygg/genie.json``) makes reuse stable across
+        processes even though Databricks' space *listing* is eventually
+        consistent. Lets ``client.genie.ask(...)`` work out of the box
+        without a pre-built space.
         """
         space_title = title or self.defaults.default_space_title
+        cat = catalog or getattr(self.client, "catalog_name", None)
+        sch = schema or getattr(self.client, "schema_name", None)
+        key = f"{getattr(self.client, 'host', '')}|{cat}|{sch}|{space_title}"
+
+        # 1. Local cache — robust reuse across processes (verified live so a
+        #    trashed space falls through to a fresh create).
+        cached_id = _read_default_space(key)
+        if cached_id and self.space(cached_id).exists():
+            LOGGER.debug("Reusing cached default Genie space %s", cached_id)
+            return self.space(cached_id)
+
+        # 2. Title lookup (covers spaces created elsewhere).
         existing = self.find_space(title=space_title)
         if existing is not None:
             LOGGER.debug("Reusing existing default Genie space %s", existing.space_id)
+            _write_default_space(key, existing.space_id)
             return existing
+
+        # 3. Create.
         space_tables = list(tables) if tables else self.discover_tables(
             catalog=catalog, schema=schema,
         )
@@ -234,9 +279,11 @@ class Genie(DatabricksService):
                 "Cannot create a default Genie space: no tables given and none "
                 "discovered. Pass tables= or a populated catalog/schema."
             )
-        return self.create_space(
+        space = self.create_space(
             tables=space_tables, title=space_title, warehouse_id=warehouse_id,
         )
+        _write_default_space(key, space.space_id)
+        return space
 
     # ------------------------------------------------------------------ #
     # One-shot ask

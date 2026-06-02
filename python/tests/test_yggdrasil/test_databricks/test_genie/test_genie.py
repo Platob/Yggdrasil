@@ -33,6 +33,9 @@ from yggdrasil.databricks.genie import (
 )
 from yggdrasil.databricks.tests import DatabricksTestCase
 
+#: Module path for patching the default-space cache helpers.
+_SVC = "yggdrasil.databricks.genie.service"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -254,25 +257,44 @@ class TestCreateSpace(GenieTestCase):
         with self.assertRaises(ValueError):
             self.genie.discover_tables()
 
-    def test_ensure_default_space_reuses_existing(self):
+    def test_ensure_default_space_cache_hit(self):
+        # A cached id that still exists is reused without listing or creating.
+        self.genie_api.get_space.return_value = SdkGenieSpace(
+            space_id="cached", title="Yggdrasil Genie",
+        )
+        with patch(f"{_SVC}._read_default_space", return_value="cached"):
+            space = self.genie.ensure_default_space()
+        self.assertEqual(space.space_id, "cached")
+        self.genie_api.create_space.assert_not_called()
+        self.genie_api.list_spaces.assert_not_called()
+
+    def test_ensure_default_space_reuses_existing_by_title(self):
         page = MagicMock()
         page.spaces = [SdkGenieSpace(space_id="exists", title="Yggdrasil Genie")]
         page.next_page_token = None
         self.genie_api.list_spaces.return_value = page
 
-        space = self.genie.ensure_default_space()
+        with patch(f"{_SVC}._read_default_space", return_value=None), \
+                patch(f"{_SVC}._write_default_space") as wr:
+            space = self.genie.ensure_default_space()
         self.assertEqual(space.space_id, "exists")
         self.genie_api.create_space.assert_not_called()
+        wr.assert_called_once()  # cache the found id
 
     def test_ensure_default_space_creates_when_missing(self):
         page = MagicMock(spaces=[], next_page_token=None)
         self.genie_api.list_spaces.return_value = page
-        with patch.object(self.genie, "discover_tables", return_value=["c.s.a"]), \
+        with patch(f"{_SVC}._read_default_space", return_value=None), \
+                patch(f"{_SVC}._write_default_space") as wr, \
+                patch.object(self.genie, "discover_tables", return_value=["c.s.a"]), \
                 patch.object(self.client.warehouses, "find_default",
                              return_value=MagicMock(warehouse_id="wh")):
             space = self.genie.ensure_default_space()
         self.assertEqual(space.space_id, "new-1")
         self.genie_api.create_space.assert_called_once()
+        wr.assert_called_once_with(  # cache the created id
+            wr.call_args.args[0], "new-1",
+        )
 
     def test_space_trash(self):
         self.genie.space("space-1").trash()

@@ -99,10 +99,10 @@ space = client.genie.ensure_default_space()   # found-or-created
 client.genie.ask("top customers by revenue", space_id=space.space_id)
 ```
 
-!!! note
-    Databricks' space listing is eventually consistent, so reuse is
-    best-effort — pin the returned id (e.g. `$YGG_GENIE_SPACE`) for stable
-    reuse rather than relying on title lookup right after creation.
+The created space's id is cached locally (`~/.ygg/genie.json`, keyed by
+`host|catalog|schema|title`), so subsequent `ensure_default_space()` calls
+reuse it across processes — even though Databricks' space *listing* is
+eventually consistent. A cached id is verified to still exist before reuse.
 
 ## Ask a question
 
