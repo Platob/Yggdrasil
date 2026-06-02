@@ -24,23 +24,36 @@ def _child(name: str, *, exists: bool = False, is_view: bool = False) -> MagicMo
     return t
 
 
-def _schema_with_children(children: list[MagicMock], *, target_present: set[str] | None = None):
+def _schema_with_children(
+    children: list[MagicMock],
+    *,
+    target_present: set[str] | None = None,
+    target_views: set[str] | None = None,
+):
     """Build a source ``UCSchema`` whose ``tables()`` yields *children* and
-    whose target-side ``table(name)`` reports presence per *target_present*."""
+    whose target-side ``table(name)`` reports presence per *target_present*
+    (and view-kind per *target_views*)."""
     present = target_present or set()
+    views = target_views or set()
     svc = MagicMock()
     svc.catalog_name = "src"
     svc.schema_name = "s"
     svc.client.base_url.host = "example.cloud.databricks.com"
 
     src = UCSchema(service=svc, catalog_name="src", schema_name="s")
+    handles: dict[str, MagicMock] = {}
 
-    # Target-side table handles: exists() answers from *present*; clone is a no-op.
+    # Target-side table handles: exists()/is_view answer from the fixture sets;
+    # clone / delete are no-ops we can assert against. Memoised per name so a
+    # test can inspect the same handle the clone touched.
     def _target_table(tname: str):
-        h = MagicMock(name=f"dst:{tname}")
-        h.exists.return_value = tname in present
-        h.full_name.return_value = f"dst.s.{tname}"
-        return h
+        if tname not in handles:
+            h = MagicMock(name=f"dst:{tname}")
+            h.exists.return_value = tname in present
+            h.is_view = tname in views
+            h.full_name.return_value = f"dst.s.{tname}"
+            handles[tname] = h
+        return handles[tname]
 
     # Patch navigation: tables() → children; target schema build → a stub whose
     # .table(name) hands back per-name target handles and ensure_created is a no-op.
@@ -70,16 +83,36 @@ def test_clone_creates_missing_and_skips_present():
     assert kwargs["mode"] is Mode.IGNORE
 
 
-def test_clone_replace_overwrites_even_when_present():
-    a = _child("a")
-    src, tgt, children = _schema_with_children([a], target_present={"a"})
+def test_clone_kind_drift_drops_stale_target_then_recreates():
+    # Source 'x' is now a VIEW; the target 'x' still exists as a TABLE. The
+    # mismatched kind can't be cross-replaced, so the stale target is dropped
+    # before the recreate (under the default IGNORE policy, which would
+    # otherwise skip an existing same-name target).
+    x = _child("x", is_view=True)
+    src, tgt, children = _schema_with_children(
+        [x], target_present={"x"}, target_views=set(),  # target is a table
+    )
     with patch.object(UCSchema, "tables", return_value=iter(children)), \
          patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
-         patch.object(type(src), "table", side_effect=tgt.table):
-        result = src.clone(schema_name="dst", replace=True)
-    assert result == {"a": "created"}
-    _, kwargs = a.clone.call_args
-    assert kwargs["mode"] is Mode.OVERWRITE
+         patch.object(UCSchema, "table", side_effect=tgt.table):
+        result = src.clone(schema_name="dst")  # default IGNORE
+    assert result == {"x": "created"}      # recreated, not skipped
+    tgt.table("x").delete.assert_called_once()
+    x.clone.assert_called_once()
+
+
+def test_clone_kind_drift_under_error_if_exists_does_not_drop():
+    # ERROR_IF_EXISTS must let a clash surface as a failure — never silently
+    # drop the existing target, even on a kind change.
+    x = _child("x", is_view=True)
+    x.clone.side_effect = RuntimeError("already exists")
+    src, tgt, children = _schema_with_children([x], target_present={"x"})
+    with patch.object(UCSchema, "tables", return_value=iter(children)), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch.object(UCSchema, "table", side_effect=tgt.table):
+        result = src.clone(schema_name="dst", mode=Mode.ERROR_IF_EXISTS)
+    assert result["x"].startswith("failed: ")
+    tgt.table("x").delete.assert_not_called()
 
 
 def test_clone_excludes_views_when_requested():
@@ -106,15 +139,15 @@ def test_clone_records_per_child_failure_without_aborting():
     good.clone.assert_called_once()
 
 
-def test_clone_mode_overrides_replace_and_forwards_to_sub_clones():
-    # mode=OVERWRITE wins even with replace=False, and is set on every sub-clone.
+def test_clone_mode_overwrite_recreates_present_and_forwards_to_sub_clones():
+    # OVERWRITE never skips an existing same-kind target — it overwrites it, and
+    # the mode is set on every sub-clone.
     a = _child("a")
     src, tgt, children = _schema_with_children([a], target_present={"a"})
     with patch.object(UCSchema, "tables", return_value=iter(children)), \
          patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
          patch.object(UCSchema, "table", side_effect=tgt.table):
         result = src.clone(schema_name="dst", mode=Mode.OVERWRITE)
-    # OVERWRITE never skips an existing target — it overwrites it.
     assert result == {"a": "created"}
     _, kwargs = a.clone.call_args
     assert kwargs["mode"] is Mode.OVERWRITE

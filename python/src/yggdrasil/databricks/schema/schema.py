@@ -738,8 +738,7 @@ class UCSchema(DatabricksPath):
         catalog_name: str | None = None,
         schema_name: str | None = None,
         deep: bool = True,
-        replace: bool = False,
-        mode: Any = ...,
+        mode: ModeLike = Mode.IGNORE,
         include_views: bool = True,
         name: str | None = None,
         max_workers: int | None = None,
@@ -747,12 +746,20 @@ class UCSchema(DatabricksPath):
         """Clone every child of this schema into *target*, in parallel.
 
         The target schema (and any missing parent catalog) is created first,
-        then each child table / view is cloned concurrently with
-        ``CREATE TABLE IF NOT EXISTS … CLONE`` semantics: a child already
-        present in the target is **skipped** (left untouched), a missing one is
-        **created**. Pass ``replace=True`` to ``CREATE OR REPLACE`` every child
-        instead (overwriting same-named targets). One child's failure is
-        recorded and never aborts the rest of the batch.
+        then each child table / view is cloned concurrently. ``mode`` is the
+        single existence policy, applied uniformly to every sub-clone:
+
+        - ``IGNORE`` (default) — ``CREATE … IF NOT EXISTS``: a child already
+          present is **skipped** (left untouched), a missing one is created.
+        - ``OVERWRITE`` / ``TRUNCATE`` — ``CREATE OR REPLACE``: overwrite
+          same-named targets.
+        - ``ERROR_IF_EXISTS`` — plain ``CREATE``: record a failure per clash.
+
+        A target that exists but **changed kind** (table ⇄ view) can't be
+        cross-replaced by Delta, so it is dropped first and recreated as the
+        source's current kind (except under ``ERROR_IF_EXISTS``, which lets the
+        clash surface as a failure). One child's failure is recorded and never
+        aborts the rest of the batch.
 
         Args:
             target:        Destination schema — a :class:`UCSchema`, a
@@ -764,15 +771,9 @@ class UCSchema(DatabricksPath):
             schema_name:   Target schema override.
             deep:          DEEP clone (independent copy) vs SHALLOW (metadata
                            only, shares the source's files).
-            replace:       ``CREATE OR REPLACE`` each child rather than skip the
-                           ones that already exist. Shorthand for
-                           ``mode=Mode.OVERWRITE``; ignored when *mode* is set.
-            mode:          Existence policy forwarded to **every** sub-clone
-                           (overrides *replace* when given): ``OVERWRITE`` /
-                           ``TRUNCATE`` overwrite same-named targets, ``IGNORE``
-                           skips the ones already present, ``ERROR_IF_EXISTS``
-                           records a failure for each clash. Left unset
-                           (``...``), the policy is derived from *replace*.
+            mode:          Existence policy (``Mode`` or mode-like string)
+                           forwarded to every sub-clone — see above. Defaults to
+                           ``IGNORE`` (skip what's already there).
             include_views: Also clone view-shaped children (re-emitting their
                            definition); ``False`` clones only tables.
             name:          Optional child-name filter (exact or glob) — clone a
@@ -786,22 +787,21 @@ class UCSchema(DatabricksPath):
         """
         import concurrent.futures as cf
 
-        # One existence policy drives the whole fan-out: an explicit ``mode``
-        # wins, otherwise ``replace`` picks OVERWRITE (replace) vs IGNORE (skip
-        # what's already there — the default). It's forwarded to every
+        # One existence policy drives the whole fan-out, forwarded to every
         # sub-clone so the batch is uniform.
-        if mode is ...:
-            sub_mode = Mode.OVERWRITE if replace else Mode.IGNORE
-        else:
-            sub_mode = Mode.from_(mode)
-            if sub_mode not in (
-                Mode.OVERWRITE, Mode.TRUNCATE, Mode.IGNORE, Mode.ERROR_IF_EXISTS,
-            ):
-                raise ValueError(
-                    f"clone mode must be OVERWRITE/TRUNCATE, IGNORE, or "
-                    f"ERROR_IF_EXISTS — got {sub_mode.name}."
-                )
+        sub_mode = Mode.from_(mode)
+        if sub_mode not in (
+            Mode.OVERWRITE, Mode.TRUNCATE, Mode.IGNORE, Mode.ERROR_IF_EXISTS,
+        ):
+            raise ValueError(
+                f"clone mode must be OVERWRITE/TRUNCATE, IGNORE, or "
+                f"ERROR_IF_EXISTS — got {sub_mode.name}."
+            )
         skip_existing = sub_mode is Mode.IGNORE
+        # ERROR_IF_EXISTS wants a clash to fail; every other mode means
+        # "(re)create over it", which is what licenses dropping a kind-drifted
+        # target before recreating it.
+        recreate_on_drift = sub_mode is not Mode.ERROR_IF_EXISTS
 
         # Resolve the destination catalog / schema from whichever form the
         # caller passed (UCSchema, dotted string, or explicit kwargs).
@@ -858,8 +858,21 @@ class UCSchema(DatabricksPath):
         def _clone_one(src: "Table") -> tuple[str, str]:
             dst = tgt.table(src.table_name)
             try:
-                if skip_existing and dst.exists():
-                    return src.table_name, "skipped"
+                if dst.exists():
+                    # ``exists()`` populated dst's infos, so ``is_view`` is free.
+                    kind_changed = bool(src.is_view) != bool(dst.is_view)
+                    if not kind_changed and skip_existing:
+                        return src.table_name, "skipped"
+                    if kind_changed and recreate_on_drift:
+                        # table ⇄ view can't be cross-replaced — drop the stale
+                        # target so it's recreated as the source's current kind.
+                        logger.info(
+                            "clone %s → %s: target changed kind (view=%s→%s) — "
+                            "dropping before recreate",
+                            src.full_name(), dst.full_name(),
+                            dst.is_view, src.is_view,
+                        )
+                        dst.delete(missing_ok=True)
                 src.clone(target=dst, deep=deep, mode=sub_mode)
                 return src.table_name, "created"
             except Exception as exc:  # noqa: BLE001 — collect, don't abort the batch
