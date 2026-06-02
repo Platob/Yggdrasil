@@ -43,7 +43,10 @@ class TestAnyToSparkLargeArrowTypes(SparkTestCase, ArrowTestCase):
 
         df = convert(table, pyspark_sql.DataFrame)
 
-        self.assertIsInstance(df, pyspark_sql.DataFrame)
+        # Accept a Spark Connect DataFrame too (a Databricks Connect session
+        # returns ``pyspark.sql.connect.dataframe.DataFrame``, not the classic).
+        from yggdrasil.lazy_imports import spark_dataframe_classes
+        self.assertIsInstance(df, spark_dataframe_classes())
         rows = sorted(df.collect(), key=lambda r: r["id"])
         self.assertEqual([r["id"] for r in rows], [1, 2, 3])
         self.assertEqual([list(r["tags"]) for r in rows], [["a", "b"], ["c"], []])

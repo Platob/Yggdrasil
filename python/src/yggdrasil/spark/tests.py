@@ -112,6 +112,38 @@ def _default_config(warehouse_dir: Path, app_name: str) -> dict[str, str]:
     }
 
 
+# Process-wide cache for the one-time UDF-support probe (the session is shared).
+_UDF_SUPPORTED: "bool | None" = None
+
+
+def _probe_udf_support(spark: "SparkSession") -> bool:
+    """Probe whether a Python UDF executes against *spark*.
+
+    Local-JVM sessions always support UDFs. A Spark Connect session only does
+    when the client and server share the same minor Python version — otherwise
+    the server raises a "Python versions ... should have the same minor Python
+    version" error. Returns ``False`` only for that specific incompatibility; any
+    other failure returns ``True`` so a real bug isn't masked as "no UDF"."""
+    try:
+        from pyspark.sql import functions as F
+        from pyspark.sql.types import LongType
+
+        spark.range(1).select(
+            F.udf(lambda v: v, LongType())("id").alias("v")
+        ).collect()
+        return True
+    except Exception as exc:  # noqa: BLE001 - classify the message below
+        msg = str(exc)
+        if "Python version" in msg or "minor Python" in msg:
+            LOGGER.warning(
+                "Python UDFs unavailable on this Spark Connect session "
+                "(client/server Python mismatch) — UDF tests will skip: %s",
+                msg.splitlines()[0] if msg else exc,
+            )
+            return False
+        return True
+
+
 def _get_test_spark(
     app_name: str = "yggdrasil-test",
     extra_config: dict[str, str] | None = None,
@@ -222,6 +254,47 @@ class SparkTestCase(unittest.TestCase):
     def tearDownClass(cls) -> None:
         # Do NOT stop the session — it's shared globally.
         super().tearDownClass()
+
+    # --- Spark Connect awareness ---------------------------------------
+    @classmethod
+    def is_spark_connect(cls) -> bool:
+        """True when the shared session is a Spark Connect (Databricks Connect)
+        session rather than a local-JVM one."""
+        return "connect" in type(getattr(cls, "spark", None)).__module__
+
+    @classmethod
+    def udf_supported(cls) -> bool:
+        """Whether Python UDFs can execute against the shared session.
+
+        Always true on a local-JVM session. On Spark Connect a Python UDF only
+        runs when the client and server share the same *minor* Python version —
+        otherwise the server rejects it ("client and server should have the same
+        minor Python version"). Probed once (a tiny UDF round-trip) and cached
+        globally, since the session is shared across the whole process."""
+        global _UDF_SUPPORTED
+        if _UDF_SUPPORTED is None:
+            _UDF_SUPPORTED = _probe_udf_support(cls.spark)
+        return _UDF_SUPPORTED
+
+    def skip_if_no_udf(
+        self,
+        reason: str = "Python UDFs need a matching client/server Python "
+                      "minor version on Spark Connect",
+    ) -> None:
+        """Skip the current test when Python UDFs can't run on the session
+        (Spark Connect with a client/server Python-version mismatch)."""
+        if not type(self).udf_supported():
+            raise unittest.SkipTest(reason)
+
+    def skip_if_spark_connect(
+        self,
+        reason: str = "JVM-only API (sparkContext / rdd) is unavailable on "
+                      "Spark Connect",
+    ) -> None:
+        """Skip the current test on a Spark Connect session — for tests that
+        reach JVM-only APIs (``sparkContext``, ``rdd``) absent in Connect."""
+        if type(self).is_spark_connect():
+            raise unittest.SkipTest(reason)
 
     def setUp(self) -> None:
         super().setUp()

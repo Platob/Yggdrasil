@@ -74,6 +74,7 @@ class TestSparkOps(SparkTestCase):
         assert [r.v for r in rows] == [10, 10, 10]
 
     def test_resample_partitioned_no_cross_partition_leak(self) -> None:
+        self.skip_if_no_udf()
         from yggdrasil.spark.ops import resample_spark_dataframe
 
         rows = []
@@ -101,6 +102,7 @@ class TestSparkOps(SparkTestCase):
         assert per_sym["B"] == [None, None, 50]
 
     def test_resample_no_fill_keeps_bucket_nulls(self) -> None:
+        self.skip_if_no_udf()
         from yggdrasil.spark.ops import resample_spark_dataframe
 
         rows = [
@@ -140,6 +142,7 @@ class TestSparkOps(SparkTestCase):
         assert [(r.id, r.v) for r in rows] == [(1, "a"), (2, "b"), (3, "d")]
 
     def test_dataset_resample_returns_dataset_with_ffill(self) -> None:
+        self.skip_if_no_udf()
         from yggdrasil.spark.tabular import SparkDataset
 
         rows = [
@@ -158,6 +161,7 @@ class TestSparkOps(SparkTestCase):
         assert [r.v for r in collected] == [10, 10, 10]
 
     def test_dataset_resample_accepts_iso_duration_string(self) -> None:
+        self.skip_if_no_udf()
         from yggdrasil.spark.tabular import SparkDataset
 
         rows = [("A", dt.datetime(2024, 1, 1, h), h) for h in range(4)]
@@ -221,6 +225,7 @@ class TestSparkOps(SparkTestCase):
     def test_dataset_filter_callable_still_works(self) -> None:
         """Legacy callable filter path is preserved — ``Dataset.filter``
         dispatches by argument type."""
+        self.skip_if_no_udf()
         from yggdrasil.spark.tabular import SparkDataset
         from yggdrasil.data import field, schema
         from yggdrasil.data.types.primitive import Int64Type

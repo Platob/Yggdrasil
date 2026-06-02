@@ -238,13 +238,14 @@ class TestDeltaSparkReadWrite(DeltaTestCase):
         super().tearDownClass()
 
     def test_read_spark_frame_returns_dataframe(self) -> None:
-        from pyspark.sql import DataFrame
+        from yggdrasil.lazy_imports import spark_dataframe_classes
 
         d = self.delta_io()
         d.write_arrow_table(self.pa.table({"id": [1, 2, 3], "val": ["a", "b", "c"]}))
 
         df = d.read_spark_frame(options=DeltaOptions(spark_session=self._spark))
-        self.assertIsInstance(df, DataFrame)
+        # classic or Spark Connect DataFrame
+        self.assertIsInstance(df, spark_dataframe_classes())
         self.assertEqual(df.count(), 3)
         self.assertEqual(sorted(df.toPandas()["id"].tolist()), [1, 2, 3])
 
