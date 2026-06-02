@@ -413,8 +413,17 @@ class S3Path(ExploreUrlRepr, RemotePath):
             return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
         resp = self.s3_bucket.http.head(self.key)
         if resp is not None:
+            size = int(resp.headers.get("Content-Length", 0) or 0)
+            if size == 0:
+                # Some S3-compatible stores (seen on UC external-location
+                # buckets) return ``Content-Length: 0`` on HEAD even for a
+                # non-empty object — which would break every size-dependent
+                # op (append-at-EOF, the zip / parquet ranged readers). Confirm
+                # the real size from a one-byte ranged GET's ``Content-Range:
+                # bytes 0-0/<total>`` header; a genuinely empty object stays 0.
+                size = self._size_via_content_range()
             return IOStats(
-                size=int(resp.headers.get("Content-Length", 0) or 0),
+                size=size,
                 mtime=_mtime_from_headers(resp.headers),
                 kind=IOKind.FILE,
                 mode=0,
@@ -426,6 +435,27 @@ class S3Path(ExploreUrlRepr, RemotePath):
         if page.objects or page.prefixes:
             return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
         return IOStats(size=0, mtime=0.0, kind=IOKind.MISSING, mode=0)
+
+    def _size_via_content_range(self) -> int:
+        """Total object size from a one-byte ranged GET's ``Content-Range``.
+
+        Fallback for stores whose HEAD under-reports ``Content-Length``.
+        ``Content-Range: bytes 0-0/<total>`` carries the true size; falls
+        back to the returned ``Content-Length`` (then 0) when the header is
+        absent. A genuinely empty object (416 / no range) resolves to 0.
+        """
+        try:
+            resp = self.s3_bucket.http.get(self.key, start=0, length=1)
+        except S3NotFound:
+            return 0
+        except Exception:
+            return 0
+        cr = resp.headers.get("Content-Range") or resp.headers.get("content-range")
+        if cr and "/" in cr:
+            total = cr.rsplit("/", 1)[-1].strip()
+            if total.isdigit():
+                return int(total)
+        return int(resp.headers.get("Content-Length", 0) or 0) or len(resp.content or b"")
 
     # ==================================================================
     # Listing (redirects to the bucket)

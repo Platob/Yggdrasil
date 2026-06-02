@@ -140,12 +140,18 @@ class TestS3PathViaExternalVolume(DatabricksIntegrationCase):
         finally:
             self._path("opened.bin").unlink(missing_ok=True)
 
-    # NOTE: append-at-EOF (``open("ab")``) is intentionally not covered here.
-    # It needs a reliable up-front object size to park the cursor at EOF, and
-    # the S3-compatible store backing UC external volumes returns
-    # ``Content-Length: 0`` on HEAD (while GET returns the full body) — so the
-    # cursor would land at 0. That's a store quirk, not an S3Path defect;
-    # whole-object reads / writes (covered above) don't depend on HEAD size.
+    def test_open_append(self) -> None:
+        # Append-at-EOF needs a reliable up-front size; this store under-reports
+        # Content-Length on HEAD, so S3Path falls back to a Content-Range probe
+        # (see ``_size_via_content_range``) — the cursor parks at the real EOF.
+        p = self._path("append.bin")
+        try:
+            p.write_bytes(b"head-")
+            with self._path("append.bin").open("ab") as io:
+                io.write(b"tail")
+            self.assertEqual(bytes(self._path("append.bin").read_bytes()), b"head-tail")
+        finally:
+            p.unlink(missing_ok=True)
 
     # -- tabular -------------------------------------------------------
     def test_parquet_roundtrip(self) -> None:
@@ -157,6 +163,27 @@ class TestS3PathViaExternalVolume(DatabricksIntegrationCase):
             got = self._path("t.parquet").read_arrow_table()
             self.assertEqual(got.num_rows, 2000)
             self.assertEqual(got.column("id").to_pylist()[:3], [0, 1, 2])
+        finally:
+            p.unlink(missing_ok=True)
+
+    def test_zip_ranged_entry_read(self) -> None:
+        """A zip on S3 reads its directory + entries via ranged block fetches
+        — never the whole archive — exactly like the volume path."""
+        import io as _io
+        import zipfile as _zf
+        raw = _io.BytesIO()
+        with _zf.ZipFile(raw, "w", _zf.ZIP_STORED) as z:
+            z.writestr("a.txt", b"alpha")
+            z.writestr("big.bin", secrets.token_bytes(1_500_000))
+            z.writestr("meta.json", b"{}")
+        big = _zf.ZipFile(_io.BytesIO(raw.getvalue())).read("big.bin")
+        p = self._path("arc.zip")
+        try:
+            p.write_bytes(raw.getvalue())
+            z = self._path("arc.zip").as_media("zip")
+            self.assertEqual(set(z.list_entries()), {"a.txt", "big.bin", "meta.json"})
+            self.assertEqual(bytes(z.child("a.txt").read_bytes()), b"alpha")
+            self.assertEqual(bytes(z.child("big.bin").read_bytes()), big)
         finally:
             p.unlink(missing_ok=True)
 
