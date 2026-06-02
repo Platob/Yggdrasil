@@ -244,9 +244,9 @@ class TestDatabricksTableInsert:
         assert ret is op and op.is_succeeded and op.result is inner
         run.assert_called_once()
         texts = run.call_args.args[1]               # the statement list
-        # Un-keyed append over a staged Parquet → COPY INTO (idempotent loader).
-        assert any("COPY INTO" in t.upper() for t in texts)
-        assert any("'/Volumes/c/s/t/.sql/tmp/x.parquet'" in t for t in texts)
+        # A single op stages one file → INSERT … SELECT (not COPY INTO).
+        assert any("INSERT" in t.upper() for t in texts)
+        assert any("parquet.`/Volumes/c/s/t/.sql/tmp/x.parquet`" in t for t in texts)
         # the staged file is registered for post-load cleanup
         assert run.call_args.kwargs["staging"] is dp.return_value
 
@@ -442,16 +442,15 @@ class TestMakeSqlInsertAtomic:
         assert "VACUUM c.s.t RETAIN 72 HOURS" in joined
 
     def test_columns_derived_from_schema_when_omitted(self):
-        # Un-keyed append over a staged Parquet → COPY INTO, columns derived
-        # from the op schema, source read by single-quoted path.
+        # A single staged file stays INSERT … SELECT (COPY INTO only wins
+        # across a batch); columns are derived from the op schema.
         from yggdrasil.databricks.table.insert import make_sql_insert
         with patch("yggdrasil.databricks.path.DatabricksPath.from_") as dp:
             dp.return_value.full_path.return_value = "/Volumes/x.parquet"
             stmts = make_sql_insert(self._op(mode="append"))
         sql = _normalize_ws(stmts[0])
-        assert sql.startswith("COPY INTO c.s.t FROM")
-        assert "FROM (SELECT `id`, `v` FROM '/Volumes/x.parquet')" in sql
-        assert "FILEFORMAT = PARQUET" in sql
+        assert sql.startswith("INSERT INTO c.s.t (`id`, `v`)")
+        assert "parquet.`/Volumes/x.parquet`" in sql
 
 
 # --------------------------------------------------------------------------- #
@@ -487,6 +486,24 @@ class TestDatabricksInsertBatch:
         assert batch.make_sql() == (
             "SELECT * FROM parquet.`a` UNION ALL SELECT * FROM parquet.`b`"
         )
+
+    def test_copy_into_only_for_multi_file_batches(self):
+        # One staged file → INSERT (COPY INTO's per-load overhead loses on a
+        # single file); 2+ files sharing a dir → one COPY INTO over a FILES
+        # allow-list (the batch win).
+        from unittest.mock import patch
+        from yggdrasil.databricks.table.insert import DatabricksInsertBatch, make_sql_insert
+        [one] = DatabricksInsertBatch.group([self._op("a")])
+        [two] = DatabricksInsertBatch.group([self._op("a", ts=1.0), self._op("b", ts=2.0)])
+        with patch(
+            "yggdrasil.databricks.table.insert._op_file_path",
+            side_effect=lambda op, c: f"/Volumes/d/{op.data}.parquet",
+        ):
+            single = " ".join(make_sql_insert(one, columns=["x"]))
+            multi = " ".join(make_sql_insert(two, columns=["x"]))
+        assert "COPY INTO" not in single and "INSERT INTO" in single
+        assert "COPY INTO" in multi and "INSERT INTO" not in multi
+        assert "FILES = ('a.parquet', 'b.parquet')" in multi
 
     def test_overwrite_supersedes_earlier_ops_but_keeps_them_for_cleanup(self):
         from yggdrasil.databricks.table.insert import DatabricksInsertBatch

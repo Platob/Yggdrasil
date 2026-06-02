@@ -619,13 +619,8 @@ class DatabricksTableInsert(_InsertExecution):
             staged = self.staged_source(self.client)
             if getattr(staged, "full_path", None) is not None:
                 staging = staged
-                source_sql = make_sql_select(
-                    self, source=WarehousePreparedStatement.volume_path_text_value(staged),
-                )
-                # Cleanup binds on the bare staged path so it matches both the
-                # INSERT (``parquet.`<path>```) and the COPY INTO (``'<path>'``)
-                # spellings of the same file.
-                source_ref = staged.full_path()
+                source_ref = WarehousePreparedStatement.volume_path_text_value(staged)
+                source_sql = make_sql_select(self, source=source_ref)
 
         texts = make_sql_insert(
             self,
@@ -914,14 +909,10 @@ def _make_op_insert(
         )
     if source_sql is None:
         source_sql = make_sql_select(op, client=client)
-    # Un-keyed append over a staged Parquet file → COPY INTO (idempotent,
-    # optimized) instead of INSERT … SELECT. The path is read off the op
-    # regardless of how ``source_sql`` references it.
-    copy_into = None
-    if op.mode in _COPY_INTO_MODES and not op.match_by and not op.is_table_source:
-        path = _op_file_path(op, client)
-        if path is not None:
-            copy_into = make_sql_copy_into(location, columns, paths=[path])
+    # A single staged file stays ``INSERT … SELECT``: COPY INTO's per-load
+    # file-tracking overhead makes it ~14% slower than INSERT for one file —
+    # it only pays off across a batch (see _make_batch_insert and
+    # benchmarks/databricks/bench_copy_into.py).
     prune_predicates = _build_where_predicates(op.predicate, target_alias="T")
     return _build_dml_statements(
         target_location=location,
@@ -935,7 +926,6 @@ def _make_op_insert(
         optimize_after_merge=op.optimize_after_merge,
         vacuum_hours=op.vacuum_hours,
         safe_merge=op.safe_merge,
-        copy_into=copy_into,
     )
 
 
@@ -1006,10 +996,12 @@ def _make_batch_insert(
             else []
         )
     # The batch win: collapse the per-file ``SELECT … UNION ALL …`` into one
-    # ``COPY INTO`` over every staged Parquet file, when the load is a plain
-    # un-keyed append and all active ops are staged files sharing a directory.
+    # ``COPY INTO`` over every staged Parquet file — a plain un-keyed append
+    # over 2+ staged files sharing a directory. A single file stays INSERT
+    # (COPY INTO's per-load overhead only pays off across a batch: ~33% faster
+    # at 8 files but ~14% slower at one — bench_copy_into.py).
     copy_into = None
-    if batch.mode in _COPY_INTO_MODES and not batch.match_by and batch.active:
+    if batch.mode in _COPY_INTO_MODES and not batch.match_by and len(batch.active) >= 2:
         paths = [_op_file_path(op, client) for op in batch.active]
         if all(p is not None for p in paths):
             copy_into = make_sql_copy_into(location, columns, paths=paths)

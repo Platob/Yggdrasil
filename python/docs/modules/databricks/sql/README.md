@@ -110,18 +110,29 @@ print(as_pylist)
 Arrow / pandas / Polars inserts stage the rows as Parquet in the target's
 Unity Catalog Volume, then load them with SQL:
 
-- **Append** (`Mode.APPEND` / `AUTO`, no match keys) uses Databricks
-  **`COPY INTO`** — the optimized, **idempotent** bulk file loader. It
-  tracks which files it already ingested, so a retried load never
-  double-inserts (unlike `INSERT INTO … SELECT`). An async batch folds
-  every staged file into a *single* `COPY INTO … FILES = (…)` over their
-  shared directory instead of a per-file `SELECT … UNION ALL …`.
+- **Multi-file append batch** (`Mode.APPEND` / `AUTO`, no match keys, 2+
+  staged files sharing a directory) folds every file into a *single*
+  Databricks **`COPY INTO … FILES = (…)`** instead of a per-file
+  `SELECT … UNION ALL …`. `COPY INTO` is the optimized, **idempotent**
+  bulk loader (it tracks ingested files, so a retried load never
+  double-inserts). The column projection rides the subquery
+  (`FROM (SELECT <cols> FROM '<dir>')`) — Parquet rejects an explicit
+  target column list.
+- **Single-file append** stays `INSERT INTO … SELECT * FROM parquet.`<path>``.
+  `COPY INTO`'s per-load file-tracking overhead only pays off across a
+  batch.
 - **Overwrite / truncate / keyed** writes keep `INSERT OVERWRITE` /
   `MERGE INTO` / keyed `DELETE`+`INSERT` (`COPY INTO` only appends).
 
-The column projection rides the `COPY INTO` subquery
-(`FROM (SELECT <cols> FROM '<path>')`) — Parquet rejects an explicit
-target column list — so columns still map by name.
+Measured on a live warehouse (`benchmarks/databricks/bench_copy_into.py`,
+250k rows/file, median of 6, load time only):
+
+| case | `COPY INTO` | `INSERT … SELECT` | delta |
+|---|---|---|---|
+| single file | 2446 ms | 2149 ms | **+14%** |
+| batch ×8 | 3311 ms | 4956 ms | **−33%** |
+
+— hence `COPY INTO` for batches, `INSERT` for a single file.
 
 ## Table DDL/DML shortcuts
 
