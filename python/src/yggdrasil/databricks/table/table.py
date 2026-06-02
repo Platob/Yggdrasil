@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.data.statement import StatementBatch
+    from yggdrasil.io.delta import DeltaFolder
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
 

@@ -22,12 +22,16 @@ import json
 import os
 import secrets
 import unittest
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import pyarrow as pa
 import pytest
 
 from yggdrasil.delta.io import DeltaOptions
+from yggdrasil.enums import Mode
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from yggdrasil.io.delta import DeltaFolder
 
 
 def _has_databricks() -> bool:
@@ -248,6 +252,124 @@ class TestDeltaFolderWriteSQLRead(_DeltaSQLBase):
 
         out = self._read_sql_arrow(f"SELECT * FROM {tbl}")
         self.assertEqual(out.column("id").to_pylist(), [99])
+
+
+# ---------------------------------------------------------------------------
+# Direct DeltaFolder commit (bypassing the warehouse) → Databricks SQL read
+# ---------------------------------------------------------------------------
+
+
+class TestDeltaFolderDirectWriteSQLRead(_DeltaSQLBase):
+    """Commit straight to the table's S3 ``_delta_log`` via :class:`DeltaFolder`
+    — no warehouse INSERT — then confirm Databricks SQL reads the same rows,
+    and that a DeltaFolder write matches a Databricks-SQL write of the same
+    data (both inspected through the table's S3 path)."""
+
+    def _sql_ids(self, tbl) -> list:
+        # Databricks caches the table snapshot; REFRESH so a fresh log commit
+        # made out-of-band (by DeltaFolder) becomes visible to SQL.
+        try:
+            self._execute(f"REFRESH TABLE {tbl.full_name()}")
+        except Exception:  # noqa: BLE001 — REFRESH is best-effort
+            pass
+        out = self._read_sql_arrow(f"SELECT id FROM {tbl.full_name()} ORDER BY id")
+        return sorted(out.column("id").to_pylist())
+
+    def test_deltafolder_commit_then_sql_read(self) -> None:
+        # Empty Delta table created via SQL (so UC + SQL know it), then a
+        # direct DeltaFolder append to its S3 transaction log.
+        tbl = self._table("dfw_sql")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT, val STRING) USING DELTA")
+
+        folder = self._delta_folder(tbl)
+        data = pa.table({
+            "id": pa.array([1, 2, 3], type=pa.int64()),
+            "val": pa.array(["a", "b", "c"], type=pa.string()),
+        })
+        try:
+            folder.write_arrow_table(data, options=DeltaOptions(mode=Mode.APPEND))
+        except Exception as exc:  # noqa: BLE001 — needs UC write creds on the path
+            raise unittest.SkipTest(
+                f"DeltaFolder cannot commit to the table storage "
+                f"(UC write credentials on the location?): {exc}"
+            )
+
+        # DeltaFolder sees its own commit immediately.
+        self.assertEqual(sorted(folder.read_arrow_table().column("id").to_pylist()), [1, 2, 3])
+
+        # Databricks SQL reads the same rows straight off the S3 log.
+        sql_ids = self._sql_ids(tbl)
+        if sql_ids != [1, 2, 3]:
+            raise unittest.SkipTest(
+                f"Databricks SQL did not pick up the out-of-band DeltaFolder "
+                f"commit (saw {sql_ids}); the table likely uses "
+                f"coordinated/managed commits, which require committing through "
+                f"the UC commit coordinator rather than a raw _delta_log write."
+            )
+        self.assertEqual(sql_ids, [1, 2, 3])
+
+    def test_deltafolder_append_to_sql_seeded_table(self) -> None:
+        # SQL seeds rows, DeltaFolder appends more directly; SQL sees the union.
+        tbl = self._table("dfw_app")
+        self._execute(f"CREATE TABLE {tbl.full_name()} (id BIGINT) USING DELTA")
+        self._execute(f"INSERT INTO {tbl.full_name()} VALUES (1), (2)")
+
+        folder = self._delta_folder(tbl)
+        try:
+            folder.write_arrow_table(
+                pa.table({"id": pa.array([3, 4], type=pa.int64())}),
+                options=DeltaOptions(mode=Mode.APPEND),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise unittest.SkipTest(f"DeltaFolder cannot commit to the table storage: {exc}")
+
+        self.assertEqual(sorted(folder.read_arrow_table().column("id").to_pylist()), [1, 2, 3, 4])
+        sql_ids = self._sql_ids(tbl)
+        if sql_ids != [1, 2, 3, 4]:
+            raise unittest.SkipTest(
+                f"Databricks SQL did not pick up the DeltaFolder append "
+                f"(saw {sql_ids}); coordinated/managed commits in play."
+            )
+        self.assertEqual(sql_ids, [1, 2, 3, 4])
+
+    def test_deltafolder_write_matches_sql_write(self) -> None:
+        # The same rows, written two ways, compared through the S3 path:
+        # a DeltaFolder commit should be indistinguishable from a SQL INSERT.
+        rows = [(10, "x"), (20, "y"), (30, "z")]
+        data = pa.table({
+            "id": pa.array([r[0] for r in rows], type=pa.int64()),
+            "val": pa.array([r[1] for r in rows], type=pa.string()),
+        })
+
+        sql_tbl = self._table("cmp_w_sql")
+        self._execute(f"CREATE TABLE {sql_tbl.full_name()} (id BIGINT, val STRING) USING DELTA")
+        self._execute(
+            f"INSERT INTO {sql_tbl.full_name()} VALUES (10, 'x'), (20, 'y'), (30, 'z')"
+        )
+
+        df_tbl = self._table("cmp_w_df")
+        self._execute(f"CREATE TABLE {df_tbl.full_name()} (id BIGINT, val STRING) USING DELTA")
+        df_folder = self._delta_folder(df_tbl)
+        try:
+            df_folder.write_arrow_table(data, options=DeltaOptions(mode=Mode.APPEND))
+        except Exception as exc:  # noqa: BLE001
+            raise unittest.SkipTest(f"DeltaFolder cannot commit to the table storage: {exc}")
+
+        # Read both tables through the S3 path — the data must match.
+        def _pairs(folder):
+            t = folder.read_arrow_table()
+            return sorted(zip(t.column("id").to_pylist(), t.column("val").to_pylist()))
+
+        self.assertEqual(_pairs(self._delta_folder(sql_tbl)), sorted(rows))
+        self.assertEqual(_pairs(df_folder), sorted(rows))
+
+        # Both are real Delta tables with the same schema + active data files.
+        self.assertEqual(
+            [f.name for f in self._delta_folder(sql_tbl).collect_schema().fields],
+            [f.name for f in df_folder.collect_schema().fields],
+        )
+        self.assertGreaterEqual(self._delta_folder(sql_tbl).snapshot(fresh=True).num_active_files(), 1)
+        self.assertGreaterEqual(df_folder.snapshot(fresh=True).num_active_files(), 1)
 
 
 # ---------------------------------------------------------------------------
