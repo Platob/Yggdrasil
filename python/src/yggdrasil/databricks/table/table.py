@@ -1832,8 +1832,9 @@ class Table(DatabricksPath):
                 "CLUSTER BY (" + ", ".join(quote_ident(c.name) for c in cluster_by) + ")"
             )
         elif not external:
-            # Liquid clustering is a managed-table feature; an external table
-            # at a caller-owned LOCATION gets no implicit clustering.
+            # CLUSTER BY AUTO is UC *managed*-only — Databricks rejects it on
+            # an external table with CLUSTER_BY_AUTO_UNSUPPORTED_TABLE_TYPE_ERROR.
+            # External tables get explicit CLUSTER BY (cols) only when asked.
             sql_parts.append("CLUSTER BY AUTO")
 
         if comment:

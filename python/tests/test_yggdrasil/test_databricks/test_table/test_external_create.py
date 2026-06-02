@@ -54,7 +54,8 @@ class TestExternalDDL:
         assert "`updated_at` TIMESTAMP" in ddl
         assert "USING DELTA" in ddl
         assert "LOCATION 's3://bucket/loc/ext_tb'" in ddl
-        # No liquid-clustering default on an external, caller-owned location.
+        # CLUSTER BY AUTO is managed-only (Databricks rejects it on external
+        # tables), so an external table gets no implicit clustering.
         assert "CLUSTER BY" not in ddl
 
     def test_managed_ddl_unchanged(self) -> None:
