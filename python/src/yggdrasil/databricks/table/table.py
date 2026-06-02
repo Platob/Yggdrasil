@@ -80,7 +80,6 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
-    from yggdrasil.databricks.warehouse import WarehousePreparedStatement
     from yggdrasil.data.statement import StatementBatch
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
@@ -174,13 +173,8 @@ INFOS_TTL: float = 300.0
 # TRUNCATE/OPTIMIZE/VACUUM stay non-retryable on purpose: re-running TRUNCATE
 # after a successful INSERT is dangerous, and OPTIMIZE/VACUUM are best-effort.
 from yggdrasil.databricks.table.insert import (  # noqa: E402
-    ALIAS_TMPSRC as _ALIAS_TMPSRC,
     DatabricksTableInsert,
-    make_sql_insert,
-    make_sql_select,
     _append_maintenance_statements,
-    _build_cast_column_projection,
-    _build_column_projection,
     _build_dml_statements,
     _build_where_predicates,
 )
@@ -189,50 +183,6 @@ from yggdrasil.databricks.table.insert import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # DML retry / execution helpers — kept local to the table layer.
 # ---------------------------------------------------------------------------
-
-
-_DML_HEAD_RE = re.compile(
-    r"\A(?:\s+|--[^\n]*\n|--[^\n]*\Z|/\*.*?\*/)*"
-    r"(?P<kw>[A-Za-z]+)",
-    re.DOTALL,
-)
-_DML_KEYWORDS: frozenset[str] = frozenset({"INSERT", "MERGE", "DELETE", "UPDATE"})
-
-
-def _classify_dml(sql: str) -> bool:
-    """True when ``sql`` looks like an INSERT/MERGE/DELETE/UPDATE."""
-    if not sql:
-        return False
-    m = _DML_HEAD_RE.match(sql)
-    if not m:
-        return False
-    return m.group("kw").upper() in _DML_KEYWORDS
-
-
-def _apply_retry_to_warehouse_statement(
-    stmt: "WarehousePreparedStatement",
-    retry: Optional[WaitingConfigArg],
-) -> None:
-    """Install ``retry`` on a warehouse statement, in place."""
-    if retry is None:
-        return
-    if retry is False:
-        stmt.retry = None
-        return
-    stmt.retry = WaitingConfig.from_(retry)
-
-
-def _apply_retry_to_statement(
-    stmt: "PreparedStatement",
-    retry: Optional[WaitingConfigArg],
-) -> None:
-    """Install ``retry`` on any prepared statement (warehouse or Spark)."""
-    if retry is None:
-        return
-    if retry is False:
-        stmt.retry = None
-        return
-    stmt.retry = WaitingConfig.from_(retry)
 
 
 def _resolve_retry(retry: Optional[WaitingConfigArg]) -> Optional[WaitingConfig]:
@@ -2769,19 +2719,17 @@ class Table(DatabricksPath):
 
         Routing:
 
-        - Query-shaped sources (str, ``PreparedStatement``,
-          ``StatementResult``) → :meth:`sql_insert`
         - Spark DataFrame (or anything when a ``SparkSession`` is reachable)
           → :meth:`spark_insert`
-        - Otherwise → :meth:`arrow_insert` (warehouse path with Volume staging)
+        - Otherwise → :meth:`arrow_insert` (the specialized warehouse path
+          with Volume staging, which delegates to
+          :class:`~yggdrasil.databricks.table.insert.DatabricksTableInsert`).
 
         Returns the submitted :class:`StatementBatch` by default. With
-        ``return_data=True`` the backend that ran the write hands back
-        its source payload as a :class:`Tabular` —
-        :class:`ArrowTabular` from :meth:`arrow_insert`,
-        :class:`Dataset` from :meth:`spark_insert`, the input
-        :class:`StatementResult` from :meth:`sql_insert` — for
-        downstream chaining without re-querying the target.
+        ``return_data=True`` the backend that ran the write hands back its
+        source payload as a :class:`Tabular` — :class:`ArrowTabular` from
+        :meth:`arrow_insert`, :class:`Dataset` from :meth:`spark_insert` —
+        for downstream chaining without re-querying the target.
         """
         # Fold the top-level predicate into cast_options so the
         # downstream backends read a single source of truth.
@@ -2799,13 +2747,6 @@ class Table(DatabricksPath):
             return_data=return_data,
             safe_merge=safe_merge,
         )
-
-        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
-            return self.sql_insert(
-                data, spark_session=spark_session,
-                schema_mode=schema_mode, cast_options=cast_options,
-                **common,
-            )
 
         if spark_session is None:
             session_attr = getattr(data, "sparkSession", None)
@@ -2950,22 +2891,7 @@ class Table(DatabricksPath):
         the staged source rows so callers can chain on the payload
         without re-reading from the target.
         """
-        from yggdrasil.databricks.warehouse import WarehousePreparedStatement
-
         cast_options = _coalesce_predicate(cast_options, predicate)
-
-        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
-            return self.sql_insert(
-                data,
-                mode=mode,
-                cast_options=cast_options,
-                match_by=match_by, update_column_names=update_column_names,
-                wait=wait, raise_error=raise_error,
-                zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
-                vacuum_hours=vacuum_hours,
-                retry=retry,
-                return_data=return_data,
-            )
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
         # Data-level OVERWRITE replaces rows (the write below), not the schema:
@@ -2977,7 +2903,6 @@ class Table(DatabricksPath):
             data,
             mode=schema_mode,
         )
-        target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
         cast_options = CastOptions.check(options=cast_options).with_target(existing_schema)
 
@@ -2991,15 +2916,10 @@ class Table(DatabricksPath):
         if return_data:
             output_data = staging.read_arrow_table()
 
-        columns = list(existing_schema.field_names())
-        # Plain column projection — the staged Parquet was already
-        # cast to the target schema in :meth:`CastOptions.cast_arrow_tabular`
-        # before the write, and the warehouse INSERT applies the
-        # column-boundary coercion on top.  No per-column CAST needed.
-        # The staged Parquet path is rendered straight into the SQL text as
-        # ``parquet.`<path>``` — no ``{alias}`` placeholder; the temporary
-        # staging is registered (cleanup-only) on the source-reading
-        # statements below so it's unlinked after the load.
+        # Build the op and let it run its own DML — the staged Parquet is
+        # referenced as ``parquet.`<path>``` and registered for post-load
+        # cleanup, the INSERT/MERGE statements are prepared + executed via
+        # ``execute_many``, all inside :meth:`DatabricksTableInsert.execute`.
         op = DatabricksTableInsert(
             target=target,
             mode=mode_enum,
@@ -3014,47 +2934,9 @@ class Table(DatabricksPath):
             vacuum_hours=vacuum_hours,
             safe_merge=safe_merge,
         )
-        source_ref = WarehousePreparedStatement.volume_path_text_value(staging)
-        source_sql = make_sql_select(op, source=source_ref)
-        sql_texts = make_sql_insert(
-            op,
-            target_location=target_location,
-            source_sql=source_sql,
-            columns=columns,
-        )
+        op.execute(wait=wait, raise_error=raise_error, engine=engine, retry=retry)
 
-        retry_active = retry is not None
-
-        def _prepare_batch(texts: list[str]) -> list[WarehousePreparedStatement]:
-            out: list[WarehousePreparedStatement] = []
-            for sql in texts:
-                # The path is already in the text; register the staging purely
-                # so its temporary scratch is reclaimed after the statement.
-                external_volume_paths = (
-                    {_ALIAS_TMPSRC: staging} if source_ref in sql else None
-                )
-                stmt = WarehousePreparedStatement.prepare(
-                    sql,
-                    client=self.client,
-                    external_volume_paths=external_volume_paths,
-                    catalog_name=target.catalog_name,
-                    schema_name=target.schema_name,
-                )
-                if retry_active and _classify_dml(sql):
-                    _apply_retry_to_warehouse_statement(stmt, retry)
-                out.append(stmt)
-            return out
-
-        prepared = _prepare_batch(sql_texts)
-
-        batch = self.sql.execute_many(
-            statements=prepared,
-            wait=wait,
-            raise_error=raise_error,
-            engine=engine,
-        )
-
-        return output_data if return_data else batch
+        return output_data if return_data else op.result
 
     # =========================================================================
     # spark_insert — Spark path, temp-view source
@@ -3098,20 +2980,6 @@ class Table(DatabricksPath):
         downstream transforms without re-querying the target.
         """
         cast_options = _coalesce_predicate(cast_options, predicate)
-
-        if isinstance(data, (PreparedStatement, StatementResult)) or PreparedStatement.looks_like_query(data):
-            return self.sql_insert(
-                data,
-                mode=mode,
-                cast_options=cast_options,
-                match_by=match_by, update_column_names=update_column_names,
-                wait=wait, raise_error=raise_error,
-                zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
-                vacuum_hours=vacuum_hours,
-                spark_session=spark_session,
-                retry=retry,
-                return_data=return_data,
-            )
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
         from yggdrasil.spark.statement import SparkPreparedStatement
@@ -3258,279 +3126,6 @@ class Table(DatabricksPath):
             from yggdrasil.spark.tabular import SparkDataset
             return SparkDataset(data_df)
         return primary_batch
-
-    # =========================================================================
-    # sql_insert — query source, no staging
-    # =========================================================================
-
-    def sql_insert(
-        self,
-        statement: "PreparedStatement | StatementResult | str",
-        *,
-        mode: Mode | str | None = None,
-        schema_mode: Mode | str | None = None,
-        cast_options: Optional[CastOptions] = None,
-        match_by: Optional[list[str]] = None,
-        update_column_names: Optional[list[str]] = None,
-        wait: WaitingConfigArg = True,
-        raise_error: bool = True,
-        zorder_by: Optional[list[str]] = None,
-        optimize_after_merge: bool = False,
-        vacuum_hours: int | None = None,
-        spark_session: Optional["pyspark.sql.SparkSession"] = None,
-        predicate: Predicate | None = None,
-        retry: Optional[WaitingConfigArg] = None,
-        return_data: bool = False,
-        safe_merge: bool = False,
-        partition_filters: Optional[list[str]] = None,
-    ) -> "StatementBatch | Tabular | None":
-        """Insert into this table from a SQL source query.
-
-        Smart dispatch:
-
-        1. Cached :class:`StatementResult` → reuse the materialised frame
-           via :meth:`insert_into` (no re-execution).
-        2. SparkSession reachable → run via :meth:`spark_insert`.
-        3. Otherwise → warehouse-side ``INSERT … SELECT`` /
-           ``MERGE … USING (q)`` with a CAST projection aligning the
-           user's query schema to the target.
-
-        Returns the submitted :class:`StatementBatch` by default
-        (warehouse fallback) or the chosen backend's batch (Arrow /
-        Spark). With ``return_data=True``, hands back the underlying
-        :class:`StatementResult` (or the materialised frame from a
-        cached one) so callers can stream the same rows the warehouse
-        just inserted.
-        """
-        cast_options = _coalesce_predicate(cast_options, predicate)
-        common = dict(
-            mode=mode,
-            match_by=match_by, update_column_names=update_column_names,
-            wait=wait, raise_error=raise_error,
-            zorder_by=zorder_by, optimize_after_merge=optimize_after_merge,
-            vacuum_hours=vacuum_hours,
-            retry=retry,
-        )
-
-        if isinstance(statement, StatementResult):
-            spark_df = getattr(statement, "spark_dataframe", None)
-            cached = spark_df if spark_df is not None else statement.to_arrow_table()
-            return self.insert_into(
-                data=cached, spark_session=spark_session,
-                cast_options=cast_options,
-                return_data=return_data, **common,
-            )
-
-        if spark_session is None:
-            spark_session = self.sql.spark.resolve_session(create=False)
-        if spark_session is not None:
-            text = (
-                statement.statement.text
-                if isinstance(statement, StatementResult)
-                else (statement.text if isinstance(statement, PreparedStatement) else str(statement))
-            )
-            df = spark_session.sql(text)
-            return self.spark_insert(
-                data=df, spark_session=spark_session,
-                schema_mode=schema_mode,
-                cast_options=cast_options,
-                partition_filters=partition_filters,
-                return_data=return_data, **common,
-            )
-
-        batch = self._sql_insert_warehouse_fallback(
-            statement, schema_mode=schema_mode, cast_options=cast_options,
-            partition_filters=partition_filters, **common,
-        )
-        if return_data and isinstance(statement, StatementResult):
-            return statement
-        return batch
-
-    def _sql_insert_warehouse_fallback(
-        self,
-        statement: "PreparedStatement | StatementResult | str",
-        *,
-        engine: Optional[Literal["api", "spark"]] = None,
-        mode: Mode | str | None,
-        schema_mode: Mode | str | None = None,
-        cast_options: Optional[CastOptions] = None,
-        match_by: Optional[list[str]],
-        update_column_names: Optional[list[str]],
-        wait: WaitingConfigArg,
-        raise_error: bool,
-        zorder_by: Optional[list[str]],
-        optimize_after_merge: bool,
-        vacuum_hours: int | None,
-        retry: Optional[WaitingConfigArg] = None,
-        partition_filters: Optional[list[str]] = None,
-    ) -> "StatementBatch | None":
-        """Warehouse fallback for :meth:`sql_insert`.
-
-        ``partition_filters`` are literal ``T.<part> IN (...)`` predicates the
-        caller resolved up front; they're spliced into a native MERGE's ``ON``
-        to prune the target scan. The live/synchronous path passes none (no
-        extra distinct-values query); the async loader job computes and passes
-        them (see :meth:`merge_partition_filters` / ``dispatch_async``)."""
-        from yggdrasil.databricks.warehouse import WarehousePreparedStatement
-
-        base = statement.statement if isinstance(statement, StatementResult) else statement
-        source_prepared = WarehousePreparedStatement.from_(base)
-
-        mode_enum = Mode.from_(mode, default=Mode.AUTO)
-        cast_options = CastOptions.check(options=cast_options)
-
-        # OVERWRITE replaces the table's rows atomically via the
-        # ``INSERT OVERWRITE TABLE ... SELECT`` that ``_build_dml_statements``
-        # emits — the live table (and its schema) is kept, so we must NOT drop
-        # it up front. Dropping here broke the async SQL-source overwrite: it
-        # carries no ``cast_options.target`` to recreate from, so the drop left
-        # nothing for the INSERT OVERWRITE to land in. A missing target is still
-        # created below when an explicit schema is available.
-        if not self.exists():
-            target_field = cast_options.target
-            if target_field is not None:
-                self.create(
-                    target_field,
-                    mode=schema_mode,
-                )
-            else:
-                raise ValueError(
-                    "sql_insert requires the target table to exist or "
-                    "cast_options.target to be set; "
-                    f"{self.full_name()!r} was not found."
-                )
-
-        target_location = self.full_name(safe=True)
-        existing_schema = self.collect_schema()
-        fields = list(existing_schema.fields)
-        columns = [f.name for f in fields]
-
-        if match_by == "auto":
-            match_by = [f.name for f in existing_schema.primary_fields] or None
-
-        source_projection = _build_cast_column_projection(
-            fields,
-            source=cast_options.source if cast_options.source and cast_options.source.children else None,
-            source_alias="raw_src",
-        )
-        source_sql = (
-            f"SELECT {source_projection} FROM (\n{source_prepared.text}\n) AS {quote_ident('raw_src')}"
-        )
-
-        prune_predicates = _build_where_predicates(
-            cast_options.predicate, target_alias="T",
-        )
-        sql_texts = _build_dml_statements(
-            target_location=target_location,
-            source_sql=source_sql,
-            columns=columns,
-            mode=mode_enum,
-            match_by=match_by,
-            update_column_names=update_column_names,
-            prune_predicates=prune_predicates,
-            zorder_by=zorder_by,
-            optimize_after_merge=optimize_after_merge,
-            vacuum_hours=vacuum_hours,
-            partition_filters=partition_filters,
-        )
-
-        retry_active = retry is not None
-
-        def _prepare_batch(texts: list[str]) -> list[WarehousePreparedStatement]:
-            out: list[WarehousePreparedStatement] = []
-            for sql in texts:
-                stmt = WarehousePreparedStatement.prepare(
-                    sql,
-                    parameters=source_prepared.parameters,
-                    external_volume_paths=source_prepared.external_volume_paths,
-                    catalog_name=self.catalog_name,
-                    schema_name=self.schema_name,
-                )
-                if retry_active and _classify_dml(sql):
-                    _apply_retry_to_warehouse_statement(stmt, retry)
-                out.append(stmt)
-            return out
-
-        prepared = _prepare_batch(sql_texts)
-
-        logger.info(
-            "SQL insert into table %r (mode=%s, match_by=%s, statements=%d, retry=%s)",
-            target_location, mode_enum.name, match_by, len(prepared), retry_active,
-        )
-
-        if not prepared:
-            return None
-
-        return _execute_dml(
-            self.sql,
-            statements=prepared,
-            wait=wait,
-            raise_error=raise_error,
-            engine=engine,
-        )
-
-    def merge_partition_filters(self, source_sql: str) -> list[str]:
-        """Literal ``T.<part> IN (...)`` predicates (one per partition column)
-        for a MERGE's ``ON``, resolved by **listing the source's distinct
-        partition values**.
-
-        Derives the target's partition columns, runs one bounded ``GROUP BY``
-        over *source_sql* to collect their distinct values, and renders them as
-        SQL literals so Delta prunes the target scan to the touched partitions.
-        A MERGE search condition can't hold a subquery, so the values must be
-        listed explicitly like this.
-
-        Returns ``[]`` when the table isn't partitioned, the source isn't
-        directly queryable (a ``{…}`` placeholder, e.g. the sync arrow path), or
-        a partition value is NULL / unrenderable (no pruning, never a wrong
-        filter). **Intended for the async loader job** — the live/synchronous
-        insert path doesn't call it, so interactive merges pay no extra query.
-
-        Note: like any partition-pruned MERGE this assumes a key doesn't move
-        partitions between target and source — if it did, the pruned-away target
-        row wouldn't match and the source row would insert as a duplicate.
-        """
-        if "{" in source_sql:
-            return []
-        # Refetch the live partition layout from the table — the partition
-        # columns are NEVER persisted in the op-log or any other metadata
-        # (the async drop carries no schema), so the loader reads them fresh
-        # from the table in the job. Drop the cached infos first so an altered
-        # partitioning is picked up even on a long-lived table handle.
-        self.invalidate_singleton()
-        partition_columns = [
-            f.name for f in self.collect_schema().fields
-            if getattr(f, "partition_by", False)
-        ]
-        if not partition_columns:
-            return []
-
-        cols = ", ".join(quote_ident(c) for c in partition_columns)
-        try:
-            rows = self.sql.execute(
-                f"SELECT {cols} FROM (\n{source_sql}\n) AS __ygg_src__ GROUP BY {cols}"
-            ).to_arrow_table()
-        except Exception:  # noqa: BLE001 - pruning is best-effort
-            logger.debug("partition-filter probe failed; merging unpruned", exc_info=True)
-            return []
-        if rows.num_rows == 0:
-            return []
-
-        filters: list[str] = []
-        for c in partition_columns:
-            values = rows.column(c).to_pylist()
-            literals: list[str] = []
-            usable = True
-            for v in values:
-                lit = _sql_literal(v)
-                if lit is None:        # NULL or unrenderable → skip this column
-                    usable = False
-                    break
-                literals.append(lit)
-            if usable and literals:
-                uniq = sorted(set(literals))
-                filters.append(f"T.{quote_ident(c)} IN ({', '.join(uniq)})")
-        return filters
 
     # =========================================================================
     # Storage & credentials

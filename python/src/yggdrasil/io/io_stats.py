@@ -28,6 +28,7 @@ from yggdrasil.enums.io_kind import IOKind
 
 if TYPE_CHECKING:
     from yggdrasil.enums import MediaType
+    from yggdrasil.data.data_field import Field
 
 
 __all__ = ["IOStats", "IOKind", "TimeLike"]
@@ -74,6 +75,14 @@ class IOStats:
     mode: int = 0
     media_type: "Optional[MediaType]" = None
     metadata: "Optional[dict[str, str]]" = None
+    #: Cached tabular schema (a :class:`yggdrasil.data.Field` /
+    #: ``StructField``), or ``None`` when unknown. Lets the stat
+    #: snapshot double as the schema cache — a listing / probe that
+    #: already knows the schema seeds it here, and tabular reads pick
+    #: it up without a second pass. Independent of the stat freshness
+    #: window (``mtime`` / ``kind`` may be cold while ``field`` is
+    #: known, and vice-versa).
+    field: "Optional[Field]" = None
 
     # ------------------------------------------------------------------
     # ``os.stat_result`` compatibility — drop-in for legacy callers
@@ -81,7 +90,9 @@ class IOStats:
 
     def __repr__(self):
         dt_ = datetime.datetime.fromtimestamp(self.mtime, datetime.timezone.utc).isoformat()
-        return f"<IOStats size={self.size} mtime={dt_!r} kind={self.kind.name} mode={self.mode} media_type={self.media_type!r}>"
+        field = "" if self.field is None else f" field={self.field!r}"
+        meta = "" if not self.metadata else f" metadata={self.metadata!r}"
+        return f"<IOStats size={self.size} mtime={dt_!r} kind={self.kind.name} mode={self.mode} media_type={self.media_type!r}{meta}{field}>"
 
     def __str__(self):
         return repr(self)
@@ -147,6 +158,8 @@ class IOStats:
         kind: Any = ...,
         mode: Any = ...,
         media_type: Any = ...,
+        metadata: Any = ...,
+        field: Any = ...,
     ) -> "IOStats":
         """Return a fresh :class:`IOStats` with selected fields overridden.
 
@@ -161,6 +174,8 @@ class IOStats:
             kind=self.kind if kind is ... else kind,
             mode=self.mode if mode is ... else mode,
             media_type=self.media_type if media_type is ... else media_type,
+            metadata=self.metadata if metadata is ... else metadata,
+            field=self.field if field is ... else field,
         )
 
     def with_(
@@ -171,6 +186,8 @@ class IOStats:
         kind: Any = ...,
         mode: Any = ...,
         media_type: Any = ...,
+        metadata: Any = ...,
+        field: Any = ...,
         inplace: bool = False,
     ) -> "IOStats":
         """Return a stats object with the given fields overridden.
@@ -188,6 +205,8 @@ class IOStats:
                 kind=kind,
                 mode=mode,
                 media_type=media_type,
+                metadata=metadata,
+                field=field,
             )
         if size is not ...:
             self.size = size
@@ -199,6 +218,10 @@ class IOStats:
             self.mode = mode
         if media_type is not ...:
             self.media_type = media_type
+        if metadata is not ...:
+            self.metadata = metadata
+        if field is not ...:
+            self.field = field
         return self
 
     # ------------------------------------------------------------------

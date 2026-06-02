@@ -97,7 +97,7 @@ class TestTableAsyncInsertDispatch(unittest.TestCase):
 class TestTableExecuteAsyncInsert(unittest.TestCase):
     def test_help_exits_zero(self):
         with self.assertRaises(SystemExit) as ctx:
-            main(["table", "execute_async_insert", "--help"])
+            main(["table", "execute_insert", "--help"])
         self.assertEqual(ctx.exception.code, 0)
 
     def test_runs_loader_over_logs_dir(self):
@@ -105,14 +105,26 @@ class TestTableExecuteAsyncInsert(unittest.TestCase):
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.databricks.table.insert.load_async", return_value=5) as load:
             rc = main([
-                "table", "execute_async_insert",
+                "table", "execute_insert",
                 "--logs", "/Volumes/c/s/t/.sql/async/logs",
             ])
         self.assertEqual(rc, 0)
         load.assert_called_once_with(
-            client.tables, logs="/Volumes/c/s/t/.sql/async/logs", log_files=None,
-            wait=True, debug=False, prune_partitions=False, use_spark=False,
+            client.tables, logs="/Volumes/c/s/t/.sql/async/logs", log_files=None, wait=True,
         )
+
+    def test_legacy_alias_still_runs_the_loader(self):
+        # ``execute_async_insert`` stays a hidden alias so file-arrival jobs
+        # deployed under the old name keep firing.
+        client = MagicMock()
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.databricks.table.insert.load_async", return_value=1) as load:
+            rc = main([
+                "table", "execute_async_insert",
+                "--logs", "/Volumes/c/s/t/.sql/async/logs",
+            ])
+        self.assertEqual(rc, 0)
+        load.assert_called_once()
 
     def test_runs_loader_over_explicit_log_files(self):
         client = MagicMock()
@@ -125,6 +137,5 @@ class TestTableExecuteAsyncInsert(unittest.TestCase):
             ])
         self.assertEqual(rc, 0)
         load.assert_called_once_with(
-            client.tables, logs=None, log_files=["/logs/a.json", "/logs/b.json"],
-            wait=True, debug=False, prune_partitions=False, use_spark=False,
+            client.tables, logs=None, log_files=["/logs/a.json", "/logs/b.json"], wait=True,
         )

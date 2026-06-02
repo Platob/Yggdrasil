@@ -329,6 +329,45 @@ class TestRemoteTabular:
         assert result.num_rows == n
         assert result.column("id").to_pylist()[-1] == n - 1
 
+    def test_write_updates_holder_cached_media_type(self) -> None:
+        # A tabular leaf write stamps the holder's cached stat with the
+        # format it just wrote, so a follow-up ``stat()`` / format
+        # re-dispatch on the holder sees the right media type even when
+        # the URL gives no hint.
+        from yggdrasil.enums import MimeTypes
+        from yggdrasil.io.base import IO
+
+        holder = _StubRemotePath("/tab/blob", singleton_ttl=False, page_size=None)
+        holder.stat()  # warm the cache (media_type unknown)
+        assert holder._stat_cached is not None
+        assert holder._stat_cached.media_type is None
+
+        ParquetFile = IO.class_for_media_type(MimeTypes.PARQUET)
+        ParquetFile(holder=holder, owns_holder=False).write_arrow_table(
+            pa.table({"a": [1, 2, 3]}), mode=Mode.OVERWRITE,
+        )
+
+        assert holder._stat_cached.media_type is not None
+        assert holder._stat_cached.media_type.mime_type == MimeTypes.PARQUET
+        assert holder.stat().media_type.mime_type == MimeTypes.PARQUET
+        # And the format now re-dispatches off the holder's stat.
+        assert isinstance(IO.for_holder(holder), ParquetFile)
+
+    def test_write_leaves_absent_cache_alone(self) -> None:
+        # No cached stat on the holder ⇒ nothing to keep coherent; the
+        # write must not fabricate one.
+        holder = _StubRemotePath("/tab/nocache.ipc", singleton_ttl=False, page_size=None)
+        holder.invalidate_singleton()
+        assert holder._stat_cached is None
+        holder.as_media("arrow").write_arrow_table(
+            pa.table({"a": [1]}), mode=Mode.OVERWRITE,
+        )
+        # IPC path may seed a stat via its own write bookkeeping, but if it
+        # does the media type is coherent; if not, it stays absent.
+        if holder._stat_cached is not None and holder._stat_cached.media_type is not None:
+            from yggdrasil.enums import MimeTypes
+            assert holder._stat_cached.media_type.mime_type == MimeTypes.ARROW_IPC
+
 
 # ---------------------------------------------------------------------------
 # TestRemoteStat

@@ -76,6 +76,62 @@ class TestFileIO:
             assert p.size == 5
             assert p.read_bytes() == b"abcde"
 
+    def test_truncate0_missing_file_is_a_noop(self, tmp_path: pathlib.Path) -> None:
+        # ``truncate(0)`` on a not-yet-created path must not force the
+        # file into existence — the overwrite-prelude's following write
+        # materialises it.
+        target = tmp_path / "fresh.bin"
+        p = LocalPath(str(target), singleton_ttl=False)
+        assert p.truncate(0) == 0
+        assert not target.exists()
+
+    def test_truncate0_skips_write_when_already_empty(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        from unittest import mock
+        from yggdrasil.path import local_path
+
+        # Existing empty file: ``truncate(0)`` is a no-op — no
+        # open(O_CREAT), no ftruncate syscall.
+        target = tmp_path / "empty.bin"
+        target.write_bytes(b"")
+        p = LocalPath(str(target), singleton_ttl=False)
+        with mock.patch.object(local_path, "_open_with_mkdir_retry") as mopen, \
+                mock.patch("os.ftruncate") as mftrunc:
+            assert p.truncate(0) == 0
+            assert mopen.call_count == 0
+            assert mftrunc.call_count == 0
+
+    def test_truncate0_acquired_already_empty_skips_ftruncate(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        from unittest import mock
+
+        p = LocalPath(str(tmp_path / "acq.bin"), singleton_ttl=False)
+        with p:
+            p.write_bytes(b"")  # exists, 0 bytes
+            with mock.patch("os.ftruncate") as mftrunc:
+                assert p.truncate(0) == 0
+                assert mftrunc.call_count == 0
+
+    def test_truncate0_zeroes_existing_nonempty(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        target = tmp_path / "data.bin"
+        target.write_bytes(b"abcdefghij")
+        p = LocalPath(str(target), singleton_ttl=False)
+        assert p.truncate(0) == 0
+        assert target.stat().st_size == 0
+
+    def test_truncate_positive_creates_missing(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        # ``truncate(n>0)`` still honours the post-condition (n-byte file).
+        target = tmp_path / "grow.bin"
+        p = LocalPath(str(target), singleton_ttl=False)
+        assert p.truncate(4) == 4
+        assert target.stat().st_size == 4
+
     def test_reserve_negative_raises(self, tmp_path: pathlib.Path) -> None:
         p = LocalPath(str(tmp_path / "res.bin"), singleton_ttl=False)
         with p:
@@ -263,6 +319,70 @@ class TestStat:
         p.invalidate_singleton(remove_global=False)
         s3 = p.stat()
         assert s3.size == 8  # live probe, not the 999
+
+
+# ---------------------------------------------------------------------------
+# TestStatCacheCoherence — a seeded stat cache (e.g. from a directory
+# listing, where ``_ls`` primes every child off ``scandir``) must track
+# the child's own modifying operations. LocalPath has no TTL, so a stale
+# entry would otherwise stick for the lifetime of the instance.
+# ---------------------------------------------------------------------------
+
+
+class TestStatCacheCoherence:
+
+    def _listed_child(self, tmp_path: pathlib.Path, name: str) -> LocalPath:
+        """A child handle whose stat slot is seeded by ``iterdir``."""
+        folder = LocalPath(str(tmp_path), singleton_ttl=False)
+        return next(c for c in folder.iterdir() if c.name == name)
+
+    def test_write_updates_seeded_size(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "w.bin").write_bytes(b"hello")
+        child = self._listed_child(tmp_path, "w.bin")
+        assert child.size == 5  # seeded off scandir
+
+        child.write_bytes(b"hello world!!! longer now")
+        assert child.size == (tmp_path / "w.bin").stat().st_size == 25
+
+    def test_truncate_updates_seeded_size(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "t.bin").write_bytes(b"abcdefghij")
+        child = self._listed_child(tmp_path, "t.bin")
+        assert child.size == 10
+
+        child.truncate(3)
+        assert child.size == (tmp_path / "t.bin").stat().st_size == 3
+
+    def test_clear_invalidates_seeded_stat(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "c.bin").write_bytes(b"data")
+        child = self._listed_child(tmp_path, "c.bin")
+        assert child.exists()
+
+        child._clear()
+        assert not (tmp_path / "c.bin").exists()
+        assert not child.exists()  # re-probes the backend, not the snapshot
+
+    def test_write_flips_cached_missing_to_file(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        p = LocalPath(str(tmp_path / "m.bin"), singleton_ttl=False)
+        # Simulate a prior probe that cached MISSING (the shape a
+        # TTL-backed remote backend would carry forward).
+        p._persist_stat_cache(IOStats(kind=IOKind.MISSING, size=0, mtime=0.0))
+        assert not p.exists()
+
+        p.write_bytes(b"abc")
+        assert p.exists()
+        assert p.is_file()
+        assert p.size == 3
+
+    def test_mkdir_refreshes_cached_missing(self, tmp_path: pathlib.Path) -> None:
+        p = LocalPath(str(tmp_path / "d"), singleton_ttl=False)
+        p._persist_stat_cache(IOStats(kind=IOKind.MISSING, size=0, mtime=0.0))
+        assert not p.exists()
+
+        p.mkdir()
+        assert p.exists()
+        assert p.is_dir()
 
 
 # ---------------------------------------------------------------------------

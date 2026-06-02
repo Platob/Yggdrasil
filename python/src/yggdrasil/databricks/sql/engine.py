@@ -739,50 +739,6 @@ class SQLEngine(DatabricksService, StatementExecutor):
             retry=retry,
         )
 
-    def sql_insert_into(
-        self,
-        statement: "PreparedStatement | StatementResult | str",
-        *,
-        mode: Mode | str | None = None,
-        location: str | None = None,
-        catalog_name: str | None = None,
-        schema_name: str | None = None,
-        table_name: str | None = None,
-        match_by: Optional[list[str]] = None,
-        update_column_names: Optional[list[str]] = None,
-        wait: WaitingConfigArg = True,
-        raise_error: bool = True,
-        zorder_by: Optional[list[str]] = None,
-        optimize_after_merge: bool = False,
-        vacuum_hours: int | None = None,
-        table: Optional[Table] = None,
-        spark_session: Optional["pyspark.sql.SparkSession"] = None,
-        predicate: Predicate | None = None,
-        retry: Optional[WaitingConfigArg] = None,
-    ) -> "StatementBatch | None":
-        """Resolve target and forward to :meth:`Table.sql_insert`."""
-        target = self._resolve_target(
-            location=location,
-            catalog_name=catalog_name,
-            schema_name=schema_name,
-            table_name=table_name,
-            table=table,
-        )
-        return target.sql_insert(
-            statement,
-            mode=mode,
-            match_by=match_by,
-            update_column_names=update_column_names,
-            wait=wait,
-            raise_error=raise_error,
-            zorder_by=zorder_by,
-            optimize_after_merge=optimize_after_merge,
-            vacuum_hours=vacuum_hours,
-            spark_session=spark_session,
-            predicate=predicate,
-            retry=retry,
-        )
-
     # ------------------------------------------------------------------
     # Drop / create
     # ------------------------------------------------------------------
