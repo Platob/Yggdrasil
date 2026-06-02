@@ -13,9 +13,25 @@ The client round-trips through a single ``dbks://...`` URL:
 """
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from yggdrasil.enums import Scheme
 from yggdrasil.databricks import DatabricksClient
 from yggdrasil.url import URL, URLBased
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch):
+    """Strip ambient ``DATABRICKS_*`` credentials so these URL round-trip
+    unit tests exercise only the explicit kwargs they pass — a real
+    ``DATABRICKS_TOKEN`` in the environment would otherwise win over an
+    explicit OAuth ``client_id`` / ``client_secret`` and skew the URL."""
+    for var in list(os.environ):
+        if var.startswith("DATABRICKS_"):
+            monkeypatch.delenv(var, raising=False)
+    yield
 
 
 class TestSchemeRegistration:

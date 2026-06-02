@@ -602,12 +602,6 @@ class Table(DatabricksPath):
                 f"(got {n}, expected 1-4)."
             )
 
-    def _bwrite(self, data: IO, pos: int, mode: Mode) -> int:
-        raise NotImplementedError("Table is a read-only resource")
-
-    def _bread(self, n: int, pos: int, mode: Mode) -> IO:
-        raise NotImplementedError("Table is a read-only resource")
-
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents, exist_ok
         if not self.exists():

@@ -249,6 +249,13 @@ class S3Bucket(ExploreUrlRepr, RemotePath):
         for key in self.iter_keys("", delimiter=None if recursive else "/"):
             yield self._child(key, singleton_ttl=singleton_ttl)
 
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        raise NotImplementedError(
+            f"{type(self).__name__} is an S3 bucket, not a positional byte "
+            f"buffer. Navigate to an object via ``bucket / '<key>'`` and read "
+            f"that instead."
+        )
+
     def _child(self, key: str, *, singleton_ttl: Any = False) -> "S3Path":
         url = self.url._replace_path("/" + key.lstrip("/"))
         return S3Path(url=url, service=self._service, s3_bucket=self, singleton_ttl=singleton_ttl)
@@ -499,9 +506,10 @@ class S3Path(ExploreUrlRepr, RemotePath):
     def read_mv(self, size: int = -1, offset: int = 0, *, cursor: bool = False) -> memoryview:
         # Whole-file fast path skips the size probe: the no-Range GET returns
         # the object + canonical Content-Length, folded into the stat cache.
+        # An in-flight write buffer takes precedence — defer to RemotePath.
         if cursor:
             offset = self._pos
-        if size < 0 and offset == 0:
+        if size < 0 and offset == 0 and self._wbuf is None:
             out = self._read_mv(-1, 0)
             if cursor:
                 self._pos = len(out)
@@ -534,7 +542,6 @@ class S3Path(ExploreUrlRepr, RemotePath):
         self._persist_stat_cache(
             IOStats(size=size, kind=IOKind.FILE, mtime=time.time(), media_type=self.media_type)
         )
-        self._cache_after_upload(bytes(content), size)
         self._invalidate_parent_ls()
         return size
 
@@ -561,7 +568,6 @@ class S3Path(ExploreUrlRepr, RemotePath):
         self._persist_stat_cache(
             IOStats(size=size, kind=IOKind.FILE, mtime=time.time(), media_type=self.media_type)
         )
-        self._note_streamed_upload(size)
         self._invalidate_parent_ls()
         return size
 

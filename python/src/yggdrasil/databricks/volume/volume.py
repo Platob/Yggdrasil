@@ -884,6 +884,13 @@ class Volume(DatabricksPath):
     def _ls(self, recursive: bool = False, *, singleton_ttl: Any = False) -> Iterator["VolumePath"]:
         pass
 
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        raise NotImplementedError(
+            f"{type(self).__name__} is a Unity Catalog volume, not a positional "
+            f"byte buffer. Navigate to a file via ``volume.path('<sub/path>')`` "
+            f"and read that instead."
+        )
+
     def full_path(self) -> str:
         return f"/Volumes/{self.catalog_name}/{self.schema_name}/{self.volume_name}"
 

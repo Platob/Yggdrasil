@@ -3390,7 +3390,14 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         """
         holder = self._parent if self._parent is not None else self
         if not append and getattr(holder, "SUPPORTS_STREAMING_UPLOAD", False):
-            return holder._upload_stream(source)
+            n = holder._upload_stream(source)
+            # A streaming commit replaces the whole object — supersede any
+            # acquire-time write buffer (e.g. the empty buffer an
+            # ``open("wb")`` truncate seeds) so the release flush doesn't
+            # clobber the streamed bytes with it.
+            if hasattr(holder, "_wbuf"):
+                holder._wbuf = None
+            return n
         return self._commit_format_payload(source.read_bytes(), append=append)
 
     def _commit_format_payload(

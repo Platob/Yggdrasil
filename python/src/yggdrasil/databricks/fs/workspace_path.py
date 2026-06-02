@@ -683,16 +683,7 @@ class WorkspacePath(DatabricksPath):
                 if not _looks_like_not_found(del_exc):
                     raise
             self._call_ensuring_parents(_do_upload)
-        committed = None
         if size >= 0:
-            if hasattr(content, "read"):
-                try:
-                    content.seek(0)
-                    committed = content.read()
-                except Exception:
-                    pass
-            else:
-                committed = bytes(content)
             self._persist_stat_cache(
                 IOStats(
                     size=size,
@@ -704,10 +695,6 @@ class WorkspacePath(DatabricksPath):
             logger.info("Uploaded workspace file %r (size=%d)", self, size)
         else:
             logger.info("Uploaded workspace file %r (size=stream)", self)
-        if committed is not None:
-            self._cache_after_upload(committed, len(committed))
-        else:
-            self._buffered_size = None
         return size
 
     # ==================================================================

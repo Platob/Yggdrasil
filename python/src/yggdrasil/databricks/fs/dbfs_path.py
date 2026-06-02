@@ -400,8 +400,8 @@ class DBFSPath(DatabricksPath):
         Loops the SDK's 1 MiB cap until the window is filled, or a
         short page signals EOF. ``n < 0`` means "read to EOF" — the
         loop keeps issuing chunk-sized requests with no upper bound
-        and stops on the first short page. The aggressive ``_bread``
-        path leans on this, so a whole-file read costs one
+        and stops on the first short page. The whole-file read fast
+        path leans on this, so a read costs one
         ``ceil(size / 1 MiB)``-chunk round-trip burst, no preceding
         ``get_status`` probe.
         """
@@ -644,16 +644,7 @@ class DBFSPath(DatabricksPath):
                         offset += _DBFS_CHUNK
 
         self._call(_do_upload)
-        committed = None
         if size >= 0:
-            if hasattr(content, "read"):
-                try:
-                    content.seek(0)
-                    committed = content.read()
-                except Exception:
-                    pass
-            else:
-                committed = bytes(content)
             self._persist_stat_cache(
                 IOStats(
                     size=size,
@@ -665,10 +656,6 @@ class DBFSPath(DatabricksPath):
             logger.info("Uploaded DBFS file %r (size=%d)", self, size)
         else:
             logger.info("Uploaded DBFS file %r (size=stream)", self)
-        if committed is not None:
-            self._cache_after_upload(committed, len(committed))
-        else:
-            self._buffered_size = None
         return size
 
     def _clear(self) -> None:

@@ -4,9 +4,8 @@ A :class:`LocalPath` is a :class:`Path` over the ``file://`` scheme.
 It owns a long-lived RDWR fd opened on :meth:`_acquire`, routing
 positional I/O through portable :func:`os.pread` / :func:`os.pwrite`
 helpers (POSIX-fast, Windows-safe via ``lseek + read/write`` with
-saved-cursor restore). The fd-fast path overrides :class:`Path`'s
-default whole-file primitives (which would round-trip through
-:meth:`_bread` / :meth:`_bwrite`).
+saved-cursor restore). It implements :class:`Path`'s positional
+primitives (:meth:`_read_mv` / :meth:`_write_mv`) fd-direct.
 
 Lifecycle
 ---------
@@ -59,9 +58,8 @@ import threading
 import time
 from typing import Any, ClassVar, Iterator
 
-from yggdrasil.enums import Mode, Scheme
+from yggdrasil.enums import Scheme
 from yggdrasil.dataclasses import WaitingConfig
-from yggdrasil.io.holder import IO
 from yggdrasil.path import Path
 from yggdrasil.io.io_stats import IOKind, IOStats
 
@@ -161,7 +159,7 @@ def _default_open_flags() -> int:
     available.
 
     Centralized so :meth:`LocalPath._acquire`, :meth:`LocalPath.truncate`,
-    and the transient-open paths in :meth:`_bread` / :meth:`_bwrite`
+    and the transient-open paths in :meth:`_read_mv` / :meth:`_write_mv`
     all use the same flag bag.
     """
     flags = os.O_RDWR | os.O_CREAT
@@ -627,64 +625,8 @@ class LocalPath(Path):
             if not missing_ok:
                 raise
 
-    def _bread(self, n: int, pos: int, mode: Mode) -> "IO":
-        """Positional read → fresh :class:`IO` over a Memory holder.
-
-        ``n < 0`` reads to EOF. Caller owns the returned buffer
-        (must close it). The :class:`Path` default would route
-        through here; LocalPath's :meth:`_read_mv` short-circuits
-        to :func:`_fd_pread` directly so this is mostly a fallback
-        for callers that explicitly want an IO instead of bytes.
-        """
-        del mode  # read is mode-agnostic
-        if self._fd >= 0:
-            size = self.size if n < 0 else n
-            data = _fd_pread(self._fd, size, pos)
-        else:
-            # Transient open — read everything at pos, then close.
-            flags = os.O_RDONLY
-            if hasattr(os, "O_BINARY"):
-                flags |= os.O_BINARY
-            fd = os.open(self.os_path, flags)
-            try:
-                size = (
-                    os.fstat(fd).st_size - pos if n < 0 else n
-                )
-                data = _fd_pread(fd, max(0, size), pos)
-            finally:
-                os.close(fd)
-
-        return IO(data)
-
-    def _bwrite(self, data: "IO", pos: int, mode: Mode) -> int:
-        """Splice *data* at *pos* on the backing.
-
-        ``mode`` honors :attr:`Mode.APPEND` by ignoring *pos* and
-        landing at EOF; everything else writes positionally.
-        :class:`LocalPath`'s :meth:`_write_mv` short-circuits to
-        :func:`_fd_pwrite` directly, so this is the fallback for
-        callers that hand in a full IO at once.
-        """
-        payload = data.read_bytes() if hasattr(data, "read_bytes") else bytes(data.to_bytes())
-        if not payload:
-            return 0
-
-        owns_fd = self._fd < 0
-        if owns_fd:
-            fd = _open_with_mkdir_retry(self.os_path, _default_open_flags())
-        else:
-            fd = self._fd
-
-        try:
-            if mode is Mode.APPEND:
-                pos = os.fstat(fd).st_size
-            return _fd_pwrite(fd, memoryview(payload), pos)
-        finally:
-            if owns_fd:
-                os.close(fd)
-
     # ==================================================================
-    # Holder primitives — fd-fast overrides of Path's defaults
+    # Holder primitives — fd-direct positional I/O
     # ==================================================================
 
     def _read_mv(self, n: int, pos: int) -> memoryview:
@@ -745,7 +687,7 @@ class LocalPath(Path):
         """Set the file size to exactly ``n`` bytes via :func:`os.ftruncate`.
 
         Shrinks drop the tail; extends zero-pad. Overrides the
-        :class:`Path` default (read-truncate-rewrite via _bread/_bwrite)
+        :class:`Path` default (read-modify-write via _read_mv/_write_mv)
         with the direct syscall. Transient fd when the holder isn't
         acquired so ``truncate`` is usable on a fresh path.
         """
