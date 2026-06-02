@@ -1701,18 +1701,24 @@ class Table(DatabricksPath):
             )
         else:
             if table_type == TableType.EXTERNAL and not storage_location:
+                # No explicit path → the default external location: the
+                # schema's (or catalog's) storage root, under ``/tables/<name>``.
                 storage_location = (
                     self.schema_storage_location(table_type=table_type)
                     + "/tables/%s" % self.table_name
                 )
-            result = self.api_create(
-                definition=definition,
+            # DDL create (USING <format> + LOCATION + PARTITIONED BY). The UC
+            # SDK ``api_create`` can't express this — it requires a per-column
+            # ``type_json`` the translator doesn't build — so external tables
+            # (PARQUET, CSV, external Delta, …) go through the SQL path.
+            result = self.sql_create(
+                definition,
                 storage_location=storage_location,
                 comment=comment,
                 properties=properties,
-                table_type=table_type,
-                data_source_format=data_source_format,
                 missing_ok=missing_ok,
+                or_replace=mode == Mode.OVERWRITE,
+                data_source_format=data_source_format,
                 record_ygg_properties=record_ygg_properties,
             )
 
@@ -1742,11 +1748,15 @@ class Table(DatabricksPath):
         if auto_tag:
             schema_info = schema_info.autotag()
         comment = comment or schema_info.comment
+        # Liquid clustering, ``delta.*`` table properties, and inline UC
+        # primary keys are Delta-only; an external ``USING PARQUET`` (or any
+        # non-Delta) table rejects them, so they're gated on the format below.
+        is_delta = data_source_format == DataSourceFormat.DELTA
         effective_fields: list[Field] = []
         column_definitions: list[str] = []
         partition_by = schema_info.partition_fields
         cluster_by = schema_info.cluster_fields
-        primary_keys = schema_info.primary_fields
+        primary_keys = schema_info.primary_fields if is_delta else []
 
         for f in schema_info.children:
             effective_fields.append(f)
@@ -1786,11 +1796,13 @@ class Table(DatabricksPath):
             sql_parts.append(
                 "PARTITIONED BY (" + ", ".join(quote_ident(c.name) for c in partition_by) + ")"
             )
-        elif cluster_by:
+        elif is_delta and cluster_by:
             sql_parts.append(
                 "CLUSTER BY (" + ", ".join(quote_ident(c.name) for c in cluster_by) + ")"
             )
-        else:
+        elif is_delta:
+            # Liquid clustering is Delta-only; non-Delta formats just lay out
+            # their files (optionally partitioned, handled above).
             sql_parts.append("CLUSTER BY AUTO")
 
         if comment:
@@ -1799,20 +1811,22 @@ class Table(DatabricksPath):
         if storage_location:
             sql_parts.append(f"LOCATION '{escape_sql_string(storage_location)}'")
 
-        props: dict[str, Any] = {
-            "delta.autoOptimize.optimizeWrite": bool(optimize_write),
-            "delta.autoOptimize.autoCompact": bool(auto_compact),
-        }
-        if enable_cdf is not None:
-            props["delta.enableChangeDataFeed"] = bool(enable_cdf)
-        if enable_deletion_vectors is not None:
-            props["delta.enableDeletionVectors"] = bool(enable_deletion_vectors)
-        if target_file_size is not None:
-            props["delta.targetFileSize"] = int(target_file_size)
-        if column_mapping_mode != "none":
-            props["delta.columnMapping.mode"] = column_mapping_mode
-            props["delta.minReaderVersion"] = 2
-            props["delta.minWriterVersion"] = 5
+        # ``delta.*`` properties only apply to Delta tables; a PARQUET (or
+        # other non-Delta) external table rejects them.
+        props: dict[str, Any] = {}
+        if is_delta:
+            props["delta.autoOptimize.optimizeWrite"] = bool(optimize_write)
+            props["delta.autoOptimize.autoCompact"] = bool(auto_compact)
+            if enable_cdf is not None:
+                props["delta.enableChangeDataFeed"] = bool(enable_cdf)
+            if enable_deletion_vectors is not None:
+                props["delta.enableDeletionVectors"] = bool(enable_deletion_vectors)
+            if target_file_size is not None:
+                props["delta.targetFileSize"] = int(target_file_size)
+            if column_mapping_mode != "none":
+                props["delta.columnMapping.mode"] = column_mapping_mode
+                props["delta.minReaderVersion"] = 2
+                props["delta.minWriterVersion"] = 5
         if record_ygg_properties:
             props.update(_build_ygg_properties(schema_info))
         if properties:

@@ -100,6 +100,27 @@ schema = pa.schema([
 ])
 orders.create(schema=schema, missing_ok=True, comment="Sales orders")
 
+# External PARQUET table, partitioned, written directly to cloud storage.
+# Tag the partition columns; omit `storage_location` to use the schema's /
+# catalog's default external location (its storage root).
+from yggdrasil.data import Field, Schema
+from databricks.sdk.service.catalog import DataSourceFormat, TableType
+
+events = client.tables.find_table("main.sales.events")
+events.create(
+    Schema.from_fields([
+        Field("id", "int64"),
+        Field("payload", "string"),
+        Field("region", "string", tags={"partition_by": True}),
+        Field("dt", "string", tags={"partition_by": True}),
+    ]),
+    table_type=TableType.EXTERNAL,
+    data_source_format=DataSourceFormat.PARQUET,
+    # storage_location="s3://bucket/prefix/events",  # or the default location
+)
+# → CREATE TABLE … USING PARQUET PARTITIONED BY (region, dt) LOCATION 's3://…'
+events.insert(arrow_table)            # writes region=…/dt=…/*.parquet to S3
+
 # Truncate / delete
 orders.truncate()
 orders.delete(if_exists=True)
