@@ -63,6 +63,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterator, TypeVar
 
 import pyarrow as pa
 from yggdrasil.data.data_field import Field as _Field
+from yggdrasil.data.data_field import _pandas_index_levels
 from yggdrasil.data.options import CastOptions
 from yggdrasil.data.schema import Schema
 from yggdrasil.dataclasses.singleton import Singleton
@@ -118,8 +119,6 @@ def _collect_index_levels(schema: pa.Schema) -> "list[tuple[int, str]]":
     produced by ``pandas.to_parquet`` / ``pandas.to_feather``, Spark,
     or other tools still restore their index on read.
     """
-    import yggdrasil.pickle.json as ygg_json
-
     levels: "list[tuple[int, str]]" = []
     for f in schema:
         meta = f.metadata
@@ -134,28 +133,16 @@ def _collect_index_levels(schema: pa.Schema) -> "list[tuple[int, str]]":
     if levels:
         return levels
 
+    # No yggdrasil tags — fall back to pandas' own ``b"pandas"`` blob so
+    # files written by ``pandas.to_parquet`` / other tools still restore.
     raw = (schema.metadata or {}).get(b"pandas")
-    if not raw:
-        return levels
-    pmeta = ygg_json.loads(raw)
-    for pos, entry in enumerate(pmeta.get("index_columns", ())):
-        if isinstance(entry, str):
-            levels.append((pos, entry))
-    return levels
+    return [(pos, name) for name, pos in _pandas_index_levels(raw).items()]
 
 
 def _tag_index_columns(table: pa.Table) -> pa.Table:
     """Stamp ``index_key`` + ``index_key_level`` on pandas index columns."""
     raw = (table.schema.metadata or {}).get(b"pandas")
-    if not raw:
-        return table
-    import yggdrasil.pickle.json as ygg_json
-    pmeta = ygg_json.loads(raw)
-    index_levels: dict[str, int] = {
-        e: pos
-        for pos, e in enumerate(pmeta.get("index_columns", ()))
-        if isinstance(e, str)
-    }
+    index_levels = _pandas_index_levels(raw)
     if not index_levels:
         return table
     tagged: list[pa.Field] = []

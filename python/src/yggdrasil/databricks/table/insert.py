@@ -1419,6 +1419,7 @@ def stage_async_insert(
     mode: Any = None,
     match_by: "list[str] | None" = None,
     cast_options: Any = None,
+    check_job: bool = False,
 ) -> "VolumePath":
     """Stage *data* as Parquet + drop a :class:`DatabricksTableInsert` op-log.
 
@@ -1427,6 +1428,10 @@ def stage_async_insert(
     :func:`logs_path` recording the staged data's uniform URL (so it can live
     anywhere). A path/URL *string* source is read into Arrow first. Returns the
     op-log path; only ``OVERWRITE`` / ``APPEND`` with no ``match_by``.
+
+    ``check_job``: if True, get-or-create the async file-arrival loader job for
+    this table (:func:`ensure_async_job`) after the log is dropped, so the
+    staged data will actually be picked up and loaded later.
     """
     mode_enum = Mode.from_(mode, default=Mode.APPEND)
     if mode_enum not in ASYNC_MODES:
@@ -1457,6 +1462,13 @@ def stage_async_insert(
     )
     log_file = logs_path(table) / f"{op.op_id}.json"
     log_file.write_bytes(op.to_json())
+
+    # Staging alone drops a log into the watched dir; nothing consumes it until
+    # the file-arrival loader job exists. When check_job is set, make sure that
+    # job is in place so the data actually lands later.
+    if check_job:
+        ensure_async_job(table)
+
     return log_file
 
 
@@ -1562,7 +1574,7 @@ def _best_effort_unlink(path: Any) -> None:
         logger.debug("async cleanup: failed to remove %s", path, exc_info=True)
 
 
-def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
+def ensure_async_job(table: "Table", *, client: Any = None, rebuild: bool = False) -> Any:
     """Get-or-create the file-arrival loader job for *table*, return the Job.
 
     Creates the watched ``logs/`` dir, builds + uploads the full ygg wheel
@@ -1570,6 +1582,9 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
     serverless job whose single python-wheel task runs ``ygg databricks table
     execute_insert --logs <dir>`` when a log lands. Any stale job watching the
     same logs dir is pruned so a single job owns the trigger.
+
+    ``rebuild`` forces the ygg wheel bundle to be rebuilt + re-uploaded instead
+    of reusing an already-deployed one.
     """
     from databricks.sdk.service.compute import Environment
     from databricks.sdk.service.jobs import (
@@ -1592,7 +1607,7 @@ def ensure_async_job(table: "Table", *, client: Any = None) -> Any:
     logger.info("async job: ensuring logs dir %s", logs.full_path())
     logs.mkdir(parents=True, exist_ok=True)
 
-    wheels = ensure_ygg_wheel(client)
+    wheels = ensure_ygg_wheel(client, rebuild=rebuild)
 
     name = job_name(table)
     logger.info("create-or-update async job %r", name)

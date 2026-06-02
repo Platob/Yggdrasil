@@ -115,6 +115,65 @@ class TestFromPandasIndexMetadata(PandasTestCase):
         self.assertEqual(list(result.index), [10, 20])
         self.assertNotIn("pk", result.columns)
 
+    def test_check_pandas_metadata_from_schema(self) -> None:
+        df = self.pd.DataFrame({"v": [10, 20]}, index=self.pd.Index([1, 2], name="pk"))
+        table = pa.Table.from_pandas(df)
+        field = Field.from_arrow_schema(table.schema.remove_metadata())
+
+        result = field.check_pandas_metadata(table.schema)
+
+        children = {f.name: f for f in result.fields}
+        self.assertTrue(children["pk"].index_key)
+        self.assertEqual(children["pk"].index_key_level, 0)
+        self.assertFalse(children["v"].index_key)
+
+    def test_check_pandas_metadata_from_table(self) -> None:
+        df = self.pd.DataFrame({"v": [1]}, index=self.pd.Index([7], name="pk"))
+        table = pa.Table.from_pandas(df)
+        field = Field.from_arrow_schema(table.schema.remove_metadata())
+
+        result = field.check_pandas_metadata(table)
+
+        self.assertTrue({f.name: f for f in result.fields}["pk"].index_key)
+
+    def test_check_pandas_metadata_from_dict_and_bytes(self) -> None:
+        import yggdrasil.pickle.json as ygg_json
+
+        df = self.pd.DataFrame({"v": [1, 2]}, index=self.pd.Index([3, 4], name="pk"))
+        table = pa.Table.from_pandas(df)
+        blob = table.schema.metadata[b"pandas"]
+        parsed = ygg_json.loads(blob)
+
+        # dict shape
+        field = Field.from_arrow_schema(table.schema.remove_metadata())
+        out_dict = field.check_pandas_metadata(parsed)
+        self.assertTrue({f.name: f for f in out_dict.fields}["pk"].index_key)
+
+        # raw bytes shape
+        field2 = Field.from_arrow_schema(table.schema.remove_metadata())
+        out_bytes = field2.check_pandas_metadata(blob)
+        self.assertTrue({f.name: f for f in out_bytes.fields}["pk"].index_key)
+
+    def test_check_pandas_metadata_falls_back_to_self_metadata(self) -> None:
+        df = self.pd.DataFrame({"v": [9]}, index=self.pd.Index([2], name="pk"))
+        table = pa.Table.from_pandas(df)
+        # from_arrow_schema preserves the b"pandas" key onto self.metadata,
+        # so no source arg means it should still find the index columns.
+        field = Field.from_arrow_schema(table.schema)
+
+        result = field.check_pandas_metadata()
+
+        self.assertTrue({f.name: f for f in result.fields}["pk"].index_key)
+
+    def test_check_pandas_metadata_noop_without_blob(self) -> None:
+        df = self.pd.DataFrame({"a": [1, 2]})
+        field = Field.from_arrow_schema(pa.Table.from_pandas(df).schema.remove_metadata())
+
+        result = field.check_pandas_metadata(None)
+
+        self.assertIs(result, field)
+        self.assertFalse(any(f.index_key for f in result.fields))
+
 
 class TestFromPolars(PolarsTestCase):
 

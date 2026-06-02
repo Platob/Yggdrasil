@@ -2547,6 +2547,16 @@ class Table(DatabricksPath):
                 f" different target catalog/schema/table."
             )
 
+        # Resolve the source's type so a view is detected even on a fresh
+        # handle whose infos haven't been read yet — ``is_view`` reads the
+        # cache only, so without this a never-inspected view would report
+        # ``False`` and wrongly take the Delta ``CLONE`` path below.
+        if self._infos is None:
+            try:
+                _ = self.infos
+            except Exception:
+                pass
+
         # Views can't ride the Delta ``CLONE`` path — re-emit the
         # source's ``view_definition`` as a fresh ``CREATE [OR REPLACE]
         # VIEW [IF NOT EXISTS]`` against the target, mirroring the
@@ -2658,6 +2668,11 @@ class Table(DatabricksPath):
         ``OVERWRITE`` / ``APPEND`` (no keys) and ``MERGE`` / ``UPSERT`` (with
         ``match_by`` keys) qualify; anything else (or a query / Spark source)
         falls through to the normal synchronous path.
+
+        On the ``wait=False`` path, ``check_job`` (forwarded via ``**kwargs``):
+        if True, get-or-create the async file-arrival loader job for this table
+        so the staged data actually gets picked up — same as calling
+        :meth:`stage_insert` directly.
         """
         from yggdrasil.databricks.table.insert import ASYNC_MODES, stage_async_insert
 
@@ -2682,6 +2697,38 @@ class Table(DatabricksPath):
             spark_session=spark_session,
             return_data=return_data,
             **kwargs,
+        )
+
+    def stage_insert(
+        self,
+        data: Any,
+        *,
+        mode: ModeLike = None,
+        match_by: Optional[list[str]] = None,
+        cast_options: Optional[CastOptions] = None,
+        check_job: bool = False,
+    ) -> VolumePath:
+        """Stage an async insert and return the op-log path — no warehouse run.
+
+        Writes *data* as Parquet to this table's staging area and drops a JSON
+        operation log under ``.sql/async/logs``; no SQL statement runs on a
+        warehouse here. The file-arrival loader job (:meth:`async_job`)
+        aggregates the staged logs and loads them into the table later.
+
+        ``check_job``: if True, get-or-create the async file-arrival loader job
+        for this table so the staged data will actually be picked up. Thin
+        wrapper over
+        :func:`~yggdrasil.databricks.table.insert.stage_async_insert`.
+        """
+        from yggdrasil.databricks.table.insert import stage_async_insert
+
+        return stage_async_insert(
+            self,
+            data,
+            mode=mode,
+            match_by=match_by,
+            cast_options=cast_options,
+            check_job=check_job,
         )
 
     # =========================================================================
