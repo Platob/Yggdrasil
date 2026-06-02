@@ -529,23 +529,39 @@ class WorkspacePyPIRegistry:
         )
 
     def _pip_wheel(self, info: DependencyInfo) -> _LocalPath:
-        """Run ``pip wheel`` and return the produced file."""
-        with tempfile.TemporaryDirectory(prefix="ygg-pip-wheel-") as raw:
+        """Build the project wheel (no deps) and return the produced file.
+
+        Prefers **uv** (``uv build --wheel`` from the source tree — no separate
+        pip needed); falls back to ``pip wheel <name> --no-deps`` when uv isn't
+        on PATH or the dep has no local source directory."""
+        with tempfile.TemporaryDirectory(prefix="ygg-build-wheel-") as raw:
             outdir = _LocalPath(raw)
-            cmd = [
-                sys.executable, "-m", "pip", "wheel", info.name,
-                "--no-deps", "-w", str(outdir),
-            ]
-            try:
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-                stderr = getattr(exc, "stderr", "") or str(exc)
-                raise _WheelBuildError(stderr) from exc
+
+            built_via_uv = False
+            if info.source is not None and info.source.is_dir():
+                try:
+                    subprocess.run(
+                        ["uv", "build", "--wheel", "--out-dir", str(outdir),
+                         str(info.source)],
+                        check=True, capture_output=True, text=True,
+                    )
+                    built_via_uv = True
+                except FileNotFoundError:
+                    pass  # uv not installed — fall through to pip
+                except subprocess.CalledProcessError as exc:
+                    stderr = getattr(exc, "stderr", "") or str(exc)
+                    raise _WheelBuildError(stderr) from exc
+
+            if not built_via_uv:
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "pip", "wheel", info.name,
+                         "--no-deps", "-w", str(outdir)],
+                        check=True, capture_output=True, text=True,
+                    )
+                except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                    stderr = getattr(exc, "stderr", "") or str(exc)
+                    raise _WheelBuildError(stderr) from exc
 
             wheels = sorted(outdir.glob("*.whl"))
             if not wheels:

@@ -111,7 +111,9 @@ class TestFlow:
 
         assert gather([3, 1, 2]) == [1, 2, 3]
 
-    def test_definition_is_serverless_v5_with_ygg_databricks(self):
+    def test_definition_is_serverless_python_matched_with_ygg_databricks(self):
+        from yggdrasil.databricks.job.wheel import serverless_environment_version
+
         @flow(parameters=["a", "b"])
         def etl(x, y):
             ...
@@ -123,7 +125,8 @@ class TestFlow:
         assert task_obj.python_wheel_task.parameters == ["a", "b"]
         assert task_obj.environment_key == "default"
         env = spec["environments"][0]
-        assert env.spec.environment_version == "5"
+        # serverless env version is chosen to match the local Python
+        assert env.spec.environment_version == serverless_environment_version()
         assert env.spec.dependencies == [f"ygg[databricks]=={__version__}", "databricks-sdk"]
 
     def test_serverless_false_drops_environment(self):

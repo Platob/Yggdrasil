@@ -124,14 +124,34 @@ class TestWheel:
         assert "--no-deps" not in cmd                 # full build by default
         assert sorted(w.name for w in wheels) == ["pyarrow-1-py3-none-any.whl", "ygg-1.0-py3-none-any.whl"]
 
-    def test_build_wheel_no_deps_passes_flag(self):
+    def test_build_wheel_no_deps_uses_uv(self):
         out = Path("/does-not-matter")
         with patch("yggdrasil.databricks.job.wheel.synthesize_project", return_value=Path("/synth")), \
              patch("yggdrasil.databricks.job.wheel.subprocess.run") as run, \
              patch("yggdrasil.databricks.job.wheel.tempfile.mkdtemp", return_value=str(out)), \
              patch("pathlib.Path.glob", return_value=[Path("/synth/ygg-1.0-py3-none-any.whl")]):
             wheel.build_wheel("yggdrasil", no_deps=True)
-        assert "--no-deps" in run.call_args.args[0]
+        cmd = run.call_args.args[0]
+        assert cmd[:3] == ["uv", "build", "--wheel"]    # uv, not pip
+        assert "/synth" in cmd
+
+    def test_build_wheel_no_deps_falls_back_to_pip_without_uv(self):
+        out = Path("/does-not-matter")
+        calls = []
+
+        def _run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:2] == ["uv", "build"]:
+                raise FileNotFoundError("uv")           # uv not on PATH
+            return None
+
+        with patch("yggdrasil.databricks.job.wheel.synthesize_project", return_value=Path("/synth")), \
+             patch("yggdrasil.databricks.job.wheel.subprocess.run", side_effect=_run), \
+             patch("yggdrasil.databricks.job.wheel.tempfile.mkdtemp", return_value=str(out)), \
+             patch("pathlib.Path.glob", return_value=[Path("/synth/ygg-1.0-py3-none-any.whl")]):
+            wheel.build_wheel("yggdrasil", no_deps=True)
+        assert calls[0][:3] == ["uv", "build", "--wheel"]
+        assert "wheel" in calls[1] and "--no-deps" in calls[1]   # pip fallback
 
     def test_ensure_builds_with_deps_and_uploads_all(self):
         client = MagicMock()
@@ -268,9 +288,18 @@ class TestWheel:
             client, workspace_dir=wheel.WORKSPACE_WHL_DIR, rebuild=False,
         )
         assert env.environment_key == "default"
-        assert env.spec.environment_version == wheel.SERVERLESS_ENVIRONMENT_VERSION == "5"
+        # defaults to the Python-matched serverless env version
+        assert env.spec.environment_version == wheel.serverless_environment_version()
         # wheel path first (installed by path), then the index-resolved deps
         assert env.spec.dependencies == wheels + deps
+
+    def test_serverless_environment_version_maps_python(self):
+        import sys
+        from unittest.mock import patch as _patch
+        cases = {(3, 10): "0", (3, 11): "2", (3, 12): "5", (3, 13): "5"}
+        for (maj, minr), expected in cases.items():
+            with _patch.object(sys, "version_info", (maj, minr, 0)):
+                assert wheel.serverless_environment_version() == expected
 
     def test_ygg_runtime_dependencies_are_index_names(self):
         deps = wheel.ygg_runtime_dependencies()

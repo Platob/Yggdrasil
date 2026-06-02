@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "WORKSPACE_WHL_DIR",
     "SERVERLESS_ENVIRONMENT_VERSION",
+    "serverless_environment_version",
     "synthesize_project",
     "build_wheel",
     "upload_wheel",
@@ -43,9 +44,25 @@ __all__ = [
 #: self-contained (and so a deploy can reuse an existing version's bundle).
 WORKSPACE_WHL_DIR = "/Workspace/Shared/.ygg/whl"
 
-#: Default serverless environment version — **v5 (latest)**, used everywhere a
-#: serverless ``Environment`` is built (the ygg image, async loader job, flows).
+#: Latest serverless environment version — the fallback when the local Python
+#: isn't one we map to an older runtime.
 SERVERLESS_ENVIRONMENT_VERSION = "5"
+
+
+def serverless_environment_version() -> str:
+    """The Databricks serverless environment version whose runtime **Python
+    matches the local interpreter**.
+
+    Matching matters twice over: a locally-built ygg wheel installs cleanly, and
+    Python UDFs run (Spark Connect requires the client and server to share a
+    minor Python version). Mapping: 3.10 → ``"0"``, 3.11 → ``"2"``, anything
+    else → the latest :data:`SERVERLESS_ENVIRONMENT_VERSION` (``"5"``)."""
+    minor = sys.version_info[1]
+    if minor == 10:
+        return "0"
+    if minor == 11:
+        return "2"
+    return SERVERLESS_ENVIRONMENT_VERSION
 
 
 def _norm(name: str) -> str:
@@ -174,24 +191,40 @@ def build_wheel(
     """Build the live *package* (synthesized project) via an isolated
     ``pip wheel`` — returns the produced ``.whl`` files.
 
-    By default builds the project **with its dependencies** (every transitive
-    dep wheel + any extra *requirements*). With ``no_deps=True`` builds **only
-    the project wheel** (``pip wheel --no-deps``): a pure-python ``py3-none-any``
-    wheel with no platform-specific dependency wheels — what you want when the
-    install target's platform / python differs from the build host (e.g. a
-    Databricks serverless runtime), so dependencies resolve there from the
-    index instead."""
+    With ``no_deps=True`` builds **only the project wheel** (a pure-python
+    ``py3-none-any`` wheel, no platform-specific dependency wheels) — what the
+    ygg image ships, since deps resolve from the index on the cluster. This is
+    built with **uv** (``uv build --wheel``; no separate pip needed), falling
+    back to ``pip wheel --no-deps`` only if uv isn't on PATH.
+
+    With ``no_deps=False`` (legacy) the project is built **with its
+    dependencies** + any extra *requirements* via ``pip wheel`` — uv build
+    doesn't bundle dependencies."""
     project = synthesize_project(package, extras=extras)
     out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-wheel-"))
-    logger.info(
-        "building wheel%s for %s into %s",
-        "" if no_deps else " (+ dependencies)", package, out,
-    )
-    cmd = [sys.executable, "-m", "pip", "wheel", str(project), *requirements,
-           "--wheel-dir", str(out)]
-    if no_deps:
-        cmd.append("--no-deps")
-    subprocess.run(cmd, check=True)
+
+    if no_deps and not requirements:
+        logger.info("building wheel for %s into %s (uv)", package, out)
+        try:
+            subprocess.run(
+                ["uv", "build", "--wheel", "--out-dir", str(out), str(project)],
+                check=True,
+            )
+        except FileNotFoundError:
+            logger.info("uv not found — falling back to pip for %s", package)
+            subprocess.run(
+                [sys.executable, "-m", "pip", "wheel", str(project),
+                 "--no-deps", "--wheel-dir", str(out)],
+                check=True,
+            )
+    else:
+        logger.info("building wheel (+ dependencies) for %s into %s (pip)", package, out)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "wheel", str(project), *requirements,
+             "--wheel-dir", str(out)],
+            check=True,
+        )
+
     wheels = sorted(out.glob("*.whl"))
     if not wheels:
         raise FileNotFoundError(f"no wheels produced in {out}")
@@ -322,22 +355,39 @@ def ygg_runtime_dependencies() -> list[str]:
     ``[databricks]`` extra (which pins the latest ``databricks-sdk``). Shipped
     as names — not wheels — so the serverless runtime installs platform-correct
     builds. ``pyarrow`` / ``numpy`` and other binary deps therefore resolve on
-    the cluster instead of being bundled from the build host."""
-    return _project_dependencies("ygg", {"databricks"})
+    the cluster instead of being bundled from the build host.
+
+    A bare, unpinned name (e.g. ``"xxhash"``) is pinned to its installed
+    version so it reads as an unambiguous **index** requirement — otherwise the
+    Spark Connect registry mistakes an installed-but-unpinned dep for a *local*
+    package and tries to build a wheel for it."""
+    _OPS = ("==", ">=", "<=", "!=", "~=", "===", ">", "<")
+    out: list[str] = []
+    for dep in _project_dependencies("ygg", {"databricks"}):
+        head = dep.split(";", 1)[0].strip()
+        if "[" in head or any(op in head for op in _OPS):
+            out.append(dep)
+            continue
+        try:
+            out.append(f"{head}=={ilmd.version(head)}")
+        except Exception:  # noqa: BLE001 - not locally installed; ship the bare name
+            out.append(dep)
+    return out
 
 
 def ygg_environment(
     client: Any,
     *,
     environment_key: str = "default",
-    environment_version: str = SERVERLESS_ENVIRONMENT_VERSION,
+    environment_version: "str | None" = None,
     rebuild: bool = False,
     workspace_dir: str = WORKSPACE_WHL_DIR,
 ) -> Any:
     """The serverless ``JobEnvironment`` for the **versioned ygg image**.
 
-    Pairs the latest serverless runtime (``environment_version``, default
-    :data:`SERVERLESS_ENVIRONMENT_VERSION` = ``"5"``) with:
+    Pairs the serverless runtime — ``environment_version``, defaulting to
+    :func:`serverless_environment_version` so the cluster Python matches the
+    local interpreter (the locally-built wheel installs and UDFs run) — with:
 
     - the get-or-created pure-python ygg wheel (:func:`ensure_ygg_wheel`),
       installed **by path**; and
@@ -357,7 +407,7 @@ def ygg_environment(
     return JobEnvironment(
         environment_key=environment_key,
         spec=Environment(
-            environment_version=environment_version,
+            environment_version=environment_version or serverless_environment_version(),
             dependencies=dependencies,
         ),
     )

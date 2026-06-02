@@ -33,7 +33,7 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar
 
-from yggdrasil.databricks.job.wheel import SERVERLESS_ENVIRONMENT_VERSION
+from yggdrasil.databricks.job.wheel import serverless_environment_version
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.concurrent.threading import ThreadJob
@@ -208,12 +208,12 @@ class Flow(_Runnable):
     entry_point: str = "ygg"
     task_key: str = "run"
 
-    #: Serverless environment version (default **v5**, the latest — sourced from
-    #: :data:`~yggdrasil.databricks.job.wheel.SERVERLESS_ENVIRONMENT_VERSION` so
-    #: every serverless surface advances together).
+    #: Serverless environment version. ``None`` (default) resolves at deploy
+    #: time via :func:`~yggdrasil.databricks.job.wheel.serverless_environment_version`
+    #: so the cluster Python matches the local interpreter; set a string to pin.
     serverless: bool = True
     environment_key: str = "default"
-    environment_version: str = SERVERLESS_ENVIRONMENT_VERSION
+    environment_version: "str | None" = None
 
     #: Fallback dependency when not shipping a built wheel — ``ygg`` (the
     #: published package, pulling its ``[databricks]`` extra) from an index.
@@ -311,8 +311,8 @@ class Flow(_Runnable):
         return dependency
 
     def environments(self) -> Optional[list]:
-        """Serverless environment list (v5 + :meth:`effective_dependencies`),
-        or ``None``."""
+        """Serverless environment list (Python-matched runtime +
+        :meth:`effective_dependencies`), or ``None``."""
         if not self.serverless:
             return None
         from databricks.sdk.service.compute import Environment
@@ -322,7 +322,9 @@ class Flow(_Runnable):
             JobEnvironment(
                 environment_key=self.environment_key,
                 spec=Environment(
-                    environment_version=self.environment_version,
+                    environment_version=(
+                        self.environment_version or serverless_environment_version()
+                    ),
                     dependencies=self.effective_dependencies(),
                 ),
             )

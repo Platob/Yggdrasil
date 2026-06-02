@@ -1183,22 +1183,23 @@ class DatabricksClient(Singleton, URLBased):
     ) -> Any:
         """The serverless ``JobEnvironment`` for the versioned ygg image.
 
-        Pairs the latest serverless runtime (default
-        :data:`~yggdrasil.databricks.job.wheel.SERVERLESS_ENVIRONMENT_VERSION`
-        = ``"5"``) with the get-or-created :meth:`ensure_ygg_wheel` bundle.
+        Pairs the serverless runtime — defaulting to
+        :func:`~yggdrasil.databricks.job.wheel.serverless_environment_version`
+        so the cluster Python matches the local interpreter — with the
+        get-or-created :meth:`ensure_ygg_wheel` bundle.
         Drop it straight into a serverless job's ``environments=[...]`` so its
         python-wheel tasks run the ``ygg`` CLI against a pinned, pre-installed
         image.
         """
         from yggdrasil.databricks.job.wheel import (
             ygg_environment,
-            SERVERLESS_ENVIRONMENT_VERSION,
+            serverless_environment_version,
         )
 
         return ygg_environment(
             self,
             environment_key=environment_key,
-            environment_version=environment_version or SERVERLESS_ENVIRONMENT_VERSION,
+            environment_version=environment_version or serverless_environment_version(),
             rebuild=rebuild,
         )
 
