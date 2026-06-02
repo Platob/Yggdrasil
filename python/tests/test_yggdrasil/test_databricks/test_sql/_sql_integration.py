@@ -29,10 +29,10 @@ __all__ = ["SQLIntegrationCase"]
 class SQLIntegrationCase(DatabricksIntegrationCase):
     """Shared fixture + helpers for the SQL integration suites.
 
-    Not collected by pytest (no ``Test`` prefix). Provisions
-    ``trading.unittest`` once per concrete subclass via
-    ``ensure_created``, registers minted tables for class-level
-    cleanup, and exposes small builders for sample schemas / data.
+    Not collected by pytest (no ``Test`` prefix). Ensures the shared
+    ``ygg_integration`` schema exists (skipping the suite if it can't),
+    scopes a :class:`SQLEngine` to it, registers minted tables for
+    class-level cleanup, and exposes small sample-data builders.
     """
 
     catalog_name: ClassVar[str]
@@ -43,49 +43,15 @@ class SQLIntegrationCase(DatabricksIntegrationCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        # Shared ``trading_tgp_dev.ygg_integration`` home (created if missing,
+        # never dropped; skips cleanly on a permission error).
+        cls.integration_schema()
         cls.catalog_name = cls.INTEGRATION_CATALOG
         cls.schema_name = cls.INTEGRATION_SCHEMA
-
-        # Engine scoped to ``trading.unittest`` so every method that takes
-        # ``catalog_name`` / ``schema_name`` keyword args inherits the right
-        # default and unqualified table names resolve correctly.
         cls.engine = cls.client.sql(
-            catalog_name=cls.catalog_name,
-            schema_name=cls.schema_name,
+            catalog_name=cls.catalog_name, schema_name=cls.schema_name,
         )
         cls.created_tables = []
-
-        # Best-effort ensure_created on the catalog + schema. The engine /
-        # table methods will retry the same path on per-test demand if a
-        # transient miss surfaces later.
-        cls._ensure_catalog_schema()
-
-    @classmethod
-    def _ensure_catalog_schema(cls) -> None:
-        """Make sure ``trading.unittest`` exists; skip the suite if we
-        can't get there (no permission to create the catalog, etc.)."""
-        catalog = cls.engine.catalogs.catalog(cls.catalog_name)
-        try:
-            catalog.ensure_created(
-                comment="yggdrasil integration-test catalog",
-            )
-        except DatabricksError as exc:
-            # Most realistic miss: no metastore-admin grant. Skip the
-            # suite cleanly so the rest of the local run isn't blocked.
-            import unittest as _ut
-            raise _ut.SkipTest(
-                f"Cannot create or access catalog {cls.catalog_name!r}: "
-                f"{exc}. Set DATABRICKS_INTEGRATION_CATALOG to a catalog "
-                "the test identity can write to, or pre-provision "
-                f"{cls.catalog_name}.{cls.schema_name}."
-            ) from exc
-
-        schema = cls.engine.schemas.schema(
-            f"{cls.catalog_name}.{cls.schema_name}"
-        )
-        schema.ensure_created(
-            comment="yggdrasil integration-test schema",
-        )
 
     @classmethod
     def tearDownClass(cls) -> None:
