@@ -35,8 +35,6 @@ from yggdrasil.enums import Mode
 
 from .. import DatabricksIntegrationCase
 
-_CATALOG = "trading"
-_SCHEMA = "unittest"
 _WAIT_SECONDS = 420
 
 _SCHEMA_FIELDS = pa.schema(
@@ -55,8 +53,17 @@ def _data(rows: list[tuple[int, str, float]]) -> pa.Table:
 
 
 class _AsyncFixture(DatabricksIntegrationCase):
-    catalog_name: ClassVar[str] = _CATALOG
-    schema_name: ClassVar[str] = _SCHEMA
+    catalog_name: ClassVar[str]
+    schema_name: ClassVar[str]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        # Shared ``trading_tgp_dev``.``ygg_integration`` home (created if
+        # missing, never dropped) from the base case.
+        cls.integration_schema()
+        cls.catalog_name = cls.INTEGRATION_CATALOG
+        cls.schema_name = cls.INTEGRATION_SCHEMA
 
     def setUp(self) -> None:
         super().setUp()
