@@ -96,14 +96,24 @@ class TestExternalLocationIntegration(DatabricksIntegrationCase):
         if el is None:
             self.skipTest("no readable S3 external location (set YGG_TEST_EXTERNAL_LOCATION)")
         self.assertTrue(el.url and el.credential_name)
-        self.assertIsInstance(el.path, S3Path)
-        self.assertEqual(el.path.bucket, _bucket_of(el.url))
+        try:
+            path = el.path
+        except PermissionDenied as exc:
+            # The path is vended through ``generate_temporary_path_credentials``;
+            # the token may lack ``EXTERNAL USE LOCATION`` on this particular
+            # location. That's an environment grant, not a code defect.
+            self.skipTest(f"no EXTERNAL USE LOCATION grant for {el.name!r}: {exc}")
+        self.assertIsInstance(path, S3Path)
+        self.assertEqual(path.bucket, _bucket_of(el.url))
 
     def test_io_list_and_read_existing(self) -> None:
         el = self._existing_s3_location()
         if el is None:
             self.skipTest("no readable S3 external location available")
-        path = el.path
+        try:
+            path = el.path
+        except PermissionDenied as exc:
+            self.skipTest(f"no EXTERNAL USE LOCATION grant for {el.name!r}: {exc}")
         try:
             children = list(path.ls(limit=25))
         except Exception as exc:  # ambient AWS creds may not reach the bucket

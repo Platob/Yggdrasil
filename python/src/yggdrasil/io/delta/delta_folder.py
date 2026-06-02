@@ -170,7 +170,10 @@ class DeltaFolder(Folder):
         target_field_names = (
             set(target_schema.names) if target_schema is not None else None
         )
-        for add in snap.prune_files(prune_values=prune):
+        candidate_adds = snap.prune_files(prune_values=prune)
+        if options.predicate is not None:
+            candidate_adds = _data_skip_adds(snap, candidate_adds, options.predicate)
+        for add in candidate_adds:
             logger.debug(
                 "DeltaFolder read: AddFile path=%s size=%d dv=%s",
                 add.path, add.size, add.deletion_vector,
@@ -463,20 +466,12 @@ class DeltaFolder(Folder):
             stem = f"part-{int(time.time() * 1000)}-{os.urandom(8).hex()}.parquet"
             file_path = target_dir / stem
 
-            # Strip partition columns + reinterpret unsigned ints
+            # Strip partition columns + coerce to Delta-physical types.
             payload_batches: "list[pa.RecordBatch]" = []
             for sb in sub_batches:
                 drop = [c for c in partition_columns if c in sb.schema.names]
                 sb = sb.drop_columns(drop) if drop else sb
-                if any(pa.types.is_unsigned_integer(f.type) for f in sb.schema):
-                    arrays = [sb.column(i).cast(_SIGNED_FOR_UINT[f.type.bit_width](), safe=False)
-                              if pa.types.is_unsigned_integer(f.type) else sb.column(i)
-                              for i, f in enumerate(sb.schema)]
-                    fields = [pa.field(f.name, _SIGNED_FOR_UINT[f.type.bit_width](), nullable=f.nullable, metadata=f.metadata)
-                              if pa.types.is_unsigned_integer(f.type) else f
-                              for f in sb.schema]
-                    sb = pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields))
-                payload_batches.append(sb)
+                payload_batches.append(_delta_physical_batch(sb))
 
             with ParquetFile(holder=file_path, owns_holder=False) as opened:
                 opened._write_arrow_batches(payload_batches, ParquetOptions(mode=Mode.OVERWRITE))
@@ -717,7 +712,10 @@ class DeltaFolder(Folder):
         spark_schema = self._collect_schema(options).to_spark_schema()
         partition_columns = snap.partition_columns
         prune = _partition_prune_values(options.predicate, partition_columns)
-        active_adds = list(snap.prune_files(prune_values=prune))
+        candidate = snap.prune_files(prune_values=prune)
+        if options.predicate is not None:
+            candidate = _data_skip_adds(snap, candidate, options.predicate)
+        active_adds = list(candidate)
         if not active_adds:
             return spark.createDataFrame([], schema=spark_schema)
 
@@ -807,14 +805,72 @@ def _stamp_partitions(batch: pa.RecordBatch, values: "dict[str, Optional[str]]",
     return batch
 
 
+def _delta_to_physical_type(t: pa.DataType) -> "Optional[pa.DataType]":
+    """Map an Arrow type to the type Delta parquet stores it as, or ``None``
+    when it already matches.
+
+    Two invariants the Delta protocol + the Spark/Photon parquet reader
+    require (and that the ``deltalake`` Rust writer enforces):
+
+    - **Timestamps are microseconds.** Delta's ``timestamp`` /
+      ``timestamp_ntz`` map to parquet ``TIMESTAMP(MICROS)``; a
+      nanosecond (or second) unit makes Databricks' reader reject the
+      file outright (``Unsupported time unit in Parquet TimestampType``).
+      The zone is preserved — ``timestamp[ns, UTC]`` → ``timestamp[us, UTC]``.
+    - **Unsigned integers don't exist in Spark.** Reinterpret them as the
+      same-width signed type so the value round-trips bit-for-bit.
+    """
+    if pa.types.is_timestamp(t) and t.unit != "us":
+        return pa.timestamp("us", tz=t.tz)
+    if pa.types.is_unsigned_integer(t):
+        return _SIGNED_FOR_UINT[t.bit_width]()
+    return None
+
+
+def _delta_physical_batch(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Coerce *batch* into the physical types Delta parquet must store.
+
+    No-op (returns *batch* unchanged) when every column already matches,
+    so the common all-micros / signed case pays nothing.
+    """
+    targets = [_delta_to_physical_type(f.type) for f in batch.schema]
+    if not any(targets):
+        return batch
+    arrays = [
+        batch.column(i).cast(tgt, safe=False) if tgt is not None else batch.column(i)
+        for i, tgt in enumerate(targets)
+    ]
+    fields = [
+        pa.field(f.name, targets[i], nullable=f.nullable, metadata=f.metadata)
+        if targets[i] is not None else f
+        for i, f in enumerate(batch.schema)
+    ]
+    return pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields))
+
+
 def _collect_stats(batches: "list[pa.RecordBatch]") -> "Optional[str]":
     if not batches: return None
     total_rows = sum(b.num_rows for b in batches)
     schema = batches[0].schema
     min_vals, max_vals, null_counts = {}, {}, {}
 
-    def _sv(val: Any) -> Any:
-        if isinstance(val, (datetime.date, datetime.datetime)): return val.isoformat()
+    def _sv(val: Any, t: pa.DataType) -> Any:
+        # Delta data-skipping compares stats *as JSON strings* against the
+        # same-formatted value, so the format must match what Databricks /
+        # Spark emit or pruning silently misfires (and cross-readers can
+        # reject the table). Timestamps: ISO-8601 UTC, millisecond
+        # precision, trailing ``Z`` for the instant (``timestamp``) type;
+        # no ``Z`` for the wall-clock (``timestamp_ntz``) type. Dates:
+        # ``yyyy-MM-dd``.
+        if isinstance(val, datetime.datetime):
+            aware = pa.types.is_timestamp(t) and t.tz is not None
+            if aware:
+                base = val.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                return base.strftime("%Y-%m-%dT%H:%M:%S.") + f"{base.microsecond // 1000:03d}Z"
+            naive = val.replace(tzinfo=None) if val.tzinfo is not None else val
+            return naive.strftime("%Y-%m-%dT%H:%M:%S.") + f"{naive.microsecond // 1000:03d}"
+        if isinstance(val, datetime.date):
+            return val.isoformat()
         if isinstance(val, bytes): return val.hex()
         if isinstance(val, decimal.Decimal): return str(val)
         return val
@@ -836,14 +892,18 @@ def _collect_stats(batches: "list[pa.RecordBatch]") -> "Optional[str]":
                 if v_min is not None and (col_min is None or v_min < col_min): col_min = v_min
                 if v_max is not None and (col_max is None or v_max > col_max): col_max = v_max
             except Exception: continue
-        if col_min is not None: min_vals[field.name] = _sv(col_min)
-        if col_max is not None: max_vals[field.name] = _sv(col_max)
+        if col_min is not None: min_vals[field.name] = _sv(col_min, t)
+        if col_max is not None: max_vals[field.name] = _sv(col_max, t)
         null_counts[field.name] = col_nulls
 
     stats: dict[str, Any] = {"numRecords": total_rows}
     if min_vals: stats["minValues"] = min_vals
     if max_vals: stats["maxValues"] = max_vals
     if null_counts: stats["nullCount"] = null_counts
+    # ``tightBounds`` tells readers the min/max are exact (computed over
+    # live rows), not loosened by a deletion vector — Databricks always
+    # stamps it, and skipping treats its absence conservatively.
+    stats["tightBounds"] = True
     return ygg_json.dumps(stats, separators=(",", ":"), to_bytes=False)
 
 
@@ -851,3 +911,167 @@ def _partition_prune_values(predicate: "Predicate", partition_columns: "List[str
     if predicate is None or not partition_columns: return None
     from yggdrasil.execution.expr import extract_partition_filters
     return extract_partition_filters(predicate, partition_columns) or None
+
+
+# ---------------------------------------------------------------------------
+# Data-skipping — drop files whose per-column stats can't satisfy a predicate
+# ---------------------------------------------------------------------------
+
+#: Column constraints we can prove against AddFile min/max stats. Maps a
+#: column to a list of ``(op, value)`` lower/upper bounds. Only emitted for
+#: leaf comparisons under a top-level conjunction — an ``OR`` anywhere on the
+#: path makes the bound non-binding, so we drop it (conservative: keep file).
+def _extract_range_constraints(predicate: "Predicate") -> "Optional[dict[str, list[tuple[str, Any]]]]":
+    """Pull ``column <op> literal`` bounds out of a conjunctive predicate.
+
+    Returns a ``{column: [(op, value), ...]}`` map of constraints joined by
+    AND, or ``None`` when nothing useful could be extracted. Disjunctions,
+    negations, and non-comparable shapes contribute no constraints (so the
+    file is conservatively kept). Only ``=`` / ``<`` / ``<=`` / ``>`` /
+    ``>=`` / ``IN`` / ``BETWEEN`` against a column on one side and a scalar
+    literal on the other are understood.
+    """
+    from yggdrasil.execution.expr.nodes import (
+        Between, Column, Comparison, InList, Literal, Logical,
+    )
+    from yggdrasil.execution.expr.operators import CompareOp, LogicalOp
+
+    out: "dict[str, list[tuple[str, Any]]]" = {}
+
+    def _add(col: str, op: str, value: Any) -> None:
+        out.setdefault(col, []).append((op, value))
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, Logical):
+            # Only AND propagates bounds — under OR a file can match via the
+            # other branch, so neither side's bound is binding.
+            if node.op is LogicalOp.AND:
+                for child in node.operands:
+                    _walk(child)
+            return
+        if isinstance(node, Comparison):
+            left, right = node.left, node.right
+            if isinstance(left, Column) and isinstance(right, Literal):
+                col, val, op = left.name, right.value, node.op
+            elif isinstance(right, Column) and isinstance(left, Literal):
+                # Flip the operator when the column is on the right.
+                col, val = right.name, left.value
+                op = {CompareOp.LT: CompareOp.GT, CompareOp.GT: CompareOp.LT,
+                      CompareOp.LE: CompareOp.GE, CompareOp.GE: CompareOp.LE}.get(
+                          node.op, node.op)
+            else:
+                return
+            _add(col, op.value, val)
+            return
+        if isinstance(node, Between):
+            if getattr(node, "negated", False):
+                return  # NOT BETWEEN can't tighten a single file's bounds.
+            target, lo, hi = node.target, node.low, node.high
+            if (isinstance(target, Column) and isinstance(lo, Literal)
+                    and isinstance(hi, Literal)):
+                _add(target.name, ">=", lo.value)
+                _add(target.name, "<=", hi.value)
+            return
+        if isinstance(node, InList):
+            if getattr(node, "negated", False):
+                return
+            # ``InList.values`` are raw Python scalars, not Literal nodes.
+            values = list(getattr(node, "values", ()) or ())
+            target = node.target
+            if isinstance(target, Column) and values:
+                _add(target.name, "in", values)
+            return
+        # Unknown shape — contributes nothing.
+
+    _walk(predicate)
+    return out or None
+
+
+def _stats_exclude_file(add: AddFile, constraints: "dict[str, list[tuple[str, Any]]]",
+                        skippable: "frozenset[str]") -> bool:
+    """True when *add*'s per-column min/max stats prove it holds no matching row.
+
+    Conservative: any missing stat / un-comparable value / unknown op leaves
+    the file in. Only columns in *skippable* (numeric + string, where the
+    JSON stat value compares directly to the predicate literal) participate.
+    """
+    if not add.stats:
+        return False
+    try:
+        stats = ygg_json.loads(add.stats)
+    except Exception:
+        return False
+    mins = stats.get("minValues") or {}
+    maxs = stats.get("maxValues") or {}
+    for col, bounds in constraints.items():
+        if col not in skippable:
+            continue
+        lo = mins.get(col)
+        hi = maxs.get(col)
+        if lo is None or hi is None:
+            continue
+        for op, val in bounds:
+            try:
+                if op == "=":
+                    if val < lo or val > hi:
+                        return True
+                elif op == ">":
+                    if hi <= val:
+                        return True
+                elif op == ">=":
+                    if hi < val:
+                        return True
+                elif op == "<":
+                    if lo >= val:
+                        return True
+                elif op == "<=":
+                    if lo > val:
+                        return True
+                elif op == "in":
+                    if all(v < lo or v > hi for v in val):
+                        return True
+            except TypeError:
+                # Mixed/incomparable types — keep the file.
+                continue
+    return False
+
+
+def _data_skip_adds(snap: Snapshot, adds: "Iterable[AddFile]",
+                    predicate: "Predicate") -> "Iterator[AddFile]":
+    """Yield only the files in *adds* whose stats don't exclude *predicate*.
+
+    Skipping is restricted to numeric + string columns (the JSON stat value
+    is directly order-comparable to the predicate literal). Partition columns
+    are handled separately by :meth:`Snapshot.prune_files` and excluded here.
+    """
+    constraints = _extract_range_constraints(predicate)
+    if not constraints:
+        yield from adds
+        return
+    target_schema = (spark_json_to_arrow_schema(snap.schema_string)
+                     if snap.schema_string else None)
+    partition_columns = set(snap.partition_columns)
+    skippable: set[str] = set()
+    if target_schema is not None:
+        for f in target_schema:
+            if f.name in partition_columns:
+                continue
+            if (pa.types.is_integer(f.type) or pa.types.is_floating(f.type)
+                    or pa.types.is_string(f.type) or pa.types.is_large_string(f.type)):
+                skippable.add(f.name)
+    frozen = frozenset(skippable)
+    if not frozen:
+        yield from adds
+        return
+    kept = skipped = 0
+    for add in adds:
+        if _stats_exclude_file(add, constraints, frozen):
+            skipped += 1
+            continue
+        kept += 1
+        yield add
+    if skipped:
+        logger.debug(
+            "DeltaFolder data-skipping at %r: kept %d file(s), skipped %d via stats",
+            snap.table_root, kept, skipped,
+        )

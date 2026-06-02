@@ -251,6 +251,58 @@ class TestDeltaFolderWriteSQLRead(_DeltaSQLBase):
 
 
 # ---------------------------------------------------------------------------
+# Timestamp physical-type compatibility (Databricks reads ygg's parquet)
+# ---------------------------------------------------------------------------
+
+
+class TestTimestampCrossRead(_DeltaSQLBase):
+    """DeltaFolder writes timestamps that Databricks / Photon can read.
+
+    The Photon parquet reader rejects nanosecond timestamps
+    (``Unsupported time unit in Parquet TimestampType``); DeltaFolder
+    down-coerces to ``TIMESTAMP(MICROS)`` while preserving the zone.
+    A tz-aware column round-trips as ``timestamp`` (UTC instant), a
+    tz-naive column as ``timestamp_ntz`` — matching the ``deltalake``
+    writer and what Databricks SQL ``DESCRIBE`` reports.
+    """
+
+    def test_nanosecond_timestamp_readable_by_databricks(self) -> None:
+        import datetime
+
+        tbl = self._table_name("ts_ns")
+        data = pa.table({
+            "id": pa.array(["a", "b", "c"], pa.string()),
+            "updated_at": pa.array(
+                [datetime.datetime(2020, 1, 1), datetime.datetime(2021, 6, 15),
+                 datetime.datetime(2029, 12, 28)],
+                pa.timestamp("ns", tz="UTC"),
+            ),
+        })
+        # Write straight to the managed-table storage path via DeltaFolder.
+        self.sql.arrow_insert_into(data, table=tbl, mode="overwrite",
+                                   wait=True, raise_error=True)
+        out = self._read_sql_arrow(f"SELECT count(*) c, min(updated_at) mn, "
+                                   f"max(updated_at) mx FROM {tbl}")
+        row = out.to_pylist()[0]
+        self.assertEqual(row["c"], 3)
+        self.assertEqual(row["mn"].year, 2020)
+        self.assertEqual(row["mx"].year, 2029)
+
+    def test_aware_timestamp_describes_as_timestamp(self) -> None:
+        tbl = self._table_name("ts_aware")
+        data = pa.table({
+            "id": pa.array(["a"], pa.string()),
+            "ts": pa.array([0], pa.timestamp("us", tz="UTC")),
+        })
+        self.sql.arrow_insert_into(data, table=tbl, mode="overwrite",
+                                   wait=True, raise_error=True)
+        desc = {r["col_name"]: r["data_type"]
+                for r in self._read_sql_arrow(f"DESCRIBE {tbl}").to_pylist()
+                if r.get("col_name")}
+        self.assertEqual(desc.get("ts"), "timestamp")
+
+
+# ---------------------------------------------------------------------------
 # Bidirectional: SQL ↔ DeltaFolder data comparison
 # ---------------------------------------------------------------------------
 
