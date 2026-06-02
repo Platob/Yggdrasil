@@ -377,19 +377,23 @@ def fake_registry(monkeypatch):
 
 class TestServerlessBranch:
 
-    def test_default_declares_ygg_with_extras(
+    def test_default_ships_ygg_wheel_plus_index_deps(
         self, serverless_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
+        from yggdrasil.databricks.job.wheel import ygg_runtime_dependencies
+
         builder, session, _env_cls, env_instances = mocked_builder
         result = serverless_client.spark()
         assert result is session
 
         env = env_instances[0]
-        # Default ygg spec carries the ``[data, databricks]`` extras
-        # so the cluster picks up the runtime + pandas / numpy /
-        # databricks-sdk surface.
-        assert env._deps == [[f"ygg[data,databricks]=={_ygg_version}"]]
+        # ygg ships as a wheel (bare ``ygg`` → the registry builds + uploads it
+        # and attaches it via ``local:``), NOT a pip ``ygg==version`` index spec
+        # — so a private ygg installs on the cluster. Its runtime deps ride
+        # along as index requirement names.
+        assert env._deps == [["ygg", *ygg_runtime_dependencies()]]
+        assert not any("==" in d and d.startswith("ygg") for d in env._deps[0])
         builder.withEnvironment.assert_called_once_with(env)
         # The client is stashed on the session for downstream use.
         assert session.ygg_client is serverless_client
@@ -398,10 +402,12 @@ class TestServerlessBranch:
         self, serverless_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
+        from yggdrasil.databricks.job.wheel import ygg_runtime_dependencies
+
         _builder, _session, _env_cls, env_instances = mocked_builder
         serverless_client.spark("numpy==1.0")
         env = env_instances[0]
-        assert env._deps == [[f"ygg[data,databricks]=={_ygg_version}", "numpy==1.0"]]
+        assert env._deps == [["ygg", *ygg_runtime_dependencies(), "numpy==1.0"]]
 
     def test_ygg_not_doubled_when_caller_passes_it(
         self, serverless_client, mocked_builder, stubbed_workspace_config,
@@ -418,15 +424,47 @@ class TestServerlessBranch:
         assert names == ["ygg==0.7.85"]
 
 
+class TestSparkConnectBuilder:
+    """``_spark_connect_builder`` — sdkConfig with a fallback for newer
+    databricks-connect that rejects it alongside env/profile connection."""
+
+    def test_uses_sdkconfig_when_accepted(
+        self, serverless_client, mocked_builder, stubbed_workspace_config,
+    ) -> None:
+        builder, _session, _env, _envs = mocked_builder
+        out = serverless_client._spark_connect_builder()
+        builder.sdkConfig.assert_called_once()
+        assert out is builder.sdkConfig.return_value
+
+    def test_falls_back_to_plain_builder_on_sdkconfig_conflict(
+        self, serverless_client, mocked_builder, stubbed_workspace_config,
+    ) -> None:
+        builder, _session, _env, _envs = mocked_builder
+        builder.sdkConfig.side_effect = Exception(
+            "sdkConfig must not be set when connection parameters are "
+            "explicitly configured."
+        )
+        out = serverless_client._spark_connect_builder()
+        # falls back to the parameter-free builder (env/profile auth)
+        assert out is builder
+
+    def test_other_builder_errors_propagate(
+        self, serverless_client, mocked_builder, stubbed_workspace_config,
+    ) -> None:
+        builder, _session, _env, _envs = mocked_builder
+        builder.sdkConfig.side_effect = RuntimeError("network down")
+        with pytest.raises(RuntimeError, match="network down"):
+            serverless_client._spark_connect_builder()
+
+
 class TestClassicBranch:
 
     def test_public_specs_dont_call_add_artifacts(
         self, classic_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
-        # The default ygg[data,databricks] spec is a public PyPI
-        # entry (no ``local:`` prefix), so the classic-compute
-        # branch has nothing to upload.
+        # The fake registry echoes the specs back without a ``local:``
+        # prefix, so the classic-compute branch has nothing to upload.
         _builder, session, _env_cls, env_instances = mocked_builder
         classic_client.spark()
         assert env_instances == []

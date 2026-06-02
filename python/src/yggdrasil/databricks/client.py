@@ -2087,7 +2087,15 @@ class DatabricksClient(Singleton, URLBased):
 
         deps = list(dependencies)
         if not any(_is_ygg_dep(d) for d in deps):
-            deps.insert(0, f"ygg[data,databricks]=={ygg_version}")
+            # Ship ygg as a *wheel* (built from the installed package + uploaded
+            # by the registry, attached via ``local:``) instead of a pip
+            # ``ygg==version`` index spec — so a private ygg installs on the
+            # cluster without a public index (the same reason the loader job's
+            # image uses a wheel). Its runtime dependencies ride along as index
+            # requirement names so the cluster resolves platform-correct builds.
+            from yggdrasil.databricks.job.wheel import ygg_runtime_dependencies
+
+            deps = ["ygg", *ygg_runtime_dependencies(), *deps]
 
         mode = "serverless" if self.is_serverless_compute else "classic"
         LOGGER.debug(
@@ -2114,7 +2122,7 @@ class DatabricksClient(Singleton, URLBased):
             self.serverless_compute_id,
             len(specs),
         )
-        builder = DatabricksSession.builder.sdkConfig(self.workspace_config)
+        builder = self._spark_connect_builder()
 
         if self.is_serverless_compute:
             env = self._build_databricks_env(install_specs=specs)
@@ -2146,6 +2154,29 @@ class DatabricksClient(Singleton, URLBased):
             len(specs),
         )
         return self._bind_spark_session(session)
+
+    def _spark_connect_builder(self):
+        """The Databricks Connect session builder, configured for this client.
+
+        Prefers ``builder.sdkConfig(workspace_config)`` so the session reuses the
+        exact resolved host + credentials. Newer ``databricks-connect`` rejects
+        ``sdkConfig`` when connection parameters are *also* discoverable from the
+        environment / a profile (``"sdkConfig must not be set when connection
+        parameters are explicitly configured"``) — in that case fall back to the
+        parameter-free builder, which reads the same auth from the environment /
+        profile (and the serverless / cluster target with it)."""
+        from databricks.connect import DatabricksSession
+
+        try:
+            return DatabricksSession.builder.sdkConfig(self.workspace_config)
+        except Exception as exc:  # noqa: BLE001 - narrow on the message below
+            if "sdkConfig must not be set" not in str(exc):
+                raise
+            LOGGER.debug(
+                "sdkConfig rejected by databricks-connect (%s) — using the "
+                "environment/profile-configured builder instead", exc,
+            )
+            return DatabricksSession.builder
 
     def _bind_spark_session(self, session: "Any") -> "Any":
         """Stash ``self`` on *session* as ``ygg_client`` and return it.
