@@ -1034,3 +1034,139 @@ export async function sendMessage(channel: string, content: string): Promise<Mes
 export function createMessageStream(channel: string): EventSource {
   return new EventSource(`/api/v2/messenger/${encodeURIComponent(channel)}/stream`);
 }
+
+// ── Market Data ────────────────────────────────────────────────────────────
+
+export interface MarketQuote {
+  symbol: string;
+  price: number | null;
+  prev_close: number | null;
+  change: number | null;
+  change_pct: number | null;
+  open: number | null;
+  day_high: number | null;
+  day_low: number | null;
+  volume: number | null;
+  market_cap: number | null;
+  name: string | null;
+  currency: string | null;
+}
+
+export interface OHLCVBar {
+  t: string;
+  o: number | null;
+  h: number | null;
+  l: number | null;
+  c: number | null;
+  v: number | null;
+}
+
+export interface MarketOHLCV {
+  symbol: string;
+  period: string;
+  interval: string;
+  bars: OHLCVBar[];
+  currency: string | null;
+}
+
+export interface MarketSearchResult {
+  symbol: string;
+  name: string;
+  exchange: string | null;
+  type: string | null;
+}
+
+export function getMarketQuote(symbol: string): Promise<MarketQuote> {
+  return jsonFetch(`/api/v2/market/quote/${encodeURIComponent(symbol.toUpperCase())}`);
+}
+
+export function getMarketOHLCV(symbol: string, period = "1y", interval = "1d"): Promise<MarketOHLCV> {
+  return jsonFetch(`/api/v2/market/ohlcv/${encodeURIComponent(symbol.toUpperCase())}?period=${period}&interval=${interval}`);
+}
+
+export function searchMarket(q: string): Promise<MarketSearchResult[]> {
+  return jsonFetch(`/api/v2/market/search?q=${encodeURIComponent(q)}`);
+}
+
+// ── Technical Indicators ───────────────────────────────────────────────────
+
+export interface IndicatorSpec {
+  type: string;
+  period?: number;
+  fast?: number;
+  slow?: number;
+  signal?: number;
+  std_dev?: number;
+  d_period?: number;
+}
+
+export interface IndicatorSeries {
+  name: string;
+  series: (number | null)[];
+}
+
+export interface TechnicalResult {
+  node_id: string;
+  path: string;
+  x: (string | number)[];
+  close: (number | null)[];
+  indicators: IndicatorSeries[];
+  source_rows: number;
+}
+
+export interface TechnicalRequest {
+  path: string;
+  close?: string;
+  high?: string;
+  low?: string;
+  volume?: string;
+  x?: string;
+  indicators: IndicatorSpec[];
+}
+
+export function computeTechnical(req: TechnicalRequest): Promise<TechnicalResult> {
+  return jsonFetch("/api/v2/technical", { method: "POST", body: JSON.stringify(req) });
+}
+
+// ── Finance Analysis (convenience wrapper) ─────────────────────────────────
+
+export interface FinanceMetrics {
+  total_return: number | null;
+  cagr: number | null;
+  ann_return: number | null;
+  ann_volatility: number | null;
+  sharpe: number | null;
+  sortino: number | null;
+  max_drawdown: number | null;
+  calmar: number | null;
+}
+
+export interface FinanceResult {
+  node_id: string;
+  path: string;
+  column: string;
+  window: number;
+  index: (string | number)[];
+  value: (number | null)[];
+  pct_change: (number | null)[];
+  cum_return: (number | null)[];
+  roll_mean: (number | null)[];
+  roll_vol: (number | null)[];
+  ema: (number | null)[];
+  drawdown: (number | null)[];
+  metrics: FinanceMetrics;
+  truncated: boolean;
+}
+
+export function getFinanceAnalysis(
+  path: string,
+  column: string,
+  orderBy?: string,
+  window = 20,
+  periodsPerYear = 252,
+): Promise<FinanceResult> {
+  return jsonFetch("/api/v2/analysis/finance", {
+    method: "POST",
+    body: JSON.stringify({ path, column, order_by: orderBy, window, periods_per_year: periodsPerYear }),
+  });
+}

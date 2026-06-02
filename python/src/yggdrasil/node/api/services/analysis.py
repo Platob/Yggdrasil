@@ -12,6 +12,7 @@ ordered series in memory for rolling windows). Formats polars can't scan
 from __future__ import annotations
 
 import math
+import os
 from functools import partial
 
 import numpy as np
@@ -69,6 +70,25 @@ class AnalysisService:
     def __init__(self, settings: Settings, *, fs: FsService) -> None:
         self.settings = settings
         self.fs = fs
+        self._row_count_cache: dict[str, tuple[float, int]] = {}  # path -> (mtime, count)
+
+    def _cached_count(self, path_str: str, lf: pl.LazyFrame) -> int:
+        """Row count for a file, cached on (path, mtime) to avoid a second full
+        streaming scan on every aggregate/series/ohlc call. A file whose mtime
+        changed is recounted; an unstattable path (remote/virtual) is counted
+        live without caching."""
+        try:
+            mtime = os.path.getmtime(path_str)
+        except OSError:
+            return lf.select(pl.len()).collect(engine="streaming").item()
+        entry = self._row_count_cache.get(path_str)
+        if entry and entry[0] == mtime:
+            return entry[1]
+        count = lf.select(pl.len()).collect(engine="streaming").item()
+        self._row_count_cache[path_str] = (mtime, count)
+        if len(self._row_count_cache) > 256:
+            self._row_count_cache.clear()
+        return count
 
     async def aggregate(self, req: AggregateRequest) -> AggregateResult:
         return await run_in_threadpool(partial(self._aggregate, req))
@@ -323,7 +343,7 @@ class AnalysisService:
         if first in out.columns and out.height:
             out = out.sort(first, descending=req.sort_desc, nulls_last=True)
         out = out.head(req.limit)
-        source_rows = lf.select(pl.len()).collect(engine="streaming").item()
+        source_rows = self._cached_count(str(self.fs._resolve(req.path)), lf)
         return AggregateResult(
             node_id=self.settings.node_id, path=req.path,
             columns=out.columns,
@@ -594,7 +614,12 @@ class AnalysisService:
             plan = plan.sort(req.x)
         plan = plan.with_row_index("__i")
 
-        source_rows = plan.select(pl.len()).collect(engine="streaming").item()
+        # The cached count reflects the raw file, so it's only valid when no
+        # predicate narrows the plan. With filters/zoom, count the plan live.
+        if not req.filters and req.x_min is None and req.x_max is None:
+            source_rows = self._cached_count(str(self.fs._resolve(req.path)), plan)
+        else:
+            source_rows = plan.select(pl.len()).collect(engine="streaming").item()
         points = max(16, min(req.points, 5000))
         if source_rows <= points:
             df = plan.collect(engine="streaming")
@@ -645,7 +670,10 @@ class AnalysisService:
             plan = plan.sort(req.x)
         plan = plan.with_row_index("__i")
 
-        source_rows = plan.select(pl.len()).collect(engine="streaming").item()
+        if not req.filters:
+            source_rows = self._cached_count(str(self.fs._resolve(req.path)), plan)
+        else:
+            source_rows = plan.select(pl.len()).collect(engine="streaming").item()
         buckets = max(2, min(req.buckets, 2000))
         size = max(1, math.ceil(source_rows / buckets))
         price = pl.col(req.column).cast(pl.Float64, strict=False)

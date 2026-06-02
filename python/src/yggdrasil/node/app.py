@@ -27,6 +27,8 @@ from .api.routers import (
     analysis_router as v2_analysis_router,
     workbook_router as v2_workbook_router,
     saga_router as v2_saga_router,
+    technical_router as v2_technical_router,
+    market_router as v2_market_router,
 )
 from .api.services.audit import AuditLog
 from .api.services.backend import BackendService
@@ -41,6 +43,8 @@ from .api.services.replicate import ReplicateService
 from .api.services.user import UserService
 from .api.services.tabular import TabularService
 from .api.services.analysis import AnalysisService
+from .api.services.technical import TechnicalService
+from .api.services.market import MarketService
 from .api.services.saga import SagaService
 from .routers import (
     call_router,
@@ -152,6 +156,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     v2_fs = FsService(settings)
     app.state.tabular_service = TabularService(settings, fs=v2_fs)
     app.state.analysis_service = AnalysisService(settings, fs=v2_fs)
+    app.state.technical_service = TechnicalService(settings, fs=v2_fs)
+    app.state.market_service = MarketService(settings)
     app.state.saga_service = SagaService(settings)
     pyenv = PyEnvService(settings, audit=audit)
     pyfunc = PyFuncService(settings, audit=audit)
@@ -380,6 +386,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(v2_fs_router, prefix=f"{prefix}/v2/fs")
     app.include_router(v2_tabular_router, prefix=f"{prefix}/v2/tabular")
     app.include_router(v2_analysis_router, prefix=f"{prefix}/v2/analysis")
+    app.include_router(v2_technical_router, prefix=f"{prefix}/v2/technical")
+    app.include_router(v2_market_router, prefix=f"{prefix}/v2/market")
     app.include_router(v2_workbook_router, prefix=f"{prefix}/v2/workbook")
     app.include_router(v2_saga_router, prefix=f"{prefix}/v2/saga")
     app.include_router(v2_user_router, prefix=f"{prefix}/v2/user")

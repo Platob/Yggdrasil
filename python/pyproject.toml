@@ -75,6 +75,11 @@ database = [
   "connectorx>=0.3",
 ]
 
+# Market data backend for the /api/v2/market service (quotes, OHLCV, search).
+market = [
+  "yfinance>=0.2",
+]
+
 databricks = [
   "databricks-sdk>=0.107",
 ]
