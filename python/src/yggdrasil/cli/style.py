@@ -57,15 +57,34 @@ def _esc(code: str, text: str) -> str:
         return text
     return f"{_CSI}{code}m{text}{_RESET}"
 
-def bold(text: str) -> str:    return _esc("1", text)
-def dim(text: str) -> str:     return _esc("2", text)
-def red(text: str) -> str:     return _esc("31", text)
-def green(text: str) -> str:   return _esc("32", text)
-def yellow(text: str) -> str:  return _esc("33", text)
-def blue(text: str) -> str:    return _esc("34", text)
-def magenta(text: str) -> str: return _esc("35", text)
-def cyan(text: str) -> str:    return _esc("36", text)
-def orange(text: str) -> str:  return _esc("38;5;208", text)
+# One coral-forward theme for every ygg CLI. Coral orange is the brand /
+# primary accent; green means good, red means bad, amber means caution, and
+# everything secondary recedes to a muted grey. The decorative names kept for
+# back-compat (``cyan``/``magenta``/``blue``) are repainted onto this theme, so
+# all CLIs share one look — retune the palette here and it changes everywhere.
+_CORAL = "38;5;209"   # brand / primary accent (coral orange)
+_GREEN = "38;5;42"    # good
+_RED   = "38;5;203"   # bad (a coral-red that sits beside the brand)
+_AMBER = "38;5;214"   # caution
+_MUTED = "38;5;245"   # secondary — labels, paths, hints
+
+def bold(text: str) -> str:  return _esc("1", text)
+def dim(text: str) -> str:   return _esc("2", text)
+
+# -- semantic palette (prefer these) --------------------------------------
+def brand(text: str) -> str: return _esc(_CORAL, text)   # coral orange
+def good(text: str) -> str:  return _esc(_GREEN, text)
+def bad(text: str) -> str:   return _esc(_RED, text)
+def amber(text: str) -> str: return _esc(_AMBER, text)
+def muted(text: str) -> str: return _esc(_MUTED, text)
+
+# -- back-compat aliases — existing call sites map onto the theme ----------
+coral = orange = brand           # brand / primary accent
+green = good                     # good
+red = bad                        # bad
+yellow = amber                   # caution
+cyan = magenta = brand           # decorative accents → brand coral
+blue = muted                     # paths / secondary → muted grey
 
 def clear_line() -> None:
     sys.stdout.write(f"{_CSI}2K\r")
@@ -112,8 +131,9 @@ _LOGOS: dict[str, tuple[str, ...]] = {
 }
 
 
-#: Warm brand gradient (256-color) painted top→bottom across the logo rows.
-_LOGO_GRADIENT = ("38;5;220", "38;5;214", "38;5;208", "38;5;202")
+#: Coral brand gradient (256-color) painted top→bottom across the logo rows —
+#: peach → coral → orange, anchored on the brand coral.
+_LOGO_GRADIENT = ("38;5;216", "38;5;209", "38;5;208", "38;5;202")
 
 
 def logo(suffix: str = "") -> str:
@@ -258,8 +278,8 @@ def hr(width: int = 46) -> str:
     return "  " + dim("─" * width)
 
 
-def info(text: str) -> None: out(event("●", text, "36") + "\n")
-def step(text: str) -> None: out(event("▸", text, "34") + "\n")
-def ok(text: str) -> None:   out(event("✓", text, "32") + "\n")
-def warn(text: str) -> None: out(event("▲", text, "33") + "\n")
-def fail(text: str) -> None: out(event("✗", text, "31") + "\n")
+def info(text: str) -> None: out(event("●", text, _CORAL) + "\n")
+def step(text: str) -> None: out(event("▸", text, _CORAL) + "\n")
+def ok(text: str) -> None:   out(event("✓", text, _GREEN) + "\n")
+def warn(text: str) -> None: out(event("▲", text, _AMBER) + "\n")
+def fail(text: str) -> None: out(event("✗", text, _RED) + "\n")

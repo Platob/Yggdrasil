@@ -88,7 +88,7 @@ class TablesCommand:
 
         if args.execute:
             # Loader only needs the log path — the log carries everything.
-            style.info(f"loading into {style.cyan(args.table_name)}")
+            style.info(f"loading into {style.brand(args.table_name)}")
             n = load_async(client.tables, log_file.full_path(), wait=True)
             cls._summary(n)
         elif args.ensure_job:

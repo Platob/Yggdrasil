@@ -1568,8 +1568,8 @@ def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> in
         processed += len(batch.logs)
         sep = style.dim("·")
         style.step(
-            f"{style.bold(style.cyan(target_name))}  {sep}  "
-            f"{style.yellow(mode.name.lower())}  {sep}  "
+            f"{style.bold(style.brand(target_name))}  {sep}  "
+            f"{style.amber(mode.name.lower())}  {sep}  "
             f"{n_files} file(s)  {sep}  "
             f"{style.dim(f'{time.perf_counter() - started:.2f}s')}"
         )
