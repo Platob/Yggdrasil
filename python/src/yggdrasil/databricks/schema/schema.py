@@ -864,8 +864,12 @@ class UCSchema(DatabricksPath):
                     if not kind_changed and skip_existing:
                         return src.table_name, "skipped"
                     if kind_changed and recreate_on_drift:
-                        # table ⇄ view can't be cross-replaced — drop the stale
-                        # target so it's recreated as the source's current kind.
+                        # Neither direction can be cross-replaced — a view can't
+                        # ``CREATE OR REPLACE TABLE`` and a table can't
+                        # ``CREATE OR REPLACE VIEW`` — so drop the stale target
+                        # (table→view *and* view→table) and recreate it as the
+                        # source's current kind. The UC tables API drops views
+                        # too, so one ``delete`` covers both.
                         logger.info(
                             "clone %s → %s: target changed kind (view=%s→%s) — "
                             "dropping before recreate",
