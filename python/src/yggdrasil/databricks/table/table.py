@@ -2547,6 +2547,16 @@ class Table(DatabricksPath):
                 f" different target catalog/schema/table."
             )
 
+        # Resolve the source's type so a view is detected even on a fresh
+        # handle whose infos haven't been read yet — ``is_view`` reads the
+        # cache only, so without this a never-inspected view would report
+        # ``False`` and wrongly take the Delta ``CLONE`` path below.
+        if self._infos is None:
+            try:
+                _ = self.infos
+            except Exception:
+                pass
+
         # Views can't ride the Delta ``CLONE`` path — re-emit the
         # source's ``view_definition`` as a fresh ``CREATE [OR REPLACE]
         # VIEW [IF NOT EXISTS]`` against the target, mirroring the

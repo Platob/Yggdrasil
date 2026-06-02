@@ -7,8 +7,11 @@ text the methods would submit is captured directly.
 from __future__ import annotations
 
 import datetime as _dt
+import time
 import unittest
 from unittest.mock import patch
+
+from databricks.sdk.service.catalog import TableInfo, TableType
 
 from yggdrasil.databricks import DatabricksClient
 from yggdrasil.databricks.table.table import Table
@@ -45,6 +48,10 @@ def _table(catalog: str = "main", schema: str = "sales", name: str = "orders") -
     sql = _RecordingSql(client=client, catalog_name=catalog, schema_name=schema)
     # Skip cache cleanup so we don't need to mock entity_tags / Tables.invalidate.
     object.__setattr__(table, "_reset_cache", lambda invalidate_cache=False: None)
+    # Seed managed-table infos so ``clone`` reads the type from cache and
+    # doesn't reach out to the (fake) workspace to resolve view-ness.
+    object.__setattr__(table, "_infos", TableInfo(table_type=TableType.MANAGED))
+    object.__setattr__(table, "_infos_fetched_at", time.time())
     return table, sql
 
 

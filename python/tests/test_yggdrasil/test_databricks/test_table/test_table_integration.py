@@ -486,6 +486,40 @@ class TestTableCloneIntegration(_TableFixture):
         self.assertEqual(rows.column("id").to_pylist(), [1, 2, 3])
         self.assertEqual(rows.column("label").to_pylist(), ["a", "b", "c"])
 
+    def test_shallow_clone_reads_source_rows(self) -> None:
+        # SHALLOW CLONE copies metadata only (shares the source's data
+        # files) but reads back identically to the source.
+        target_name = self._sibling("yg_clone_shallow").split(".")[-1]
+        try:
+            cloned = self.table.clone(target_name, deep=False)
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "Cannot shallow-clone table")
+        self.assertEqual(cloned.table_name, target_name)
+        self.assertTrue(cloned.exists())
+        rows = self._sql(
+            f"SELECT id, label FROM {cloned.full_name(safe=True)} ORDER BY id"
+        )
+        self.assertEqual(rows.column("id").to_pylist(), [1, 2, 3])
+        self.assertEqual(rows.column("label").to_pylist(), ["a", "b", "c"])
+
+    def test_clone_replace_refreshes_existing_target(self) -> None:
+        # First clone seeds the target with the 3-row source; after
+        # shrinking the source to one row, ``replace=True`` re-clones over
+        # the existing target so it reflects the new source state.
+        target_name = self._sibling("yg_clone_replace").split(".")[-1]
+        try:
+            first = self.table.clone(target_name)
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "Cannot clone table")
+        self.assertEqual(self._count(first), 3)
+
+        self.table.insert(_sample_data().slice(0, 1), mode=Mode.OVERWRITE)
+        try:
+            self.table.clone(target_name, replace=True)
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "Cannot replace-clone table")
+        self.assertEqual(self._count(first), 1)
+
     def test_clone_onto_self_raises(self) -> None:
         with self.assertRaises(ValueError):
             self.table.clone(self.table.full_name())
@@ -540,6 +574,41 @@ class TestTableViewIntegration(_TableFixture):
         except (DatabricksError, PermissionDenied) as exc:
             self._skip(exc, "Cannot create view")
         rows = self._sql(f"SELECT id, label FROM {view.full_name(safe=True)} ORDER BY id")
+        self.assertEqual(rows.column("id").to_pylist(), [2, 3])
+        self.assertEqual(rows.column("label").to_pylist(), ["b", "c"])
+
+    def test_clone_view_recreates_definition(self) -> None:
+        # Cloning a view can't ride Delta ``CLONE`` — ``Table.clone``
+        # re-emits the source ``view_definition`` as a fresh
+        # ``CREATE VIEW`` against the target, even from a handle whose
+        # infos were never warmed (the clone path resolves the type).
+        view = self._new_view()
+        try:
+            view.create_view(
+                f"SELECT id, label FROM {self.table.full_name(safe=True)} WHERE id >= 2",
+                mode=Mode.OVERWRITE,
+            )
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "Cannot create view")
+
+        # Fresh handle to the same view — infos deliberately not read, so
+        # this exercises the in-clone type resolution.
+        source = self.client.tables.view(view.full_name())
+        target_full = self._sibling("yg_view_clone")
+        try:
+            cloned = source.clone(target_full)
+        except (DatabricksError, PermissionDenied) as exc:
+            self._skip(exc, "Cannot clone view")
+
+        self.assertEqual(cloned.full_name(), target_full)
+        self.assertTrue(cloned.exists())
+        _ = cloned.infos  # warm the cache so ``is_view`` reads from it
+        self.assertTrue(cloned.is_view)
+        self.assertIsNotNone(cloned.view_definition)
+        # The clone is an independent view returning the same rows.
+        rows = self._sql(
+            f"SELECT id, label FROM {cloned.full_name(safe=True)} ORDER BY id"
+        )
         self.assertEqual(rows.column("id").to_pylist(), [2, 3])
         self.assertEqual(rows.column("label").to_pylist(), ["b", "c"])
 
