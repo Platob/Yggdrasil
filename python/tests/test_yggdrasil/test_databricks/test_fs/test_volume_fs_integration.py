@@ -40,6 +40,7 @@ __all__ = [
     "TestVolumeCallEfficiency",
     "TestVolumeTabular",
     "TestVolumePandas",
+    "TestVolumeZip",
 ]
 
 
@@ -240,3 +241,45 @@ class TestVolumePandas(VolumeFsCase, PandasTestCase):
         with self._fresh("frame.xlsx").open("rb") as fh:
             loaded = self.pd.read_excel(io.BytesIO(fh.read()))
         self.assertFrameEqual(loaded, df)
+
+
+class TestVolumeZip(VolumeFsCase):
+    """A zip on a volume reads its directory + entries via *ranged* block
+    fetches — never downloading the whole archive — and caches the directory
+    so repeated metadata / entry reads on one handle don't re-fetch."""
+
+    def _make_archive(self, name: str, entries: dict) -> None:
+        import io as _io
+        import zipfile as _zf
+        raw = _io.BytesIO()
+        with _zf.ZipFile(raw, "w", _zf.ZIP_STORED) as z:
+            for n, payload in entries.items():
+                z.writestr(n, payload)
+        self._fresh(name).write_bytes(raw.getvalue())
+
+    def test_small_archive_reads_in_one_get(self) -> None:
+        self._make_archive("small.zip", {
+            "a.txt": b"alpha", "b.txt": b"beta", "meta.json": b"{}",
+        })
+        z = self._fresh("small.zip").as_media("zip")
+        with self._count() as calls:
+            names = z.list_entries()
+            payloads = {n: bytes(z.child(n).read_bytes()) for n in names}
+        self.assertEqual(set(names), {"a.txt", "b.txt", "meta.json"})
+        self.assertEqual(payloads["a.txt"], b"alpha")
+        # Whole metadata + every entry of a tiny archive fits one block GET.
+        self.assertLessEqual(calls.get("GET", 0), 1, dict(calls))
+
+    def test_selective_entry_read_is_bounded(self) -> None:
+        import secrets as _s
+        block = 1 << 20  # _RangedBlockReader.BLOCK
+        entries = {f"e{i}.bin": _s.token_bytes(block) for i in range(6)}
+        self._make_archive("big.zip", entries)  # ~6 MiB, spans many blocks
+        z = self._fresh("big.zip").as_media("zip")
+        with self._count() as calls:
+            data = bytes(z.child("e3.bin").read_bytes())
+        self.assertEqual(data, entries["e3.bin"])
+        # Only the directory block + the entry's blocks — far fewer than the
+        # ~6 a whole-archive download would touch, and bounded regardless of
+        # archive size.
+        self.assertLessEqual(calls.get("GET", 0), 4, dict(calls))

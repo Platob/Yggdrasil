@@ -36,6 +36,68 @@ def _build_archive(entries: dict[str, bytes]) -> bytes:
     return raw.getvalue()
 
 
+class _CountingRangedHolder:
+    """Minimal ranged holder that records every ``_read_mv(n, pos)``."""
+
+    SUPPORTS_RANGED_RANDOM_ACCESS = True
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.reads: list[tuple[int, int]] = []
+
+    @property
+    def size(self) -> int:
+        return len(self._data)
+
+    def _read_mv(self, n: int, pos: int):
+        self.reads.append((n, pos))
+        end = len(self._data) if n < 0 else pos + n
+        return memoryview(self._data[pos:end])
+
+
+class TestRangedBlockReader:
+    """The block-caching reader behind zip's ranged metadata / entry reads."""
+
+    def test_small_reads_in_one_block_are_one_fetch(self) -> None:
+        from yggdrasil.io.zip_file import _RangedBlockReader
+
+        data = bytes((i % 256) for i in range(3_000_000))  # > 2 blocks
+        h = _CountingRangedHolder(data)
+        r = _RangedBlockReader(h, len(data))
+        r.seek(10)
+        assert bytes(r.read(5)) == data[10:15]
+        r.seek(2000)
+        assert bytes(r.read(100)) == data[2000:2100]
+        # Both windows live in block 0 — a single backend fetch.
+        assert len(h.reads) == 1
+
+    def test_selective_read_fetches_only_touched_blocks(self) -> None:
+        from yggdrasil.io.zip_file import _RangedBlockReader
+
+        block = _RangedBlockReader.BLOCK
+        data = bytes((i % 256) for i in range(5 * block))
+        h = _CountingRangedHolder(data)
+        r = _RangedBlockReader(h, len(data))
+        # Read a window near the end (e.g. a central directory) ...
+        r.seek(len(data) - 50)
+        assert bytes(r.read(50)) == data[-50:]
+        # ... and a window in block 1 — never the whole object.
+        r.seek(block + 7)
+        assert bytes(r.read(20)) == data[block + 7:block + 27]
+        assert len(h.reads) == 2  # last block + block 1 only
+
+    def test_seek_whence_and_eof(self) -> None:
+        from yggdrasil.io.zip_file import _RangedBlockReader
+
+        data = b"abcdefghij"
+        r = _RangedBlockReader(_CountingRangedHolder(data), len(data))
+        assert r.seek(-3, 2) == 7 and bytes(r.read()) == b"hij"
+        r.seek(0)
+        assert bytes(r.read(4)) == b"abcd" and r.tell() == 4
+        r.seek(2, 1)
+        assert bytes(r.read()) == b"ghij"
+
+
 class TestListEntries:
 
     def test_list_returns_entry_names(self) -> None:

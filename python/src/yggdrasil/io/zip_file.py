@@ -52,6 +52,8 @@ Convenience helper :meth:`write_entries` packs arbitrary
 
 from __future__ import annotations
 
+import collections
+import contextlib
 import dataclasses
 import threading
 import zipfile
@@ -72,6 +74,123 @@ from yggdrasil.io.tabular.base import Tabular
 
 
 __all__ = ["ZipFile", "ZipOptions", "ZipEntryFile"]
+
+
+class _RangedBlockReader:
+    """Seekable binary reader over a holder's ranged ``_read_mv`` with
+    aligned block caching.
+
+    :mod:`zipfile` reads an archive with a flurry of tiny seeks + reads —
+    the End-Of-Central-Directory scan, then field-by-field through the
+    central directory, then the local header + compressed data of each
+    entry it decompresses. Over a remote object each of those reads, taken
+    literally, is a separate ranged GET round trip (measured: ~9 GETs to
+    pull one small entry). This batches them: a read is served from
+    fixed-size blocks fetched on demand and kept in a small bounded cache,
+    so a localized burst of small reads collapses onto one (or a few)
+    block fetches.
+
+    The result scales both ways — a small archive fits in a single block
+    (one GET for the whole metadata + entry walk), while a multi-GB
+    archive only ever fetches the blocks the caller actually touches
+    (the directory tail + the entries it reads), never the whole object.
+    Read-only; cache holds at most :attr:`MAX_BLOCKS` blocks.
+    """
+
+    __slots__ = ("_holder", "_size", "_pos", "_blocks", "_lock")
+
+    BLOCK: int = 1 << 20  # 1 MiB — one block usually covers EOCD + dir tail
+    MAX_BLOCKS: int = 16  # bounded resident set (≤ 16 MiB)
+
+    def __init__(
+        self,
+        holder: "Holder",
+        size: int,
+        *,
+        blocks: "collections.OrderedDict[int, bytes] | None" = None,
+        lock: "threading.Lock | None" = None,
+    ) -> None:
+        self._holder = holder
+        self._size = int(size)
+        self._pos = 0
+        # The cursor (``_pos``) is per-reader, but the block cache may be
+        # *shared* across readers minted from one :class:`ZipFile` handle —
+        # so reading several entries (each its own short-lived zipfile open)
+        # reuses the directory + data blocks already fetched instead of
+        # re-fetching. Guarded by a lock since those readers can run on
+        # different threads.
+        self._blocks = blocks if blocks is not None else collections.OrderedDict()
+        self._lock = lock if lock is not None else threading.Lock()
+
+    def _block(self, idx: int) -> bytes:
+        with self._lock:
+            blk = self._blocks.get(idx)
+            if blk is not None:
+                self._blocks.move_to_end(idx)
+                return blk
+        start = idx * self.BLOCK
+        length = min(self.BLOCK, self._size - start)
+        blk = bytes(self._holder._read_mv(length, start)) if length > 0 else b""
+        with self._lock:
+            self._blocks[idx] = blk
+            self._blocks.move_to_end(idx)
+            while len(self._blocks) > self.MAX_BLOCKS:
+                self._blocks.popitem(last=False)
+        return blk
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return True
+
+    @property
+    def closed(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = offset
+        elif whence == 1:
+            self._pos += offset
+        else:
+            self._pos = self._size + offset
+        return self._pos
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            end = self._size
+        else:
+            end = min(self._pos + n, self._size)
+        if end <= self._pos:
+            return b""
+        out = bytearray()
+        p = self._pos
+        while p < end:
+            idx = p // self.BLOCK
+            off = p - idx * self.BLOCK
+            blk = self._block(idx)
+            if not blk:
+                break
+            take = min(len(blk) - off, end - p)
+            if take <= 0:
+                break
+            out += blk[off:off + take]
+            p += take
+        self._pos = p
+        return bytes(out)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
 
 def _registered_tabular_extensions() -> "list[str]":
@@ -219,7 +338,7 @@ class ZipEntryFile(IO):
         if parent_size == 0:
             self._materialized = True
             return
-        with self._zip_parent.view(pos=0) as v:
+        with self._zip_parent._zip_reader() as v:
             with zipfile.ZipFile(v, "r") as zf:
                 payload = zf.read(self.entry_name)
         self._parent.write_bytes(payload, 0)
@@ -241,12 +360,12 @@ class ZipEntryFile(IO):
         # hint nor materialized payload is available.
         if self._zip_parent.size == 0:
             return 0
-        with self._zip_parent.view(pos=0) as v:
-            with zipfile.ZipFile(v, "r") as zf:
-                info = zf.getinfo(self.entry_name)
-                self._zip_info = info
-                self._uncompressed_size = int(info.file_size)
-        return self._uncompressed_size
+        info = self._zip_parent._info_for(self.entry_name)
+        if info is not None:
+            self._zip_info = info
+            self._uncompressed_size = int(info.file_size)
+            return self._uncompressed_size
+        return 0
 
     # ==================================================================
     # Active holder routing — materialize on first read/write
@@ -383,7 +502,7 @@ class ZipEntryFile(IO):
         """Return the pre-existing entry's bytes, or ``None`` if missing."""
         if self._zip_parent.size == 0:
             return None
-        with self._zip_parent.view(pos=0) as v:
+        with self._zip_parent._zip_reader() as v:
             with zipfile.ZipFile(v, "r") as zf:
                 try:
                     return zf.read(self.entry_name)
@@ -465,6 +584,76 @@ class ZipFile(IO):
         return lock
 
     # ==================================================================
+    # Ranged reader + cached directory — read metadata / entries without
+    # pulling the whole archive or re-parsing the directory per access.
+    # ==================================================================
+
+    @contextlib.contextmanager
+    def _zip_reader(self):
+        """Yield a seekable file-like for ``zipfile.ZipFile(...)`` to read.
+
+        Over a backing holder that can range-read (VolumePath / S3Path) the
+        handle is a block-caching :class:`_RangedBlockReader`, so the many
+        tiny seeks zipfile makes collapse onto a handful of block GETs and a
+        huge archive never downloads whole. Anything else (in-memory
+        :class:`Memory`, a backend that snapshots) falls back to the
+        zero-copy :meth:`view`.
+        """
+        holder = self._parent if self._parent is not None else self
+        if getattr(holder, "SUPPORTS_RANGED_RANDOM_ACCESS", False):
+            blocks, lock = self._shared_blocks(int(self.size))
+            yield _RangedBlockReader(holder, int(self.size), blocks=blocks, lock=lock)
+        else:
+            with self.view(pos=0) as v:
+                yield v
+
+    def _shared_blocks(self, size: int):
+        """The per-handle shared block cache (``OrderedDict`` + lock) for the
+        current archive size — reused by every reader so cross-operation
+        reads (directory walk, then several entry reads) hit fetched blocks
+        instead of re-downloading. Reset when the archive size changes."""
+        cache = self.__dict__.get("__zip_blocks__")
+        if cache is None or cache[0] != size:
+            cache = (size, collections.OrderedDict(), threading.Lock())
+            self.__dict__["__zip_blocks__"] = cache
+        return cache[1], cache[2]
+
+    def _cached_infos(self) -> "list[zipfile.ZipInfo]":
+        """Parse + cache the central directory once.
+
+        The directory (entry names, offsets, sizes — *metadata only*, never
+        the entry payloads) is parsed on first access and reused while the
+        archive's size is unchanged; write paths invalidate it explicitly.
+        Repeated ``list_entries`` / ``iter_children`` / ``child`` calls then
+        cost zero extra round trips.
+        """
+        size = int(self.size)
+        cached = self.__dict__.get("__zip_dir__")
+        if cached is not None and self.__dict__.get("__zip_dir_size__") == size:
+            return cached
+        if size == 0:
+            infos: "list[zipfile.ZipInfo]" = []
+        else:
+            with self._zip_reader() as v:
+                with zipfile.ZipFile(v, "r") as zf:
+                    infos = list(zf.infolist())
+        self.__dict__["__zip_dir__"] = infos
+        self.__dict__["__zip_dir_size__"] = size
+        return infos
+
+    def _info_for(self, name: str) -> "zipfile.ZipInfo | None":
+        for info in self._cached_infos():
+            if info.filename == name:
+                return info
+        return None
+
+    def _invalidate_dir(self) -> None:
+        """Drop the cached central directory + block cache — call after any write."""
+        self.__dict__.pop("__zip_dir__", None)
+        self.__dict__.pop("__zip_dir_size__", None)
+        self.__dict__.pop("__zip_blocks__", None)
+
+    # ==================================================================
     # Children surface — lazy iteration
     # ==================================================================
 
@@ -482,10 +671,7 @@ class ZipFile(IO):
         # check would short-circuit a not-yet-read stream to "empty".
         if self.size_known and self.size == 0:
             return
-        with self.view(pos=0) as v:
-            with zipfile.ZipFile(v, "r") as zf:
-                infos = list(zf.infolist())
-        for info in infos:
+        for info in self._cached_infos():
             if info.is_dir():
                 continue
             yield ZipEntryFile(
@@ -500,9 +686,7 @@ class ZipFile(IO):
         # ``size_known`` guard — a streaming holder is size 0 until pulled.
         if self.size_known and self.size == 0:
             return []
-        with self.view(pos=0) as v:
-            with zipfile.ZipFile(v, "r") as zf:
-                return [info.filename for info in zf.infolist() if not info.is_dir()]
+        return [info.filename for info in self._cached_infos() if not info.is_dir()]
 
     # ==================================================================
     # Per-entry handle — read AND write surface
@@ -541,14 +725,7 @@ class ZipFile(IO):
         Unlike :meth:`child`, no error is raised when *name* doesn't
         exist — the returned handle is a writer-target.
         """
-        info: "zipfile.ZipInfo | None" = None
-        if self.size > 0:
-            with self.view(pos=0) as v:
-                with zipfile.ZipFile(v, "r") as zf:
-                    try:
-                        info = zf.getinfo(name)
-                    except KeyError:
-                        info = None
+        info = self._info_for(name) if self.size > 0 else None
         return ZipEntryFile(
             entry_name=name,
             zip_parent=self,
@@ -564,16 +741,13 @@ class ZipFile(IO):
         Doesn't pre-fetch bytes — the returned handle materializes
         on first read.
         """
-        with self.view(pos=0) as v:
-            with zipfile.ZipFile(v, "r") as zf:
-                try:
-                    info = zf.getinfo(entry_name)
-                except KeyError:
-                    names = [i.filename for i in zf.infolist() if not i.is_dir()]
-                    raise KeyError(
-                        f"No entry named {entry_name!r} in {self!r}. "
-                        f"Available: {names!r}."
-                    )
+        info = self._info_for(entry_name)
+        if info is None:
+            names = [i.filename for i in self._cached_infos() if not i.is_dir()]
+            raise KeyError(
+                f"No entry named {entry_name!r} in {self!r}. "
+                f"Available: {names!r}."
+            )
         return ZipEntryFile(
             entry_name=entry_name,
             zip_parent=self,
@@ -634,7 +808,7 @@ class ZipFile(IO):
         # media-type -> Holder class table.
         _bootstrap_holder_format_registry()
 
-        with self.view(pos=0) as v:
+        with self._zip_reader() as v:
             with zipfile.ZipFile(v, "r") as zf:
                 file_entries = [
                     info for info in zf.infolist() if not info.is_dir()
@@ -781,12 +955,14 @@ class ZipFile(IO):
             # separate holder); ``write_bytes`` copies it once into
             # ``self`` rather than ``to_bytes`` copying a second time.
             self.write_bytes(scratch.read_mv(-1, 0))
+            self._invalidate_dir()
             return
 
         self.seek(0)
         self.truncate(0)
         with zipfile.ZipFile(self, "w", **write_kwargs) as zf:
             zf.writestr(options.entry_name, entry_payload)
+        self._invalidate_dir()
 
     def write_entries(self, entries: Iterable[tuple[str, bytes]]) -> None:
         """Pack arbitrary ``(name, bytes)`` pairs into a fresh archive.
@@ -804,6 +980,7 @@ class ZipFile(IO):
         with zipfile.ZipFile(self, "w", **write_kwargs) as zf:
             for name, blob in entries:
                 zf.writestr(name, blob)
+        self._invalidate_dir()
 
     def _resolve_action(self, mode: Mode) -> Mode:
         if mode is Mode.AUTO or mode is Mode.OVERWRITE or mode is Mode.TRUNCATE:
@@ -848,6 +1025,7 @@ class ZipFile(IO):
                 # Empty target — fresh archive with just this entry.
                 with zipfile.ZipFile(self, "w", **write_kwargs) as zf:
                     zf.writestr(entry_name, payload)
+                self._invalidate_dir()
                 return
 
             scratch = Memory()
@@ -872,6 +1050,7 @@ class ZipFile(IO):
             # Zero-copy view of the rebuilt archive — one copy into
             # ``self`` instead of an extra ``to_bytes`` snapshot.
             self.write_bytes(scratch.read_mv(-1, 0))
+            self._invalidate_dir()
 
 
 # ---------------------------------------------------------------------------
