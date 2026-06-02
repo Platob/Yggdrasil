@@ -517,6 +517,20 @@ class VolumePath(DatabricksPath):
                 },
             )
             self._raise_for_files_status(complete, api_path)
+        except PermissionDenied as exc:
+            # The presigned-multipart coordination endpoints need the
+            # ``all-apis`` token scope; a scoped PAT can't mint part URLs.
+            # That's a capability gap, not a hard failure — abort the
+            # half-open session, warn, and let the caller fall back to a
+            # single whole-object PUT (which the file API still permits).
+            logger.warning(
+                "Multipart upload not authorized for %r (%s) — falling back "
+                "to a single PUT. Grant the token the 'all-apis' scope to "
+                "enable concurrent multipart uploads.",
+                self, exc,
+            )
+            self._multipart_abort(api_path, token, expire)
+            return False
         except Exception:
             self._multipart_abort(api_path, token, expire)
             raise

@@ -1,8 +1,8 @@
 """Concurrency + high-volume live integration for :class:`VolumePath`.
 
 Same provisioning + skip rules as ``test_volume_fs_integration`` (a
-scratch dir under ``trading`` / ``unittest`` / ``tmp`` by default).
-Exercises the Files-API transport under parallel load and large
+scratch dir under the shared ``trading_tgp_dev``.``ygg_integration``
+volume). Exercises the Files-API transport under parallel load and large
 payloads:
 
 * many files written then read back concurrently (round-trip under fan-out),
@@ -32,7 +32,7 @@ from databricks.sdk.errors.platform import PermissionDenied
 from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.io.io_stats import IOKind
 
-from ._base import FsIntegrationCase, _env
+from ._base import FsIntegrationCase
 
 __all__ = ["TestVolumeLoadIntegration"]
 
@@ -52,15 +52,12 @@ class TestVolumeLoadIntegration(FsIntegrationCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cat = _env("DATABRICKS_INTEGRATION_CATALOG", "trading")
-        sch = _env("DATABRICKS_INTEGRATION_SCHEMA", "unittest")
-        vol = _env("DATABRICKS_INTEGRATION_VOLUME", "tmp")
-        base = f"/Volumes/{cat}/{sch}/{vol}/_ygg_load_{secrets.token_hex(4)}"
-        cls.root = cls.client.path(base)
+        volume = cls.integration_volume()
+        cls.root = volume.path(f"_ygg_load_{secrets.token_hex(4)}")
         try:
             cls.root.mkdir(parents=True, exist_ok=True)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"cannot write to {base}: {exc}") from exc
+            raise unittest.SkipTest(f"cannot write to {cls.root}: {exc}") from exc
 
     # -- concurrency ---------------------------------------------------
     def test_concurrent_writes_then_reads(self) -> None:
@@ -148,17 +145,14 @@ class TestVolumeLoadIntegration(FsIntegrationCase):
         self.assertEqual(back.column("v").to_pylist()[:3], [0, 2, 4])
 
     def test_multipart_upload_round_trip(self) -> None:
-        # Above the single-PUT ceiling → presigned concurrent multipart parts.
+        # Above the single-PUT ceiling → presigned concurrent multipart parts,
+        # transparently falling back to a single PUT when the token lacks the
+        # ``all-apis`` scope (warns, doesn't fail).
         size = VolumePath.MULTIPART_MIN_SIZE + _MIB
         payload = secrets.token_bytes(size)
         digest = hashlib.sha256(payload).hexdigest()
         p = self.root / "multipart" / "huge.bin"
-        try:
-            p.write_bytes(payload)
-        except PermissionDenied as exc:
-            # Presigned multipart URLs require the ``all-apis`` token scope;
-            # a scoped PAT can't mint them. Capability gap, not a defect.
-            raise unittest.SkipTest(f"multipart upload not permitted: {exc}") from exc
+        p.write_bytes(payload)
         self.assertEqual(p.stat().size, size)
 
         p.invalidate_singleton()

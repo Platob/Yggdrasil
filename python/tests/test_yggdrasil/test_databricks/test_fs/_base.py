@@ -25,7 +25,6 @@ can only partially write to.
 from __future__ import annotations
 
 import collections
-import os
 import secrets
 import unittest
 from contextlib import contextmanager
@@ -37,10 +36,6 @@ from .. import DatabricksIntegrationCase
 
 
 __all__ = ["FsIntegrationCase", "FsRoundTripMixin"]
-
-
-def _env(name: str, default: str) -> str:
-    return os.environ.get(name, default).strip()
 
 
 class FsIntegrationCase(DatabricksIntegrationCase):

@@ -1,15 +1,16 @@
 """Live volume *lifecycle* integration — creating schemas + managed and
 external volumes and round-tripping through them.
 
-Distinct from ``test_volume_fs_integration`` (which writes under an
-*existing* volume): this file needs CREATE SCHEMA / CREATE VOLUME on the
-catalog, so it provisions a throw-away schema (``yg_volife_<hex>``) per
-class and drops it cascade-style on teardown. The catalog is read from
-:envvar:`DATABRICKS_INTEGRATION_CATALOG` (default ``trading``); a
-permission error degrades to a skip.
+Distinct from ``test_volume_fs_integration`` (which writes under the
+shared *existing* volume): this file needs CREATE SCHEMA / CREATE VOLUME,
+so it mints a throw-away ``ygg_integration_<hex>`` schema per class (via
+:meth:`scratch_schema`) under ``trading_tgp_dev`` and drops it
+cascade-style on teardown through the :meth:`safe_drop_schema` guard
+(never a catalog, never a non-``ygg_integration`` schema). A permission
+error degrades to a skip.
 
-The external-volume test is the seed for the future S3Path coverage —
-it creates a ``volume_type="EXTERNAL"`` volume (storage location derived
+The external-volume test is the seed for the S3Path coverage — it
+creates a ``volume_type="EXTERNAL"`` volume (storage location derived
 from the workspace default, or :envvar:`DATABRICKS_INTEGRATION_EXTERNAL_LOCATION`
 when set) and round-trips bytes through its backing object store.
 """
@@ -34,43 +35,27 @@ __all__ = ["TestManagedVolumeLifecycle", "TestExternalVolumeLifecycle"]
 
 
 class _VolumeLifecycleCase(DatabricksIntegrationCase):
-    """Per-class throw-away schema the volume tests create volumes under."""
+    """Per-class throw-away ``ygg_integration_<hex>`` schema the volume
+    tests create volumes under, dropped via the safety guard on teardown."""
 
-    catalog_name: ClassVar[str]
-    schema_name: ClassVar[str]
     schema: ClassVar[UCSchema]
 
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.catalog_name = os.environ.get(
-            "DATABRICKS_INTEGRATION_CATALOG", "trading",
-        ).strip()
-        cls.schema_name = f"yg_volife_{secrets.token_hex(4)}"
-        try:
-            cls.schema = cls.client.schemas(
-                catalog_name=cls.catalog_name,
-            ).schema(schema_name=cls.schema_name)
-            cls.schema.ensure_created(comment="yggdrasil volume lifecycle test")
-        except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(
-                f"cannot create schema {cls.catalog_name}.{cls.schema_name}: "
-                f"{exc}. Override DATABRICKS_INTEGRATION_CATALOG with a catalog "
-                f"the test identity can CREATE SCHEMA + VOLUME on."
-            ) from exc
+        cls.schema = cls.scratch_schema()
 
     @classmethod
     def tearDownClass(cls) -> None:
         try:
-            schema = getattr(cls, "schema", None)
-            if schema is not None:
-                schema.delete(force=True, raise_error=False)
+            cls.safe_drop_schema(getattr(cls, "schema", None))
         finally:
             super().tearDownClass()
 
     def _volumes(self):
         return self.client.volumes(
-            catalog_name=self.catalog_name, schema_name=self.schema_name,
+            catalog_name=self.INTEGRATION_CATALOG,
+            schema_name=self.schema.schema_name,
         )
 
 
@@ -101,8 +86,8 @@ class TestManagedVolumeLifecycle(_VolumeLifecycleCase):
         try:
             table = Table(
                 service=self.client.tables,
-                catalog_name=self.catalog_name,
-                schema_name=self.schema_name,
+                catalog_name=self.INTEGRATION_CATALOG,
+                schema_name=self.schema.schema_name,
                 table_name="integration",
             )
             staged = table.insert_volume_path(temporary=False)

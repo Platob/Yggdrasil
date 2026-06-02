@@ -1,12 +1,13 @@
 """Live :class:`VolumePath` integration — IO, navigation, call efficiency,
 tabular round-trips against a real Unity Catalog volume (no mocks).
 
-Provisions a per-run scratch directory under an *existing* volume read
-from :envvar:`DATABRICKS_INTEGRATION_CATALOG` / ``_SCHEMA`` / ``_VOLUME``
-(default ``trading`` / ``unittest`` / ``tmp``); a permission error
-degrades to a skip. Volume *lifecycle* (creating schemas / managed +
-external volumes) lives in ``test_volume_lifecycle_integration``; bulk /
-concurrency in ``test_volume_load_integration``.
+Provisions a per-run scratch directory under the shared
+``trading_tgp_dev``.``ygg_integration``.``ygg_integration`` volume
+(created if missing, never dropped — only the scratch dir is removed); a
+permission error degrades to a skip. Volume *lifecycle* (creating
+schemas / managed + external volumes) lives in
+``test_volume_lifecycle_integration``; bulk / concurrency in
+``test_volume_load_integration``.
 
 Sections:
 
@@ -30,7 +31,7 @@ from databricks.sdk.errors.platform import PermissionDenied
 from yggdrasil.enums import MimeTypes
 from yggdrasil.pandas.tests import PandasTestCase
 
-from ._base import FsIntegrationCase, FsRoundTripMixin, _env
+from ._base import FsIntegrationCase, FsRoundTripMixin
 
 
 __all__ = [
@@ -43,22 +44,19 @@ __all__ = [
 
 
 class VolumeFsCase(FsIntegrationCase):
-    """Per-class scratch directory under an existing UC volume."""
+    """Per-class scratch directory under the shared integration volume."""
 
     ext = "bin"
 
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cat = _env("DATABRICKS_INTEGRATION_CATALOG", "trading")
-        sch = _env("DATABRICKS_INTEGRATION_SCHEMA", "unittest")
-        vol = _env("DATABRICKS_INTEGRATION_VOLUME", "tmp")
-        base = f"/Volumes/{cat}/{sch}/{vol}/_ygg_{secrets.token_hex(4)}"
-        cls.root = cls.client.path(base)
+        volume = cls.integration_volume()
+        cls.root = volume.path(f"_ygg_{secrets.token_hex(4)}")
         try:
             cls.root.mkdir(parents=True, exist_ok=True)
         except (DatabricksError, PermissionDenied) as exc:
-            raise unittest.SkipTest(f"cannot write to {base}: {exc}") from exc
+            raise unittest.SkipTest(f"cannot write to {cls.root}: {exc}") from exc
 
 
 class TestVolumeRoundTrip(VolumeFsCase, FsRoundTripMixin):
