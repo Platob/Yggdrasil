@@ -726,7 +726,8 @@ class TestEnsureAsyncJob:
         assert task.python_wheel_task.entry_point == "ygg"
         assert task.python_wheel_task.parameters == [
             "databricks", "table", "execute_async_insert",
-            "--logs", "/Volumes/c/s/t/.sql/async/logs", "--debug", "--prune-partitions",
+            "--logs", "/Volumes/c/s/t/.sql/async/logs",
+            "--debug", "--prune-partitions", "--spark",
         ]
         # serverless v5 image shipped as the env, wired to the task
         env = kwargs["environments"][0]
@@ -886,6 +887,44 @@ class TestLoadAsync:
         log_b.unlink.assert_called_once()
         data_paths["dbfs+volume:/c/s/t/.sql/tmp/a.parquet"].unlink.assert_called_once()
         data_paths["dbfs+volume:/c/s/t/.sql/tmp/b.parquet"].unlink.assert_called_once()
+
+    def test_use_spark_resolves_session_and_passes_it(self):
+        from yggdrasil.databricks.table.insert import load_async
+        svc = _tables_service()
+        session = MagicMock(name="spark-session")
+        svc.client.spark.return_value = session
+        target = MagicMock()
+        svc.__getitem__.return_value = target
+        from_fn, _ = _fake_databricks_from()
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
+            load_async(svc, _logs_dir(_log("a")), wait=False, use_spark=True)
+        # the loader resolves the cluster Spark session and runs the load on it
+        svc.client.spark.assert_called_once()
+        assert target.sql_insert.call_args.kwargs["spark_session"] is session
+
+    def test_use_spark_falls_back_to_warehouse_when_unavailable(self):
+        from yggdrasil.databricks.table.insert import load_async
+        svc = _tables_service()
+        svc.client.spark.side_effect = RuntimeError("no compute reachable")
+        target = MagicMock()
+        svc.__getitem__.return_value = target
+        from_fn, _ = _fake_databricks_from()
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
+            n = load_async(svc, _logs_dir(_log("a")), wait=False, use_spark=True)
+        assert n == 1
+        # spark unavailable → warehouse path (spark_session=None), load still runs
+        assert target.sql_insert.call_args.kwargs["spark_session"] is None
+
+    def test_warehouse_path_does_not_resolve_spark(self):
+        from yggdrasil.databricks.table.insert import load_async
+        svc = _tables_service()
+        target = MagicMock()
+        svc.__getitem__.return_value = target
+        from_fn, _ = _fake_databricks_from()
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=from_fn):
+            load_async(svc, _logs_dir(_log("a")), wait=False)   # use_spark defaults False
+        svc.client.spark.assert_not_called()
+        assert target.sql_insert.call_args.kwargs["spark_session"] is None
 
     def test_debug_prints_batch_and_sql_to_stdout(self, capsys):
         from yggdrasil.databricks.table.insert import load_async

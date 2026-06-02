@@ -1106,6 +1106,7 @@ def load_async(
     limit: "int | None" = None,
     debug: bool = False,
     prune_partitions: bool = False,
+    use_spark: bool = False,
 ) -> int:
     """Run the async loader over pending op-logs — group, aggregate, load, clean.
 
@@ -1156,7 +1157,8 @@ def load_async(
             break
 
     return dispatch_async(
-        tables, ops, wait=wait, debug=debug, prune_partitions=prune_partitions,
+        tables, ops, wait=wait, debug=debug,
+        prune_partitions=prune_partitions, use_spark=use_spark,
     )
 
 
@@ -1175,6 +1177,7 @@ def dispatch_async(
     wait: Any = True,
     debug: bool = False,
     prune_partitions: bool = False,
+    use_spark: bool = False,
 ) -> int:
     """Group parsed ops by target into a :class:`DatabricksInsertBatch` and load
     each through the target's ``sql_insert`` (one aggregated body per target),
@@ -1187,6 +1190,11 @@ def dispatch_async(
     the **deployed loader job** turns it on — the live / synchronous execute
     path merges without it.
 
+    ``use_spark=True`` runs the load on the **cluster's Spark session** (reusing
+    the active session on a job, or building one against the ygg wheel image)
+    instead of a SQL warehouse — so the deployed loader job uses its own compute.
+    Falls back to the warehouse if no Spark session can be resolved.
+
     ``debug=True`` prints, per target, the file count, mode, keys, partition
     filters, and the generated SQL to **stdout** — so a deployed loader job's run
     captures it (see ``JobRun.stdout`` / ``JobRun.debug``)."""
@@ -1196,6 +1204,21 @@ def dispatch_async(
         logger.info("async loader: no pending operation logs")
         return 0
     logger.info("async loader: %d target group(s)", len(batches))
+
+    # Resolve a Spark session once for the whole dispatch when requested —
+    # reuses the active cluster session on a job, or builds one against the ygg
+    # wheel image. Degrade to the warehouse path if Spark isn't reachable.
+    spark_session = None
+    if use_spark:
+        try:
+            spark_session = client.spark()
+        except Exception:  # noqa: BLE001 - spark is best-effort; warehouse works
+            logger.warning(
+                "async loader: Spark session unavailable — using the warehouse",
+                exc_info=True,
+            )
+        if debug:
+            _emit(f"[async-load] spark session: {'on' if spark_session else 'unavailable → warehouse'}")
 
     processed = 0
     for batch in batches:
@@ -1225,6 +1248,7 @@ def dispatch_async(
         target.sql_insert(
             sql, mode=mode.name.lower(), match_by=batch.match_by, wait=wait,
             partition_filters=partition_filters or None,
+            spark_session=spark_session,
         )
         if debug:
             _emit(f"[async-load] {target_name}: loaded {len(batch.active)} file(s)")
@@ -1312,7 +1336,8 @@ def ensure_async_job(
                     entry_point="ygg",
                     parameters=[
                         "databricks", "table", "execute_async_insert",
-                        "--logs", logs.full_path(), "--debug", "--prune-partitions",
+                        "--logs", logs.full_path(),
+                        "--debug", "--prune-partitions", "--spark",
                     ],
                 ),
             )

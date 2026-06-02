@@ -68,6 +68,12 @@ class TablesCommand:
                  "distinct partition values and add them as a literal IN filter "
                  "on the MERGE ON (prunes the target scan). Costs one extra query.",
         )
+        ex.add_argument(
+            "--spark", dest="use_spark", action="store_true",
+            help="Run the load on the cluster's Spark session (reusing the job's "
+                 "active session / the ygg wheel image) instead of a SQL "
+                 "warehouse; falls back to the warehouse if Spark isn't reachable.",
+        )
         ex.set_defaults(handler=cls._execute_async_insert)
 
         parser.set_defaults(handler=lambda args, bc: parser.print_help() or 1)
@@ -109,6 +115,7 @@ class TablesCommand:
             client.tables, logs=args.logs, log_files=args.log_files or None,
             wait=True, debug=getattr(args, "debug", False),
             prune_partitions=getattr(args, "prune_partitions", False),
+            use_spark=getattr(args, "use_spark", False),
         )
         sys.stdout.write(f"executed {n} pending operation(s)\n")
         return 0

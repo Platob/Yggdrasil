@@ -3077,6 +3077,7 @@ class Table(DatabricksPath):
         retry: Optional[WaitingConfigArg] = None,
         return_data: bool = False,
         safe_merge: bool = False,
+        partition_filters: Optional[list[str]] = None,
     ) -> "StatementBatch | Tabular | None":
         """Insert into this table using Spark.
 
@@ -3200,6 +3201,7 @@ class Table(DatabricksPath):
                 optimize_after_merge=optimize_after_merge,
                 vacuum_hours=vacuum_hours,
                 safe_merge=safe_merge,
+                partition_filters=partition_filters,
             )
 
         retry_cfg = _resolve_retry(retry)
@@ -3328,6 +3330,7 @@ class Table(DatabricksPath):
                 data=df, spark_session=spark_session,
                 schema_mode=schema_mode,
                 cast_options=cast_options,
+                partition_filters=partition_filters,
                 return_data=return_data, **common,
             )
 
