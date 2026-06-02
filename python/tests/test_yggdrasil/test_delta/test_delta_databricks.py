@@ -251,6 +251,94 @@ class TestDeltaFolderWriteSQLRead(_DeltaSQLBase):
 
 
 # ---------------------------------------------------------------------------
+# Local DeltaFolder commit, then Databricks SQL INSERT on top
+# ---------------------------------------------------------------------------
+
+
+class TestSQLInsertAfterLocalInsert(_DeltaSQLBase):
+    """A local DeltaFolder commit, then Databricks SQL ``INSERT INTO`` on top.
+
+    The DeltaFolder writes parquet + a ``_delta_log`` commit straight to
+    cloud storage (UC only vends the READ_WRITE temp creds this needs for an
+    *external* table). Databricks must then read our commit and append its
+    own version on top — proving the round-trip in the write→write direction,
+    not just write→read.
+
+    Skips when an external table can't be provisioned (no
+    ``YGG_TEST_EXTERNAL_LOCATION`` and the catalog's default storage location
+    rejects ``CREATE EXTERNAL TABLE`` for this principal, or RW creds aren't
+    vendable) — an environment grant, not a code defect.
+    """
+
+    def _external_delta_table(self, tag: str, definition):
+        from databricks.sdk.errors import DatabricksError
+        from databricks.sdk.errors.platform import PermissionDenied
+        from databricks.sdk.service.catalog import TableType
+
+        tbl = self._table(tag)
+        base = os.environ.get("YGG_TEST_EXTERNAL_LOCATION")
+        location = (base.rstrip("/") + "/" + tbl.table_name) if base else None
+        try:
+            # External (not managed) — UC vends READ_WRITE temp creds only for
+            # external tables, which a local ``_delta_log`` commit requires.
+            tbl.create(definition, table_type=TableType.EXTERNAL, storage_location=location)
+        except (DatabricksError, PermissionDenied, NotImplementedError, ValueError) as exc:
+            raise unittest.SkipTest(f"cannot provision external table: {exc}") from exc
+        return tbl
+
+    def test_sql_insert_after_local_insert(self) -> None:
+        from yggdrasil.data.schema import Schema, field
+        from yggdrasil.enums import Mode
+
+        definition = Schema([
+            field("id", "string", nullable=False),
+            field("name", "string"),
+            field("value", "float64"),
+        ])
+        tbl = self._external_delta_table("local_then_sql", definition)
+        try:
+            # 1) Our local insert: a DeltaFolder commit straight to storage.
+            folder = self._delta_folder(tbl)
+            local = pa.table({
+                "id": pa.array(["a", "b"], pa.string()),
+                "name": pa.array(["x", "y"], pa.string()),
+                "value": pa.array([1.0, 2.0], pa.float64()),
+            })
+            folder.write_arrow_table(local, mode=Mode.APPEND)
+
+            # Databricks sees our commit.
+            n0 = self._read_sql_arrow(
+                f"SELECT count(*) c FROM {tbl.full_name()}"
+            ).to_pylist()[0]["c"]
+            self.assertEqual(n0, 2)
+
+            # 2) Databricks SQL INSERT appends a new version on top of ours.
+            self._execute(
+                f"INSERT INTO {tbl.full_name()} VALUES ('c', 'z', 3.0)"
+            )
+
+            rows = self._read_sql_arrow(
+                f"SELECT id, name, value FROM {tbl.full_name()} ORDER BY id"
+            ).to_pylist()
+            self.assertEqual([r["id"] for r in rows], ["a", "b", "c"])
+            self.assertEqual(rows[2]["name"], "z")
+            self.assertEqual(rows[2]["value"], 3.0)
+
+            # 3) And DeltaFolder reads back the SQL-appended version.
+            ygg = self._delta_folder(tbl).read_arrow_table()
+            self.assertEqual(sorted(ygg.column("id").to_pylist()), ["a", "b", "c"])
+        finally:
+            # External-table data outlives DROP TABLE — purge the S3 prefix
+            # while the table's temporary credentials are still vendable.
+            try:
+                sp = tbl.storage_path()
+                if sp is not None:
+                    sp.remove(recursive=True, missing_ok=True)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Timestamp physical-type compatibility (Databricks reads ygg's parquet)
 # ---------------------------------------------------------------------------
 
