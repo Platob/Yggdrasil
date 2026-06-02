@@ -567,6 +567,15 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
     mime_type: "ClassVar[MimeType | None]" = None
 
+    #: Whether :meth:`_read_arrow_table` returns a freshly-decoded table
+    #: whose buffers no one else holds — so a consumer may destroy it in
+    #: place (``to_pandas(self_destruct=True)``) to halve peak memory.
+    #: True for every backend that decodes a new table per read (parquet,
+    #: arrow-ipc, csv, pickle, warehouse, …). In-memory holders that hand
+    #: back a *cached* table shared with the live instance override this to
+    #: False so the cache survives the conversion.
+    _READ_TABLE_OWNED: "ClassVar[bool]" = True
+
     #: Lifetime of a seeded :attr:`_stat_cached` entry. ``None`` (the
     #: default) trusts a seeded snapshot until it is explicitly
     #: invalidated — right for in-memory and local-filesystem holders.
@@ -1713,7 +1722,18 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         )
 
     def _read_polars_frame(self, options: O) -> "pl.DataFrame":
-        return polars_module().from_arrow(self._read_arrow_table(options))  # type: ignore[return-value]
+        # ``rechunk=False`` keeps polars from copying every column into a
+        # single contiguous chunk on ingest. The Arrow table arrives
+        # already chunked (one chunk per read flush / spill part), and the
+        # default ``rechunk=True`` memcpy's the whole result to coalesce
+        # them — pure overhead in both time and peak memory. Skipping it
+        # lets the frame share the Arrow buffers zero-copy (numeric columns)
+        # or copy once during conversion (everything else); polars handles
+        # a multi-chunk frame transparently, and any op that genuinely wants
+        # one chunk can ``.rechunk()`` on demand.
+        return polars_module().from_arrow(  # type: ignore[return-value]
+            self._read_arrow_table(options), rechunk=False,
+        )
 
     def scan_polars_frame(
         self, options: "O | None" = None, **kwargs: Any,
@@ -1783,8 +1803,22 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         placeholders map back to the unnamed levels they came from.
         """
         table = self._read_arrow_table(options)
-        df = table.to_pandas()
-        levels = _collect_index_levels(table.schema)
+        schema = table.schema  # metadata only — safe to read post-destruct
+        if self._READ_TABLE_OWNED:
+            # ``self_destruct=True`` (with its required ``split_blocks=True``)
+            # frees each Arrow column the instant it's converted into pandas,
+            # instead of holding the whole Arrow table alongside the finished
+            # DataFrame — roughly halves peak memory on a wide table. Sound
+            # only because this backend's ``_read_arrow_table`` returns a
+            # freshly-decoded, solely-owned table; ``table`` must not be
+            # touched for data afterwards, hence the ``del``.
+            df = table.to_pandas(split_blocks=True, self_destruct=True)
+            del table
+        else:
+            # Shared/cached table (in-memory holder): destroying it would
+            # corrupt later reads, so take the plain, copy-once conversion.
+            df = table.to_pandas()
+        levels = _collect_index_levels(schema)
         if not levels:
             return df
         levels.sort()
