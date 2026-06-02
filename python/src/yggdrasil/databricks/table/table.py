@@ -1672,7 +1672,7 @@ class Table(DatabricksPath):
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
 
         if data_source_format is None:
-            data_source_format = DataSourceFormat.DELTA if table_type == TableType.MANAGED else DataSourceFormat.PARQUET
+            data_source_format = DataSourceFormat.DELTA
 
         if self.exists():
             data_source_format = self.infos.data_source_format
@@ -1696,15 +1696,29 @@ class Table(DatabricksPath):
                 comment=comment,
                 missing_ok=missing_ok,
                 properties=properties,
-                or_replace=mode == Mode.OVERWRITE and table_type == TableType.MANAGED,
+                or_replace=mode == Mode.OVERWRITE,
+                data_source_format=data_source_format,
+                record_ygg_properties=record_ygg_properties,
+            )
+        elif table_type == TableType.EXTERNAL:
+            # An external table is created via DDL — ``CREATE EXTERNAL TABLE
+            # … USING <fmt> LOCATION '…'`` — so the LOCATION is recorded and
+            # (for Delta) the ``_delta_log`` is initialised at that path.
+            # Default the location to the catalog's governed storage root
+            # when the caller didn't pin one.
+            if not storage_location:
+                storage_location = self._default_external_location()
+            result = self.sql_create(
+                definition,
+                storage_location=storage_location,
+                comment=comment,
+                missing_ok=missing_ok,
+                properties=properties,
+                or_replace=mode == Mode.OVERWRITE,
+                data_source_format=data_source_format,
                 record_ygg_properties=record_ygg_properties,
             )
         else:
-            if table_type == TableType.EXTERNAL and not storage_location:
-                storage_location = (
-                    self.schema_storage_location(table_type=table_type)
-                    + "/tables/%s" % self.table_name
-                )
             result = self.api_create(
                 definition=definition,
                 storage_location=storage_location,
@@ -1717,6 +1731,26 @@ class Table(DatabricksPath):
             )
 
         return result
+
+    def _default_external_location(self) -> str:
+        """Governed default ``LOCATION`` for an external table created without
+        one: the catalog's UC ``storage_root`` + ``<schema>/<table>``.
+
+        Prefers a schema-scoped storage root when the schema advertises one
+        (Databricks' ``__unitystorage`` layout), else falls back to the
+        catalog storage root via
+        :meth:`DatabricksClient.default_storage_location`.
+        """
+        try:
+            return "%s/tables/%s" % (
+                self.schema_storage_location(table_type=TableType.EXTERNAL),
+                self.table_name,
+            )
+        except NotImplementedError:
+            return self.client.default_storage_location(
+                suffix="%s/%s" % (self.schema_name, self.table_name),
+                catalog_name=self.catalog_name,
+            )
 
     def sql_create(
         self,
@@ -1768,12 +1802,19 @@ class Table(DatabricksPath):
 
         table_definitions = column_definitions + constraint_clauses
 
+        # A bound ``storage_location`` makes this an external table. Emit the
+        # explicit ``EXTERNAL`` keyword for the plain / ``IF NOT EXISTS`` forms
+        # (matching ``CREATE EXTERNAL TABLE … USING DELTA LOCATION …``); the
+        # ``OR REPLACE`` grammar doesn't allow the keyword, but the ``LOCATION``
+        # clause below still makes that table external.
+        external = storage_location is not None
+        ext_kw = " EXTERNAL" if external else ""
         if or_replace:
             create_kw = "CREATE OR REPLACE TABLE"
         elif missing_ok:
-            create_kw = "CREATE TABLE IF NOT EXISTS"
+            create_kw = f"CREATE{ext_kw} TABLE IF NOT EXISTS"
         else:
-            create_kw = "CREATE TABLE"
+            create_kw = f"CREATE{ext_kw} TABLE"
 
         sql_parts: list[str] = [
             f"{create_kw} {self.full_name(safe=True)} (",
@@ -1790,7 +1831,9 @@ class Table(DatabricksPath):
             sql_parts.append(
                 "CLUSTER BY (" + ", ".join(quote_ident(c.name) for c in cluster_by) + ")"
             )
-        else:
+        elif not external:
+            # Liquid clustering is a managed-table feature; an external table
+            # at a caller-owned LOCATION gets no implicit clustering.
             sql_parts.append("CLUSTER BY AUTO")
 
         if comment:

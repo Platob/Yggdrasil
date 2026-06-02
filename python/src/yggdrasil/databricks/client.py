@@ -2316,12 +2316,45 @@ class DatabricksClient(Singleton, URLBased):
 
     def default_storage_location(
         self,
-        suffix: str = None
+        suffix: str = None,
+        *,
+        catalog_name: str | None = None,
     ) -> str:
-        base = "s3://odp-aws-dls3-eu-central-1-p-apps/3mv/"
+        """Default cloud-storage base for an asset created without an explicit
+        ``LOCATION`` (external table / external volume).
+
+        Resolves the Unity Catalog catalog's ``storage_root`` — the governed
+        location managed and external assets in that catalog live under — and
+        appends *suffix*. ``catalog_name`` defaults to this client's
+        :attr:`catalog_name`. Raises when no catalog is in scope or the
+        catalog exposes no ``storage_root`` (callers should then pass an
+        explicit location). The lookup is cached per (host, catalog) for the
+        process so repeated external creates don't re-hit the SDK.
+        """
+        catalog_name = catalog_name or self.catalog_name
+        if not catalog_name:
+            raise ValueError(
+                "default_storage_location needs a catalog to resolve a "
+                "storage root — pass catalog_name=..., set the client's "
+                "catalog_name, or supply an explicit storage location."
+            )
+
+        key = (self.host, catalog_name)
+        root = _CATALOG_STORAGE_ROOTS.get(key)
+        if root is None:
+            info = self.workspace_client().catalogs.get(catalog_name)
+            root = info.storage_root
+            if not root:
+                raise ValueError(
+                    f"Catalog {catalog_name!r} has no storage_root; cannot "
+                    f"derive a default storage location — pass an explicit "
+                    f"location."
+                )
+            _CATALOG_STORAGE_ROOTS[key] = root
+
+        base = root.rstrip("/") + "/"
         if not suffix:
             return base
-
         return base + suffix.lstrip("/")
 
 
@@ -2335,6 +2368,14 @@ _TO_URL_QUERY_KEYS: tuple[str, ...] = tuple(
     if name not in ("host", "token", "client_id", "client_secret")
 )
 CHECKED_TMP_WORKSPACES: ExpiringDict[str, set[str]] = ExpiringDict()
+
+# Per-(host, catalog) cache of resolved UC ``storage_root`` URLs, backing
+# :meth:`DatabricksClient.default_storage_location`. A catalog's storage root
+# is effectively static, so a 1h TTL keeps external-create defaulting off the
+# SDK without pinning a stale value forever.
+_CATALOG_STORAGE_ROOTS: ExpiringDict[tuple[str, str], str] = ExpiringDict(
+    default_ttl=3600,
+)
 
 
 def is_checked_tmp_path(host: str, base_path: str):
