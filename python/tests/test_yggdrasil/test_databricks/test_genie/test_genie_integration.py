@@ -98,6 +98,34 @@ class TestGenieIntegration(DatabricksIntegrationCase):
         self.assertIsInstance(space.title, (str, type(None)))
         self.assertTrue(space.space_id)
 
+    def test_create_and_trash_space(self):
+        """Discover tables, create a throw-away space, ask it, then trash it."""
+        import secrets
+
+        catalog = self.INTEGRATION_CATALOG
+        schema = self.INTEGRATION_SCHEMA
+        try:
+            tables = self.genie.discover_tables(catalog=catalog, schema=schema)
+        except _ASK_ERRORS as exc:
+            raise unittest.SkipTest(f"cannot list tables in {catalog}.{schema}: {exc}")
+        if not tables:
+            raise unittest.SkipTest(f"no tables in {catalog}.{schema} to build a space")
+
+        title = f"ygg_smoke_{secrets.token_hex(4)}"
+        try:
+            space = self.genie.create_space(tables=tables[:5], title=title)
+        except _ASK_ERRORS as exc:
+            raise unittest.SkipTest(f"cannot create a Genie space: {exc}")
+
+        try:
+            self.assertTrue(space.space_id)
+            self.assertTrue(space.warehouse_id)
+            # The fresh space is immediately queryable.
+            answer = space.ask("How many tables can you see? Reply with a number.")
+            self.assertIsInstance(answer, GenieAnswer)
+        finally:
+            space.trash(missing_ok=True)
+
     def test_ask_round_trip(self):
         _space, answer = self._ask_any_space()
         self.assertIsInstance(answer, GenieAnswer)

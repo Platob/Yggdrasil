@@ -8,7 +8,7 @@ mocked SDK calls.
 from __future__ import annotations
 
 from dataclasses import replace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from databricks.sdk.errors import NotFound
 from databricks.sdk.service.dashboards import (
@@ -178,6 +178,109 @@ class TestSpaces(GenieTestCase):
     def test_space_exists_false_on_not_found(self):
         self.genie_api.get_space.side_effect = NotFound("missing")
         self.assertFalse(self.genie.space("space-x").exists())
+
+
+# ---------------------------------------------------------------------------
+# Space creation
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSpace(GenieTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.genie_api.create_space.return_value = SdkGenieSpace(
+            space_id="new-1", title="Yggdrasil Genie", warehouse_id="wh-1",
+        )
+
+    def test_create_space_builds_serialized_from_tables(self):
+        from yggdrasil.pickle import json as ygg_json
+
+        with patch.object(
+            self.client.warehouses, "find_default",
+            return_value=MagicMock(warehouse_id="wh-default"),
+        ):
+            space = self.genie.create_space(tables=["c.s.a", "c.s.b"], title="My Space")
+
+        self.assertEqual(space.space_id, "new-1")
+        call = self.genie_api.create_space.call_args
+        self.assertEqual(call.kwargs["warehouse_id"], "wh-default")
+        self.assertEqual(call.kwargs["title"], "My Space")
+        parsed = ygg_json.loads(call.kwargs["serialized_space"])
+        self.assertEqual(parsed, {
+            "version": 2,
+            "data_sources": {"tables": [{"identifier": "c.s.a"}, {"identifier": "c.s.b"}]},
+        })
+
+    def test_create_space_uses_default_warehouse_from_defaults(self):
+        self.genie.defaults = replace(self.genie.defaults, warehouse_id="wh-cfg")
+        self.genie.create_space(tables=["c.s.a"])
+        self.assertEqual(
+            self.genie_api.create_space.call_args.kwargs["warehouse_id"], "wh-cfg",
+        )
+
+    def test_create_space_default_title(self):
+        self.genie.defaults = replace(self.genie.defaults, warehouse_id="wh")
+        self.genie.create_space(tables=["c.s.a"])
+        self.assertEqual(
+            self.genie_api.create_space.call_args.kwargs["title"], "Yggdrasil Genie",
+        )
+
+    def test_create_space_requires_tables_or_serialized(self):
+        self.genie.defaults = replace(self.genie.defaults, warehouse_id="wh")
+        with self.assertRaises(ValueError):
+            self.genie.create_space()
+
+    def test_create_space_requires_a_warehouse(self):
+        with patch.object(self.client.warehouses, "find_default", return_value=None):
+            with self.assertRaises(ValueError):
+                self.genie.create_space(tables=["c.s.a"])
+
+    def test_discover_tables_via_show_tables(self):
+        import pyarrow as pa
+
+        result = MagicMock()
+        result.to_arrow_table.return_value = pa.table({
+            "database": ["s", "s", "s"],
+            "tableName": ["a", "b", "tmp"],
+            "isTemporary": [False, False, True],
+        })
+        with patch.object(self.client.sql, "execute", return_value=result) as ex:
+            tables = self.genie.discover_tables(catalog="c", schema="s")
+        ex.assert_called_once_with("SHOW TABLES IN `c`.`s`")
+        # Temp tables are skipped; names are three-part.
+        self.assertEqual(tables, ["c.s.a", "c.s.b"])
+
+    def test_discover_tables_requires_catalog_schema(self):
+        with self.assertRaises(ValueError):
+            self.genie.discover_tables()
+
+    def test_ensure_default_space_reuses_existing(self):
+        page = MagicMock()
+        page.spaces = [SdkGenieSpace(space_id="exists", title="Yggdrasil Genie")]
+        page.next_page_token = None
+        self.genie_api.list_spaces.return_value = page
+
+        space = self.genie.ensure_default_space()
+        self.assertEqual(space.space_id, "exists")
+        self.genie_api.create_space.assert_not_called()
+
+    def test_ensure_default_space_creates_when_missing(self):
+        page = MagicMock(spaces=[], next_page_token=None)
+        self.genie_api.list_spaces.return_value = page
+        with patch.object(self.genie, "discover_tables", return_value=["c.s.a"]), \
+                patch.object(self.client.warehouses, "find_default",
+                             return_value=MagicMock(warehouse_id="wh")):
+            space = self.genie.ensure_default_space()
+        self.assertEqual(space.space_id, "new-1")
+        self.genie_api.create_space.assert_called_once()
+
+    def test_space_trash(self):
+        self.genie.space("space-1").trash()
+        self.genie_api.trash_space.assert_called_once_with(space_id="space-1")
+
+    def test_space_trash_missing_ok(self):
+        self.genie_api.trash_space.side_effect = NotFound("gone")
+        self.genie.space("space-1").trash(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

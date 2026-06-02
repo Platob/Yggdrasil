@@ -138,14 +138,69 @@ class TestGenieCliBehaviour(unittest.TestCase):
             space_id="sp-1", planner="databricks-claude-sonnet-4", max_turns=4,
         )
 
-    def test_console_requires_space(self):
-        # No --space and no env → exit code 2.
+    def test_console_no_space_creates_default(self):
+        # No --space → a default space is ensured and the console opens.
+        self.client.genie.ensure_default_space.return_value = MagicMock(
+            space_id="auto-1", title="Yggdrasil Genie",
+        )
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("YGG_GENIE_SPACE", None)
+            with patch("builtins.input", side_effect=EOFError):
+                rc, _out = self._run(["genie", "console"])
+        self.assertEqual(rc, 0)
+        self.client.genie.ensure_default_space.assert_called_once_with()
+
+    def test_console_no_space_no_default_fails(self):
+        # No space and no default creatable (no catalog/schema) → exit 2.
+        self.client.genie.ensure_default_space.side_effect = ValueError("no catalog/schema")
         with patch.dict("os.environ", {}, clear=False):
             import os
 
             os.environ.pop("YGG_GENIE_SPACE", None)
             rc, _out = self._run(["genie", "console"])
         self.assertEqual(rc, 2)
+
+    def test_ask_auto_creates_default_space(self):
+        self.client.genie.ensure_default_space.return_value = MagicMock(
+            space_id="auto-1", title="Yggdrasil Genie",
+        )
+        self.client.genie.ask.return_value = _answer(text="42")
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop("YGG_GENIE_SPACE", None)
+            rc, out = self._run(["genie", "ask", "the answer?"])
+        self.assertEqual(rc, 0)
+        self.client.genie.ask.assert_called_once_with("the answer?", space_id="auto-1")
+        self.assertIn("42", out)
+
+    def test_create_builds_space_from_discovered_tables(self):
+        self.client.genie.discover_tables.return_value = ["c.s.t1", "c.s.t2"]
+        self.client.genie.create_space.return_value = MagicMock(
+            space_id="new-1", title="Yggdrasil Genie",
+        )
+        rc, out = self._run(["genie", "create", "--catalog", "c", "--schema", "s"])
+        self.assertEqual(rc, 0)
+        self.client.genie.discover_tables.assert_called_once_with(catalog="c", schema="s")
+        self.client.genie.create_space.assert_called_once_with(
+            tables=["c.s.t1", "c.s.t2"], title=None, warehouse_id=None,
+        )
+        self.assertIn("new-1", out)
+
+    def test_create_explicit_tables(self):
+        self.client.genie.create_space.return_value = MagicMock(
+            space_id="new-2", title="My Space",
+        )
+        rc, _out = self._run([
+            "genie", "create", "--tables", "a.b.c, a.b.d", "--title", "My Space",
+        ])
+        self.assertEqual(rc, 0)
+        self.client.genie.discover_tables.assert_not_called()
+        self.client.genie.create_space.assert_called_once_with(
+            tables=["a.b.c", "a.b.d"], title="My Space", warehouse_id=None,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ default ``space_id`` once and stop repeating it::
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 
 from yggdrasil.databricks.service import DatabricksService
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
@@ -106,6 +106,137 @@ class Genie(DatabricksService):
             if (space.title or "").strip().lower() == target:
                 return space
         return None
+
+    # ------------------------------------------------------------------ #
+    # Space creation
+    # ------------------------------------------------------------------ #
+    def create_space(
+        self,
+        *,
+        tables: Optional[Sequence[str]] = None,
+        title: Optional[str] = None,
+        warehouse_id: Optional[str] = None,
+        description: Optional[str] = None,
+        parent_path: Optional[str] = None,
+        serialized_space: Optional[str] = None,
+    ) -> GenieSpace:
+        """Create a Genie space over a set of Unity Catalog tables.
+
+        ``tables`` is a list of three-part ``catalog.schema.table`` names —
+        they become the space's data sources. ``warehouse_id`` defaults to
+        :attr:`GenieDefaults.warehouse_id`, then the workspace's default
+        warehouse (:meth:`Warehouses.find_default`). ``serialized_space``
+        is the raw Genie space document; pass it to override the
+        ``tables``-derived one.
+        """
+        from yggdrasil.pickle import json as ygg_json
+
+        if serialized_space is None:
+            if not tables:
+                raise ValueError(
+                    "create_space needs tables= (catalog.schema.table names) "
+                    "or an explicit serialized_space=."
+                )
+            serialized_space = ygg_json.dumps(
+                {
+                    "version": 2,
+                    "data_sources": {
+                        "tables": [{"identifier": t} for t in tables],
+                    },
+                },
+                to_bytes=False,
+            )
+
+        wh_id = warehouse_id or self.defaults.warehouse_id
+        if not wh_id:
+            warehouse = self.client.warehouses.find_default()
+            wh_id = warehouse.warehouse_id if warehouse is not None else None
+        if not wh_id:
+            raise ValueError(
+                "create_space needs a warehouse_id — none given, no "
+                "Genie.defaults.warehouse_id, and no default warehouse found."
+            )
+
+        LOGGER.debug(
+            "Creating Genie space %r (warehouse=%s, tables=%s)",
+            title, wh_id, list(tables or []),
+        )
+        info = self.api.create_space(
+            warehouse_id=wh_id,
+            serialized_space=serialized_space,
+            title=title or self.defaults.default_space_title,
+            description=description,
+            parent_path=parent_path,
+        )
+        LOGGER.info("Created Genie space %s (%r)", info.space_id, info.title)
+        return GenieSpace(service=self, space_id=info.space_id, details=info)
+
+    def discover_tables(
+        self,
+        *,
+        catalog: Optional[str] = None,
+        schema: Optional[str] = None,
+        limit: int = 25,
+    ) -> list[str]:
+        """List ``catalog.schema.table`` names in a schema via ``SHOW TABLES``.
+
+        Catalog / schema default to the client's bound ``catalog_name`` /
+        ``schema_name``. Temporary tables are skipped. Capped at ``limit``
+        (default 25) — a Genie space accepts at most 30 tables.
+        """
+        cat = catalog or getattr(self.client, "catalog_name", None)
+        sch = schema or getattr(self.client, "schema_name", None)
+        if not cat or not sch:
+            raise ValueError(
+                "discover_tables needs a catalog and schema — pass them or "
+                "bind the client to a catalog/schema."
+            )
+        rows = self.client.sql.execute(
+            f"SHOW TABLES IN `{cat}`.`{sch}`"
+        ).to_arrow_table().to_pylist()
+        names = [
+            f"{cat}.{sch}.{r['tableName']}"
+            for r in rows
+            if r.get("tableName") and not r.get("isTemporary")
+        ]
+        return names[:limit]
+
+    def ensure_default_space(
+        self,
+        *,
+        catalog: Optional[str] = None,
+        schema: Optional[str] = None,
+        title: Optional[str] = None,
+        warehouse_id: Optional[str] = None,
+        tables: Optional[Sequence[str]] = None,
+    ) -> GenieSpace:
+        """Return a default Genie space, creating it on first use.
+
+        If a space already exists with the default title it is reused;
+        otherwise one is created over ``tables`` (or up to 25 tables
+        discovered in the catalog/schema — Genie caps a space at 30). Lets
+        ``client.genie.ask(...)`` work out of the box without a pre-built
+        space. Reuse is best-effort: Databricks' space listing is
+        eventually consistent, so a just-created space can be briefly
+        invisible — pin the returned id (e.g. ``$YGG_GENIE_SPACE``) for
+        stable reuse.
+        """
+        space_title = title or self.defaults.default_space_title
+        existing = self.find_space(title=space_title)
+        if existing is not None:
+            LOGGER.debug("Reusing existing default Genie space %s", existing.space_id)
+            return existing
+        space_tables = list(tables) if tables else self.discover_tables(
+            catalog=catalog, schema=schema,
+        )
+        if not space_tables:
+            raise ValueError(
+                "Cannot create a default Genie space: no tables given and none "
+                "discovered. Pass tables= or a populated catalog/schema."
+            )
+        return self.create_space(
+            tables=space_tables, title=space_title, warehouse_id=warehouse_id,
+        )
 
     # ------------------------------------------------------------------ #
     # One-shot ask

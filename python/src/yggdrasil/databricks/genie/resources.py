@@ -178,6 +178,7 @@ class GenieDefaults:
     space_id: Optional[str] = None
     warehouse_id: Optional[str] = None
     max_result_rows: Optional[int] = None
+    default_space_title: str = "Yggdrasil Genie"
     wait: WaitingConfig = DEFAULT_GENIE_WAIT
 
 
@@ -617,3 +618,16 @@ class GenieSpace(DatabricksResource):
         from .agent import GenieAgent
 
         return GenieAgent(space=self, **kwargs)
+
+    def trash(self, *, missing_ok: bool = False) -> None:
+        """Move this space to the trash (the SDK's delete for spaces)."""
+        from databricks.sdk.errors import NotFound
+
+        LOGGER.debug("Trashing Genie space %r", self)
+        try:
+            self.api.trash_space(space_id=self.space_id)
+        except NotFound:
+            if not missing_ok:
+                raise
+            LOGGER.debug("Genie space %r already gone", self)
+        self._details = None

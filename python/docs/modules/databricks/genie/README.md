@@ -69,6 +69,41 @@ print(space.warehouse_id)   # the warehouse Genie runs queries on
 print(space.explore_url)    # deep link into the Databricks UI
 ```
 
+## Create a space
+
+You don't need a pre-built space — create one over a set of Unity Catalog
+tables (the warehouse defaults to the workspace's default):
+
+```python
+space = genie.create_space(
+    tables=["main.sales.orders", "main.sales.customers"],
+    title="Sales",                    # default: GenieDefaults.default_space_title
+    warehouse_id=None,                # default: workspace default warehouse
+)
+print(space.space_id)
+
+# Discover a schema's tables (skips temp tables; capped at 25 — Genie
+# allows at most 30 per space)
+tables = genie.discover_tables(catalog="main", schema="sales")
+
+space.trash()                          # move a space to the trash
+```
+
+`ensure_default_space()` is the zero-config path — it reuses a space with
+the default title if one exists, else creates one over the client's bound
+catalog/schema, so `ask`/`agent`/the console work out of the box:
+
+```python
+client = DatabricksClient(catalog_name="main", schema_name="sales")
+space = client.genie.ensure_default_space()   # found-or-created
+client.genie.ask("top customers by revenue", space_id=space.space_id)
+```
+
+!!! note
+    Databricks' space listing is eventually consistent, so reuse is
+    best-effort — pin the returned id (e.g. `$YGG_GENIE_SPACE`) for stable
+    reuse rather than relying on title lookup right after creation.
+
 ## Ask a question
 
 `ask()` is the one-shot path — it starts a fresh conversation and returns
@@ -233,7 +268,11 @@ drives the *whole* Databricks surface from one prompt — not just Genie.
 # List spaces
 ygg databricks genie spaces
 
-# One-shot ask (space id or $YGG_GENIE_SPACE)
+# Create a space over a schema's tables (or pass --tables a.b.c,a.b.d)
+ygg databricks genie create --catalog main --schema sales --title Sales
+
+# One-shot ask (space id or $YGG_GENIE_SPACE). With no space set, a default
+# space is created over the client's bound catalog/schema automatically.
 ygg databricks genie ask "How many renewable sites are there?" --space 01f133…
 
 # Autonomous agent (heuristic, or fully autonomous with an LLM planner)

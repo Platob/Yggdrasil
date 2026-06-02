@@ -95,6 +95,39 @@ def _resolve_space(args: Any) -> Optional[str]:
     return getattr(args, "space_id", None) or os.environ.get("YGG_GENIE_SPACE") or None
 
 
+def _resolve_or_create_space(client: Any, args: Any) -> Optional[str]:
+    """Resolve the target space id, creating a default one when none is set.
+
+    Explicit ``--space`` / ``$YGG_GENIE_SPACE`` win. Otherwise a default
+    space is ensured over the client's bound catalog/schema (idempotent —
+    reused on later runs). Returns ``None`` only when no space is set *and*
+    no default could be created (no catalog/schema), so the caller can
+    print guidance.
+    """
+    space_id = _resolve_space(args)
+    if space_id:
+        return space_id
+    try:
+        sp = style.Spinner("no space set — creating a default Genie space…",
+                           color="38;5;209").start()
+        try:
+            space = client.genie.ensure_default_space()
+        finally:
+            sp.stop()
+    except Exception as exc:  # noqa: BLE001 — surface a helpful hint
+        style.fail(str(exc))
+        style.out("  " + style.muted(
+            "pass --space <id>, set $YGG_GENIE_SPACE, or bind a catalog/schema "
+            "(DATABRICKS_CATALOG / _SCHEMA) so a default space can be created.\n"
+        ))
+        return None
+    style.ok(f"using Genie space {style.bold(space.title or '')} ({space.space_id})")
+    style.out("  " + style.muted(
+        f"tip: export YGG_GENIE_SPACE={space.space_id} to reuse it next time\n"
+    ))
+    return space.space_id
+
+
 # ---------------------------------------------------------------------------
 # Interactive console
 # ---------------------------------------------------------------------------
@@ -298,6 +331,21 @@ class GenieCommand:
         ls = sub.add_parser("spaces", help="List Genie spaces.")
         ls.set_defaults(handler=cls._spaces)
 
+        create = sub.add_parser(
+            "create", help="Create a Genie space over a catalog/schema's tables.",
+        )
+        create.add_argument("--catalog", default=None,
+                            help="Catalog to source tables from (default: client catalog).")
+        create.add_argument("--schema", default=None,
+                            help="Schema to source tables from (default: client schema).")
+        create.add_argument("--tables", default=None,
+                            help="Comma-separated catalog.schema.table names (overrides "
+                                 "--catalog/--schema discovery).")
+        create.add_argument("--title", default=None, help="Space title.")
+        create.add_argument("--warehouse-id", dest="warehouse_id", default=None,
+                            help="Warehouse the space runs on (default: workspace default).")
+        create.set_defaults(handler=cls._create)
+
         ask = sub.add_parser("ask", help="Ask a one-shot question against a space.")
         ask.add_argument("question", help="Natural-language question.")
         ask.add_argument("--space", dest="space_id", default=None,
@@ -342,17 +390,41 @@ class GenieCommand:
         return 0
 
     @classmethod
+    def _create(cls, args: Any, build_client: Any) -> int:
+        client = build_client(args)
+        tables = [t.strip() for t in args.tables.split(",") if t.strip()] if args.tables else None
+        if not tables:
+            tables = client.genie.discover_tables(catalog=args.catalog, schema=args.schema)
+        if not tables:
+            style.fail("no tables to build a space from — pass --tables or a populated "
+                       "--catalog/--schema.")
+            return 1
+        space = client.genie.create_space(
+            tables=tables, title=args.title, warehouse_id=args.warehouse_id,
+        )
+        style.ok(f"created Genie space {style.bold(space.title or '')}")
+        style.out(f"  {style.muted('space_id')}  {space.space_id}\n")
+        style.out(f"  {style.muted('tables')}    {len(tables)}\n")
+        return 0
+
+    @classmethod
     def _ask(cls, args: Any, build_client: Any) -> int:
         client = build_client(args)
-        answer = client.genie.ask(args.question, space_id=_resolve_space(args))
+        space_id = _resolve_or_create_space(client, args)
+        if not space_id:
+            return 2
+        answer = client.genie.ask(args.question, space_id=space_id)
         _render_answer(answer, with_data=not args.no_data)
         return 0 if not answer.failed else 1
 
     @classmethod
     def _agent(cls, args: Any, build_client: Any) -> int:
         client = build_client(args)
+        space_id = _resolve_or_create_space(client, args)
+        if not space_id:
+            return 2
         agent = client.genie.agent(
-            space_id=_resolve_space(args), planner=args.planner, max_turns=args.max_turns,
+            space_id=space_id, planner=args.planner, max_turns=args.max_turns,
         )
         style.step(f"agent investigating: {args.goal}")
         run = agent.run(args.goal)
@@ -362,9 +434,8 @@ class GenieCommand:
     @classmethod
     def _console(cls, args: Any, build_client: Any) -> int:
         client = build_client(args)
-        space_id = _resolve_space(args)
+        space_id = _resolve_or_create_space(client, args)
         if not space_id:
-            style.fail("no space id — pass --space <id> or set YGG_GENIE_SPACE.")
             return 2
         return GenieConsole(
             client, space_id, planner=args.planner, max_turns=args.max_turns,
