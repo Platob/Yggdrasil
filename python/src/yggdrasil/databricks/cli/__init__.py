@@ -65,7 +65,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logging.getLogger("yggdrasil").setLevel(logging.DEBUG)
 
     try:
-        from yggdrasil.cli.style import print_logo
+        from yggdrasil.cli.style import force_color, print_logo
+        # This CLI's output lands in ANSI-rendering surfaces — a terminal or a
+        # Databricks job / notebook panel — so paint color even off a TTY
+        # (NO_COLOR still opts out).
+        force_color()
         print_logo("YGGDBKS")
     except Exception:
         pass
