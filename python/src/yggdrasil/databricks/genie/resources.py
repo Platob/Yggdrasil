@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from yggdrasil.databricks.resource import DatabricksResource
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg

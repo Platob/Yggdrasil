@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence, Union
 
 from yggdrasil.databricks.resource import DatabricksResource
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
@@ -51,7 +51,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         QueryEndpointResponse,
         RateLimit,
         ServedEntityInput,
-        ServedModelInput,
         ServerLogsResponse,
         ServingEndpointDetailed,
         TrafficConfig,
@@ -193,30 +192,6 @@ def _coerce_workload_type(value: Any) -> "Any":
     return ServedModelInputWorkloadType(str(value).upper())
 
 
-def _coerce_provider(value: Any) -> "Any":
-    from databricks.sdk.service.serving import ExternalModelProvider
-
-    if isinstance(value, ExternalModelProvider):
-        return value
-    # Providers are dasherized (``amazon-bedrock``, ``google-cloud-vertex-ai``);
-    # accept both the wire value and the looser ``amazon_bedrock`` spelling.
-    return ExternalModelProvider(str(value).strip().lower().replace("_", "-"))
-
-
-def _coerce_messages(messages: "MessagesLike") -> "list[ChatMessage]":
-    from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
-
-    out: list[ChatMessage] = []
-    for m in messages:
-        if isinstance(m, ChatMessage):
-            out.append(m)
-            continue
-        role = m.get("role", "user")
-        role_enum = role if isinstance(role, ChatMessageRole) else ChatMessageRole(str(role))
-        out.append(ChatMessage(role=role_enum, content=m["content"]))
-    return out
-
-
 def _tags_to_list(tags: Optional[Mapping[str, str]]) -> "Optional[list[EndpointTag]]":
     if not tags:
         return None
@@ -286,8 +261,6 @@ class Served:
 
     @staticmethod
     def external(
-        provider: Any,
-        model: str,
         external_model: "ExternalModel",
         *,
         name: Optional[str] = None,
@@ -296,12 +269,13 @@ class Served:
 
         The per-provider helpers (:meth:`openai`, :meth:`anthropic`, …)
         call through here; reach for this directly only when you need a
-        provider the helpers don't cover yet.
+        provider the helpers don't cover yet. ``name`` defaults to the
+        external model's own name.
         """
         from databricks.sdk.service.serving import ServedEntityInput
 
         return ServedEntityInput(
-            name=name or model,
+            name=name or external_model.name,
             external_model=external_model,
         )
 
@@ -342,7 +316,7 @@ class Served:
             task=task,
             openai_config=cfg,
         )
-        return Served.external(ExternalModelProvider.OPENAI, model, em, name=name)
+        return Served.external(em, name=name)
 
     @staticmethod
     def anthropic(
@@ -365,7 +339,7 @@ class Served:
             task=task,
             anthropic_config=AnthropicConfig(anthropic_api_key=_secret_ref(api_key_secret)),
         )
-        return Served.external(ExternalModelProvider.ANTHROPIC, model, em, name=name)
+        return Served.external(em, name=name)
 
     @staticmethod
     def amazon_bedrock(
@@ -398,7 +372,7 @@ class Served:
             task=task,
             amazon_bedrock_config=cfg,
         )
-        return Served.external(ExternalModelProvider.AMAZON_BEDROCK, model, em, name=name)
+        return Served.external(em, name=name)
 
     @staticmethod
     def cohere(
@@ -425,7 +399,7 @@ class Served:
                 cohere_api_base=api_base,
             ),
         )
-        return Served.external(ExternalModelProvider.COHERE, model, em, name=name)
+        return Served.external(em, name=name)
 
     @staticmethod
     def google_vertex(
@@ -455,7 +429,7 @@ class Served:
             task=task,
             google_cloud_vertex_ai_config=cfg,
         )
-        return Served.external(ExternalModelProvider.GOOGLE_CLOUD_VERTEX_AI, model, em, name=name)
+        return Served.external(em, name=name)
 
 
 def _secret_ref(value: Optional[str]) -> Optional[str]:
@@ -586,42 +560,19 @@ class ServingEndpoint(DatabricksResource):
     # ------------------------------------------------------------------ #
     # Config assembly
     # ------------------------------------------------------------------ #
-    def _resolve_inference_table(self) -> "Any":
-        """Build the AI Gateway inference-table config, or ``None``.
-
-        Catalog / schema resolve from the service defaults, then the
-        client's bound catalog / schema. When neither yields a catalog
-        *and* a schema, payload capture is silently skipped — there is
-        nowhere governed to write the Delta table.
-        """
-        from databricks.sdk.service.serving import AiGatewayInferenceTableConfig
-
-        d = self.service.defaults
-        catalog = d.inference_table_catalog or getattr(self.client, "catalog_name", None)
-        schema = d.inference_table_schema or getattr(self.client, "schema_name", None)
-        if not catalog or not schema:
-            LOGGER.debug(
-                "Skipping inference-table capture for %r: no catalog/schema "
-                "resolvable (set ServingDefaults.inference_table_catalog/_schema "
-                "or bind the client to a catalog/schema).",
-                self,
-            )
-            return None
-        return AiGatewayInferenceTableConfig(
-            enabled=True,
-            catalog_name=catalog,
-            schema_name=schema,
-            table_name_prefix=d.inference_table_prefix or self.name.replace("-", "_"),
-        )
-
     def _default_ai_gateway(self) -> "Optional[AiGatewayConfig]":
         """Assemble the AI Gateway config from the service defaults.
 
-        Returns ``None`` when every gateway feature is disabled so the
-        endpoint is created without a gateway block at all.
+        Mirrors the "max-config" defaults: usage tracking + inference-table
+        payload capture + an optional rate limit. Inference-table capture
+        needs a catalog *and* schema (from the defaults or the client's
+        bound catalog/schema); without one it's silently skipped — there's
+        nowhere governed to write the Delta table. Returns ``None`` when
+        every gateway feature is off so no gateway block is sent.
         """
         from databricks.sdk.service.serving import (
             AiGatewayConfig,
+            AiGatewayInferenceTableConfig,
             AiGatewayRateLimit,
             AiGatewayRateLimitKey,
             AiGatewayRateLimitRenewalPeriod,
@@ -632,7 +583,26 @@ class ServingEndpoint(DatabricksResource):
         usage = (
             AiGatewayUsageTrackingConfig(enabled=True) if d.enable_usage_tracking else None
         )
-        inference = self._resolve_inference_table() if d.enable_inference_table else None
+
+        inference = None
+        if d.enable_inference_table:
+            catalog = d.inference_table_catalog or getattr(self.client, "catalog_name", None)
+            schema = d.inference_table_schema or getattr(self.client, "schema_name", None)
+            if catalog and schema:
+                inference = AiGatewayInferenceTableConfig(
+                    enabled=True,
+                    catalog_name=catalog,
+                    schema_name=schema,
+                    table_name_prefix=d.inference_table_prefix or self.name.replace("-", "_"),
+                )
+            else:
+                LOGGER.debug(
+                    "Skipping inference-table capture for %r: no catalog/schema "
+                    "resolvable (set ServingDefaults.inference_table_catalog/_schema "
+                    "or bind the client to a catalog/schema).",
+                    self,
+                )
+
         rate_limits = None
         if d.rate_limit_calls:
             rate_limits = [
@@ -942,12 +912,19 @@ class ServingEndpoint(DatabricksResource):
         turn) or a sequence of ``{"role": ..., "content": ...}`` mappings
         / :class:`ChatMessage` objects.
         """
-        if isinstance(messages, str):
-            msgs = [{"role": "user", "content": messages}]
-        else:
-            msgs = messages
+        from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+        raw = [{"role": "user", "content": messages}] if isinstance(messages, str) else messages
+        chat_messages: list[ChatMessage] = []
+        for m in raw:
+            if isinstance(m, ChatMessage):
+                chat_messages.append(m)
+            else:
+                role = m.get("role", "user")
+                role = role if isinstance(role, ChatMessageRole) else ChatMessageRole(str(role))
+                chat_messages.append(ChatMessage(role=role, content=m["content"]))
         return self.query(
-            messages=_coerce_messages(msgs),
+            messages=chat_messages,
             max_tokens=max_tokens,
             temperature=temperature,
             n=n,

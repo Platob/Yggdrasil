@@ -192,9 +192,6 @@ class GenieAgent:
 
         return run
 
-    #: ``investigate`` reads better at some call sites; same behaviour.
-    investigate = run
-
     def ask(self, question: str) -> "GenieAnswer":
         """One-shot passthrough — ask without driving follow-ups."""
         return self.space.ask(question, wait=self.wait)
