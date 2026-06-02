@@ -22,6 +22,7 @@ import base64
 import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Mapping, Optional
+from urllib.parse import quote
 from xml.etree import ElementTree as ET
 
 from yggdrasil.aws.fs.sigv4 import (
@@ -124,9 +125,15 @@ class S3HttpClient:
     # ------------------------------------------------------------------
     def _url(self, key: str = "", *, query: "Mapping[str, str] | None" = None) -> URL:
         # Virtual-hosted: bucket is already in ``endpoint`` host. Path-style:
-        # ``/<bucket>/<key>``. Either way ``URL`` percent-encodes the key once
-        # and the signer signs that exact path.
-        path = f"/{self.bucket}/{key}" if self.path_style else f"/{key}"
+        # ``/<bucket>/<key>``. Percent-encode the (raw) key once — preserving
+        # only ``/`` and the RFC-3986 unreserved set — so the path the signer
+        # canonicalizes and the path on the wire agree with what S3 computes.
+        # ``URL``'s default path-safe set keeps sub-delims like ``=`` literal,
+        # but S3's SigV4 canonical URI encodes them (``region=us`` ->
+        # ``region%3Dus``); without this a Delta partition key (``col=val``)
+        # signs to ``SignatureDoesNotMatch``.
+        enc_key = quote(key, safe="/~") if key else key
+        path = f"/{self.bucket}/{enc_key}" if self.path_style else f"/{enc_key}"
         url = self.endpoint._replace_path(path)
         if query:
             url = url.with_query_items(query)

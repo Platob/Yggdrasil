@@ -3585,6 +3585,27 @@ class Table(DatabricksPath):
             return None
         return self.aws().s3.path(location)
 
+    def delta(self) -> "DeltaFolder":
+        """Return a :class:`~yggdrasil.io.delta.DeltaFolder` over this table's
+        backing storage — the native Delta read/write surface.
+
+        Built from :meth:`storage_path` so the folder (and every parquet /
+        ``_delta_log`` child it resolves) inherits the table's
+        temporary-credential :class:`AWSClient`; constructing a DeltaFolder
+        from the bare URI string would drop those creds. Lets callers read
+        (``tbl.delta().read_arrow_table()``) or commit
+        (``tbl.delta().write_arrow_table(t, mode=Mode.APPEND)``) straight
+        against the transaction log, bypassing the warehouse.
+        """
+        from yggdrasil.io.delta import DeltaFolder
+
+        path = self.storage_path()
+        if path is None:
+            raise FileNotFoundError(
+                f"{self!r} has no resolvable storage_location for a DeltaFolder."
+            )
+        return DeltaFolder(path=path)
+
     def aws(
         self,
         operation: "TableOperation | ModeLike | None" = None,
