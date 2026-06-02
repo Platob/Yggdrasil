@@ -1288,6 +1288,16 @@ class Table(DatabricksPath):
             Column.from_api(table=self, infos=col_info)
             for col_info in (infos.columns or [])
         ]
+        # A successful info fetch proves the table exists — seed the stat
+        # cache in the same beat (built inline to avoid recursing through
+        # ``_stat_uncached`` → ``read_infos`` → here) so a follow-up
+        # ``exists`` / ``stat`` reuses it.
+        self._persist_stat_cache(
+            IOStats(
+                kind=IOKind.DIRECTORY,
+                media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_TABLE,
+            )
+        )
         logger.debug(
             "Stored info for table %r (id=%s, columns=%d, type=%s)",
             self, getattr(infos, "table_id", None),

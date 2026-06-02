@@ -373,6 +373,14 @@ class Volume(DatabricksPath):
         # drop the cached Path so the next call resolves against the
         # fresh URL.
         self._storage_path = None
+        # A successful info fetch proves the volume exists — seed the stat
+        # cache (a volume is directory-like) in the same beat so a follow-up
+        # ``exists`` / ``stat`` / ``is_dir`` reuses it instead of re-probing.
+        # Build the IOStats inline (not via ``_stat_uncached``, which routes
+        # back through ``read_info`` → here and would recurse).
+        self._persist_stat_cache(
+            IOStats(kind=IOKind.DIRECTORY, media_type=MediaTypes.DIRECTORY)
+        )
         return info
 
     def _reset_cache(self) -> None:
@@ -381,6 +389,10 @@ class Volume(DatabricksPath):
         self._storage_path = None
         self._catalog = None
         self._schema = None
+        # The info and the stat snapshot describe the same object — drop
+        # them together so a re-probe after a delete / rebind is honest.
+        self._stat_cached = None
+        self._stat_cached_at = 0.0
 
     def clear(self) -> "Volume":
         """Public alias for :meth:`_reset_cache`; returns ``self``."""
