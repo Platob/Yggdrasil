@@ -1535,10 +1535,13 @@ def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> in
     """Group parsed ops by target into a :class:`DatabricksInsertBatch` and let
     each batch execute itself (one aggregated body per target), clearing the
     consumed logs + data afterward. Returns the op count."""
+    from yggdrasil.cli import style
+
     client = tables.client
     batches = DatabricksInsertBatch.group(ops)
     if not batches:
         logger.info("async loader: no pending operation logs")
+        style.info("no pending operations")
         return 0
     logger.info("async loader: %d target group(s)", len(batches))
 
@@ -1547,13 +1550,15 @@ def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> in
         target_name = batch.logs[0].target_name
         target = tables[target_name]
         mode = batch.mode
+        n_files = len(batch.active)
         logger.info(
             "loading %d file(s) into %s (%s)",
-            len(batch.active), target_name, mode.name.lower(),
+            n_files, target_name, mode.name.lower(),
         )
         # The batch builds + runs its own DML — bind the resolved Table and
         # let it execute (renders the UNION ALL body, runs it via the
         # target's sql_insert / execute_many).
+        started = time.perf_counter()
         batch.execute(target=target, wait=wait)
         # Clear consumed logs + data (incl. superseded ops) after a load —
         # unlink a staged file, drop a staged table (the Spark dispatch).
@@ -1561,6 +1566,13 @@ def dispatch_async(tables: Any, ops: "Iterable[Any]", *, wait: Any = True) -> in
             _best_effort_unlink(op.log_file)
             op.cleanup_staged_data(client)
         processed += len(batch.logs)
+        sep = style.dim("·")
+        style.step(
+            f"{style.bold(style.brand(target_name))}  {sep}  "
+            f"{style.amber(mode.name.lower())}  {sep}  "
+            f"{n_files} file(s)  {sep}  "
+            f"{style.dim(f'{time.perf_counter() - started:.2f}s')}"
+        )
     return processed
 
 

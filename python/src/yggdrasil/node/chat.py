@@ -234,7 +234,7 @@ class ChatClient:
         print_logo("YGGCHAT")
         with Spinner("connecting...", color="33") as sp:
             channels = self.list_channels()
-            sp.stop(f"{yellow('connected')} to {bold(self.base_url)} as {colored_name(self.username)}")
+            sp.stop(f"{green('connected')} to {bold(self.base_url)} as {colored_name(self.username)}")
         self._cmd_channels()
         self._sys(f"joined #{self.channel} -- type /help for commands\n")
         self._seed_last_id()

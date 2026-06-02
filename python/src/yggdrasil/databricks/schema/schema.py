@@ -47,7 +47,7 @@ from yggdrasil.databricks.sql.sql_utils import DEFAULT_TAG_COLLATION, databricks
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
-from yggdrasil.enums.mode import ModeLike
+from yggdrasil.enums.mode import Mode, ModeLike
 from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.path import Path
@@ -728,6 +728,179 @@ class UCSchema(DatabricksPath):
         # Structural change — drop both _infos and the entity-tag cache.
         self._reset_cache(invalidate_cache=True)
         return self
+
+    # ── clone ───────────────────────────────────────────────────────────────────
+
+    def clone(
+        self,
+        target: "str | UCSchema | None" = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        deep: bool = True,
+        mode: ModeLike = Mode.IGNORE,
+        include_views: bool = True,
+        name: str | None = None,
+        max_workers: int | None = None,
+    ) -> dict[str, str]:
+        """Clone every child of this schema into *target*, in parallel.
+
+        The target schema (and any missing parent catalog) is created first,
+        then each child table / view is cloned concurrently. ``mode`` is the
+        single existence policy, applied uniformly to every sub-clone:
+
+        - ``IGNORE`` (default) — ``CREATE … IF NOT EXISTS``: a child already
+          present is **skipped** (left untouched), a missing one is created.
+        - ``OVERWRITE`` / ``TRUNCATE`` — ``CREATE OR REPLACE``: overwrite
+          same-named targets.
+        - ``ERROR_IF_EXISTS`` — plain ``CREATE``: record a failure per clash.
+
+        A target that exists but **changed kind** (table ⇄ view) can't be
+        cross-replaced by Delta, so it is dropped first and recreated as the
+        source's current kind (except under ``ERROR_IF_EXISTS``, which lets the
+        clash surface as a failure). One child's failure is recorded and never
+        aborts the rest of the batch.
+
+        Args:
+            target:        Destination schema — a :class:`UCSchema`, a
+                           ``"catalog.schema"`` / ``"schema"`` dotted name, or
+                           ``None`` when *catalog_name* / *schema_name* are
+                           passed explicitly. A bare name reuses this schema's
+                           catalog.
+            catalog_name:  Target catalog override (defaults to this schema's).
+            schema_name:   Target schema override.
+            deep:          DEEP clone (independent copy) vs SHALLOW (metadata
+                           only, shares the source's files).
+            mode:          Existence policy (``Mode`` or mode-like string)
+                           forwarded to every sub-clone — see above. Defaults to
+                           ``IGNORE`` (skip what's already there).
+            include_views: Also clone view-shaped children (re-emitting their
+                           definition); ``False`` clones only tables.
+            name:          Optional child-name filter (exact or glob) — clone a
+                           subset.
+            max_workers:   Thread-pool size for the fan-out (defaults to the
+                           child count, capped at 16).
+
+        Returns:
+            ``{table_name: status}`` where status is ``"created"``,
+            ``"skipped"`` (already present), or ``"failed: <error>"``.
+        """
+        import concurrent.futures as cf
+
+        # One existence policy drives the whole fan-out, forwarded to every
+        # sub-clone so the batch is uniform.
+        sub_mode = Mode.from_(mode)
+        if sub_mode not in (
+            Mode.OVERWRITE, Mode.TRUNCATE, Mode.IGNORE, Mode.ERROR_IF_EXISTS,
+        ):
+            raise ValueError(
+                f"clone mode must be OVERWRITE/TRUNCATE, IGNORE, or "
+                f"ERROR_IF_EXISTS — got {sub_mode.name}."
+            )
+        skip_existing = sub_mode is Mode.IGNORE
+        # ERROR_IF_EXISTS wants a clash to fail; every other mode means
+        # "(re)create over it", which is what licenses dropping a kind-drifted
+        # target before recreating it.
+        recreate_on_drift = sub_mode is not Mode.ERROR_IF_EXISTS
+
+        # Resolve the destination catalog / schema from whichever form the
+        # caller passed (UCSchema, dotted string, or explicit kwargs).
+        if isinstance(target, UCSchema):
+            target_catalog, target_schema = target.catalog_name, target.schema_name
+        else:
+            parsed_catalog = parsed_schema = None
+            if target:
+                parts = [p.strip().strip("`") for p in str(target).split(".") if p.strip()]
+                if len(parts) == 1:
+                    parsed_schema = parts[0]
+                elif len(parts) == 2:
+                    parsed_catalog, parsed_schema = parts
+                else:
+                    raise ValueError(
+                        f"clone target {target!r} must be a 'schema' or "
+                        f"'catalog.schema' name."
+                    )
+            target_catalog = catalog_name or parsed_catalog or self.catalog_name
+            target_schema = schema_name or parsed_schema
+        if not target_schema:
+            raise ValueError(
+                "clone needs a target schema — pass target='catalog.schema' / "
+                "'schema', a UCSchema, or schema_name=."
+            )
+        if target_catalog == self.catalog_name and target_schema == self.schema_name:
+            raise ValueError(
+                f"Cannot clone {self.full_name()} onto itself — choose a "
+                f"different target catalog/schema."
+            )
+
+        tgt = (
+            target
+            if isinstance(target, UCSchema)
+            else type(self)(
+                service=self.service,
+                catalog_name=target_catalog,
+                schema_name=target_schema,
+                path_prefix=self.path_prefix,
+            )
+        )
+        tgt.ensure_created(comment=f"clone of {self.full_name()}")
+
+        # ``list_tables`` pre-stores each child's SchemaInfo, so ``is_view`` is
+        # free here — no extra round-trip to filter views out.
+        children = [
+            child for child in self.tables(name=name)
+            if include_views or not child.is_view
+        ]
+        if not children:
+            logger.info("clone %s → %s: no children to copy", self, tgt)
+            return {}
+
+        def _clone_one(src: "Table") -> tuple[str, str]:
+            dst = tgt.table(src.table_name)
+            try:
+                if dst.exists():
+                    # ``exists()`` populated dst's infos, so ``is_view`` is free.
+                    kind_changed = bool(src.is_view) != bool(dst.is_view)
+                    if not kind_changed and skip_existing:
+                        return src.table_name, "skipped"
+                    if kind_changed and recreate_on_drift:
+                        # Neither direction can be cross-replaced — a view can't
+                        # ``CREATE OR REPLACE TABLE`` and a table can't
+                        # ``CREATE OR REPLACE VIEW`` — so drop the stale target
+                        # (table→view *and* view→table) and recreate it as the
+                        # source's current kind. The UC tables API drops views
+                        # too, so one ``delete`` covers both.
+                        logger.info(
+                            "clone %s → %s: target changed kind (view=%s→%s) — "
+                            "dropping before recreate",
+                            src.full_name(), dst.full_name(),
+                            dst.is_view, src.is_view,
+                        )
+                        dst.delete(missing_ok=True)
+                src.clone(target=dst, deep=deep, mode=sub_mode)
+                return src.table_name, "created"
+            except Exception as exc:  # noqa: BLE001 — collect, don't abort the batch
+                logger.warning(
+                    "clone %s → %s failed: %s", src.full_name(), dst.full_name(), exc,
+                )
+                return src.table_name, f"failed: {exc}"
+
+        workers = max_workers or min(len(children), 16)
+        results: dict[str, str] = {}
+        with cf.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="ygg-schema-clone",
+        ) as pool:
+            for table_name, status in pool.map(_clone_one, children):
+                results[table_name] = status
+
+        created = sum(s == "created" for s in results.values())
+        skipped = sum(s == "skipped" for s in results.values())
+        failed = sum(s.startswith("failed") for s in results.values())
+        logger.info(
+            "cloned %s → %s: %d created, %d skipped, %d failed",
+            self.full_name(), tgt.full_name(), created, skipped, failed,
+        )
+        return results
 
     # ── tags ──────────────────────────────────────────────────────────────────
 

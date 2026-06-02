@@ -10,8 +10,8 @@ End-to-end tests that:
 
 Requires:
     DATABRICKS_HOST, DATABRICKS_TOKEN (or auth profile)
-    Optional: DATABRICKS_INTEGRATION_CATALOG (default: main)
-              DATABRICKS_INTEGRATION_SCHEMA (default: ygg_delta_test)
+    Optional: DATABRICKS_INTEGRATION_CATALOG (default: trading_tgp_dev)
+              DATABRICKS_INTEGRATION_SCHEMA (default: ygg_integration)
 
 Run:
     python -m pytest tests/test_yggdrasil/test_delta/test_delta_databricks.py -v -s -m integration
@@ -39,7 +39,7 @@ def _catalog() -> str:
 
 
 def _schema() -> str:
-    return os.environ.get("DATABRICKS_INTEGRATION_SCHEMA", "ygg_delta_test").strip() or "ygg_delta_test"
+    return os.environ.get("DATABRICKS_INTEGRATION_SCHEMA", "ygg_integration").strip() or "ygg_integration"
 
 
 # ---------------------------------------------------------------------------

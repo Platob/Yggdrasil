@@ -6,6 +6,7 @@ Auto-disables color when stdout is not a TTY.
 from __future__ import annotations
 
 import itertools
+import os
 import sys
 import threading
 import time
@@ -14,22 +15,76 @@ _CSI = "\033["
 _RESET = f"{_CSI}0m"
 _IS_TTY = sys.stdout.isatty()
 
+
+def _color_enabled() -> bool:
+    """Whether to emit ANSI color.
+
+    A real TTY gets color; so does Databricks job / notebook output (it
+    renders ANSI even though stdout is not a TTY) and anything that opts in
+    via ``FORCE_COLOR`` / ``YGG_FORCE_COLOR``. ``NO_COLOR`` (the de-facto
+    standard) always wins and turns it off."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    force = os.environ.get("FORCE_COLOR") or os.environ.get("YGG_FORCE_COLOR")
+    if force and force.lower() not in ("0", "false", "no"):
+        return True
+    if _IS_TTY:
+        return True
+    return bool(os.environ.get("DATABRICKS_RUNTIME_VERSION"))
+
+
+#: Color is gated separately from :data:`_IS_TTY` — escape sequences render in
+#: places that aren't a terminal (Databricks output panels), while cursor
+#: animations (spinner, clear-line) stay TTY-only so logs don't fill with
+#: ``\r`` junk. Flip it explicitly with :func:`force_color`.
+_COLOR = _color_enabled()
+
+
+def force_color(enabled: bool = True) -> None:
+    """Override color autodetection (``NO_COLOR`` still wins when disabling).
+
+    Used by CLIs whose output is consumed in ANSI-rendering surfaces — a
+    terminal or a Databricks job / notebook panel — so color shows even off a
+    TTY."""
+    global _COLOR
+    _COLOR = bool(enabled) and not os.environ.get("NO_COLOR")
+
+
 # -- colors ----------------------------------------------------------------
 
 def _esc(code: str, text: str) -> str:
-    if not _IS_TTY:
+    if not _COLOR:
         return text
     return f"{_CSI}{code}m{text}{_RESET}"
 
-def bold(text: str) -> str:    return _esc("1", text)
-def dim(text: str) -> str:     return _esc("2", text)
-def red(text: str) -> str:     return _esc("31", text)
-def green(text: str) -> str:   return _esc("32", text)
-def yellow(text: str) -> str:  return _esc("33", text)
-def blue(text: str) -> str:    return _esc("34", text)
-def magenta(text: str) -> str: return _esc("35", text)
-def cyan(text: str) -> str:    return _esc("36", text)
-def orange(text: str) -> str:  return _esc("38;5;208", text)
+# One coral-forward theme for every ygg CLI. Coral orange is the brand /
+# primary accent; green means good, red means bad, amber means caution, and
+# everything secondary recedes to a muted grey. The decorative names kept for
+# back-compat (``cyan``/``magenta``/``blue``) are repainted onto this theme, so
+# all CLIs share one look — retune the palette here and it changes everywhere.
+_CORAL = "38;5;209"   # brand / primary accent (coral orange)
+_GREEN = "38;5;42"    # good
+_RED   = "38;5;203"   # bad (a coral-red that sits beside the brand)
+_AMBER = "38;5;214"   # caution
+_MUTED = "38;5;245"   # secondary — labels, paths, hints
+
+def bold(text: str) -> str:  return _esc("1", text)
+def dim(text: str) -> str:   return _esc("2", text)
+
+# -- semantic palette (prefer these) --------------------------------------
+def brand(text: str) -> str: return _esc(_CORAL, text)   # coral orange
+def good(text: str) -> str:  return _esc(_GREEN, text)
+def bad(text: str) -> str:   return _esc(_RED, text)
+def amber(text: str) -> str: return _esc(_AMBER, text)
+def muted(text: str) -> str: return _esc(_MUTED, text)
+
+# -- back-compat aliases — existing call sites map onto the theme ----------
+coral = orange = brand           # brand / primary accent
+green = good                     # good
+red = bad                        # bad
+yellow = amber                   # caution
+cyan = magenta = brand           # decorative accents → brand coral
+blue = muted                     # paths / secondary → muted grey
 
 def clear_line() -> None:
     sys.stdout.write(f"{_CSI}2K\r")
@@ -76,19 +131,26 @@ _LOGOS: dict[str, tuple[str, ...]] = {
 }
 
 
+#: Coral brand gradient (256-color) painted top→bottom across the logo rows —
+#: peach → coral → orange, anchored on the brand coral.
+_LOGO_GRADIENT = ("38;5;216", "38;5;209", "38;5;208", "38;5;202")
+
+
 def logo(suffix: str = "") -> str:
     """Render the YGG logo with an optional suffix like BOT, CHAT, GENIE."""
     key = suffix or "YGG"
     lines = _LOGOS.get(key, _LOGOS["YGG"])
-    if not _IS_TTY:
+    if not _COLOR:
         parts = ["  " + ln for ln in lines]
         if key not in _LOGOS and suffix:
             parts.append(f"  {suffix}")
         return "\n".join(parts)
 
-    o = f"{_CSI}38;5;208m"
     r = _RESET
-    rendered = [f"  {o}{ln}{r}" for ln in lines]
+    rendered = [
+        f"  {_CSI}{_LOGO_GRADIENT[min(i, len(_LOGO_GRADIENT) - 1)]}m{ln}{r}"
+        for i, ln in enumerate(lines)
+    ]
     if key not in _LOGOS and suffix:
         rendered.append(f"  {_CSI}1m{suffix}{r}")
     return "\n".join(rendered)
@@ -170,7 +232,7 @@ def progress_bar(current: int, total: int, width: int = 30, label: str = "") -> 
     filled = int(width * frac)
     bar = "█" * filled + "░" * (width - filled)
     pct = f"{frac * 100:5.1f}%"
-    if _IS_TTY:
+    if _COLOR:
         return f"  {_CSI}36m{bar}{_RESET} {pct} {dim(label)}"
     return f"  [{bar}] {pct} {label}"
 
@@ -201,3 +263,23 @@ def pulse_text(text: str, duration: float = 1.5, cycles: int = 2) -> None:
             out(f"\r{_CSI}2K  {_CSI}{code}m{text}{_RESET}")
             time.sleep(delay)
     out(f"\r{_CSI}2K  {text}\n")
+
+
+# -- structured log lines --------------------------------------------------
+
+def event(icon: str, text: str, code: str = "36") -> str:
+    """A timestamped, glyph-led log line: ``  HH:MM:SS  ● text`` (the glyph
+    colored, the clock dimmed)."""
+    return f"  {dim(time.strftime('%H:%M:%S'))}  {_esc(code, icon)}  {text}"
+
+
+def hr(width: int = 46) -> str:
+    """A dim horizontal rule."""
+    return "  " + dim("─" * width)
+
+
+def info(text: str) -> None: out(event("●", text, _CORAL) + "\n")
+def step(text: str) -> None: out(event("▸", text, _CORAL) + "\n")
+def ok(text: str) -> None:   out(event("✓", text, _GREEN) + "\n")
+def warn(text: str) -> None: out(event("▲", text, _AMBER) + "\n")
+def fail(text: str) -> None: out(event("✗", text, _RED) + "\n")

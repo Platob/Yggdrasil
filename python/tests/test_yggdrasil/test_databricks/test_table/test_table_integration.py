@@ -21,12 +21,13 @@ that only meaningfully exercises against a live Unity Catalog endpoint:
 
 Skip rules
 ----------
-Skipped wholesale unless ``DATABRICKS_HOST`` is set. The catalog /
-schema are read from :envvar:`DATABRICKS_INTEGRATION_CATALOG`
-(default ``trading``) and :envvar:`DATABRICKS_INTEGRATION_SCHEMA`
-(default ``unittest``); the test identity must have CREATE TABLE on
-the target schema. Permission-gated operations degrade to
-``unittest.SkipTest`` rather than failing the suite.
+Skipped wholesale unless ``DATABRICKS_HOST`` is set. Fixtures live in
+the shared ``trading_tgp_dev``.``ygg_integration`` home from
+:class:`DatabricksIntegrationCase` (override via
+:envvar:`DATABRICKS_INTEGRATION_CATALOG` /
+:envvar:`DATABRICKS_INTEGRATION_SCHEMA`); the test identity must have
+CREATE TABLE on the target schema. Permission-gated operations degrade
+to ``unittest.SkipTest`` rather than failing the suite.
 
 Cleanup
 -------
@@ -37,7 +38,6 @@ are dropped in ``tearDown`` — so a failed run leaves at most one orphan.
 
 from __future__ import annotations
 
-import os
 import secrets
 import unittest
 from typing import ClassVar
@@ -75,16 +75,6 @@ __all__ = [
     "TestTableAsyncInsertLogPathIntegration",
     "TestTablePandasIndexIntegration",
 ]
-
-
-def _resolve_env(var: str, default: str) -> str:
-    name = os.environ.get(var, default).strip()
-    if not name:
-        raise unittest.SkipTest(
-            f"{var} is empty — set it to a location the test identity "
-            f"has CREATE TABLE on."
-        )
-    return name
 
 
 def _sample_schema() -> pa.Schema:
@@ -125,8 +115,11 @@ class _TableFixture(DatabricksIntegrationCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.catalog_name = _resolve_env("DATABRICKS_INTEGRATION_CATALOG", "trading")
-        cls.schema_name = _resolve_env("DATABRICKS_INTEGRATION_SCHEMA", "unittest")
+        # Shared ``trading_tgp_dev``.``ygg_integration`` home (created if
+        # missing, never dropped) from the base case.
+        cls.integration_schema()
+        cls.catalog_name = cls.INTEGRATION_CATALOG
+        cls.schema_name = cls.INTEGRATION_SCHEMA
         cls.table_name = cls.table_prefix
         full_name = f"{cls.catalog_name}.{cls.schema_name}.{cls.table_name}"
         try:

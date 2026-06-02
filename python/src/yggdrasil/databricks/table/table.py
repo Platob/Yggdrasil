@@ -2480,6 +2480,7 @@ class Table(DatabricksPath):
         deep: bool = True,
         replace: bool = False,
         missing_ok: bool = False,
+        mode: "ModeLike | None" = None,
         properties: Mapping[str, Any] | None = None,
         location: str | None = None,
         version: int | None = None,
@@ -2502,6 +2503,11 @@ class Table(DatabricksPath):
             replace:       Emit ``CREATE OR REPLACE TABLE``.
             missing_ok: Emit ``CREATE TABLE IF NOT EXISTS``. Mutually
                            exclusive with *replace*.
+            mode:          Existence policy as a :class:`Mode` (overrides
+                           *replace* / *missing_ok* when set): ``OVERWRITE`` /
+                           ``TRUNCATE`` → ``CREATE OR REPLACE``, ``IGNORE`` →
+                           ``CREATE … IF NOT EXISTS``, ``ERROR_IF_EXISTS`` →
+                           plain ``CREATE`` (fails if the target exists).
             properties:    Optional ``TBLPROPERTIES`` overrides.
             location:      External storage path for the target.
             version:       Delta source version (``VERSION AS OF``).
@@ -2510,6 +2516,20 @@ class Table(DatabricksPath):
         Returns:
             A :class:`Table` bound to this service pointing at the target.
         """
+        if mode is not None:
+            resolved = Mode.from_(mode)
+            if resolved in (Mode.OVERWRITE, Mode.TRUNCATE):
+                replace, missing_ok = True, False
+            elif resolved is Mode.IGNORE:
+                replace, missing_ok = False, True
+            elif resolved is Mode.ERROR_IF_EXISTS:
+                replace, missing_ok = False, False
+            else:
+                raise ValueError(
+                    f"clone mode must be OVERWRITE/TRUNCATE, IGNORE, or "
+                    f"ERROR_IF_EXISTS — got {resolved.name}. Clone creates the "
+                    f"target; APPEND/MERGE/UPSERT/AUTO don't apply."
+                )
         if replace and missing_ok:
             raise ValueError("Use either replace=True or missing_ok=True, not both.")
         if version is not None and timestamp is not None:
