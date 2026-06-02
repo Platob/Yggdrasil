@@ -68,11 +68,14 @@ from yggdrasil.data.statement import (
 from yggdrasil.databricks.sql.exceptions import SQLError
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.io.tabular import Tabular
+from yggdrasil.lazy_imports import polars_module
 from ..fs import VolumePath, DatabricksPath
 from yggdrasil.aws.fs.path import S3Path
 from ..sql.types import parse_databricks_field
 
 if TYPE_CHECKING:
+    import polars as pl
+
     from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
@@ -1118,6 +1121,73 @@ class WarehouseStatementResult(StatementResult):
 
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: CastOptions) -> None:
         raise NotImplementedError("Cannot write to Databricks SQL")
+
+    # ------------------------------------------------------------------
+    # Polars
+    # ------------------------------------------------------------------
+
+    def _scan_polars_frame(self, options: CastOptions) -> "pl.LazyFrame":
+        """Autonomous polars :class:`~polars.LazyFrame` over the result.
+
+        The base implementation wraps a one-shot :class:`pa.RecordBatchReader`
+        in :func:`polars.scan_pyarrow_dataset` — a frame that drains on the
+        first ``collect()`` and can't be re-scanned, and whose
+        ``RecordBatchReader`` eagerly pulls every external-link chunk into
+        memory the moment polars plans the scan.
+
+        This override registers a polars *IO plugin* whose generator
+        re-streams the statement's external-link Arrow chunks on each
+        collect.  The returned LazyFrame is self-contained:
+
+        - **Re-collectable** — every ``collect()`` (or ``collect()`` inside
+          a larger plan) re-runs the generator, re-fetching chunks from the
+          warehouse rather than replaying an exhausted reader.
+        - **Pushdown-aware** — polars hands the generator its
+          projection (``with_columns``), ``predicate``, and ``n_rows``;
+          we apply each so only the needed columns are converted, rows are
+          filtered as they stream, and fetching stops once ``n_rows`` are
+          produced.
+        - **Streaming** — chunks flow one batch at a time through the
+          executor's pooled HTTP session, never buffering the whole result.
+
+        ``is_pure=True`` lets polars de-duplicate the scan when the same
+        result appears more than once in a plan — sound because a terminal
+        statement's result is immutable.
+        """
+        pl = polars_module()
+
+        # Defer the schema probe (which waits for the statement to reach a
+        # terminal state) until polars actually plans the scan — keeps the
+        # ``scan`` call itself lazy.
+        def schema() -> "pl.Schema":
+            return self.collect_schema(options).to_polars_schema()
+
+        def source(
+            with_columns: "list[str] | None",
+            predicate: "pl.Expr | None",
+            n_rows: "int | None",
+            batch_size: "int | None",
+        ) -> "Iterator[pl.DataFrame]":
+            remaining = n_rows
+            for batch in self._read_arrow_batches(options):
+                frame = pl.from_arrow(batch)
+                if with_columns is not None:
+                    frame = frame.select(with_columns)
+                if predicate is not None:
+                    frame = frame.filter(predicate)
+                if remaining is not None:
+                    # Stop before pulling (and fetching) the next chunk
+                    # once the row budget is met — closing this generator
+                    # cancels any chunks the executor pool prefetched.
+                    if frame.height >= remaining:
+                        yield frame.head(remaining)
+                        return
+                    remaining -= frame.height
+                yield frame
+
+        return pl.io.plugins.register_io_source(
+            source, schema=schema, is_pure=True,
+        )
 
 
 # ---------------------------------------------------------------------------
