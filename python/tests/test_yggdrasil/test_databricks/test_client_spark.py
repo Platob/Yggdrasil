@@ -228,6 +228,18 @@ class TestClassifyDependency:
 
 class TestWorkspacePyPIRegistry:
 
+    def test_default_base_is_shared_registry(self, serverless_client, monkeypatch):
+        # No base_path → the shared workspace registry (same root the job image
+        # uses), so Spark Connect and the job image share one index.
+        from yggdrasil.databricks.job.wheel import WORKSPACE_PYPI_DIR
+        monkeypatch.setattr(
+            type(serverless_client), "workspaces",
+            property(lambda self: MagicMock(name="Workspaces")),
+        )
+        assert WorkspacePyPIRegistry.DEFAULT_BASE == WORKSPACE_PYPI_DIR == "/Workspace/Shared/pypi"
+        reg = WorkspacePyPIRegistry(client=serverless_client)
+        assert reg.base_path.full_path() == "/Workspace/Shared/pypi"
+
     @pytest.fixture
     def registry(self, serverless_client, tmp_path, monkeypatch):
         """Registry with a mocked workspace upload path.

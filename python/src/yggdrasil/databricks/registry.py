@@ -336,11 +336,10 @@ class WorkspacePyPIRegistry:
                 <package>-<other-version>-py3-none-any.whl
                 ...
 
-    ``base_path`` defaults to
-    ``/Workspace/Users/<me>/.ygg/pypi/simple`` so a single-user
-    install Just Works without an admin first; pass an explicit
-    workspace path (``/Workspace/Shared/...``) to share across a
-    team.
+    ``base_path`` defaults to the shared ``/Workspace/Shared/pypi`` — the same
+    workspace-wide index the serverless job image deploys to — so the Spark
+    Connect path and the job image reuse one registry. Pass an explicit
+    workspace path for a private / per-user root.
 
     :meth:`publish` is the entry point. It classifies the dep,
     builds a wheel locally when needed, uploads it to the
@@ -362,7 +361,11 @@ class WorkspacePyPIRegistry:
     base_path: "WorkspacePath" = field(default=None)  # type: ignore[assignment]
     local_cache: _LocalPath = field(default=None)  # type: ignore[assignment]
 
-    DEFAULT_BASE: ClassVar[str] = "/Workspace/Users/<me>/.ygg/pypi/simple"
+    #: Shared workspace registry root — the same PyPI-like index the ygg image
+    #: deploys to (``yggdrasil.databricks.job.wheel.WORKSPACE_PYPI_DIR``), so the
+    #: Spark Connect path and the serverless job image share one workspace-wide
+    #: index. Pass an explicit ``base_path`` for a private / per-user root.
+    DEFAULT_BASE: ClassVar[str] = "/Workspace/Shared/pypi"
 
     def __post_init__(self) -> None:
         from yggdrasil.databricks.fs.workspace_path import WorkspacePath
