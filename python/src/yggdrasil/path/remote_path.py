@@ -451,6 +451,28 @@ class RemotePath(Path):
         cached.mtime = now
         self._persist_stat_cache(cached)
 
+    def _touch_stat(
+        self,
+        *,
+        size: "int | None" = None,
+        mtime: "float | None" = None,
+        media_type: Any = None,
+    ) -> None:
+        """Post-write metadata update, kept consistent for remote paths.
+
+        :class:`Holder._touch_stat` only updates the holder-owned ``_size``, but
+        a remote path reads :attr:`size` / :attr:`exists` from the **stat
+        cache** — so after a write through ``write_mv`` the cache would stay
+        stale (e.g. ``MISSING`` from a pre-write probe). Mirror the new size into
+        the stat cache (creating / flipping it to ``FILE``) so a follow-up
+        ``size`` reflects the write without a re-stat round trip."""
+        super()._touch_stat(size=size, mtime=mtime, media_type=media_type)
+        if size is not None:
+            self._stamp_buffered_size(int(size))
+        if media_type is not None and self._stat_cached is not None:
+            self._stat_cached.media_type = media_type
+            self._persist_stat_cache(self._stat_cached)
+
     def _cache_after_upload(self, content: bytes, size: int) -> None:
         """Populate the page cache with committed content after upload.
 
