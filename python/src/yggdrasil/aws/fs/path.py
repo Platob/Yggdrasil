@@ -428,6 +428,7 @@ class S3Path(ExploreUrlRepr, RemotePath):
                 kind=IOKind.FILE,
                 mode=0,
                 media_type=_media_type_from_headers(resp.headers),
+                metadata=_metadata_from_headers(resp.headers),
             )
         # No object at the exact key — is it a prefix?
         prefix = self.key if self.key.endswith("/") else self.key + "/"
@@ -558,7 +559,8 @@ class S3Path(ExploreUrlRepr, RemotePath):
         if n < 0 and pos == 0 and self._stat_cached is None:
             self._persist_stat_cache(
                 IOStats(size=len(data), kind=IOKind.FILE, mtime=time.time(),
-                        media_type=_media_type_from_headers(resp.headers))
+                        media_type=_media_type_from_headers(resp.headers),
+                        metadata=_metadata_from_headers(resp.headers))
             )
         return memoryview(data)
 
@@ -639,3 +641,32 @@ def _mtime_from_headers(headers: Any) -> float:
         return parsedate_to_datetime(lm).timestamp()
     except Exception:
         return 0.0
+
+
+# Response headers worth surfacing as ``IOStats.metadata`` — the object's
+# identity / versioning / integrity, plus all user metadata
+# (``x-amz-meta-*``) and storage class. Keyed case-insensitively.
+_S3_META_HEADERS = {
+    "etag", "content-type", "content-encoding", "cache-control",
+    "x-amz-version-id", "x-amz-storage-class", "x-amz-server-side-encryption",
+    "x-amz-expiration", "x-amz-restore", "x-amz-checksum-sha256",
+    "x-amz-checksum-crc32", "last-modified",
+}
+
+
+def _metadata_from_headers(headers: Any) -> "dict[str, str] | None":
+    """Flatten the interesting HEAD/GET headers into ``IOStats.metadata``.
+
+    Lower-cased keys: every ``x-amz-meta-*`` user-metadata header plus a
+    curated set of object identity / versioning / integrity headers
+    (ETag, version id, storage class, checksums, …). ``None`` when none
+    are present so an object with no extra metadata leaves the slot empty.
+    """
+    if not headers:
+        return None
+    out: "dict[str, str]" = {}
+    for key, value in headers.items():
+        lk = str(key).lower()
+        if lk in _S3_META_HEADERS or lk.startswith("x-amz-meta-"):
+            out[lk] = str(value)
+    return out or None

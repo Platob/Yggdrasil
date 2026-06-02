@@ -58,9 +58,14 @@ class IOStats:
       bytes). ``None`` when no honest answer is available; never
       guess :class:`MimeTypes.OCTET_STREAM` here — let the caller
       decide.
+    - ``metadata`` — free-form backend metadata as a flat
+      ``dict[str, str]`` (S3 response + ``x-amz-meta-*`` headers,
+      Databricks Files headers, ETag, version id, …). ``None`` when the
+      backend exposes nothing extra; a single home for "everything else
+      the backend told us" without subclassing :class:`IOStats`.
 
-    Backends with richer metadata (ETag, content-type, owner…) should
-    subclass and extend rather than cram extras into ``mode``.
+    Backends with richer metadata (ETag, content-type, owner…) populate
+    :attr:`metadata` rather than cramming extras into ``mode``.
     """
 
     size: int = 0
@@ -68,6 +73,7 @@ class IOStats:
     kind: IOKind = IOKind.MISSING
     mode: int = 0
     media_type: "Optional[MediaType]" = None
+    metadata: "Optional[dict[str, str]]" = None
 
     # ------------------------------------------------------------------
     # ``os.stat_result`` compatibility — drop-in for legacy callers

@@ -121,6 +121,18 @@ class TestS3PathViaExternalVolume(DatabricksIntegrationCase):
         finally:
             p.unlink(missing_ok=True)
 
+    def test_stat_carries_metadata(self) -> None:
+        # The HEAD probe folds object identity / versioning headers into
+        # ``IOStats.metadata`` (etag, version id, content-type, …).
+        p = self._path("meta.bin")
+        try:
+            p.write_bytes(b"with-metadata")
+            stat = self._path("meta.bin").stat()
+            self.assertIsInstance(stat.metadata, dict)
+            self.assertIn("etag", stat.metadata)
+        finally:
+            p.unlink(missing_ok=True)
+
     def test_overwrite_replaces_contents(self) -> None:
         p = self._path("overwrite.bin")
         try:
