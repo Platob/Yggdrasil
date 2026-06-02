@@ -145,6 +145,59 @@ class TestWarehousePolarsLazyIntegration(SQLIntegrationCase):
         head = lf.head(5).collect()
         self.assertEqual(head["id"].to_list(), [0, 1, 2, 3, 4])
 
+    def test_head_does_not_drain_the_whole_stream(self) -> None:
+        """A tiny ``head`` over a large result must *fetch* only a little.
+
+        Correctness alone (``head(5) == [0..4]``) doesn't prove the frame
+        streamed lazily — the base ``scan_pyarrow_dataset`` reader would
+        also return the right 5 rows after eagerly pulling every chunk.
+        This asserts the *fetch* short-circuits: we count how many Arrow
+        batches ``_read_arrow_batches`` actually pulls from the warehouse
+        and require ``head(5)`` to pull far fewer than a full collect.
+
+        ``byte_size`` is forced small so the 250k-row result flushes as
+        many batches (the default 32 MiB cap would buffer the whole ~4 MiB
+        result into a single batch, hiding the early-termination signal).
+        """
+        n = 250_000
+        text = f"SELECT id, CAST(id AS STRING) AS name FROM range(0, {n})"
+        result = self._result(text)
+
+        # Count the batches the lazy generator pulls. The closure in
+        # ``_scan_polars_frame`` reads ``self._read_arrow_batches`` at
+        # collect time, so shadowing the bound method on the instance with
+        # a counting wrapper instruments every pull — and chaining through
+        # the original generator keeps the executor's cancel-on-close fetch
+        # behaviour intact.
+        original = result._read_arrow_batches
+        pulled = 0
+
+        def counting(options):
+            nonlocal pulled
+            for batch in original(options):
+                pulled += 1
+                yield batch
+
+        result._read_arrow_batches = counting
+
+        # Small flush size → the full result spans many batches.
+        flush_bytes = 256 * 1024
+        head = result.scan_polars_frame(byte_size=flush_bytes).head(5).collect()
+        self.assertEqual(head["id"].to_list(), [0, 1, 2, 3, 4])
+        pulled_for_head = pulled
+
+        pulled = 0
+        full = result.scan_polars_frame(byte_size=flush_bytes).collect()
+        self.assertEqual(full.height, n)
+        pulled_for_full = pulled
+
+        # The full collect spans many batches; the head pulls only the
+        # first one (or two, on a flush boundary) before the row budget is
+        # met and the stream is cancelled.
+        self.assertGreaterEqual(pulled_for_full, 5)
+        self.assertLessEqual(pulled_for_head, 2)
+        self.assertLess(pulled_for_head, pulled_for_full)
+
     def test_eager_read_polars_frame_still_works(self) -> None:
         """The eager ``read_polars_frame`` surface is unaffected by the
         lazy override."""
