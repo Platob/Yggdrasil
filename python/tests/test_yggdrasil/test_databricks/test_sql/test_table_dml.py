@@ -43,6 +43,7 @@ from yggdrasil.databricks.table.insert import (
     _build_delete_insert_statements,
     _build_dml_statements,
     _build_where_predicates,
+    make_sql_copy_into,
 )
 
 
@@ -58,6 +59,49 @@ def _normalize_ws(sql: str) -> str:
 
 def _texts(stmts: list[str]) -> list[str]:
     return [_normalize_ws(s) for s in stmts]
+
+
+# ---------------------------------------------------------------------------
+# make_sql_copy_into
+# ---------------------------------------------------------------------------
+
+
+class TestMakeSqlCopyInto:
+
+    def test_single_file_by_name(self) -> None:
+        sql = make_sql_copy_into("cat.sch.t", ["id", "v"], paths=["/Volumes/a.parquet"])
+        norm = _normalize_ws(sql)
+        # No target column list — Parquet rejects ``COPY INTO t (cols)``; the
+        # projection lives in the SELECT subquery instead.
+        assert norm.startswith("COPY INTO cat.sch.t FROM")
+        assert "FROM (SELECT `id`, `v` FROM '/Volumes/a.parquet')" in norm
+        assert "FILEFORMAT = PARQUET" in norm
+        assert "FILES" not in norm  # single file needs no allow-list
+        assert "COPY_OPTIONS ('mergeSchema' = 'false')" in norm
+
+    def test_many_files_same_dir_fold_into_files_list(self) -> None:
+        sql = make_sql_copy_into(
+            "cat.sch.t", ["id"],
+            paths=["/Volumes/d/a.parquet", "/Volumes/d/b.parquet"],
+        )
+        norm = _normalize_ws(sql)
+        assert "FROM (SELECT `id` FROM '/Volumes/d/')" in norm
+        assert "FILES = ('a.parquet', 'b.parquet')" in norm
+
+    def test_many_files_different_dirs_returns_none(self) -> None:
+        # COPY INTO reads one source path — mixed dirs aren't foldable.
+        assert make_sql_copy_into(
+            "cat.sch.t", ["id"],
+            paths=["/Volumes/d1/a.parquet", "/Volumes/d2/b.parquet"],
+        ) is None
+
+    def test_no_columns_loads_by_position(self) -> None:
+        sql = _normalize_ws(make_sql_copy_into("cat.sch.t", [], paths=["/Volumes/a.parquet"]))
+        assert sql.startswith("COPY INTO cat.sch.t FROM (SELECT * FROM '/Volumes/a.parquet')")
+        assert "(`" not in sql  # no explicit column list
+
+    def test_empty_paths_returns_none(self) -> None:
+        assert make_sql_copy_into("cat.sch.t", ["id"], paths=[]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +351,56 @@ class TestDMLDispatch:
         assert sql.startswith("INSERT INTO cat.sch.t")
         assert "NOT EXISTS" not in sql
         assert "DELETE" not in sql
+
+    def test_copy_into_replaces_plain_insert_on_append(self) -> None:
+        # When the un-keyed append carries a COPY INTO, it supersedes the
+        # plain INSERT … SELECT.
+        copy = make_sql_copy_into("cat.sch.t", ["id", "v"], paths=["/Volumes/x.parquet"])
+        stmts = _build_dml_statements(
+            target_location="cat.sch.t",
+            source_sql="SELECT `id`, `v` FROM parquet.`/Volumes/x.parquet`",
+            columns=["id", "v"],
+            mode=Mode.APPEND,
+            match_by=None,
+            update_column_names=None,
+            prune_predicates=[],
+            copy_into=copy,
+        )
+        sql = _normalize_ws(stmts[0])
+        assert sql.startswith("COPY INTO cat.sch.t")
+        assert "INSERT INTO" not in sql
+
+    def test_copy_into_ignored_for_overwrite(self) -> None:
+        # OVERWRITE can't be a COPY INTO (append-only) — stays INSERT OVERWRITE.
+        stmts = _build_dml_statements(
+            target_location="cat.sch.t",
+            source_sql="SELECT `id` FROM parquet.`/Volumes/x.parquet`",
+            columns=["id"],
+            mode=Mode.OVERWRITE,
+            match_by=None,
+            update_column_names=None,
+            prune_predicates=[],
+            copy_into="COPY INTO should-not-be-used",
+        )
+        sql = _normalize_ws(stmts[0])
+        assert sql.startswith("INSERT OVERWRITE cat.sch.t")
+        assert "COPY INTO" not in sql
+
+    def test_copy_into_ignored_when_keyed(self) -> None:
+        # A keyed append is a MERGE, not a COPY INTO.
+        stmts = _build_dml_statements(
+            target_location="cat.sch.t",
+            source_sql="SELECT `id`, `v` FROM parquet.`/Volumes/x.parquet`",
+            columns=["id", "v"],
+            mode=Mode.APPEND,
+            match_by=["id"],
+            update_column_names=None,
+            prune_predicates=[],
+            copy_into="COPY INTO should-not-be-used",
+        )
+        sql = _normalize_ws(stmts[0])
+        assert "MERGE INTO" in sql
+        assert "COPY INTO" not in sql
 
     def test_safe_merge_ignores_update_column_names(self) -> None:
         """``safe_merge=True`` discards ``update_column_names`` —

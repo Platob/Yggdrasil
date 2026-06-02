@@ -70,6 +70,7 @@ __all__ = [
     "DatabricksTableInsert",
     "DatabricksInsertBatch",
     "make_sql_select",
+    "make_sql_copy_into",
     "make_sql_insert",
     "stage_async_insert",
     "load_async",
@@ -103,6 +104,11 @@ _NAME_PREFIX = "[YGG][ASYNC]"
 #: Placeholder a staged Parquet source is referenced by on the warehouse path —
 #: substituted for the concrete external-data ``VolumePath`` at prepare time.
 ALIAS_TMPSRC = "__tmpsrc__"
+
+#: Modes whose plain (un-keyed) load is a pure *append* — the only shape
+#: ``COPY INTO`` can express. ``OVERWRITE`` / ``TRUNCATE`` / keyed writes keep
+#: ``INSERT`` / ``MERGE``.
+_COPY_INTO_MODES = (Mode.APPEND, Mode.AUTO)
 
 #: Schema (under the *target's* catalog) where a Spark-frame ``data`` source is
 #: staged as a temporary Delta table before its URL is recorded in the op-log.
@@ -613,8 +619,13 @@ class DatabricksTableInsert(_InsertExecution):
             staged = self.staged_source(self.client)
             if getattr(staged, "full_path", None) is not None:
                 staging = staged
-                source_ref = WarehousePreparedStatement.volume_path_text_value(staged)
-                source_sql = make_sql_select(self, source=source_ref)
+                source_sql = make_sql_select(
+                    self, source=WarehousePreparedStatement.volume_path_text_value(staged),
+                )
+                # Cleanup binds on the bare staged path so it matches both the
+                # INSERT (``parquet.`<path>```) and the COPY INTO (``'<path>'``)
+                # spellings of the same file.
+                source_ref = staged.full_path()
 
         texts = make_sql_insert(
             self,
@@ -787,6 +798,63 @@ def make_sql_select(
     return f"SELECT * FROM parquet.`{ref}`"
 
 
+def make_sql_copy_into(
+    target_location: str,
+    columns: "list[str]",
+    *,
+    paths: "list[str]",
+) -> "str | None":
+    """Render a ``COPY INTO`` load over staged Parquet ``paths``.
+
+    ``COPY INTO`` is Databricks' optimized, **idempotent** bulk file loader:
+    it tracks which files it has already ingested per target, so a retried
+    load skips files it already wrote (no duplicate rows — unlike
+    ``INSERT INTO … SELECT``). It only *appends*, so the caller restricts it
+    to the un-keyed APPEND / AUTO path.
+
+    Shapes:
+
+    * one file → ``FROM (SELECT <cols> FROM '<file>')``
+    * many files under a common directory → one load over that directory with
+      a ``FILES = (...)`` allow-list (this is the batch win: a single
+      ``COPY INTO`` replaces the per-file ``SELECT … UNION ALL …``)
+    * many files across *different* directories → returns ``None`` so the
+      caller falls back to the ``UNION ALL`` ``INSERT`` (``COPY INTO`` reads
+      from a single source path)
+
+    The column projection lives in the ``SELECT`` subquery (named columns →
+    by-name mapping into the target); with no known columns it loads ``*``.
+    A target column list (``COPY INTO t (c1, …)``) is deliberately *not*
+    emitted — Databricks rejects it for ``FILEFORMAT = PARQUET``
+    (``COPY_INTO_FEATURE_INCOMPATIBLE_SETTING``); the subquery projection is
+    the Parquet-compatible way to select / order columns.
+    """
+    import posixpath
+
+    if not paths:
+        return None
+
+    projection = ", ".join(quote_ident(c) for c in columns) if columns else "*"
+
+    if len(paths) == 1:
+        from_path = paths[0]
+        files_clause = ""
+    else:
+        dirs = {posixpath.dirname(p) for p in paths}
+        if len(dirs) != 1:
+            return None  # not foldable into one COPY INTO — caller falls back
+        from_path = next(iter(dirs)).rstrip("/") + "/"
+        names = ", ".join(f"'{posixpath.basename(p)}'" for p in paths)
+        files_clause = f"\nFILES = ({names})"
+
+    return (
+        f"COPY INTO {target_location}\n"
+        f"FROM (SELECT {projection} FROM '{from_path}')\n"
+        f"FILEFORMAT = PARQUET{files_clause}\n"
+        f"COPY_OPTIONS ('mergeSchema' = 'false')"
+    )
+
+
 def make_sql_insert(
     target: "DatabricksTableInsert | DatabricksInsertBatch",
     *,
@@ -846,6 +914,14 @@ def _make_op_insert(
         )
     if source_sql is None:
         source_sql = make_sql_select(op, client=client)
+    # Un-keyed append over a staged Parquet file → COPY INTO (idempotent,
+    # optimized) instead of INSERT … SELECT. The path is read off the op
+    # regardless of how ``source_sql`` references it.
+    copy_into = None
+    if op.mode in _COPY_INTO_MODES and not op.match_by and not op.is_table_source:
+        path = _op_file_path(op, client)
+        if path is not None:
+            copy_into = make_sql_copy_into(location, columns, paths=[path])
     prune_predicates = _build_where_predicates(op.predicate, target_alias="T")
     return _build_dml_statements(
         target_location=location,
@@ -859,7 +935,24 @@ def _make_op_insert(
         optimize_after_merge=op.optimize_after_merge,
         vacuum_hours=op.vacuum_hours,
         safe_merge=op.safe_merge,
+        copy_into=copy_into,
     )
+
+
+def _op_file_path(op: "DatabricksTableInsert", client: Any) -> "str | None":
+    """The staged Parquet's warehouse path for ``op``, or ``None``.
+
+    ``None`` when the op isn't a single staged file (a Delta-table source, or
+    a path that can't be resolved) — the caller then keeps ``INSERT``.
+    """
+    if op.is_table_source:
+        return None
+    try:
+        path = op.data_path(client)
+    except Exception:  # noqa: BLE001 - unresolvable path → fall back to INSERT
+        return None
+    full = getattr(path, "full_path", None)
+    return full() if callable(full) else None
 
 
 def _batch_source_sql(batch: "DatabricksInsertBatch", *, client: Any) -> str:
@@ -912,6 +1005,14 @@ def _make_batch_insert(
             if head is not None and head.schema is not None and head.schema.fields
             else []
         )
+    # The batch win: collapse the per-file ``SELECT … UNION ALL …`` into one
+    # ``COPY INTO`` over every staged Parquet file, when the load is a plain
+    # un-keyed append and all active ops are staged files sharing a directory.
+    copy_into = None
+    if batch.mode in _COPY_INTO_MODES and not batch.match_by and batch.active:
+        paths = [_op_file_path(op, client) for op in batch.active]
+        if all(p is not None for p in paths):
+            copy_into = make_sql_copy_into(location, columns, paths=paths)
     prune_predicates = _build_where_predicates(
         head.predicate if head is not None else None, target_alias="T",
     )
@@ -927,6 +1028,7 @@ def _make_batch_insert(
         optimize_after_merge=bool(head.optimize_after_merge) if head is not None else False,
         vacuum_hours=head.vacuum_hours if head is not None else None,
         safe_merge=bool(head.safe_merge) if head is not None else False,
+        copy_into=copy_into,
     )
 
 
@@ -1288,6 +1390,7 @@ def _build_dml_statements(
     optimize_after_merge: bool = False,
     vacuum_hours: Optional[int] = None,
     safe_merge: bool = False,
+    copy_into: "str | None" = None,
 ) -> list[str]:
     """Generate INSERT / MERGE / DELETE / OPTIMIZE / VACUUM SQL.
 
@@ -1373,6 +1476,11 @@ def _build_dml_statements(
             match_by=match_by,
             prune_predicates=prune_predicates,
         ))
+
+    elif copy_into is not None:
+        # Un-keyed append over staged Parquet — the optimized, idempotent
+        # bulk loader instead of ``INSERT INTO … SELECT``.
+        statements.append(copy_into)
 
     else:
         statements.append(

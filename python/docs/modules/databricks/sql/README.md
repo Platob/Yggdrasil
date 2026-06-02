@@ -105,6 +105,24 @@ print(as_pylist)
 - You can fan out one SQL result into Arrow/pandas/Polars/Spark/Python-native outputs.
 - The unstructured path (`list[dict]` and freeform string payloads) is useful for logs, notes, and semi-structured ingestion before normalization.
 
+### How a write lands (staged Parquet + `COPY INTO`)
+
+Arrow / pandas / Polars inserts stage the rows as Parquet in the target's
+Unity Catalog Volume, then load them with SQL:
+
+- **Append** (`Mode.APPEND` / `AUTO`, no match keys) uses Databricks
+  **`COPY INTO`** — the optimized, **idempotent** bulk file loader. It
+  tracks which files it already ingested, so a retried load never
+  double-inserts (unlike `INSERT INTO … SELECT`). An async batch folds
+  every staged file into a *single* `COPY INTO … FILES = (…)` over their
+  shared directory instead of a per-file `SELECT … UNION ALL …`.
+- **Overwrite / truncate / keyed** writes keep `INSERT OVERWRITE` /
+  `MERGE INTO` / keyed `DELETE`+`INSERT` (`COPY INTO` only appends).
+
+The column projection rides the `COPY INTO` subquery
+(`FROM (SELECT <cols> FROM '<path>')`) — Parquet rejects an explicit
+target column list — so columns still map by name.
+
 ## Table DDL/DML shortcuts
 
 - Build a typed table handle: `orders = sql.table("main.sales.orders")`

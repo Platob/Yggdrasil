@@ -244,8 +244,9 @@ class TestDatabricksTableInsert:
         assert ret is op and op.is_succeeded and op.result is inner
         run.assert_called_once()
         texts = run.call_args.args[1]               # the statement list
-        assert any("INSERT" in t.upper() for t in texts)
-        assert any("parquet.`/Volumes/c/s/t/.sql/tmp/x.parquet`" in t for t in texts)
+        # Un-keyed append over a staged Parquet → COPY INTO (idempotent loader).
+        assert any("COPY INTO" in t.upper() for t in texts)
+        assert any("'/Volumes/c/s/t/.sql/tmp/x.parquet'" in t for t in texts)
         # the staged file is registered for post-load cleanup
         assert run.call_args.kwargs["staging"] is dp.return_value
 
@@ -441,13 +442,16 @@ class TestMakeSqlInsertAtomic:
         assert "VACUUM c.s.t RETAIN 72 HOURS" in joined
 
     def test_columns_derived_from_schema_when_omitted(self):
+        # Un-keyed append over a staged Parquet → COPY INTO, columns derived
+        # from the op schema, source read by single-quoted path.
         from yggdrasil.databricks.table.insert import make_sql_insert
         with patch("yggdrasil.databricks.path.DatabricksPath.from_") as dp:
             dp.return_value.full_path.return_value = "/Volumes/x.parquet"
             stmts = make_sql_insert(self._op(mode="append"))
         sql = _normalize_ws(stmts[0])
-        assert "(`id`, `v`)" in sql
-        assert "parquet.`/Volumes/x.parquet`" in sql
+        assert sql.startswith("COPY INTO c.s.t FROM")
+        assert "FROM (SELECT `id`, `v` FROM '/Volumes/x.parquet')" in sql
+        assert "FILEFORMAT = PARQUET" in sql
 
 
 # --------------------------------------------------------------------------- #
@@ -795,13 +799,15 @@ class TestLoadAsync:
             processed = load_async(svc, logs, wait=False)
 
         assert processed == 2
-        # one load per (target, mode) group, with the union body in the DML
+        # one load per (target, mode) group — the un-keyed append batch folds
+        # both staged files into a single COPY INTO (no per-file UNION ALL).
         assert len(calls) == 1
-        union = "\n".join(calls[0][1])
-        assert "UNION ALL" in union
-        assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
-        assert "parquet.`/Volumes/c/s/t/.sql/tmp/b.parquet`" in union
-        assert "INSERT INTO" in union and "OVERWRITE" not in union   # append
+        sql = "\n".join(calls[0][1])
+        assert "COPY INTO" in sql and "UNION ALL" not in sql
+        assert "INSERT INTO" not in sql and "OVERWRITE" not in sql   # append
+        assert "FILES = ('a.parquet', 'b.parquet')" in sql
+        # this loader-target mock has no schema → positional ``SELECT *`` load
+        assert "FROM (SELECT * FROM '/Volumes/c/s/t/.sql/tmp/')" in sql
         # consumed logs + data (reconstructed from the uniform URL) cleaned up
         log_a.unlink.assert_called_once()
         log_b.unlink.assert_called_once()
@@ -892,5 +898,7 @@ class TestLoadAsync:
             processed = dispatch_async(svc, ops)
         assert processed == 2
         assert len(calls) == 1
-        union = "\n".join(calls[0][1])
-        assert "parquet.`/Volumes/c/s/t/.sql/tmp/a.parquet`" in union
+        sql = "\n".join(calls[0][1])
+        # both staged files fold into one COPY INTO over their shared directory
+        assert "COPY INTO" in sql
+        assert "FILES = ('a.parquet', 'b.parquet')" in sql
