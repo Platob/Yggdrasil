@@ -6,6 +6,10 @@ Subcommands::
     ygg databricks warehouses list/get/create/delete
     ygg databricks table async_insert --table-name … --data …
     ygg databricks table execute_insert --logs … | --log-file …
+    ygg databricks genie spaces
+    ygg databricks genie ask "top customers by revenue" --space <id>
+    ygg databricks genie agent "why did Q3 revenue dip?" --space <id>
+    ygg databricks genie repl --space <id>
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ from typing import Any, Optional, Sequence
 
 from .services import (
     ClustersCommand,
+    GenieCommand,
     TablesCommand,
     WarehousesCommand,
 )
@@ -55,6 +60,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     subparsers = parser.add_subparsers(dest="command")
     ClustersCommand.register(subparsers)
+    GenieCommand.register(subparsers)
     TablesCommand.register(subparsers)
     WarehousesCommand.register(subparsers)
 

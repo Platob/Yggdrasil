@@ -17,5 +17,6 @@ service-specific flags, and implementing :meth:`DatabricksCLI.run`.
 """
 
 from .base import DatabricksCLI
+from .genie import GenieCLI
 
-__all__ = ["DatabricksCLI"]
+__all__ = ["DatabricksCLI", "GenieCLI"]
