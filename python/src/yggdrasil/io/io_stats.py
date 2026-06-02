@@ -59,9 +59,14 @@ class IOStats:
       bytes). ``None`` when no honest answer is available; never
       guess :class:`MimeTypes.OCTET_STREAM` here — let the caller
       decide.
+    - ``metadata`` — free-form backend metadata as a flat
+      ``dict[str, str]`` (S3 response + ``x-amz-meta-*`` headers,
+      Databricks Files headers, ETag, version id, …). ``None`` when the
+      backend exposes nothing extra; a single home for "everything else
+      the backend told us" without subclassing :class:`IOStats`.
 
-    Backends with richer metadata (ETag, content-type, owner…) should
-    subclass and extend rather than cram extras into ``mode``.
+    Backends with richer metadata (ETag, content-type, owner…) populate
+    :attr:`metadata` rather than cramming extras into ``mode``.
     """
 
     size: int = 0
@@ -77,6 +82,7 @@ class IOStats:
     #: window (``mtime`` / ``kind`` may be cold while ``field`` is
     #: known, and vice-versa).
     field: "Optional[Field]" = None
+    metadata: "Optional[dict[str, str]]" = None
 
     # ------------------------------------------------------------------
     # ``os.stat_result`` compatibility — drop-in for legacy callers
@@ -85,7 +91,8 @@ class IOStats:
     def __repr__(self):
         dt_ = datetime.datetime.fromtimestamp(self.mtime, datetime.timezone.utc).isoformat()
         field = "" if self.field is None else f" field={self.field!r}"
-        return f"<IOStats size={self.size} mtime={dt_!r} kind={self.kind.name} mode={self.mode} media_type={self.media_type!r}{field}>"
+        meta = "" if self.metadata is None else f" metadata={self.metadata!r}"
+        return f"<IOStats size={self.size} mtime={dt_!r} kind={self.kind.name} mode={self.mode} media_type={self.media_type!r}{field}{meta}>"
 
     def __str__(self):
         return repr(self)
@@ -152,6 +159,7 @@ class IOStats:
         mode: Any = ...,
         media_type: Any = ...,
         field: Any = ...,
+        metadata: Any = ...,
     ) -> "IOStats":
         """Return a fresh :class:`IOStats` with selected fields overridden.
 
@@ -167,6 +175,7 @@ class IOStats:
             mode=self.mode if mode is ... else mode,
             media_type=self.media_type if media_type is ... else media_type,
             field=self.field if field is ... else field,
+            metadata=self.metadata if metadata is ... else metadata,
         )
 
     def with_(
@@ -178,6 +187,7 @@ class IOStats:
         mode: Any = ...,
         media_type: Any = ...,
         field: Any = ...,
+        metadata: Any = ...,
         inplace: bool = False,
     ) -> "IOStats":
         """Return a stats object with the given fields overridden.
@@ -196,6 +206,7 @@ class IOStats:
                 mode=mode,
                 media_type=media_type,
                 field=field,
+                metadata=metadata,
             )
         if size is not ...:
             self.size = size
@@ -209,6 +220,8 @@ class IOStats:
             self.media_type = media_type
         if field is not ...:
             self.field = field
+        if metadata is not ...:
+            self.metadata = metadata
         return self
 
     # ------------------------------------------------------------------

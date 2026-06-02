@@ -370,12 +370,6 @@ class Folder(Path):
     def full_path(self) -> str:
         return self.path.full_path()
 
-    def _bread(self, n, pos, mode):
-        raise NotImplementedError(f"{type(self).__name__} is a directory.")
-
-    def _bwrite(self, data, pos, mode):
-        raise NotImplementedError(f"{type(self).__name__} is a directory.")
-
     def _ls(self, *, recursive=False, include_dirs=False, **kwargs):
         return self.path._ls(recursive=recursive, include_dirs=include_dirs, **kwargs)
 

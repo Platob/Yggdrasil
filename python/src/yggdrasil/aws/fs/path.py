@@ -249,6 +249,13 @@ class S3Bucket(ExploreUrlRepr, RemotePath):
         for key in self.iter_keys("", delimiter=None if recursive else "/"):
             yield self._child(key, singleton_ttl=singleton_ttl)
 
+    def _read_mv(self, n: int, pos: int) -> memoryview:
+        raise NotImplementedError(
+            f"{type(self).__name__} is an S3 bucket, not a positional byte "
+            f"buffer. Navigate to an object via ``bucket / '<key>'`` and read "
+            f"that instead."
+        )
+
     def _child(self, key: str, *, singleton_ttl: Any = False) -> "S3Path":
         url = self.url._replace_path("/" + key.lstrip("/"))
         return S3Path(url=url, service=self._service, s3_bucket=self, singleton_ttl=singleton_ttl)
@@ -406,12 +413,22 @@ class S3Path(ExploreUrlRepr, RemotePath):
             return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
         resp = self.s3_bucket.http.head(self.key)
         if resp is not None:
+            size = int(resp.headers.get("Content-Length", 0) or 0)
+            if size == 0:
+                # Some S3-compatible stores (seen on UC external-location
+                # buckets) return ``Content-Length: 0`` on HEAD even for a
+                # non-empty object — which would break every size-dependent
+                # op (append-at-EOF, the zip / parquet ranged readers). Confirm
+                # the real size from a one-byte ranged GET's ``Content-Range:
+                # bytes 0-0/<total>`` header; a genuinely empty object stays 0.
+                size = self._size_via_content_range()
             return IOStats(
-                size=int(resp.headers.get("Content-Length", 0) or 0),
+                size=size,
                 mtime=_mtime_from_headers(resp.headers),
                 kind=IOKind.FILE,
                 mode=0,
                 media_type=_media_type_from_headers(resp.headers),
+                metadata=_metadata_from_headers(resp.headers),
             )
         # No object at the exact key — is it a prefix?
         prefix = self.key if self.key.endswith("/") else self.key + "/"
@@ -419,6 +436,27 @@ class S3Path(ExploreUrlRepr, RemotePath):
         if page.objects or page.prefixes:
             return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
         return IOStats(size=0, mtime=0.0, kind=IOKind.MISSING, mode=0)
+
+    def _size_via_content_range(self) -> int:
+        """Total object size from a one-byte ranged GET's ``Content-Range``.
+
+        Fallback for stores whose HEAD under-reports ``Content-Length``.
+        ``Content-Range: bytes 0-0/<total>`` carries the true size; falls
+        back to the returned ``Content-Length`` (then 0) when the header is
+        absent. A genuinely empty object (416 / no range) resolves to 0.
+        """
+        try:
+            resp = self.s3_bucket.http.get(self.key, start=0, length=1)
+        except S3NotFound:
+            return 0
+        except Exception:
+            return 0
+        cr = resp.headers.get("Content-Range") or resp.headers.get("content-range")
+        if cr and "/" in cr:
+            total = cr.rsplit("/", 1)[-1].strip()
+            if total.isdigit():
+                return int(total)
+        return int(resp.headers.get("Content-Length", 0) or 0) or len(resp.content or b"")
 
     # ==================================================================
     # Listing (redirects to the bucket)
@@ -499,9 +537,10 @@ class S3Path(ExploreUrlRepr, RemotePath):
     def read_mv(self, size: int = -1, offset: int = 0, *, cursor: bool = False) -> memoryview:
         # Whole-file fast path skips the size probe: the no-Range GET returns
         # the object + canonical Content-Length, folded into the stat cache.
+        # An in-flight write buffer takes precedence — defer to RemotePath.
         if cursor:
             offset = self._pos
-        if size < 0 and offset == 0:
+        if size < 0 and offset == 0 and self._scratch is None:
             out = self._read_mv(-1, 0)
             if cursor:
                 self._pos = len(out)
@@ -520,7 +559,8 @@ class S3Path(ExploreUrlRepr, RemotePath):
         if n < 0 and pos == 0 and self._stat_cached is None:
             self._persist_stat_cache(
                 IOStats(size=len(data), kind=IOKind.FILE, mtime=time.time(),
-                        media_type=_media_type_from_headers(resp.headers))
+                        media_type=_media_type_from_headers(resp.headers),
+                        metadata=_metadata_from_headers(resp.headers))
             )
         return memoryview(data)
 
@@ -534,7 +574,6 @@ class S3Path(ExploreUrlRepr, RemotePath):
         self._persist_stat_cache(
             IOStats(size=size, kind=IOKind.FILE, mtime=time.time(), media_type=self.media_type)
         )
-        self._cache_after_upload(bytes(content), size)
         self._invalidate_parent_ls()
         return size
 
@@ -561,7 +600,6 @@ class S3Path(ExploreUrlRepr, RemotePath):
         self._persist_stat_cache(
             IOStats(size=size, kind=IOKind.FILE, mtime=time.time(), media_type=self.media_type)
         )
-        self._note_streamed_upload(size)
         self._invalidate_parent_ls()
         return size
 
@@ -603,3 +641,32 @@ def _mtime_from_headers(headers: Any) -> float:
         return parsedate_to_datetime(lm).timestamp()
     except Exception:
         return 0.0
+
+
+# Response headers worth surfacing as ``IOStats.metadata`` — the object's
+# identity / versioning / integrity, plus all user metadata
+# (``x-amz-meta-*``) and storage class. Keyed case-insensitively.
+_S3_META_HEADERS = {
+    "etag", "content-type", "content-encoding", "cache-control",
+    "x-amz-version-id", "x-amz-storage-class", "x-amz-server-side-encryption",
+    "x-amz-expiration", "x-amz-restore", "x-amz-checksum-sha256",
+    "x-amz-checksum-crc32", "last-modified",
+}
+
+
+def _metadata_from_headers(headers: Any) -> "dict[str, str] | None":
+    """Flatten the interesting HEAD/GET headers into ``IOStats.metadata``.
+
+    Lower-cased keys: every ``x-amz-meta-*`` user-metadata header plus a
+    curated set of object identity / versioning / integrity headers
+    (ETag, version id, storage class, checksums, …). ``None`` when none
+    are present so an object with no extra metadata leaves the slot empty.
+    """
+    if not headers:
+        return None
+    out: "dict[str, str]" = {}
+    for key, value in headers.items():
+        lk = str(key).lower()
+        if lk in _S3_META_HEADERS or lk.startswith("x-amz-meta-"):
+            out[lk] = str(value)
+    return out or None

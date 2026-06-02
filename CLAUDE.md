@@ -77,6 +77,7 @@ Treat a cross-language divergence as a bug.
 5. **POC mode** — ship fast, iterate. No legacy compat.
 6. **Int64 IDs** — prefer `int` over string UUIDs. Use xxhash-based composites: `xxh32(semantic_key) << 32 | timestamp_ms`. Two xxhash int64s are acceptable when coupling different concepts. Never use cryptographic hashes for IDs.
 7. **Upsert by default** — POST endpoints create if name not found, update if it exists. ID is immutable once assigned.
+8. **Prefer uv over pip** — use `uv` for all Python tooling: `uv venv`, `uv pip install`, and `uv build --wheel` for building wheels (no separate `pip` needed). Reach for `pip` only as a fallback when `uv` isn't on PATH, or for the rare build that must bundle dependencies (`uv build` produces the project wheel only — deps resolve at install). Run tests/scripts with `uv run`.
 
 ## Layout
 

@@ -1,13 +1,12 @@
 """Tests for Databricks path types: VolumePath, DBFSPath, WorkspacePath.
 
-Mock tests verify construction, singleton caching, and minimum SDK
-calls.  Integration tests (marked ``@pytest.mark.integration``) run
-against a live workspace when ``DATABRICKS_HOST`` is set.
+Mock-only: verifies construction, singleton caching, mock read/write,
+and minimum SDK calls. Never touches a live workspace — live round-trips
+live in ``tests/test_yggdrasil/test_databricks/test_fs/*_integration.py``.
 """
 from __future__ import annotations
 
 import base64
-import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -401,60 +400,7 @@ class TestDatabricksPathSingleton:
         assert a is b
 
 
-# ---------------------------------------------------------------------------
-# Integration tests — require DATABRICKS_HOST env var
-# ---------------------------------------------------------------------------
-
-
-_HAS_WORKSPACE = bool(os.getenv("DATABRICKS_HOST"))
-
-
-@pytest.mark.skipif(not _HAS_WORKSPACE, reason="DATABRICKS_HOST not set")
-class TestVolumePathIntegration:
-
-    @pytest.fixture(autouse=True)
-    def _setup(self):
-        from yggdrasil.databricks import DatabricksClient
-        self.client = DatabricksClient.current()
-        self.catalog = os.getenv("DATABRICKS_CATALOG", "main")
-        self.schema = os.getenv("DATABRICKS_SCHEMA", "default")
-        self.volume = os.getenv("DATABRICKS_VOLUME", "ygg_test")
-
-    def _volume_path(self, path):
-        RemotePath._INSTANCES.clear()
-        return VolumePath(
-            f"/Volumes/{self.catalog}/{self.schema}/{self.volume}/{path}",
-            client=self.client,
-        )
-
-    def test_write_read_bytes_roundtrip(self):
-        p = self._volume_path("_ygg_test/integration.bin")
-        p.write_bytes(b"integration test data")
-        p.invalidate_singleton(remove_global=False)
-        data = p.read_bytes()
-        assert data == b"integration test data"
-        p._remove_file(missing_ok=True, wait=None)
-
-    def test_write_read_arrow_roundtrip(self):
-        import pyarrow as pa
-        p = self._volume_path("_ygg_test/integration.parquet")
-        leaf = p.as_media("parquet")
-        table = pa.table({"x": [1, 2, 3]})
-        leaf.write_arrow_table(table)
-        result = leaf.read_arrow_table()
-        assert result.num_rows == 3
-        p._remove_file(missing_ok=True, wait=None)
-
-    def test_mkdir_and_list(self):
-        p = self._volume_path("_ygg_test/subdir/")
-        p._mkdir(parents=True, exist_ok=True)
-        parent = self._volume_path("_ygg_test/")
-        entries = list(parent._ls())
-        assert any("subdir" in str(e) for e in entries)
-
-    def test_stat_returns_size(self):
-        p = self._volume_path("_ygg_test/stat.bin")
-        p.write_bytes(b"x" * 100)
-        p.invalidate_singleton(remove_global=False)
-        assert p.size >= 100
-        p._remove_file(missing_ok=True, wait=None)
+# Live-workspace round-trips live in
+# ``tests/test_yggdrasil/test_databricks/test_fs/test_volume_fs_integration.py``
+# (and its siblings) — this file is mock-only and never touches a real
+# workspace.

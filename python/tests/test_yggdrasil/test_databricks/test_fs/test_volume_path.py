@@ -401,11 +401,10 @@ class TestRangeReads:
 class TestOpenedCursor:
     """Opened (``vp.open("rb")`` + seek/read) vs non-opened reads.
 
-    An opened cursor routes reads through ``_read_mv(n, pos)`` so they
-    become HTTP Range requests, page-quantized by ``page_size``:
-    ``page_size=None`` fetches exact slices, a set page fetches whole
-    pages. Non-opened convenience reads (``read_bytes``) pull the whole
-    object. (Requires the HEAD-stat size to be correct — see the
+    Whole-blob, no page cache: an opened cursor routes each read through
+    ``_read_mv(n, pos)`` as an exact HTTP Range request — only the bytes
+    touched move. Non-opened convenience reads (``read_bytes``) pull the
+    whole object. (Requires the HEAD-stat size to be correct — see the
     bodyless Content-Length fix.)"""
 
     PAYLOAD = bytes(range(256)) * 16  # 4096 bytes
@@ -422,9 +421,9 @@ class TestOpenedCursor:
         )
         workspace.files.get_directory_metadata.side_effect = NotFound()
 
-    def test_opened_unpaged_reads_exact_slices(self, workspace, client, service):
+    def test_opened_reads_exact_slices(self, workspace, client, service):
         self._store_backed(workspace, self.PAYLOAD)
-        p = VolumePath("/Volumes/c/s/v/raw.bin", service=service, page_size=None)
+        p = VolumePath("/Volumes/c/s/v/raw.bin", service=service)
         with p.open("rb") as fh:
             fh.seek(1000)
             a = bytes(fh.read(64))
@@ -432,19 +431,8 @@ class TestOpenedCursor:
             b = bytes(fh.read(50))
         assert a == self.PAYLOAD[1000:1064]
         assert b == self.PAYLOAD[3000:3050]
-        # Opened + unpaged == exact random access: only touched bytes move.
+        # Opened cursor == exact random access: only touched bytes move.
         assert client.files_session.return_value.bytes_served == 64 + 50
-
-    def test_opened_paged_fetches_whole_pages(self, workspace, client, service):
-        self._store_backed(workspace, self.PAYLOAD)
-        p = VolumePath("/Volumes/c/s/v/raw.bin", service=service, page_size=256)
-        with p.open("rb") as fh:
-            fh.seek(1000)
-            chunk = bytes(fh.read(10))
-        assert chunk == self.PAYLOAD[1000:1010]
-        # Page-quantized: one ~256B page, not the whole 4096B object.
-        served = client.files_session.return_value.bytes_served
-        assert 0 < served <= 256
 
     def test_non_opened_read_bytes_pulls_whole_object(self, workspace, client, service):
         self._store_backed(workspace, self.PAYLOAD)
@@ -708,24 +696,17 @@ class TestWrite:
         service,
     ) -> None:
         # ``with vp.open("wb") as fh: fh.write(...)`` must collapse to
-        # a single ``files.upload`` even when the payload spans
-        # multiple buffered pages — the cursor's release flush and the
+        # a single ``files.upload`` — the cursor's release flush and the
         # parent's release flush both fire (``IO._release`` →
         # ``parent.flush()`` plus ``RemotePath._release`` →
-        # ``self.flush()``), but the second hop must observe a clean
-        # dirty-page set and skip the upload. Without this guarantee
-        # every ``open("wb") + write`` round-trips the body twice over
-        # the wire.
+        # ``self.flush()``), but the second hop must observe a drained
+        # write buffer and skip the upload. Without this guarantee every
+        # ``open("wb") + write`` round-trips the body twice over the wire.
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
         workspace.files.download.side_effect = NotFound()
-        page_size = 1024
-        payload = b"A" * (page_size * 5 + 13)  # 5+ pages, off-boundary tail
-        p = VolumePath(
-            "/Volumes/c/s/v/x.bin",
-            service=service,
-            page_size=page_size,
-        )
+        payload = b"A" * (1024 * 5 + 13)  # off-boundary tail
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
         with p.open("wb") as fh:
             fh.write(payload)
         assert workspace.files.upload.call_count == 1
@@ -740,20 +721,14 @@ class TestWrite:
         service,
     ) -> None:
         # Repeated small writes inside one ``open("wb")`` accumulate in
-        # the page cache and commit on close as one upload — no
-        # per-write flush, even when the running total crosses a page
-        # boundary partway through.
+        # the in-memory write buffer and commit on close as one upload —
+        # no per-write flush.
         workspace.files.get_metadata.side_effect = NotFound()
         workspace.files.get_directory_metadata.side_effect = NotFound()
         workspace.files.download.side_effect = NotFound()
-        page_size = 1024
         chunk = b"X" * 200
-        n_chunks = 50  # 10_000 bytes total, ~10 pages
-        p = VolumePath(
-            "/Volumes/c/s/v/x.bin",
-            service=service,
-            page_size=page_size,
-        )
+        n_chunks = 50  # 10_000 bytes total
+        p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
         with p.open("wb") as fh:
             for _ in range(n_chunks):
                 fh.write(chunk)

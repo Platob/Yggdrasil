@@ -111,7 +111,9 @@ class TestFlow:
 
         assert gather([3, 1, 2]) == [1, 2, 3]
 
-    def test_definition_is_serverless_v5_with_ygg_databricks(self):
+    def test_definition_is_serverless_python_matched_with_ygg_databricks(self):
+        from yggdrasil.databricks.job.wheel import serverless_environment_version
+
         @flow(parameters=["a", "b"])
         def etl(x, y):
             ...
@@ -123,7 +125,8 @@ class TestFlow:
         assert task_obj.python_wheel_task.parameters == ["a", "b"]
         assert task_obj.environment_key == "default"
         env = spec["environments"][0]
-        assert env.spec.environment_version == "5"
+        # serverless env version is chosen to match the local Python
+        assert env.spec.environment_version == serverless_environment_version()
         assert env.spec.dependencies == [f"ygg[databricks]=={__version__}", "databricks-sdk"]
 
     def test_serverless_false_drops_environment(self):
@@ -152,8 +155,8 @@ class TestFlow:
 
         client = MagicMock()
         wheels = [
-            "/Workspace/Shared/.ygg/whl/ygg-demo/ygg-9.9-py3-none-any.whl",
-            "/Workspace/Shared/.ygg/whl/ygg-demo/databricks_sdk-1.2.3-py3-none-any.whl",
+            "/Workspace/Shared/pypi/ygg-demo/ygg-9.9-py3-none-any.whl",
+            "/Workspace/Shared/pypi/ygg-demo/databricks_sdk-1.2.3-py3-none-any.whl",
         ]
         with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheels) as ew:
             deployed = demo.deploy(client)
@@ -162,7 +165,7 @@ class TestFlow:
         # and ship them as workspace wheels — no index install
         assert ew.call_count == 1
         assert ew.call_args.args[1] == demo.wheel_package()     # (client, package, ...)
-        assert ew.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/.ygg/whl/ygg-demo"
+        assert ew.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/pypi/ygg-demo"
         assert ew.call_args.kwargs["extras"] == ("databricks",)
         assert ew.call_args.kwargs["requirements"] == ("databricks-sdk",)
         kwargs = client.jobs.create_or_update.call_args.kwargs
