@@ -1680,25 +1680,41 @@ class Folder(Path):
         self,
         predicate: "Predicate" = None,
         *,
+        remove_path: bool = False,
+        recursive: bool = True,
+        files_only: bool = False,
         wait: Any = True,
         missing_ok: bool = False,
         delete_staging: bool = True,
+        fresher_than: Any = None,
+        older_than: Any = None,
         **kwargs: Any,
     ) -> int:
         """Walk children, filter each leaf in isolation, rewrite survivors.
 
-        Streams leaf-by-leaf so a single match in one part file doesn't
-        trigger a folder-wide rewrite — only the leaves that actually
-        hold matched rows are rewritten. Sub-folders recurse. Files
-        the predicate fully drains are unlinked outright; leaves with
-        a mix of survivors and matches are rewritten as a fresh part
-        and the original is unlinked once the new file is on disk. A
+        Path-removal mode (``remove_path=True``, set by :meth:`remove` /
+        :meth:`unlink`) drops straight through to :class:`Path`'s physical
+        recursive removal of the whole folder — there is no row work to do.
+
+        Otherwise this is a row delete: stream leaf-by-leaf so a single match
+        in one part file doesn't trigger a folder-wide rewrite — only the
+        leaves that actually hold matched rows are rewritten. Sub-folders
+        recurse. Files the predicate fully drains are unlinked outright;
+        leaves with a mix of survivors and matches are rewritten as a fresh
+        part and the original is unlinked once the new file is on disk. A
         ``None`` *predicate* removes every row (all leaves unlinked).
 
         Per-batch filtering goes through
         :meth:`Predicate.filter_arrow_batches`, so the row work runs
         in pyarrow's C++ kernels — no Python row iteration.
         """
+        if remove_path:
+            return super()._delete(
+                remove_path=True, recursive=recursive, files_only=files_only,
+                missing_ok=missing_ok, wait=wait,
+                fresher_than=fresher_than, older_than=older_than,
+            )
+
         options = self.check_options(kwargs.pop("options", None), **kwargs)
         not_pred = ~predicate if predicate is not None else None
         deleted = 0

@@ -820,11 +820,27 @@ class DeltaFolder(Folder):
         self,
         predicate: "Predicate" = None,
         *,
+        remove_path: bool = False,
+        recursive: bool = True,
+        files_only: bool = False,
         wait: Any = True,
         missing_ok: bool = False,
         delete_staging: bool = True,
+        fresher_than: Any = None,
+        older_than: Any = None,
         **kwargs: Any,
     ) -> int:
+        # Path-removal mode (``remove`` / ``unlink``) physically deletes the
+        # whole table directory — ``_delta_log`` and all — via Path; that's
+        # distinct from a row delete / logical truncate (``predicate``-driven
+        # RemoveFile commits, below), which keeps the table and its history.
+        if remove_path:
+            return super()._delete(
+                remove_path=True, recursive=recursive, files_only=files_only,
+                missing_ok=missing_ok, wait=wait,
+                fresher_than=fresher_than, older_than=older_than,
+            )
+
         options = self.check_options(kwargs.pop("options", None), **kwargs)
         snap = self.snapshot(fresh=True)
         if snap.metadata is None:
