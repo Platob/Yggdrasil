@@ -122,7 +122,7 @@ class TestRequestSchema:
 
     def test_sent_at_field_type(self) -> None:
         fields = _arrow_field_map(REQUEST_SCHEMA)
-        assert fields["sent_at"].type == pa.timestamp("us", "UTC")
+        assert fields["sent_at"].type == pa.timestamp("us", "Etc/UTC")
         assert fields["sent_at"].nullable is False
 
     def test_partition_key_field_type(self) -> None:
@@ -241,7 +241,7 @@ class TestResponseSchema:
 
     def test_received_at_field_type(self) -> None:
         fields = _arrow_field_map(RESPONSE_SCHEMA)
-        assert fields["received_at"].type == pa.timestamp("us", "UTC")
+        assert fields["received_at"].type == pa.timestamp("us", "Etc/UTC")
         assert fields["received_at"].nullable is False
 
     def test_partition_key_field_type(self) -> None:

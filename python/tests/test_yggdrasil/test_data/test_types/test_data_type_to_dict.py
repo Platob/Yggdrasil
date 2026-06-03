@@ -81,7 +81,7 @@ class TestPrimitiveDictRoundTrip(unittest.TestCase):
         restored = DataType.from_dict(original.to_dict())
 
         self.assertIsInstance(restored, TimestampType)
-        self.assertEqual(restored.tz, "UTC")
+        self.assertEqual(restored.tz, "Etc/UTC")
         self.assertEqual(restored.unit, "us")
 
     def test_timestamp_naive_preserves_none_tz(self) -> None:

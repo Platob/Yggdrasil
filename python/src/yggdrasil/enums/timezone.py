@@ -37,12 +37,12 @@ __all__ = [
 ]
 
 _TIMEZONE_ALIASES: dict[str, str] = {
-    "UTC": "UTC",
-    "ETC/UTC": "UTC",
-    "+00:00": "UTC",
-    "-00:00": "UTC",
-    "GMT": "UTC",
-    "Z": "UTC",
+    "UTC": "Etc/UTC",
+    "ETC/UTC": "Etc/UTC",
+    "+00:00": "Etc/UTC",
+    "-00:00": "Etc/UTC",
+    "GMT": "Etc/UTC",
+    "Z": "Etc/UTC",
     "CET": "Europe/Paris",
     "CEST": "Europe/Paris",
     "WET": "Europe/Lisbon",
@@ -105,6 +105,11 @@ def _parse_timezone_string(s: str) -> str:
     if not raw:
         raise ValueError("Timezone string cannot be empty")
 
+    # Plain UTC always folds to the canonical ``Etc/UTC`` — checked before the
+    # available-zones lookup, since ``"UTC"`` is itself a valid IANA zone.
+    if raw.upper() in ("UTC", "ETC/UTC"):
+        return "Etc/UTC"
+
     if raw in _available_timezones_cached():
         return raw
 
@@ -128,7 +133,7 @@ def _parse_timezone_string(s: str) -> str:
             )
 
         if hours == 0:
-            return "UTC"
+            return "Etc/UTC"
 
         # IANA Etc/GMT sign convention is reversed.
         etc_sign = "-" if sign == "+" else "+"
@@ -570,7 +575,7 @@ class Timezone:
 
 # ── Class-level constants (can't be set inside a frozen dataclass body) ──────
 Timezone.NAIVE = Timezone(_NAIVE_IANA)
-Timezone.UTC = Timezone("UTC")
+Timezone.UTC = Timezone("Etc/UTC")
 Timezone.CET = Timezone("Europe/Paris")
 Timezone.WET = Timezone("Europe/Lisbon")
 Timezone.EET = Timezone("Europe/Helsinki")
@@ -618,6 +623,12 @@ def _seed_timezone_cache() -> None:
         lower = alias.lower()
         if lower != alias and lower not in available:
             _TIMEZONE_STR_CACHE[lower] = instance
+
+    # ``"UTC"`` is itself a valid IANA zone, so the loop above pins it to a
+    # literal ``Timezone("UTC")``. Re-fold every plain-UTC spelling onto the
+    # single canonical ``Etc/UTC`` instance — the project standard.
+    for spelling in ("UTC", "utc"):
+        _TIMEZONE_STR_CACHE[spelling] = Timezone.UTC
 
 
 _seed_timezone_cache()

@@ -137,7 +137,7 @@ _RE_CLOCK_DURATION = re.compile(
     r"^(?P<sign>[+-])?(?P<hours>\d+):(?P<minutes>\d{1,2})(?::(?P<seconds>\d{1,2}(?:\.\d+)?))?$"
 )
 
-UTC_ALIAS_TIMEZONES = frozenset({"Z", "Etc/UTC", "+00:00"})
+UTC_ALIAS_TIMEZONES = frozenset({"Z", "UTC", "Etc/UTC", "+00:00"})
 
 
 def _parse_iso_duration(text: str) -> "dt.timedelta | None":
@@ -546,7 +546,7 @@ class TemporalType(PrimitiveType, ABC):
             if normalized is not None:
                 object.__setattr__(self, "unit", normalized)
         if self.tz and self.tz in UTC_ALIAS_TIMEZONES:
-            object.__setattr__(self, "tz", "UTC")
+            object.__setattr__(self, "tz", "Etc/UTC")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "DateType":
@@ -1073,7 +1073,7 @@ class TimestampType(TemporalType):
     def from_spark_type(cls, dtype: "pst.DataType") -> "TimestampType":
         spark = spark_sql_module()
         if isinstance(dtype, spark.types.TimestampType):
-            return cls(byte_size=8, unit="us", tz="UTC")
+            return cls(byte_size=8, unit="us", tz="Etc/UTC")
         if isinstance(dtype, spark.types.TimestampNTZType):
             return cls(byte_size=8, unit="us", tz=None)
         raise TypeError(f"Unsupported Spark data type: {dtype!r}")

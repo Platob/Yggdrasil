@@ -353,6 +353,16 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         # bytes (with codec compression when set) on context exit.
         write_options = options.check_source(first.schema)
         first_casted = write_options.cast_arrow_batch(first)
+        schema = write_options.merged.to_arrow_schema()
+
+        # The yggdrasil cast compares logical types, which canonicalise UTC tz
+        # aliases ("UTC" ≡ "Etc/UTC"), so a physical ``timestamp[…, UTC]``
+        # batch can come back unchanged while ``schema`` carries the canonical
+        # ``Etc/UTC``. Relabel a batch onto the writer schema when it diverges
+        # — zero-copy for a tz-alias-only difference — so the IPC writer's
+        # byte-identical schema check passes (mirrors ``_write_arrow_table``).
+        if first_casted.schema != schema:
+            first_casted = first_casted.cast(schema)
 
         # ``compression="auto"`` resolves against the first batch's
         # in-memory size — a representative proxy for the typical
@@ -364,7 +374,7 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
         with self.arrow_output_stream() as sink:
             with ipc.RecordBatchFileWriter(
                 sink,
-                write_options.merged.to_arrow_schema(),
+                schema,
                 options=options.to_writer_options(nbytes_hint),
             ) as writer:
                 if first_casted.num_rows > 0:
@@ -372,6 +382,8 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
 
                 for batch in iterator:
                     casted_batch = write_options.cast_arrow_batch(batch)
+                    if casted_batch.schema != schema:
+                        casted_batch = casted_batch.cast(schema)
                     if casted_batch.num_rows > 0:
                         writer.write_batch(casted_batch)
 

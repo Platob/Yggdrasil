@@ -124,7 +124,7 @@ class TestFromStr(ArrowTestCase):
             parsed.to_arrow(),
             pa.struct(
                 [
-                    pa.field("q", pa.timestamp("us", "UTC")),
+                    pa.field("q", pa.timestamp("us", "Etc/UTC")),
                     pa.field("v", pa.float64()),
                 ]
             ),

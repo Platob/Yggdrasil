@@ -711,13 +711,13 @@ class TestMerge:
         merged = TimestampType(tz="UTC")._merge_with_same_id(
             TimestampType(tz="UTC")
         )
-        assert merged.tz == "UTC"
+        assert merged.tz == "Etc/UTC"
 
     def test_tz_unification_conflict_upcast_picks_first_non_none(self) -> None:
         merged = TimestampType(tz="UTC")._merge_with_same_id(
             TimestampType(tz="Europe/Paris")
         )
-        assert merged.tz in {"UTC", "Europe/Paris"}
+        assert merged.tz in {"Etc/UTC", "Europe/Paris"}
 
     def test_tz_unification_conflict_downcast_drops(self) -> None:
         from yggdrasil.enums.timezone import Timezone
@@ -778,7 +778,7 @@ class TestSerde:
             (DateType(byte_size=8, unit="ms"), pa.date64()),
             (TimeType(unit="us"), pa.time64("us")),
             (TimeType(unit="ms"), pa.time32("ms")),
-            (TimestampType(unit="us", tz="UTC"), pa.timestamp("us", "UTC")),
+            (TimestampType(unit="us", tz="UTC"), pa.timestamp("us", "Etc/UTC")),
             (TimestampType(unit="ns"), pa.timestamp("ns")),
             (DurationType(unit="us"), pa.duration("us")),
         ],
@@ -793,7 +793,7 @@ class TestSerde:
         [
             (DateType(), pa.date32()),
             (TimeType(unit="ns"), pa.time64("ns")),
-            (TimestampType(unit="us", tz="UTC"), pa.timestamp("us", "UTC")),
+            (TimestampType(unit="us", tz="UTC"), pa.timestamp("us", "Etc/UTC")),
             (DurationType(unit="ms"), pa.duration("ms")),
         ],
     )

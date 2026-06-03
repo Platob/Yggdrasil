@@ -385,6 +385,15 @@ class ParquetFile(IO[bytes, ParquetOptions]):
         first_casted = write_options.cast_arrow_batch(first)
         schema = write_options.merged.to_arrow_schema()
 
+        # The yggdrasil cast compares logical types, which canonicalise UTC tz
+        # aliases ("UTC" ≡ "Etc/UTC"), so a physical ``timestamp[…, UTC]``
+        # batch can come back unchanged while ``schema`` carries the canonical
+        # ``Etc/UTC``. Relabel a batch onto the writer schema when it diverges
+        # — zero-copy for a tz-alias-only difference — so the ParquetWriter's
+        # exact schema check passes (mirrors ``_write_arrow_table``).
+        if first_casted.schema != schema:
+            first_casted = first_casted.cast(schema)
+
         # If the first batch came back as the same object the cast was a
         # full bypass (source schema already matched the target). The
         # batches downstream share the same source schema, so the cast
@@ -409,6 +418,8 @@ class ParquetFile(IO[bytes, ParquetOptions]):
                 else:
                     for batch in iterator:
                         casted = write_options.cast_arrow_batch(batch)
+                        if casted.schema != schema:
+                            casted = casted.cast(schema)
                         if casted.num_rows > 0:
                             writer.write_batch(casted, row_group_size=options.row_group_size)
 

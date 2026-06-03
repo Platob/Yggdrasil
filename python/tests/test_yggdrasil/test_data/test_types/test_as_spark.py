@@ -531,7 +531,7 @@ class TestAsPolars(unittest.TestCase):
         t = TimestampType(unit="s", tz="UTC")
         polars = t.as_polars()
         self.assertEqual(str(polars.unit), "ms")
-        self.assertEqual(polars.tz.iana, "UTC")
+        self.assertEqual(polars.tz.iana, "Etc/UTC")
 
     def test_timestamp_us_unchanged(self) -> None:
         for unit in ("ms", "us", "ns"):
