@@ -95,6 +95,11 @@ _VIEW_TABLE_TYPES: frozenset[TableType] = frozenset({
     TableType.METRIC_VIEW,
 })
 
+# Below this on-disk size, ``use_warehouse=None`` reads/writes a Delta table
+# natively (DeltaFolder); at or above it the SQL warehouse parallelises the
+# scan/commit better. Matches Delta's default target file size.
+_NATIVE_DELTA_MAX_BYTES: int = 128 * 1024 * 1024
+
 
 def _coerce_tag_str(value: Any) -> str:
     """Coerce a tag key/value to a UTF-8 string.
@@ -863,42 +868,70 @@ class Table(DatabricksPath):
 
         return query
 
-    def _prefer_delta_read(self, options: CastOptions) -> bool:
-        """``True`` when ``prefer_sql=False`` and this is a Delta table we can
-        read natively (resolvable storage). Reads UC-vended *read* creds —
-        works for managed and external Delta alike."""
-        if getattr(options, "prefer_sql", True):
-            return False
-        try:
-            infos = self.infos
-        except Exception:
-            return False
-        return (
-            infos.table_type not in _VIEW_TABLE_TYPES
-            and infos.data_source_format == DataSourceFormat.DELTA
-            and bool(infos.storage_location)
-        )
+    def _native_delta(self, options: CastOptions, *, write: bool) -> bool:
+        """Decide whether to use the native :meth:`delta` DeltaFolder (``True``)
+        or the SQL warehouse (``False``) for this read / write.
 
-    def _prefer_delta_write(self, options: CastOptions) -> bool:
-        """``True`` when ``prefer_sql=False`` and this is an *external* Delta
-        table. A native ``_delta_log`` commit needs UC READ_WRITE creds, which
-        UC only vends for external tables — managed Delta writes stay on SQL."""
-        if getattr(options, "prefer_sql", True):
-            return False
+        Only Delta tables with resolvable storage qualify; a native *write*
+        additionally needs an *external* table (UC vends READ_WRITE creds only
+        for external — a managed-Delta commit would 403, so it stays on SQL).
+
+        ``options.use_warehouse`` then selects:
+
+        - ``True``  → warehouse (``False``);
+        - ``False`` → native DeltaFolder (``True``);
+        - ``None``  → guess: an active Spark session → warehouse; else a small
+          table (``< _NATIVE_DELTA_MAX_BYTES`` on disk) → native, a larger one
+          → warehouse (the warehouse parallelises big scans/writes better).
+        """
         try:
             infos = self.infos
         except Exception:
             return False
-        return (
-            infos.table_type == TableType.EXTERNAL
-            and infos.data_source_format == DataSourceFormat.DELTA
-            and bool(infos.storage_location)
-        )
+        if (
+            infos.table_type in _VIEW_TABLE_TYPES
+            or infos.data_source_format != DataSourceFormat.DELTA
+            or not infos.storage_location
+        ):
+            return False
+        if write and infos.table_type != TableType.EXTERNAL:
+            return False
+
+        use_warehouse = getattr(options, "use_warehouse", None)
+        if use_warehouse is True:
+            return False
+        if use_warehouse is False:
+            return True
+
+        # use_warehouse is None → guess.
+        if self._has_active_spark(options):
+            return False
+        size = self._delta_total_bytes()
+        return size is not None and size < _NATIVE_DELTA_MAX_BYTES
+
+    @staticmethod
+    def _has_active_spark(options: CastOptions) -> bool:
+        """True when a Spark session is bound on *options* or active in-process."""
+        if getattr(options, "spark_session", None) is not None:
+            return True
+        try:
+            from pyspark.sql import SparkSession
+            return SparkSession.getActiveSession() is not None
+        except Exception:
+            return False
+
+    def _delta_total_bytes(self) -> "int | None":
+        """The Delta table's on-disk byte size (sum of active ``AddFile``
+        sizes from the ``_delta_log``), or ``None`` if it can't be resolved."""
+        try:
+            return self.delta().snapshot().total_bytes
+        except Exception:
+            return None
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
-        # prefer_sql=False on a Delta table → read straight off the
+        # Delta table the router picks native for → read straight off the
         # ``_delta_log`` + parquet via our DeltaFolder, bypassing the warehouse.
-        if self._prefer_delta_read(options):
+        if self._native_delta(options, write=False):
             folder = self.delta()
             yield from folder._read_arrow_batches(folder.check_options(options))
             return
@@ -925,9 +958,9 @@ class Table(DatabricksPath):
         batches: Iterable[pa.RecordBatch],
         options: CastOptions
     ) -> None:
-        # prefer_sql=False on an external Delta table → commit straight to the
-        # ``_delta_log`` via our DeltaFolder, bypassing the warehouse.
-        if self._prefer_delta_write(options):
+        # External Delta table the router picks native for → commit straight to
+        # the ``_delta_log`` via our DeltaFolder, bypassing the warehouse.
+        if self._native_delta(options, write=True):
             self.delta().write_arrow_batches(batches, options=options)
             return
 

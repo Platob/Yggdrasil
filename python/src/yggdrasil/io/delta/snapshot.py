@@ -118,6 +118,11 @@ class Snapshot:
                 except Exception: pass
         return total
 
+    @property
+    def total_bytes(self) -> int:
+        """Sum of the active data files' on-disk sizes (from ``AddFile.size``)."""
+        return sum(int(f.size or 0) for f in self.active_files.values())
+
     def prune_files(self, *, prune_values: "Optional[Mapping[str, Iterable]]" = None) -> "Iterator[AddFile]":
         if not prune_values:
             yield from self.active_files.values()

@@ -21,15 +21,21 @@ class TableOptions(CastOptions):
     ``match_by``, ``zorder_by``, ``vacuum_hours``, …) and adds the
     table-only routing knob:
 
-    - :attr:`prefer_sql` — ``True`` (default) routes reads and writes
-      through the SQL warehouse. ``False`` prefers yggdrasil's **native
-      DeltaFolder** read/write (a direct ``_delta_log`` + parquet path over
-      UC-vended credentials) whenever the table is Delta-backed, bypassing
-      the warehouse. Writes fall back to SQL for managed Delta tables
-      (UC only vends read-only credentials there), so the native write path
-      engages for external Delta tables.
+    - :attr:`use_warehouse` — pick the read/write engine:
+
+      * ``True`` — always go through the SQL warehouse (Databricks).
+      * ``False`` — prefer yggdrasil's **native DeltaFolder** (a direct
+        ``_delta_log`` + parquet path over UC-vended credentials) whenever
+        the table is Delta-backed. Native writes need an *external* Delta
+        table (UC vends read-only credentials for managed tables), so a
+        managed-Delta write still goes through the warehouse.
+      * ``None`` (default) — **guess** per call: an active Spark session →
+        Databricks; otherwise a small Delta table (< 128 MiB on disk) →
+        native DeltaFolder, a larger one → Databricks. Non-Delta tables
+        always use the warehouse.
     """
 
-    #: Prefer the SQL warehouse for read/write. When ``False`` and the table
-    #: is Delta-backed, prefer the native :meth:`Table.delta` DeltaFolder.
-    prefer_sql: bool = True
+    #: Read/write engine selector. ``True`` → SQL warehouse, ``False`` →
+    #: native :meth:`Table.delta` DeltaFolder (when Delta-backed), ``None``
+    #: → guess from active Spark + table size.
+    use_warehouse: "bool | None" = None
