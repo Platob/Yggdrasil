@@ -1803,19 +1803,17 @@ class Table(DatabricksPath):
 
         table_definitions = column_definitions + constraint_clauses
 
-        # A bound ``storage_location`` makes this an external table. Emit the
-        # explicit ``EXTERNAL`` keyword for the plain / ``IF NOT EXISTS`` forms
-        # (matching ``CREATE EXTERNAL TABLE … USING DELTA LOCATION …``); the
-        # ``OR REPLACE`` grammar doesn't allow the keyword, but the ``LOCATION``
-        # clause below still makes that table external.
+        # A bound ``storage_location`` makes this external. We don't emit the
+        # ``EXTERNAL`` keyword — the ``LOCATION`` clause below is what makes the
+        # table external (this is the form Databricks itself generates), and it
+        # composes cleanly with ``CLUSTER BY`` / ``OR REPLACE``.
         external = storage_location is not None
-        ext_kw = " EXTERNAL" if external else ""
         if or_replace:
             create_kw = "CREATE OR REPLACE TABLE"
         elif missing_ok:
-            create_kw = f"CREATE{ext_kw} TABLE IF NOT EXISTS"
+            create_kw = "CREATE TABLE IF NOT EXISTS"
         else:
-            create_kw = f"CREATE{ext_kw} TABLE"
+            create_kw = "CREATE TABLE"
 
         sql_parts: list[str] = [
             f"{create_kw} {self.full_name(safe=True)} (",
@@ -1832,10 +1830,20 @@ class Table(DatabricksPath):
             sql_parts.append(
                 "CLUSTER BY (" + ", ".join(quote_ident(c.name) for c in cluster_by) + ")"
             )
-        elif not external:
-            # CLUSTER BY AUTO is UC *managed*-only — Databricks rejects it on
-            # an external table with CLUSTER_BY_AUTO_UNSUPPORTED_TABLE_TYPE_ERROR.
-            # External tables get explicit CLUSTER BY (cols) only when asked.
+        elif external:
+            # CLUSTER BY AUTO is UC *managed*-only (Databricks rejects it on an
+            # external table with CLUSTER_BY_AUTO_UNSUPPORTED_TABLE_TYPE_ERROR),
+            # so specify explicit liquid-clustering columns instead — the
+            # primary key when present, else the first column (liquid clustering
+            # caps at 4 keys). Callers can override via partition / cluster tags.
+            default_cluster = (primary_keys or effective_fields[:1])[:4]
+            if default_cluster:
+                sql_parts.append(
+                    "CLUSTER BY ("
+                    + ", ".join(quote_ident(c.name) for c in default_cluster)
+                    + ")"
+                )
+        else:
             sql_parts.append("CLUSTER BY AUTO")
 
         if comment:

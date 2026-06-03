@@ -46,17 +46,44 @@ class TestExternalDDL:
             record_ygg_properties=False,
         )
         ddl = captured[0]
+        # No EXTERNAL keyword — LOCATION makes it external (Databricks' own form).
         assert ddl.startswith(
-            "CREATE EXTERNAL TABLE IF NOT EXISTS "
+            "CREATE TABLE IF NOT EXISTS "
             "`trading_tgp_dev`.`ygg_integration`.`ext_tb` ("
         )
+        assert "EXTERNAL" not in ddl
         assert "`id` STRING NOT NULL" in ddl
         assert "`updated_at` TIMESTAMP" in ddl
         assert "USING DELTA" in ddl
         assert "LOCATION 's3://bucket/loc/ext_tb'" in ddl
-        # CLUSTER BY AUTO is managed-only (Databricks rejects it on external
-        # tables), so an external table gets no implicit clustering.
-        assert "CLUSTER BY" not in ddl
+        # AUTO is managed-only, so an external table specifies explicit
+        # liquid-clustering columns — defaulting to the first column.
+        assert "CLUSTER BY (`id`)" in ddl
+        assert "CLUSTER BY AUTO" not in ddl
+
+    def test_external_clusters_by_primary_key_when_present(self) -> None:
+        t, captured = _mock_table()
+        sch = Schema([
+            field("id", "string", nullable=False, tags={"primary_key": "true"}),
+            field("name", "string"),
+        ])
+        t.sql_create(
+            sch, storage_location="s3://bucket/loc/ext_tb",
+            data_source_format=DataSourceFormat.DELTA, record_ygg_properties=False,
+        )
+        assert "CLUSTER BY (`id`)" in captured[0]
+
+    def test_external_explicit_cluster_tag_wins(self) -> None:
+        t, captured = _mock_table()
+        sch = Schema([
+            field("id", "string", nullable=False),
+            field("name", "string", tags={"cluster_by": "true"}),
+        ])
+        t.sql_create(
+            sch, storage_location="s3://bucket/loc/ext_tb",
+            data_source_format=DataSourceFormat.DELTA, record_ygg_properties=False,
+        )
+        assert "CLUSTER BY (`name`)" in captured[0]
 
     def test_managed_ddl_unchanged(self) -> None:
         t, captured = _mock_table()
