@@ -10,10 +10,13 @@ single instance to verify the full insert plumbs the staging
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock, patch
+
+from databricks.sdk.service.catalog import TableType
 
 from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.table.table import Table
+from yggdrasil.databricks.volume import Volume
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +105,65 @@ class TestInsertVolumePath:
         ws = MagicMock(name="workspace")
         tbl = _table(workspace=ws)
         assert tbl.insert_volume_path().workspace_client is ws
+
+
+# ---------------------------------------------------------------------------
+# staging_volume — external, rooted at the schema storage location
+# ---------------------------------------------------------------------------
+
+
+class TestStagingVolumeExternal:
+
+    def test_property_is_a_cheap_handle(self) -> None:
+        """Reading ``staging_volume`` never resolves infos or creates a
+        volume — it just mints the handle (creation is deferred to
+        :meth:`Table.ensure_staging_volume`)."""
+        tbl = _table("cat", "sch", "tbl")
+        with patch.object(Volume, "get_or_create") as goc:
+            vol = tbl.staging_volume
+            assert tbl.staging_volume is vol  # singleton
+        assert isinstance(vol, Volume)
+        goc.assert_not_called()
+
+    def test_external_table_creates_external_under_table_id(self) -> None:
+        """For an external table, ``ensure_staging_volume`` get-or-creates an
+        **external** volume rooted at the schema storage location (the segment
+        before ``__unitystorage``) + ``/uc/tables/<table_id>`` — never the
+        client default storage location."""
+        tbl = _table("cat", "sch", "tbl")
+        with patch.object(
+            Table, "infos", new_callable=PropertyMock,
+        ) as infos, patch.object(
+            Table, "schema_storage_location",
+            return_value="s3://bkt/meta/__unitystorage/catalogs/x/schemas/y",
+        ), patch.object(
+            Table, "table_id", new_callable=PropertyMock, return_value="tid-123",
+        ), patch.object(
+            Volume, "get_or_create",
+        ) as goc:
+            infos.return_value.table_type = TableType.EXTERNAL
+            vol = tbl.ensure_staging_volume()
+
+        assert isinstance(vol, Volume)
+        goc.assert_called_once()
+        kw = goc.call_args.kwargs
+        assert kw["volume_type"] == "EXTERNAL"
+        assert kw["storage_location"] == "s3://bkt/meta/uc/tables/tid-123"
+
+    def test_managed_table_skips_external_create(self) -> None:
+        """A managed table leaves the staging volume to the default (managed)
+        create path — no external get_or_create at the staging boundary."""
+        tbl = _table("cat", "sch", "tbl")
+        with patch.object(
+            Table, "infos", new_callable=PropertyMock,
+        ) as infos, patch.object(
+            Volume, "get_or_create",
+        ) as goc:
+            infos.return_value.table_type = TableType.MANAGED
+            vol = tbl.ensure_staging_volume()
+
+        assert isinstance(vol, Volume)
+        goc.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

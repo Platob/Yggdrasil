@@ -3220,12 +3220,41 @@ class Table(DatabricksPath):
             schema_name=self.schema_name,
         ).volume(value)
 
+    def ensure_staging_volume(self) -> "Volume":
+        """Get-or-create this table's staging :class:`Volume` and return it.
+
+        For an **external** table the staging volume is created *external*
+        too, rooted on the schema's storage location — the segment before
+        ``__unitystorage`` — and keyed by the table's UC id:
+        ``<schema_root>/uc/tables/<table_id>``. That keeps staged Parquet on
+        the same governed external location as the table instead of a
+        fabricated client default location. A managed table keeps the default
+        (managed) create path, materialised lazily on first write.
+
+        Kept off the :attr:`staging_volume` property on purpose — resolving
+        ``infos`` / creating a volume on a bare handle read is too surprising;
+        creation belongs at the staging-folder boundary where a write is
+        actually imminent.
+        """
+        volume = self.staging_volume
+        if self.infos.table_type == TableType.EXTERNAL:
+            root = self.schema_storage_location().split("/__unitystorage")[0].rstrip("/")
+            volume.get_or_create(
+                volume_type="EXTERNAL",
+                storage_location=f"{root}/uc/tables/{self.table_id}",
+            )
+        return volume
+
     def staging_folder(
         self,
         temporary: bool = False,
     ) -> VolumePath:
-        """Return the staging folder for this table."""
-        return self.staging_volume.path(".sql/tmp", temporary=temporary)
+        """Return the staging folder for this table.
+
+        Ensures the staging volume exists first (external for an external
+        table — see :meth:`ensure_staging_volume`).
+        """
+        return self.ensure_staging_volume().path(".sql/tmp", temporary=temporary)
 
     def insert_volume_path(
         self,
@@ -3248,7 +3277,7 @@ class Table(DatabricksPath):
         target = target if target is not None else self
         seed = uuid.uuid4().hex[:8]
         leaf = f"tmp-{int(time.time() * 1000)}-{seed}.parquet"
-        staging_volume = target.staging_volume if staging_volume is None else staging_volume
+        staging_volume = target.ensure_staging_volume() if staging_volume is None else staging_volume
 
         return staging_volume.path(
             f".sql/tmp/{leaf}",
