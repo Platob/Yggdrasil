@@ -48,6 +48,15 @@ describe("Tabular core", () => {
       { id: 1, name: "a" }, { id: 2, name: "b" }, { id: 3, name: "c" },
     ]);
   });
+
+  it("scanArrowTable / scanArrowBatches expose zero-copy views", () => {
+    const t = sample();
+    // The held Table is returned verbatim — same reference, no copy/cast.
+    expect(t.scanArrowTable()).toBe(t.toArrow());
+    const batches = t.scanArrowBatches();
+    expect(batches).toBe(t.toArrow().batches);
+    expect(batches.reduce((n, b) => n + b.numRows, 0)).toBe(3);
+  });
 });
 
 describe("Arrow IPC round-trip (the wire contract)", () => {

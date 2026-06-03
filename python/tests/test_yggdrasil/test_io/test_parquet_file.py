@@ -80,6 +80,34 @@ class TestLocalPathRoundTrip:
         assert cursor.parent is path
 
 
+class TestScanArrow:
+    """Zero-copy ``scan_arrow_*`` over a byte-backed (Parquet) leaf."""
+
+    def _path(self, tmp_path):
+        table = pa.table({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+        path = LocalPath(str(tmp_path / "scan.parquet"))
+        path.write_arrow_table(table)
+        return path, table
+
+    def test_scan_arrow_batches(self, tmp_path) -> None:
+        path, table = self._path(tmp_path)
+        batches = list(path.scan_arrow_batches())
+        assert sum(b.num_rows for b in batches) == 3
+        assert all(isinstance(b, pa.RecordBatch) for b in batches)
+
+    def test_scan_arrow_table(self, tmp_path) -> None:
+        path, table = self._path(tmp_path)
+        out = path.scan_arrow_table()
+        assert out.num_rows == 3
+        assert out.column_names == ["x", "y"]
+
+    def test_scan_arrow_batch_reader(self, tmp_path) -> None:
+        path, table = self._path(tmp_path)
+        reader = path.scan_arrow_batch_reader()
+        assert isinstance(reader, pa.RecordBatchReader)
+        assert reader.read_all().num_rows == 3
+
+
 class TestOptions:
 
     def test_options_class(self) -> None:

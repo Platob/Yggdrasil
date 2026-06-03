@@ -26,7 +26,14 @@ A leaf implements three things:
 
 Public methods route caller kwargs through :meth:`check_options` to
 a single resolved options instance, then dispatch to one of the
-hooks.
+hooks. The Arrow surface comes in two flavours: ``read_arrow_*``
+(:meth:`read_arrow_batches` / :meth:`read_arrow_table` /
+:meth:`read_arrow_batch_reader`) runs the full options pipeline — cast,
+projection, resample, dedup, row-limit — and so may copy; ``scan_arrow_*``
+(:meth:`scan_arrow_batches` / :meth:`scan_arrow_table` /
+:meth:`scan_arrow_batch_reader`) is the zero-copy passthrough that hands
+back the source's batches / table as views, untouched. Same split as
+:meth:`read_polars_frame` vs :meth:`scan_polars_frame`.
 
 Why not inherit from Holder
 ---------------------------
@@ -1379,6 +1386,27 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
                 n_rows += batch.num_rows
                 yield batch
 
+    def scan_arrow_batches(
+        self, options: "O | None" = None, **kwargs: Any,
+    ) -> Iterator[pa.RecordBatch]:
+        """Zero-copy scan — yield the source's :class:`pa.RecordBatch` views verbatim.
+
+        The lazy / zero-copy counterpart to :meth:`read_arrow_batches`,
+        mirroring :meth:`read_polars_frame` vs :meth:`scan_polars_frame`.
+        Where ``read_arrow_batches`` layers the full options pipeline on
+        every batch — target cast, projection, resample, dedup, row-limit
+        slicing, each of which can copy or re-encode — ``scan_arrow_batches``
+        hands back exactly what the leaf produced, untouched. For an
+        in-memory source (:class:`~yggdrasil.arrow.tabular.ArrowTabular`)
+        those batches are views over the held buffers (no copy); for a
+        byte-backed leaf they're the freshly-decoded batches with none of
+        the extra processing copies layered on. Use it when you want the
+        raw Arrow stream and will project / filter downstream yourself.
+        """
+        return self._read_arrow_batches(
+            self.check_options(options, overrides=locals())
+        )
+
     def read_arrow_table(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> pa.Table:
@@ -1417,6 +1445,34 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             table = table.slice(0, options.row_limit)
         return table
 
+    def scan_arrow_table(
+        self, options: "O | None" = None, **kwargs: Any,
+    ) -> pa.Table:
+        """Zero-copy scan into one chunked :class:`pa.Table` (no rechunk, no cast).
+
+        The zero-copy counterpart to :meth:`read_arrow_table`. Assembles
+        the source batches with :func:`pa.Table.from_batches`, which
+        *references* the batch buffers as table chunks rather than copying
+        them — so no cast, no projection, no rechunk memcpy that
+        ``read_arrow_table`` performs to coalesce + conform the result. An
+        empty source yields an empty table carrying the bound schema.
+
+        The batches must share one schema (the zero-copy contract):
+        ``read_arrow_table`` reconciles parts that drifted across writes,
+        ``scan_arrow_table`` does not — reach for ``read_arrow_table`` when
+        a source's parts are known to be heterogeneous.
+        """
+        options = self.check_options(options, overrides=locals())
+        batches = list(self._read_arrow_batches(options))
+        if not batches:
+            schema = (
+                getattr(options, "target_schema", None)
+                or getattr(options, "source_schema", None)
+                or Schema.empty()
+            )
+            return schema.to_arrow_schema().empty_table()
+        return pa.Table.from_batches(batches)
+
     def read_arrow_batch_reader(
         self, options: "O | None" = None, **kwargs: Any,
     ) -> "pa.RecordBatchReader":
@@ -1445,6 +1501,34 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             arrow_schema,
             stream,
         )
+
+    def scan_arrow_batch_reader(
+        self, options: "O | None" = None, **kwargs: Any,
+    ) -> "pa.RecordBatchReader":
+        """Zero-copy scan as a streaming :class:`pa.RecordBatchReader` view.
+
+        The raw-reader counterpart to :meth:`read_arrow_batch_reader`: wraps
+        the source batch stream in a reader *without* the per-batch
+        conform / target-cast pass, so batches flow through as views over
+        the source buffers. The reader's schema is the source's own — taken
+        from the first batch, so it matches the raw views exactly (no
+        ``collect_schema`` probe, which on a byte cursor would consume the
+        stream out from under the read). Only the first batch is pulled up
+        front to seed the schema; the rest stay lazy behind the reader.
+        """
+        options = self.check_options(options, overrides=locals())
+        stream = self._read_arrow_batches(options)
+        first = next(stream, None)
+        if first is None:
+            return pa.RecordBatchReader.from_batches(
+                self.collect_schema(options).to_arrow_schema(), iter(()),
+            )
+
+        def _chained() -> "Iterator[pa.RecordBatch]":
+            yield first
+            yield from stream
+
+        return pa.RecordBatchReader.from_batches(first.schema, _chained())
 
     def read_arrow_dataset(
         self, options: "O | None" = None, **kwargs: Any,
