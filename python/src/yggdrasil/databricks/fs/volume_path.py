@@ -567,16 +567,25 @@ class VolumePath(DatabricksPath):
         # whether the path is a file / directory / missing in one
         # syscall — no HTTPS round trip needed.
         if _local_mount_available():
+            # The kernel mount is the source of truth for existence here.
+            # ``os.path.exists`` treats *any* ``os.stat`` failure as "not
+            # present" (it swallows the whole ``OSError`` family —
+            # ``FileNotFoundError`` for a missing leaf, ``NotADirectoryError``
+            # when an intermediate component is a file, permission / EIO /
+            # ESTALE for an unreachable one). We MUST agree: a path the
+            # kernel can't stat is ``MISSING``. Falling through to the Files
+            # REST API on a non-``FileNotFoundError`` used to let a second
+            # transport override the kernel and report the path as existing,
+            # so ``VolumePath.exists()`` returned ``True`` while
+            # ``os.path.exists()`` returned ``False`` for the same path.
             try:
                 st = os.stat(api_path)
-            except FileNotFoundError:
-                logger.debug("stat via kernel mount: %r -> MISSING", api_path)
-                return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
             except OSError as exc:
                 logger.debug(
-                    "stat via kernel mount: %r -> OSError %r, "
-                    "falling back to Files API", api_path, exc,
+                    "stat via kernel mount: %r -> %s -> MISSING",
+                    api_path, type(exc).__name__,
                 )
+                return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
             else:
                 if _stat.S_ISDIR(st.st_mode):
                     logger.debug(

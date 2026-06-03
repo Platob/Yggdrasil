@@ -168,6 +168,35 @@ class TestStatFastPath:
         assert stats.kind is IOKind.MISSING
         service.client.workspace_client.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            NotADirectoryError("an intermediate component is a file"),
+            PermissionError("no READ VOLUME grant on the mount"),
+            OSError("ESTALE / EIO from the kernel mount"),
+        ],
+    )
+    def test_stat_os_error_is_missing_not_files_api(
+        self, fake_volume_root, service, monkeypatch, exc,
+    ):
+        # On the kernel mount the kernel is authoritative for existence:
+        # ``os.path.exists`` swallows the whole ``OSError`` family and
+        # reports ``False``, so ``VolumePath`` must agree and report
+        # MISSING — never fall through to the Files API, which (with
+        # different auth / an object-store view) could disagree and flip
+        # ``exists()`` to ``True`` for a path the kernel can't stat.
+        def boom(path, *args, **kwargs):
+            raise exc
+
+        monkeypatch.setattr(vp_module.os, "stat", boom)
+        p = VolumePath(
+            "/Volumes/cat/sch/vol/ghost", service=service,
+        )
+        assert p._stat_uncached().kind is IOKind.MISSING
+        assert not p.exists()
+        # The Files-API transport must never have been consulted.
+        service.client.files_session.assert_not_called()
+
 
 # ===========================================================================
 # _read_mv reads off the kernel mount
