@@ -5,7 +5,7 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, ORJSONResponse
 
 from ..config import Settings, get_settings
 from ..exceptions import register_exception_handlers
@@ -26,6 +26,7 @@ from .routers import (
     workbook_router,
     user_router,
     saga_router,
+    trading_router,
 )
 from .services.audit import AuditLog
 from .services.backend import BackendService
@@ -42,6 +43,7 @@ from .services.analysis import AnalysisService
 from .services.user import UserService
 from .services.excel import ExcelService
 from .services.saga import SagaService
+from .services.trading import TradingService
 
 
 def create_api(settings: Settings | None = None) -> FastAPI:
@@ -53,6 +55,9 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         docs_url="/v2/docs",
         redoc_url="/v2/redoc",
         openapi_url="/v2/openapi.json",
+        # orjson serializes large analytics payloads (price series, matrices)
+        # 3-10x faster than the stdlib json encoder.
+        default_response_class=ORJSONResponse,
     )
 
     app.state.settings = settings
@@ -65,6 +70,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.state.fs_service = fs
     app.state.tabular_service = TabularService(settings, fs=fs)
     app.state.analysis_service = AnalysisService(settings, fs=fs)
+    app.state.trading_service = TradingService(settings, fs=fs)
     app.state.saga_service = SagaService(settings)
 
     pyenv = PyEnvService(settings, audit=audit)
@@ -282,6 +288,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.include_router(fs_router, prefix=f"{prefix}/fs")
     app.include_router(tabular_router, prefix=f"{prefix}/tabular")
     app.include_router(analysis_router, prefix=f"{prefix}/analysis")
+    app.include_router(trading_router, prefix=f"{prefix}/trading")
     app.include_router(workbook_router, prefix=f"{prefix}/workbook")
     app.include_router(user_router, prefix=f"{prefix}/user")
     app.include_router(messenger_router, prefix=f"{prefix}/messenger")

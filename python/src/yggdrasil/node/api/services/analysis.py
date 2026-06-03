@@ -11,8 +11,12 @@ ordered series in memory for rolling windows). Formats polars can't scan
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import time
 from functools import partial
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -50,6 +54,29 @@ _AGGS = {"sum", "mean", "min", "max", "count", "median", "std", "var"}
 _STATS = ["count", "null_count", "mean", "std", "min", "25%", "50%", "75%", "max"]
 
 
+class _ComputeCache:
+    """Tiny TTL+LRU-ish cache for expensive compute results, keyed by a hash of
+    the request. Evicts the oldest entry when full. Not thread-safe by lock, but
+    the dict ops are atomic enough under the GIL for this best-effort cache."""
+
+    def __init__(self, ttl: float = 60.0, maxsize: int = 128) -> None:
+        self._store: dict[str, tuple[float, Any]] = {}
+        self._ttl = ttl
+        self._maxsize = maxsize
+
+    def get(self, key: str):
+        e = self._store.get(key)
+        if e and time.monotonic() - e[0] < self._ttl:
+            return e[1]
+        return None
+
+    def set(self, key: str, val) -> None:
+        if len(self._store) >= self._maxsize:
+            oldest = min(self._store, key=lambda k: self._store[k][0])
+            del self._store[oldest]
+        self._store[key] = (time.monotonic(), val)
+
+
 def _safe(v):
     """JSON-safe scalar: drop NaN/inf, stringify anything exotic."""
     if v is None:
@@ -69,6 +96,7 @@ class AnalysisService:
     def __init__(self, settings: Settings, *, fs: FsService) -> None:
         self.settings = settings
         self.fs = fs
+        self._cache = _ComputeCache(ttl=60.0, maxsize=64)
 
     async def aggregate(self, req: AggregateRequest) -> AggregateResult:
         return await run_in_threadpool(partial(self._aggregate, req))
@@ -105,6 +133,11 @@ class AnalysisService:
         polars scan keeps the read bounded."""
         from .forecast import forecast_series
         from ..schemas.analysis import ForecastResult, ForecastSeries
+
+        key = self._cache_key("forecast", req)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
 
         lf = self._apply_filters(self._frame(req.path), req.filters)
         cols = set(lf.collect_schema().names())
@@ -173,12 +206,14 @@ class AnalysisService:
         else:
             out.append(_series_for(df))
 
-        return ForecastResult(
+        result = ForecastResult(
             node_id=self.settings.node_id, path=req.path, column=req.column,
             model_used=used[0], horizon=req.horizon, period=req.period,
             series=out, source_rows=source_rows,
             sampled=any(len(s.history_x) < source_rows for s in out),
         )
+        self._cache.set(key, result)
+        return result
 
     # -- lazy scan ----------------------------------------------------------
 
@@ -296,7 +331,16 @@ class AnalysisService:
 
     # -- aggregate / pivot --------------------------------------------------
 
+    def _cache_key(self, prefix: str, req) -> str:
+        return f"{prefix}:" + hashlib.md5(
+            json.dumps(req.model_dump(), default=str, sort_keys=True).encode()
+        ).hexdigest()
+
     def _aggregate(self, req: AggregateRequest) -> AggregateResult:
+        key = self._cache_key("aggregate", req)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
         if not req.measures:
             raise BadRequestError("aggregate needs at least one measure")
         lf = self._apply_filters(self._frame(req.path), req.filters)
@@ -324,12 +368,14 @@ class AnalysisService:
             out = out.sort(first, descending=req.sort_desc, nulls_last=True)
         out = out.head(req.limit)
         source_rows = lf.select(pl.len()).collect(engine="streaming").item()
-        return AggregateResult(
+        result = AggregateResult(
             node_id=self.settings.node_id, path=req.path,
             columns=out.columns,
             rows=[[_safe(v) for v in row] for row in out.iter_rows()],
             group_count=group_count, source_rows=source_rows, truncated=False,
         )
+        self._cache.set(key, result)
+        return result
 
     # -- describe -----------------------------------------------------------
 
@@ -502,6 +548,10 @@ class AnalysisService:
     # -- finance series -----------------------------------------------------
 
     def _finance(self, req: FinanceRequest) -> FinanceResult:
+        key = self._cache_key("finance", req)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
         lf = self._frame(req.path)
         cols = set(lf.collect_schema().names())
         if req.column not in cols:
@@ -565,7 +615,7 @@ class AnalysisService:
                 calmar=(cagr / abs(max_dd)) if (cagr is not None and max_dd) else None,
             )
 
-        return FinanceResult(
+        result = FinanceResult(
             node_id=self.settings.node_id, path=req.path, column=req.column, window=window,
             index=[_safe(v) for v in index],
             value=_safe_list(val), pct_change=_safe_list(ret), cum_return=_safe_list(cum),
@@ -573,6 +623,8 @@ class AnalysisService:
             ema=_safe_list(ema), drawdown=_safe_list(drawdown), metrics=metrics,
             truncated=truncated,
         )
+        self._cache.set(key, result)
+        return result
 
     # -- adaptive downsample ------------------------------------------------
 

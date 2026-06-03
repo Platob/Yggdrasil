@@ -14,6 +14,7 @@ from .user import router as user_router
 from .messenger import router as messenger_router
 from .excel import router as excel_router
 from .saga import router as saga_router
+from .trading import router as trading_router
 
 __all__ = [
     "backend_router",
@@ -32,4 +33,5 @@ __all__ = [
     "workbook_router",
     "user_router",
     "saga_router",
+    "trading_router",
 ]

@@ -16,6 +16,7 @@ from .services.user import UserService
 from .services.messenger import MessengerService as V2MessengerService
 from .services.excel import ExcelService
 from .services.saga import SagaService
+from .services.trading import TradingService
 
 
 def get_fs_service(request: Request) -> FsService:
@@ -72,3 +73,7 @@ def get_excel_service(request: Request) -> ExcelService:
 
 def get_saga_service(request: Request) -> SagaService:
     return request.app.state.saga_service
+
+
+def get_trading_service(request: Request) -> TradingService:
+    return request.app.state.trading_service
