@@ -57,7 +57,7 @@ from yggdrasil.databricks.sql.sql_utils import (
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
-from yggdrasil.enums.engine_name import EngineName
+from yggdrasil.enums.engine_type import EngineType
 from yggdrasil.execution.expr import (
     Predicate,
 )
@@ -888,29 +888,29 @@ class Table(DatabricksPath):
             return False
         return True
 
-    def _resolve_engine(self, options: CastOptions, *, write: bool) -> "EngineName":
+    def _resolve_engine(self, options: CastOptions, *, write: bool) -> "EngineType":
         """Resolve the compute engine for this read / write.
 
-        ``options.engine`` selects explicitly (an :class:`EngineName` or alias);
+        ``options.engine`` selects explicitly (an :class:`EngineType` or alias);
         ``YGGDRASIL`` on a table that can't take the native path degrades to the
         warehouse rather than erroring. ``None`` **guesses best**: an active
         Spark session → ``SPARK``; else a small Delta table
         (``< _NATIVE_DELTA_MAX_BYTES`` on disk) → ``YGGDRASIL``; else →
         ``DATABRICKS_SQL_WAREHOUSE`` (it parallelises big scans/writes better).
         """
-        engine = EngineName.from_(getattr(options, "engine", None))
+        engine = EngineType.from_(getattr(options, "engine", None))
         if engine is not None:
-            if engine == EngineName.YGGDRASIL and not self._delta_capable(write=write):
-                return EngineName.DATABRICKS_SQL_WAREHOUSE
+            if engine == EngineType.YGGDRASIL and not self._delta_capable(write=write):
+                return EngineType.DATABRICKS_SQL_WAREHOUSE
             return engine
 
         if self._has_active_spark(options):
-            return EngineName.SPARK
+            return EngineType.SPARK
         if self._delta_capable(write=write):
             size = self._delta_total_bytes()
             if size is not None and size < _NATIVE_DELTA_MAX_BYTES:
-                return EngineName.YGGDRASIL
-        return EngineName.DATABRICKS_SQL_WAREHOUSE
+                return EngineType.YGGDRASIL
+        return EngineType.DATABRICKS_SQL_WAREHOUSE
 
     @staticmethod
     def _has_active_spark(options: CastOptions) -> bool:
@@ -981,16 +981,16 @@ class Table(DatabricksPath):
         # YGGDRASIL → read straight off the ``_delta_log`` + parquet via our
         # DeltaFolder. ``_native_delta_folder`` probes UC credentials first,
         # returning None (and falling through to the warehouse) on a vend error.
-        if engine == EngineName.YGGDRASIL:
+        if engine == EngineType.YGGDRASIL:
             folder = self._native_delta_folder(write=False)
             if folder is not None:
                 yield from folder._read_arrow_batches(folder.check_options(options))
                 return
-            engine = EngineName.DATABRICKS_SQL_WAREHOUSE
+            engine = EngineType.DATABRICKS_SQL_WAREHOUSE
 
         options = options.with_source(source=self.collect_schema())
         query = self._options_to_sql(options)
-        sql_engine = "spark" if engine == EngineName.SPARK else "api"
+        sql_engine = "spark" if engine == EngineType.SPARK else "api"
 
         try:
             execution = self.sql.execute(query, engine=sql_engine)
@@ -1016,12 +1016,12 @@ class Table(DatabricksPath):
         # YGGDRASIL → commit straight to the ``_delta_log`` via our DeltaFolder.
         # The credential probe runs *before* ``batches`` is consumed, so a vend
         # failure falls back to the SQL insert below with the stream intact.
-        if engine == EngineName.YGGDRASIL:
+        if engine == EngineType.YGGDRASIL:
             folder = self._native_delta_folder(write=True)
             if folder is not None:
                 folder.write_arrow_batches(batches, options=options)
                 return
-            engine = EngineName.DATABRICKS_SQL_WAREHOUSE
+            engine = EngineType.DATABRICKS_SQL_WAREHOUSE
 
         options = options.with_target(self.collect_schema(options))
 
@@ -1030,7 +1030,7 @@ class Table(DatabricksPath):
         # Spark session is reachable in-process).
         return self.arrow_insert(
             batches,
-            engine="spark" if engine == EngineName.SPARK else "api",
+            engine="spark" if engine == EngineType.SPARK else "api",
             mode=options.mode,
             match_by=options.match_by_keys,
             update_column_names=options.update_column_names,

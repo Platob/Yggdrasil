@@ -8,7 +8,7 @@ from __future__ import annotations
 import dataclasses
 
 from yggdrasil.data.options import CastOptions
-from yggdrasil.enums.engine_name import EngineName
+from yggdrasil.enums.engine_type import EngineType
 
 __all__ = ["TableOptions"]
 
@@ -22,15 +22,15 @@ class TableOptions(CastOptions):
     ``match_by``, ``zorder_by``, ``vacuum_hours``, …) and adds the
     table-only routing knob:
 
-    - :attr:`engine` — pick the read/write compute (an :class:`EngineName`):
+    - :attr:`engine` — pick the read/write compute (an :class:`EngineType`):
 
-      * :attr:`~EngineName.YGGDRASIL` — yggdrasil's **native DeltaFolder** (a
+      * :attr:`~EngineType.YGGDRASIL` — yggdrasil's **native DeltaFolder** (a
         direct ``_delta_log`` + parquet path over UC-vended credentials) when
         the table is Delta-backed. Native writes need an *external* Delta table
         (UC vends read-only credentials for managed tables); a non-Delta or
         managed-Delta write falls back to the warehouse.
-      * :attr:`~EngineName.DATABRICKS_SQL_WAREHOUSE` — the SQL warehouse.
-      * :attr:`~EngineName.SPARK` — a Spark session.
+      * :attr:`~EngineType.DATABRICKS_SQL_WAREHOUSE` — the SQL warehouse.
+      * :attr:`~EngineType.SPARK` — a Spark session.
       * ``None`` (default) — **guess best** per call: an active Spark session →
         ``SPARK``; otherwise a small Delta table (< 128 MiB on disk) →
         ``YGGDRASIL``; a larger one → ``DATABRICKS_SQL_WAREHOUSE``.
@@ -39,15 +39,15 @@ class TableOptions(CastOptions):
     table's storage, the read/write transparently falls back to the warehouse.
     """
 
-    #: Read/write compute selector (:class:`EngineName`). ``None`` → guess best
+    #: Read/write compute selector (:class:`EngineType`). ``None`` → guess best
     #: from active Spark + table size.
-    engine: "EngineName | None" = None
+    engine: "EngineType | None" = None
 
     def __post_init__(self) -> None:
         # Explicit base call — a ``slots=True`` dataclass replaces the class
         # object, which breaks the zero-arg ``super()`` cell.
         CastOptions.__post_init__(self)
-        # Coerce an alias string / int code into a canonical EngineName so
-        # ``options.engine == EngineName.SPARK`` comparisons hold downstream.
-        if self.engine is not None and not isinstance(self.engine, EngineName):
-            object.__setattr__(self, "engine", EngineName.from_(self.engine))
+        # Coerce an alias string / int code into a canonical EngineType so
+        # ``options.engine == EngineType.SPARK`` comparisons hold downstream.
+        if self.engine is not None and not isinstance(self.engine, EngineType):
+            object.__setattr__(self, "engine", EngineType.from_(self.engine))

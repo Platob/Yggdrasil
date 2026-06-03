@@ -1,4 +1,4 @@
-"""``TableOptions.engine`` (EngineName) → compute-engine dispatch.
+"""``TableOptions.engine`` (EngineType) → compute-engine dispatch.
 
 ``engine`` picks YGGDRASIL (native DeltaFolder) / DATABRICKS_SQL_WAREHOUSE /
 SPARK explicitly; ``None`` guesses best (active Spark → SPARK; small Delta
@@ -11,6 +11,8 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
 from databricks.sdk.service.catalog import (
     DataSourceFormat,
     TableInfo,
@@ -19,27 +21,51 @@ from databricks.sdk.service.catalog import (
 )
 
 from yggdrasil.data.options import CastOptions
-from yggdrasil.enums import EngineName
+from yggdrasil.enums import EngineType
 from yggdrasil.databricks.table.options import TableOptions
 from yggdrasil.databricks.table.table import Table, _NATIVE_DELTA_MAX_BYTES
 
-WH = EngineName.DATABRICKS_SQL_WAREHOUSE
-YG = EngineName.YGGDRASIL
-SP = EngineName.SPARK
+WH = EngineType.DATABRICKS_SQL_WAREHOUSE
+YG = EngineType.YGGDRASIL
+SP = EngineType.SPARK
 
 
-class TestEngineName:
+class TestEngineType:
     def test_members(self):
         assert (YG.value, WH.value, SP.value) == (0, 1, 2)
 
-    def test_from_aliases(self):
-        assert EngineName.from_("api") is WH
-        assert EngineName.from_("warehouse") is WH
-        assert EngineName.from_("ygg") is YG
-        assert EngineName.from_("native") is YG
-        assert EngineName.from_("spark") is SP
-        assert EngineName.from_(2) is SP
-        assert EngineName.from_(None) is None
+    def test_from_str_aliases(self):
+        assert EngineType.from_str("warehouse") is WH
+        assert EngineType.from_str("sql") is WH
+        assert EngineType.from_str("ygg") is YG
+        assert EngineType.from_str("native") is YG
+        assert EngineType.from_str("spark") is SP
+        assert EngineType.from_str("connect") is SP
+
+    def test_api_alias_removed(self):
+        # ``api`` is too broad — no longer maps to an engine.
+        with pytest.raises(ValueError):
+            EngineType.from_str("api")
+        assert EngineType.from_str("api", default=WH) is WH
+
+    def test_from_numeric(self):
+        assert EngineType.from_numeric(0) is YG
+        assert EngineType.from_numeric(2) is SP
+        with pytest.raises(ValueError):
+            EngineType.from_numeric(9)
+        assert EngineType.from_numeric(9, default=None) is None
+        with pytest.raises(ValueError):
+            EngineType.from_numeric(True)  # bool rejected
+
+    def test_from_dispatch(self):
+        assert EngineType.from_(SP) is SP
+        assert EngineType.from_("warehouse") is WH
+        assert EngineType.from_(2) is SP
+        assert EngineType.from_(None) is None      # unset → None
+        assert EngineType.from_(...) is None
+        with pytest.raises(ValueError):
+            EngineType.from_("nope")
+        assert EngineType.from_("nope", default=WH) is WH
 
 
 class TestTableOptions:
