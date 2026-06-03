@@ -162,11 +162,13 @@ class TestListing:
         names = sorted(child.key for child in wire_s3_path(fake, "s3://bkt/p")._ls(recursive=True))
         assert names == ["p/a", "p/sub/c", "p/sub/deep/d"]
 
-    def test_listing_cache_reuses(self, fake):
+    def test_listing_is_never_cached(self, fake):
+        # No listing cache — every ``_ls`` is a fresh ListObjectsV2 so
+        # concurrent / external mutations show up immediately.
         for k in ["p/a", "p/b"]:
             _path(fake, k).write_bytes(b"z")
         d = wire_s3_path(fake, "s3://bkt/p")
         list(d._ls())
         before = fake.calls.get("list", 0)
-        list(d._ls())  # second walk hits the bucket's listing cache
-        assert fake.calls.get("list", 0) == before
+        list(d._ls())  # second walk re-lists
+        assert fake.calls.get("list", 0) == before + 1

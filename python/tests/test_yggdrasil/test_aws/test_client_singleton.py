@@ -181,10 +181,8 @@ class TestServiceSingleton:
     def test_service_init_is_idempotent(self) -> None:
         c = AWSClient(region="us-east-1")
         s = S3Service(client=c)
-        s.ls_cache["bucket/prefix"] = ("x",)
         again = S3Service(client=c)
         assert again is s
-        assert "bucket/prefix" in again.ls_cache
 
 
 # ---------------------------------------------------------------------------
@@ -199,29 +197,6 @@ class TestServicePickle:
         s = S3Service(client=c)
         restored = pickle.loads(pickle.dumps(s))
         assert restored is s
-
-    def test_ls_cache_excluded_from_state(self) -> None:
-        c = AWSClient(region="us-east-1")
-        s = S3Service(client=c)
-        s.ls_cache["k"] = ("v",)  # populate so ExpiringDict exists
-        state = s.__getstate__()
-        assert "_ls_cache" not in state
-
-    def test_cross_process_unpickle_rebuilds_ls_cache_slot(self) -> None:
-        c = AWSClient(region="ap-northeast-1")
-        s = S3Service(client=c)
-        s.ls_cache["bucket/prefix"] = ("a", "b")
-        blob = pickle.dumps(s)
-        AWSClient._INSTANCES.clear()
-        S3Service._INSTANCES.clear()
-
-        restored = pickle.loads(blob)
-        assert restored is not s
-        # The slot exists and is None — the property's lazy build kicks
-        # in fresh on the receiver side.
-        assert restored._ls_cache is None
-        # And the live cache content didn't leak through.
-        assert "bucket/prefix" not in restored.ls_cache
 
     def test_getnewargs_carries_client(self) -> None:
         c = AWSClient(region="us-east-1")

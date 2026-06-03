@@ -171,9 +171,17 @@ class DeltaFolder(Folder):
 
     def snapshot(self, version: "Optional[int]" = None, *,
                  fresh: bool = False) -> Snapshot:
+        # ``fresh`` must re-read from storage, not just rebuild from the cached
+        # log: ``DeltaFolder`` is a location-keyed singleton, so a snapshot
+        # taken before an *external* commit (a warehouse / Spark INSERT, another
+        # writer) would otherwise be replayed from the stale ``_delta_log``
+        # listing. Invalidate the log too — same as :meth:`refresh`.
+        if fresh:
+            self._log.invalidate()
+            self._snapshot = None
         if version is not None:
             return Snapshot.from_log(self._log, version)
-        if not fresh and self._snapshot is not None:
+        if self._snapshot is not None:
             return self._snapshot
         self._snapshot = Snapshot.from_log(self._log, None)
         return self._snapshot
