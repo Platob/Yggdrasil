@@ -231,12 +231,62 @@ class DeltaFolder(Folder):
 
     def _read_arrow_batches(self, options: DeltaOptions) -> Iterator[pa.RecordBatch]:
         snap = self.snapshot(options.version)
+        yield from self._read_snapshot_batches(snap, options)
+
+    def _read_snapshot_batches(self, snap: Snapshot,
+                               options: DeltaOptions) -> Iterator[pa.RecordBatch]:
+        """Stream Arrow batches off a *pinned* :class:`Snapshot`.
+
+        Split out from :meth:`_read_arrow_batches` so the polars IO-source
+        plugin can close over a snapshot captured once at scan-build time and
+        replay it on every ``collect`` without ``self`` re-resolving the log
+        (no second listing per collect, an immutable consistent view). The
+        Arrow read path passes the latest snapshot; both share the column
+        pushdown below.
+        """
         if snap.metadata is None:
             return
 
         partition_columns = snap.partition_columns
-        target_schema = (spark_json_to_arrow_schema(snap.schema_string)
-                         if snap.schema_string else None)
+        full_schema = (spark_json_to_arrow_schema(snap.schema_string)
+                       if snap.schema_string else None)
+
+        # Column pushdown. ``read_columns()`` is the projection ∪ the
+        # predicate's columns; ``None`` means "read everything" (unchanged
+        # behaviour). We keep partition columns out of the leaf projection —
+        # they're stripped from the data files on write and re-stamped below —
+        # but keep predicate columns in so the row filter still sees them. The
+        # final narrowing to the caller's output columns happens in the
+        # post-read cast (``_read_arrow_table`` / the scan's ``select``).
+        wanted = options.read_columns()
+        partition_set = set(partition_columns)
+        if wanted is not None and full_schema is not None:
+            keep = [n for n in full_schema.names
+                    if n in wanted and n not in partition_set]
+            # Anything the predicate needs that the projection dropped is
+            # already folded into ``read_columns()``, so ``keep`` is the full
+            # set of leaf columns the read + filter require.
+            # Push the projection into each parquet leaf so only those column
+            # chunks are decoded off disk (ParquetFile honours a bound target
+            # via ``_projection_columns``). When ``keep`` is empty — the caller
+            # asked only for partition column(s), which live in the AddFile not
+            # the leaf — read just the first physical column to learn the row
+            # count cheaply; it's dropped when the partition columns are
+            # stamped on and the cast projects to the output.
+            if keep:
+                target_schema = pa.schema([full_schema.field(n) for n in keep])
+                leaf_proj = target_schema
+            elif full_schema is not None and len(full_schema.names) > len(partition_set):
+                first_physical = next(n for n in full_schema.names
+                                      if n not in partition_set)
+                target_schema = pa.schema([full_schema.field(first_physical)])
+                leaf_proj = target_schema
+            else:
+                target_schema = full_schema
+                leaf_proj = None
+        else:
+            target_schema = full_schema
+            leaf_proj = None
         sidecar_cache: dict[str, bytes] = {}
 
         # Build row-level filter once
@@ -262,15 +312,17 @@ class DeltaFolder(Folder):
                 pass
 
         prune = _partition_prune_values(options.predicate, partition_columns)
+        # Binding a target on the leaf options is what makes ``ParquetFile``
+        # push ``columns=`` down to ``pq.ParquetFile`` — only the projected
+        # column chunks are decoded off disk (lower bytes-read + peak RSS).
+        # When no projection is requested ``leaf_proj`` is None ⇒ full read.
         leaf_opts = ParquetOptions.check(
             options=None, row_size=options.row_size,
             byte_size=options.byte_size, use_threads=options.use_threads,
             mode=Mode.READ_ONLY,
+            target=leaf_proj,
         )
 
-        target_field_names = (
-            set(target_schema.names) if target_schema is not None else None
-        )
         candidate_adds = snap.prune_files(prune_values=prune)
         if options.predicate is not None:
             candidate_adds = _data_skip_adds(snap, candidate_adds, options.predicate)
@@ -315,8 +367,13 @@ class DeltaFolder(Folder):
                         base_offset += batch.num_rows
                         if masked.num_rows == 0:
                             continue
+                        # Stamp partitions off the *full* schema so a
+                        # projected-out partition column still gets its
+                        # declared type (the narrowed ``target_schema`` no
+                        # longer carries partition fields). The post-read cast
+                        # drops any partition column the caller didn't ask for.
                         stamped = _stamp_partitions(masked, add.partition_values,
-                                                    partition_columns, target_schema)
+                                                    partition_columns, full_schema)
                         if row_filter is not None:
                             stamped = row_filter(stamped)
                             if stamped.num_rows == 0:
@@ -324,6 +381,84 @@ class DeltaFolder(Folder):
                         yield stamped
             except FileNotFoundError:
                 continue
+
+    # ------------------------------------------------------------------
+    # Polars — snapshot-self-contained, pruned, re-collectable lazy scan
+    # ------------------------------------------------------------------
+
+    def _scan_polars_frame(self, options: DeltaOptions) -> "Any":
+        """Pure-lazy :class:`~polars.LazyFrame` that holds its own snapshot.
+
+        Mirrors :meth:`Tabular._scan_polars_frame` (and the autonomous
+        ``WarehouseStatementResult`` frame) but pins the resolved
+        :class:`Snapshot` **once at scan-build time**:
+
+        - The version is pinned to ``snap.version`` so the frame is a
+          consistent, immutable view — a write that lands *after* the scan is
+          built doesn't change what an earlier-built scan collects.
+        - The deferred ``schema`` callable and the source generator both close
+          over the captured ``snap``, never ``self``'s live state — so the
+          frame can be returned, passed around, and collected on its own with
+          no re-resolution of the ``_delta_log`` and no second snapshot
+          listing per ``collect``.
+        - Each collect streams the snapshot's AddFiles with column pushdown
+          (``with_columns`` → Task A's leaf ``columns=``), predicate filter,
+          and ``n_rows`` early-stop.
+
+        ``is_pure=True`` is sound: a pinned version is immutable, so two reads
+        of this frame inside one polars plan yield identical data.
+        """
+        from yggdrasil.lazy_imports import polars_module
+        pl = polars_module()
+
+        snap = self.snapshot(options.version)
+        pinned = dataclasses.replace(options, version=snap.version)
+
+        # Resolve the polars schema once from the pinned snapshot's
+        # ``schema_string`` — no read, no live ``self`` lookup on collect.
+        if snap.metadata is None or not snap.schema_string:
+            from yggdrasil.data.schema import Schema
+            pinned_schema = Schema.empty()
+        else:
+            pinned_schema = spark_json_to_schema(snap.schema_string)
+
+        def schema() -> "Any":
+            return pinned_schema.to_polars_schema()
+
+        def source(with_columns, predicate, n_rows, batch_size):
+            read_options = pinned
+            if with_columns is not None:
+                base = (pinned.target if pinned.target is not None
+                        else pinned_schema)
+                read_options = pinned.with_target(base.select(with_columns))
+            remaining = n_rows
+            for batch in self._read_snapshot_batches(snap, read_options):
+                frame = pl.from_arrow(batch)
+                if with_columns is not None:
+                    frame = frame.select(with_columns)
+                if predicate is not None:
+                    frame = frame.filter(predicate)
+                if remaining is not None:
+                    if frame.height >= remaining:
+                        yield frame.head(remaining)
+                        return
+                    remaining -= frame.height
+                yield frame
+
+        return pl.io.plugins.register_io_source(source, schema=schema, is_pure=True)
+
+    def _read_polars_frame(self, options: DeltaOptions) -> "Any":
+        # Eager read reuses the pruned Arrow path (Task A pushes the
+        # projection into each parquet leaf) and ingests with ``rechunk=False``
+        # so numeric columns stay zero-copy views over the Arrow buffers
+        # instead of being memcpy'd into one contiguous chunk. Lower peak than
+        # ``scan(...).collect()`` here: the IO-source plugin materializes a
+        # polars frame *per batch* then concatenates, whereas ``from_arrow``
+        # over the already-assembled table coalesces once.
+        from yggdrasil.lazy_imports import polars_module
+        return polars_module().from_arrow(
+            self._read_arrow_table(options), rechunk=False,
+        )
 
     # ==================================================================
     # Write
@@ -1021,14 +1156,44 @@ class DeltaFolder(Folder):
         import pickle
         from yggdrasil.environ import PyEnv
         spark = PyEnv.spark_session(options.spark_session, create=True, import_error=True)
+        # Pin the snapshot version so the distributed frame reads a consistent
+        # view: the AddFiles + schema captured here, pickled per-file, make the
+        # frame self-contained — the ``mapInArrow`` closure references only the
+        # pickled payload (root + add + projection + partition info), never
+        # ``self``.
         snap = self.snapshot(options.version)
+        full_schema_obj = self._collect_schema(dataclasses.replace(options, version=snap.version))
         if snap.metadata is None or not snap.active_files:
-            return spark.createDataFrame([], schema=self._collect_schema(options).to_spark_schema())
-        target_schema = spark_json_to_arrow_schema(snap.schema_string) if snap.schema_string else None
-        if target_schema is None:
-            return spark.createDataFrame([], schema=self._collect_schema(options).to_spark_schema())
-        spark_schema = self._collect_schema(options).to_spark_schema()
+            return spark.createDataFrame([], schema=full_schema_obj.to_spark_schema())
+        full_schema = spark_json_to_arrow_schema(snap.schema_string) if snap.schema_string else None
+        if full_schema is None:
+            return spark.createDataFrame([], schema=full_schema_obj.to_spark_schema())
         partition_columns = snap.partition_columns
+        partition_set = set(partition_columns)
+
+        # Column pushdown (mirror of the Arrow read). ``read_columns()`` is the
+        # projection ∪ predicate columns; partition columns are stamped, not
+        # read off the leaf. Narrow both the per-leaf projection (pushed into
+        # the closure's ``columns=``) and the result ``spark_schema``.
+        wanted = options.read_columns()
+        if wanted is not None:
+            leaf_proj = [n for n in full_schema.names
+                         if n in wanted and n not in partition_set]
+            arrow_proj = pa.schema([full_schema.field(n) for n in leaf_proj]) if leaf_proj else None
+            # The *output* columns are the projection only (``column_names``);
+            # ``wanted`` (= ``read_columns()``) additionally carries predicate
+            # columns that must be *read* but not returned. Drop those from the
+            # result schema. The mapInArrow closure still yields the predicate
+            # columns, so narrow each yielded batch down to ``output_cols``.
+            output_cols = [n for n in full_schema.names
+                           if options.column_names is None or n in options.column_names]
+            spark_schema = full_schema_obj.select(output_cols).to_spark_schema()
+            output_set = frozenset(output_cols)
+        else:
+            arrow_proj = None
+            spark_schema = full_schema_obj.to_spark_schema()
+            output_set = None
+
         prune = _partition_prune_values(options.predicate, partition_columns)
         candidate = snap.prune_files(prune_values=prune)
         if options.predicate is not None:
@@ -1037,7 +1202,8 @@ class DeltaFolder(Folder):
         if not active_adds:
             return spark.createDataFrame([], schema=spark_schema)
 
-        blobs = [pickle.dumps((self.path, add, partition_columns, target_schema)) for add in active_adds]
+        blobs = [pickle.dumps((self.path, add, partition_columns, full_schema, arrow_proj, output_set))
+                 for add in active_adds]
         try: parallelism = max(spark.sparkContext.defaultParallelism, 1)
         except Exception: parallelism = 4
         leaf_df = spark.createDataFrame(
@@ -1051,14 +1217,26 @@ class DeltaFolder(Folder):
             from yggdrasil.enums import Mode as _M
             for batch in batches:
                 for blob in batch.column("_pkl").to_pylist():
-                    root, add, pcols, ts = _pkl.loads(blob)
+                    root, add, pcols, full_sch, proj, out_set = _pkl.loads(blob)
                     dv = _dv(add.deletion_vector, table_root=root)
+                    # Bind the projection as the leaf options' target → only
+                    # the requested column chunks are decoded off disk.
+                    leaf_opts = _PO.check(options=None, mode=_M.READ_ONLY, target=proj)
                     base = 0
                     with _PF(holder=root / add.path, owns_holder=False) as f:
-                        for rb in f._read_arrow_batches(_PO(mode=_M.READ_ONLY)):
+                        for rb in f._read_arrow_batches(leaf_opts):
                             m = _mask(rb, dv, base_offset=base); base += rb.num_rows
-                            if m.num_rows > 0:
-                                yield _stamp_partitions(m, add.partition_values, pcols, ts)
+                            if m.num_rows == 0:
+                                continue
+                            stamped = _stamp_partitions(m, add.partition_values, pcols, full_sch)
+                            # Drop predicate-only columns the projection didn't
+                            # ask for so the batch matches ``spark_schema``
+                            # (mapInArrow binds by position).
+                            if out_set is not None:
+                                keep = [n for n in stamped.schema.names if n in out_set]
+                                if keep != stamped.schema.names:
+                                    stamped = stamped.select(keep)
+                            yield stamped
         return leaf_df.mapInArrow(_read_delta_files, schema=spark_schema)
 
     def _write_spark_frame(self, frame: "Any", options: DeltaOptions) -> None:
