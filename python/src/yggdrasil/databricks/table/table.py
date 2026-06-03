@@ -40,6 +40,7 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
 from yggdrasil.data.options import CastOptions
+from yggdrasil.databricks.table.options import TableOptions
 from yggdrasil.data.schema import Schema as DataSchema, Schema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 from yggdrasil.databricks.client import DatabricksClient
@@ -581,7 +582,7 @@ class Table(DatabricksPath):
 
     @classmethod
     def options_class(cls) -> type[CastOptions]:
-        return CastOptions
+        return TableOptions
 
     @classmethod
     def safe_name(cls, raw: str | None) -> str:
@@ -862,7 +863,46 @@ class Table(DatabricksPath):
 
         return query
 
+    def _prefer_delta_read(self, options: CastOptions) -> bool:
+        """``True`` when ``prefer_sql=False`` and this is a Delta table we can
+        read natively (resolvable storage). Reads UC-vended *read* creds —
+        works for managed and external Delta alike."""
+        if getattr(options, "prefer_sql", True):
+            return False
+        try:
+            infos = self.infos
+        except Exception:
+            return False
+        return (
+            infos.table_type not in _VIEW_TABLE_TYPES
+            and infos.data_source_format == DataSourceFormat.DELTA
+            and bool(infos.storage_location)
+        )
+
+    def _prefer_delta_write(self, options: CastOptions) -> bool:
+        """``True`` when ``prefer_sql=False`` and this is an *external* Delta
+        table. A native ``_delta_log`` commit needs UC READ_WRITE creds, which
+        UC only vends for external tables — managed Delta writes stay on SQL."""
+        if getattr(options, "prefer_sql", True):
+            return False
+        try:
+            infos = self.infos
+        except Exception:
+            return False
+        return (
+            infos.table_type == TableType.EXTERNAL
+            and infos.data_source_format == DataSourceFormat.DELTA
+            and bool(infos.storage_location)
+        )
+
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
+        # prefer_sql=False on a Delta table → read straight off the
+        # ``_delta_log`` + parquet via our DeltaFolder, bypassing the warehouse.
+        if self._prefer_delta_read(options):
+            folder = self.delta()
+            yield from folder._read_arrow_batches(folder.check_options(options))
+            return
+
         options = options.with_source(source=self.collect_schema())
         query = self._options_to_sql(options)
 
@@ -885,6 +925,12 @@ class Table(DatabricksPath):
         batches: Iterable[pa.RecordBatch],
         options: CastOptions
     ) -> None:
+        # prefer_sql=False on an external Delta table → commit straight to the
+        # ``_delta_log`` via our DeltaFolder, bypassing the warehouse.
+        if self._prefer_delta_write(options):
+            self.delta().write_arrow_batches(batches, options=options)
+            return
+
         options = options.with_target(self.collect_schema(options))
 
         return self.insert(
@@ -1317,6 +1363,19 @@ class Table(DatabricksPath):
         the table's ``infos`` has been resolved at least once.
         """
         return self.table_type in _VIEW_TABLE_TYPES
+
+    @property
+    def is_delta(self) -> bool:
+        """True for a Delta-backed table (``USING DELTA``), from cached infos.
+
+        Reads the cached ``infos`` only — never a network round trip; returns
+        ``False`` until the table has been resolved at least once. Views are
+        never Delta.
+        """
+        cached = self._infos
+        if cached is None or self.is_view:
+            return False
+        return cached.data_source_format == DataSourceFormat.DELTA
 
     @property
     def is_materialized_view(self) -> bool:
