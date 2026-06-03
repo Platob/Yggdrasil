@@ -7,9 +7,16 @@
 # Jobs
 # ----
 #   detect             → reads version, checks ygg on PyPI, decides
-#   build-python       → sdist + pure-Python wheel (uv / setuptools)
+#   build-python       → sdist + pure-Python wheel (uv / setuptools), plus
+#                        the serverless environment spec pairing the wheel +
+#                        the bundled dependency wheels (databricks-sdk, polars
+#                        + polars-runtime, orjson, xxhash — all by path) with
+#                        the py3.12 Databricks serverless env version
+#                        (scripts/build_serverless_env.py → environments/ygg/)
 #   publish-python     → uploads ygg dist to PyPI
-#   tag                → creates vX.Y.Z git tag + GitHub Release
+#   tag                → creates vX.Y.Z git tag + GitHub Release (dist +
+#                        serverless env spec + bundled wheels), commits the
+#                        spec to environments/ygg/
 #   cleanup-previous   → opt-in: removes previous tag/release on
 #                        ``!cleanup-prev-release`` commit marker
 #   skip               → summary when publish is intentionally skipped
@@ -219,11 +226,61 @@ jobs:
       - name: Verify dist contents
         run: ls -lh dist/
 
+      # Fetch the bundled dependency wheels to ship BY PATH alongside the ygg
+      # wheel. The runner is Linux x86_64 / py3.12 — the serverless target — so
+      # a native download yields the correct manylinux cp312 builds (no cross
+      # flags). Kept OUT of dist/ so they are never uploaded to PyPI.
+      - name: Fetch bundled dependency wheels
+        run: |
+          mkdir -p serverless-wheels
+          # Pure-python / no-dep packages — their common transitive deps
+          # (e.g. requests for databricks-sdk) ship in the serverless base image.
+          python -m pip download databricks-sdk orjson xxhash \
+            --no-deps --only-binary=:all: -d serverless-wheels
+          # polars is a thin shim over a compiled runtime — pull the closure
+          # (polars + polars-runtime-XX) so it works with no index install.
+          python -m pip download polars \
+            --only-binary=:all: -d serverless-wheels
+          ls -lh serverless-wheels/
+
+      # Alongside the wheel, generate the serverless environment spec — it pairs
+      # this version's ygg wheel with the bundled dependency wheels (all by path,
+      # no index installs) and the py3.12 serverless environment version. Written
+      # to environments/ygg/. Stdlib only, so no install is required.
+      - name: Generate serverless environment spec
+        run: >-
+          python scripts/build_serverless_env.py
+          --version "${{ needs.detect.outputs.version }}"
+          --python 3.12
+          --wheel-dir serverless-wheels
+
+      - name: Verify serverless environment spec
+        working-directory: ${{ github.workspace }}
+        run: cat "environments/ygg/ygg-${{ needs.detect.outputs.version }}-py3.12-serverless.yml"
+
+      # Stage the env spec + the bundled wheels into one flat directory so the
+      # release assets (and the deploy bundle) are the spec next to its wheels.
+      - name: Stage serverless bundle
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p serverless-bundle
+          cp "environments/ygg/ygg-${{ needs.detect.outputs.version }}-py3.12-serverless.yml" serverless-bundle/
+          cp python/serverless-wheels/*.whl serverless-bundle/
+          ls -lh serverless-bundle/
+
       - name: Upload python dist artifacts
         uses: actions/upload-artifact@v4
         with:
           name: python-dist-${{ needs.detect.outputs.version }}
           path: python/dist/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload serverless environment bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: serverless-env-${{ needs.detect.outputs.version }}
+          path: serverless-bundle/
           retention-days: 7
           if-no-files-found: error
 
@@ -321,6 +378,12 @@ jobs:
           name: python-dist-${{ needs.detect.outputs.version }}
           path: release/
 
+      - name: Download serverless environment bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: serverless-env-${{ needs.detect.outputs.version }}
+          path: release/
+
       - name: List release assets
         run: ls -lh release/
 
@@ -334,6 +397,32 @@ jobs:
             --title "Release ${TAG}" \
             --generate-notes \
             --verify-tag
+
+      # Commit the generated serverless env spec back into environments/ygg/
+      # so the repo carries a per-version catalog. Runs after the Release is
+      # cut so a push race never blocks publishing — a non-fast-forward push
+      # only warns. The publish trigger's path filter excludes environments/**,
+      # so this push does not re-run the workflow.
+      - name: Commit serverless environment spec to environments/ygg
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          SPEC="environments/ygg/ygg-${VERSION}-py3.12-serverless.yml"
+          mkdir -p "environments/ygg"
+          cp "release/ygg-${VERSION}-py3.12-serverless.yml" "$SPEC"
+          if git diff --quiet -- "$SPEC"; then
+            echo "ℹ️  $SPEC already up to date — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$SPEC"
+          git commit -m "chore(environments): add serverless env spec for ygg ${VERSION}"
+          if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+            echo "📦 Committed $SPEC to ${GITHUB_REF_NAME}"
+          else
+            echo "::warning ::Could not push $SPEC to ${GITHUB_REF_NAME} (branch moved?); the spec is still attached to the Release."
+          fi
 
       - name: Write release summary
         env:

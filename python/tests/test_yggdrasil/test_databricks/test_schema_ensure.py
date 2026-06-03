@@ -36,7 +36,7 @@ def test_schema_create_ensures_catalog_on_not_found_and_retries():
     uc = s.client.workspace_client().schemas
     uc.create.side_effect = [_Boom("Catalog does not exist"), object()]
     with patch.object(UCSchema, "read_infos", return_value=None), \
-         patch.object(UCCatalog, "ensure_created") as catalog_ensure:
+         patch.object(UCCatalog, "get_or_create") as catalog_ensure:
         assert s.create() is s
     catalog_ensure.assert_called_once()
     assert uc.create.call_count == 2
@@ -47,7 +47,7 @@ def test_schema_create_does_not_ensure_parent_when_create_succeeds():
     uc = s.client.workspace_client().schemas
     uc.create.return_value = object()
     with patch.object(UCSchema, "read_infos", return_value=None), \
-         patch.object(UCCatalog, "ensure_created") as catalog_ensure:
+         patch.object(UCCatalog, "get_or_create") as catalog_ensure:
         s.create()
     catalog_ensure.assert_not_called()
     uc.create.assert_called_once()

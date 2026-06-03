@@ -59,6 +59,20 @@ export class Tabular {
 
   /** Materialise rows as plain objects (bounded — for small previews). */
   toArray(): Record<string, unknown>[] { return this.table.toArray().map((r) => ({ ...r })); }
+
+  // PARITY: python ``Tabular.scan_arrow_table`` / ``scan_arrow_batches``. The
+  // zero-copy counterpart of the ``read*`` surface: where ``read``/``cast`` run
+  // the options pipeline (project/cast/limit — copying), ``scan`` hands back the
+  // underlying Arrow data as views, untouched. arrow-js Tables are already
+  // in-memory, so a scan is just exposing the held Table / its record batches.
+  // (Python's streaming ``scan_arrow_batch_reader`` has no JS analog — arrow-js
+  // has no lazy ``RecordBatchReader`` pull model; ``scanArrowBatches`` is it.)
+
+  /** Zero-copy view of the held Arrow Table (no cast/projection). */
+  scanArrowTable(): arrow.Table { return this.table; }
+
+  /** Zero-copy views of the held Table's record batches (no cast/projection). */
+  scanArrowBatches(): arrow.RecordBatch[] { return this.table.batches; }
 }
 
 /** Read/write interface for a tabular source (a file format leaf). */

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ygg"
-version = "0.8.48"
+version = "0.8.49"
 description = "Type-friendly utilities for moving data between Python objects, Arrow, Polars, Pandas, Spark, and Databricks"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
@@ -125,6 +125,7 @@ Documentation = "https://platob.github.io/Yggdrasil/"
 
 [project.scripts]
 ygg = "yggdrasil.cli.main:main"
+ygg-run = "yggdrasil.databricks.job.runner:main"
 
 # ── setuptools ────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]

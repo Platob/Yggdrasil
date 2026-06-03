@@ -10,7 +10,7 @@ home for everything that used to live as ad-hoc state on
   :class:`AWSDatabricksVolumeCredentials` refresher.
 - Storage-location → :class:`Path` resolution (S3 today; other
   backends fall back to the generic Path registry).
-- Lifecycle (``create`` / ``ensure_created`` / ``delete``)
+- Lifecycle (``create`` / ``get_or_create`` / ``delete``)
   :class:`VolumePath` when a write hits a missing catalog / schema
   / volume.
 
@@ -750,7 +750,7 @@ class Volume(DatabricksPath):
                 # Parent schema (and, through it, the catalog) missing —
                 # create the parents and retry the volume create once.
                 logger.info("Volume %r create failed (%s); ensuring parents", self, exc)
-                self.schema.ensure_created()
+                self.schema.get_or_create()
                 self._store_infos(uc.create(**kwargs))
             else:
                 raise
@@ -759,7 +759,7 @@ class Volume(DatabricksPath):
         self._persist_stat_cache(self._stat_uncached())
         return self
 
-    def ensure_created(
+    def get_or_create(
         self,
         *,
         comment: str | None = None,

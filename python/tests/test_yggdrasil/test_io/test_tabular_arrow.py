@@ -152,6 +152,49 @@ class TestArrowTabularReadTable(ArrowTestCase):
         self.assertEqual(second["x"].to_pylist(), [10, 20])
 
 
+class TestTabularScanArrow(ArrowTestCase):
+    """``scan_arrow_*`` — the zero-copy / view counterpart of ``read_arrow_*``."""
+
+    def _table(self):
+        return self.table({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+
+    def test_scan_arrow_batches_yields_record_batches(self) -> None:
+        io = ArrowTabular(self._table())
+        batches = list(io.scan_arrow_batches())
+        self.assertEqual(sum(b.num_rows for b in batches), 3)
+        self.assertTrue(all(isinstance(b, self.pa.RecordBatch) for b in batches))
+
+    def test_scan_arrow_batches_is_zero_copy_view(self) -> None:
+        # The scanned batch must reference the *same* underlying Arrow
+        # buffers as the held table — no copy, a genuine view.
+        t = self._table()
+        io = ArrowTabular(t)
+        scanned = next(iter(io.scan_arrow_batches()))
+        src_buf = t.column("x").chunks[0].buffers()[1].address
+        scan_buf = scanned.column("x").buffers()[1].address
+        self.assertEqual(src_buf, scan_buf)
+
+    def test_scan_arrow_table_returns_full_table(self) -> None:
+        io = ArrowTabular(self._table())
+        out = io.scan_arrow_table()
+        self.assertEqual(out.num_rows, 3)
+        self.assertEqual(out.column_names, ["x", "y"])
+
+    def test_scan_arrow_table_empty_holder(self) -> None:
+        out = ArrowTabular().scan_arrow_table()
+        self.assertEqual(out.num_rows, 0)
+
+    def test_scan_arrow_batch_reader_streams_all_rows(self) -> None:
+        io = ArrowTabular(self._table())
+        reader = io.scan_arrow_batch_reader()
+        self.assertIsInstance(reader, self.pa.RecordBatchReader)
+        self.assertEqual(reader.read_all().num_rows, 3)
+
+    def test_scan_arrow_batch_reader_empty_holder(self) -> None:
+        reader = ArrowTabular().scan_arrow_batch_reader()
+        self.assertEqual(reader.read_all().num_rows, 0)
+
+
 class TestArrowTabularSpill(ArrowTestCase):
     """Append-only spill to a folder of :class:`ArrowIPCFile` part files."""
 

@@ -1,8 +1,8 @@
-"""Unit tests for the Prefect-style @task / @flow + serverless deploy."""
+"""Unit tests for the Prefect-style @task / @flow + transparent serverless deploy."""
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -11,7 +11,7 @@ from yggdrasil.version import __version__
 
 
 # --------------------------------------------------------------------------- #
-# @task — callable, retries, submit, with_options
+# @task — local execution, retries, submit, with_options
 # --------------------------------------------------------------------------- #
 class TestTask:
     def test_decorator_yields_callable_task(self):
@@ -20,7 +20,7 @@ class TestTask:
             return a + b
 
         assert isinstance(add, Task)
-        assert add(2) == 3                      # callable like a function
+        assert add.local(2) == 3                 # .local() runs in-process
         assert add.fn.__name__ == "add"
         assert add.name == "add"
 
@@ -34,7 +34,7 @@ class TestTask:
                 raise ValueError("boom")
             return "ok"
 
-        assert flaky() == "ok"
+        assert flaky.local() == "ok"
         assert calls["n"] == 3
 
     def test_retries_exhausted_reraises(self):
@@ -43,7 +43,7 @@ class TestTask:
             raise ValueError("nope")
 
         with pytest.raises(ValueError):
-            always()
+            always.local()
 
     def test_submit_returns_future(self):
         @task
@@ -84,20 +84,53 @@ class TestTask:
 
 
 # --------------------------------------------------------------------------- #
-# @flow — callable, orchestrates tasks, deploys serverless
+# transparent dispatch — in-Databricks runs local, elsewhere routes remote
+# --------------------------------------------------------------------------- #
+class TestTransparentDispatch:
+    def test_call_inside_databricks_runs_in_process(self):
+        @task
+        def add(a, b):
+            return a + b
+
+        with patch(
+            "yggdrasil.databricks.client.DatabricksClient.is_in_databricks_environment",
+            return_value=True,
+        ):
+            assert add(2, 3) == 5                   # ran locally, no deploy
+
+    def test_call_outside_databricks_dispatches_remote(self):
+        @flow
+        def etl(x):
+            return x
+
+        with patch(
+            "yggdrasil.databricks.client.DatabricksClient.is_in_databricks_environment",
+            return_value=False,
+        ), patch.object(Flow, "_dispatch_remote", return_value="REMOTE") as disp:
+            assert etl(7, k=1) == "REMOTE"
+        disp.assert_called_once_with((7,), {"k": 1})
+
+    def test_target_ref_points_at_the_decorated_object(self):
+        # A module-level flow has an importable target the runner can resolve.
+        ref = module_level_flow._target_ref()
+        assert ref == f"{__name__}:module_level_flow"
+
+
+# --------------------------------------------------------------------------- #
+# @flow — local orchestration + serverless rendering
 # --------------------------------------------------------------------------- #
 class TestFlow:
-    def test_flow_runs_tasks(self):
+    def test_flow_runs_tasks_locally(self):
         @task
         def double(x):
             return x * 2
 
         @flow(name="etl")
         def etl(x):
-            return double(x) + 1
+            return double(x) + 1                    # task call → in-process here
 
         assert isinstance(etl, Flow)
-        assert etl(10) == 21
+        assert etl.local(10) == 21
         assert etl.name == "etl"
 
     def test_flow_fans_out_with_submit(self):
@@ -109,9 +142,9 @@ class TestFlow:
         def gather(items):
             return sorted(f.result() for f in fetch.map(items))
 
-        assert gather([3, 1, 2]) == [1, 2, 3]
+        assert gather.local([3, 1, 2]) == [1, 2, 3]
 
-    def test_definition_is_serverless_python_matched_with_ygg_databricks(self):
+    def test_definition_runs_target_via_ygg_run(self):
         from yggdrasil.databricks.job.wheel import serverless_environment_version
 
         @flow(parameters=["a", "b"])
@@ -122,11 +155,14 @@ class TestFlow:
         assert spec["name"] == "etl"
         assert "trigger" not in spec
         task_obj = spec["tasks"][0]
-        assert task_obj.python_wheel_task.parameters == ["a", "b"]
+        # the cluster runs the ygg-run CLI against the target + scheduled params
+        assert task_obj.python_wheel_task.package_name == "ygg"
+        assert task_obj.python_wheel_task.entry_point == "ygg-run"
+        assert task_obj.python_wheel_task.parameters == [etl._target_ref(), "a", "b"]
         assert task_obj.environment_key == "default"
         env = spec["environments"][0]
-        # serverless env version is chosen to match the local Python
         assert env.spec.environment_version == serverless_environment_version()
+        # no wheels shipped yet (definition without deploy) → published fallback
         assert env.spec.dependencies == [f"ygg[databricks]=={__version__}", "databricks-sdk"]
 
     def test_serverless_false_drops_environment(self):
@@ -146,32 +182,24 @@ class TestFlow:
 
         assert etl.definition()["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
 
-    def test_deploy_builds_and_ships_wheels_by_default(self):
-        from unittest.mock import patch
-
+    def test_deploy_ships_composed_wheels_by_default(self):
         @flow(name="ygg-demo", parameters=["a"])
         def demo(x):
             ...
 
         client = MagicMock()
         wheels = [
-            "/Workspace/Shared/pypi/ygg-demo/ygg-9.9-py3-none-any.whl",
-            "/Workspace/Shared/pypi/ygg-demo/databricks_sdk-1.2.3-py3-none-any.whl",
+            "/Workspace/Shared/pypi/ygg/ygg-9.9-py3-none-any.whl",
+            "xxhash==1.2.3",
         ]
-        with patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=wheels) as ew:
+        with patch.object(Flow, "_serverless_dependencies", return_value=wheels) as sd:
             deployed = demo.deploy(client)
 
-        # by default: build ygg + databricks-sdk (+ deps) from the live package
-        # and ship them as workspace wheels — no index install
-        assert ew.call_count == 1
-        assert ew.call_args.args[1] == demo.wheel_package()     # (client, package, ...)
-        assert ew.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/pypi/ygg-demo"
-        assert ew.call_args.kwargs["extras"] == ("databricks",)
-        assert ew.call_args.kwargs["requirements"] == ("databricks-sdk",)
+        sd.assert_called_once_with(client)
         kwargs = client.jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-demo"
-        assert kwargs["tasks"][0].python_wheel_task.parameters == ["a"]
-        assert kwargs["environments"][0].spec.dependencies == wheels   # all shipped wheels
+        assert kwargs["tasks"][0].python_wheel_task.parameters == [demo._target_ref(), "a"]
+        assert kwargs["environments"][0].spec.dependencies == wheels  # shipped by path
         assert deployed is client.jobs.create_or_update.return_value
 
     def test_deploy_can_use_published_ygg(self):
@@ -184,8 +212,9 @@ class TestFlow:
         deployed = demo.deploy(client)
         client.jobs.create_or_update.assert_called_once()
         kwargs = client.jobs.create_or_update.call_args.kwargs
-        # published ygg (pinned) from the index + latest databricks-sdk — no built wheel
-        assert kwargs["environments"][0].spec.dependencies == [f"ygg[databricks]=={__version__}", "databricks-sdk"]
+        assert kwargs["environments"][0].spec.dependencies == [
+            f"ygg[databricks]=={__version__}", "databricks-sdk",
+        ]
         assert deployed is client.jobs.create_or_update.return_value
 
 
@@ -198,5 +227,45 @@ def test_class_based_flow_overrides_run():
             return x + 100
 
     f = MyFlow()
-    assert f(5) == 105                              # callable
+    assert f.local(5) == 105                          # in-process
     assert f.name == "mine"
+    assert "MyFlow" in f._target_ref()                # class-based target
+
+
+# A module-level flow target (importable ``module:qualname`` for the runner).
+@flow(name="module-level")
+def module_level_flow(x):
+    return x
+
+
+def test_all_environments_attaches_one_env_per_python():
+    from yggdrasil.databricks.job import wheel as W
+
+    @flow(name="multi")
+    def f(x):
+        ...
+
+    f.all_environments = True
+    # simulate a completed deploy build (per-Python wheel matrix stashed)
+    f._ygg_wheels = ["/ws/ygg-1.0-py3-none-any.whl"]
+    f._user_wheels = []
+    f._user_deps = []
+    f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl", "pyarrow>=20")
+    from unittest.mock import patch
+    with patch.object(W, "ygg_runtime_dependencies", return_value=["pyarrow>=20"]):
+        envs = f.environments()
+    keys = [e.environment_key for e in envs]
+    assert keys == ["default", "py310", "py311", "py312", "py313"]
+    by = {e.environment_key: e for e in envs}
+    assert by["py310"].spec.environment_version == "1"
+    assert by["py311"].spec.environment_version == "2"
+
+
+def test_default_only_single_environment_without_flag():
+    @flow(name="single")
+    def f(x):
+        ...
+
+    f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl",)
+    envs = f.environments()
+    assert [e.environment_key for e in envs] == ["default"]

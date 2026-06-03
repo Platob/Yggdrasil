@@ -202,7 +202,7 @@ class VolumePath(DatabricksPath):
     # consistent with the Files API: ``volumes.create`` returns, but the
     # next ``PUT /files`` / ``create_directory`` can still 404 with
     # "Volume ... does not exist" for a second or two while the edge
-    # catches up. After an :meth:`Volume.ensure_created` recovery we retry
+    # catches up. After an :meth:`Volume.get_or_create` recovery we retry
     # the write up to ``VOLUME_VISIBILITY_RETRIES`` times with capped
     # exponential backoff so a single ``write_bytes`` no longer races the
     # propagation the way the old single-shot retry did.
@@ -567,16 +567,25 @@ class VolumePath(DatabricksPath):
         # whether the path is a file / directory / missing in one
         # syscall — no HTTPS round trip needed.
         if _local_mount_available():
+            # The kernel mount is the source of truth for existence here.
+            # ``os.path.exists`` treats *any* ``os.stat`` failure as "not
+            # present" (it swallows the whole ``OSError`` family —
+            # ``FileNotFoundError`` for a missing leaf, ``NotADirectoryError``
+            # when an intermediate component is a file, permission / EIO /
+            # ESTALE for an unreachable one). We MUST agree: a path the
+            # kernel can't stat is ``MISSING``. Falling through to the Files
+            # REST API on a non-``FileNotFoundError`` used to let a second
+            # transport override the kernel and report the path as existing,
+            # so ``VolumePath.exists()`` returned ``True`` while
+            # ``os.path.exists()`` returned ``False`` for the same path.
             try:
                 st = os.stat(api_path)
-            except FileNotFoundError:
-                logger.debug("stat via kernel mount: %r -> MISSING", api_path)
-                return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
             except OSError as exc:
                 logger.debug(
-                    "stat via kernel mount: %r -> OSError %r, "
-                    "falling back to Files API", api_path, exc,
+                    "stat via kernel mount: %r -> %s -> MISSING",
+                    api_path, type(exc).__name__,
                 )
+                return IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
             else:
                 if _stat.S_ISDIR(st.st_mode):
                     logger.debug(
@@ -966,7 +975,7 @@ class VolumePath(DatabricksPath):
         parent, which fixes the common case (only a sub-directory was
         missing) without touching Unity Catalog. Only if that ``mkdir``
         NotFounds (the volume itself is missing) fall back to the idempotent
-        :meth:`Volume.ensure_created` (which creates the volume and any
+        :meth:`Volume.get_or_create` (which creates the volume and any
         missing catalog / schema, retrying once) and then retry the parent
         ``mkdir``. Blind creates swallow ``AlreadyExists`` so the idempotent
         path costs at most three SDK calls.
@@ -995,7 +1004,7 @@ class VolumePath(DatabricksPath):
         # retry the directory create — looping over the visibility window so a
         # just-created volume that the Files edge hasn't caught up to yet
         # doesn't fail the recovery on the first immediate retry.
-        self.volume.ensure_created()
+        self.volume.get_or_create()
 
         if has_subdir:
             def _mkdir() -> None:
@@ -1011,7 +1020,7 @@ class VolumePath(DatabricksPath):
     def _retry_until_volume_visible(self, op) -> None:
         """Run *op*, absorbing the post-create volume-visibility window.
 
-        :meth:`Volume.ensure_created` returns as soon as Unity Catalog has the
+        :meth:`Volume.get_or_create` returns as soon as Unity Catalog has the
         volume, but the Files API edge can keep 404-ing "Volume ... does not
         exist" for a second or two afterwards (eventual consistency). Retry
         *op* up to :attr:`VOLUME_VISIBILITY_RETRIES` times with capped
@@ -1058,7 +1067,7 @@ class VolumePath(DatabricksPath):
         # it can't create the volume securable itself (that's a catalog
         # object, not a plain directory). So when ``os.makedirs`` fails
         # against a missing volume, recover exactly like the Files-API path:
-        # ``Volume.ensure_created`` (volume + any missing catalog/schema),
+        # ``Volume.get_or_create`` (volume + any missing catalog/schema),
         # then retry the mkdir off the now-present mount.
         if _local_mount_available():
             api_path = self.api_path
@@ -1077,7 +1086,7 @@ class VolumePath(DatabricksPath):
                     "mkdir via kernel mount %r failed (%r) — ensuring volume "
                     "exists, then retrying", api_path, exc,
                 )
-                self.volume.ensure_created()
+                self.volume.get_or_create()
                 self._retry_until_volume_visible(
                     lambda: os.makedirs(api_path, exist_ok=True)
                 )
@@ -1368,7 +1377,7 @@ class VolumePath(DatabricksPath):
         instead of returning a clean 404 when the target volume doesn't exist —
         and that transport error never trips the NotFound recovery. So on an
         ``HTTPError`` / ``OSError`` from the upload, ensure the volume exists
-        (idempotent :meth:`Volume.ensure_created`) and retry over the volume
+        (idempotent :meth:`Volume.get_or_create`) and retry over the volume
         visibility window — a freshly-created volume isn't immediately visible
         to the Files edge, so a single immediate retry races the propagation.
         """
@@ -1381,7 +1390,7 @@ class VolumePath(DatabricksPath):
                 "Upload of %r failed at the transport layer (%s) — ensuring the "
                 "volume exists and retrying.", self, exc,
             )
-            self.volume.ensure_created()
+            self.volume.get_or_create()
             self._retry_until_volume_visible(
                 lambda: self._call_ensuring_parents(do_upload)
             )

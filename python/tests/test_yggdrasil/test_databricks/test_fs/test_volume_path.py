@@ -1095,7 +1095,7 @@ class TestVolumeAutoCreate:
 
         # mkdir tried first (fails), volume created, mkdir retried.
         assert workspace.files.create_directory.call_count == 2
-        client.schemas.schema.return_value.ensure_created.assert_not_called()
+        client.schemas.schema.return_value.get_or_create.assert_not_called()
         workspace.catalogs.create.assert_not_called()
         workspace.schemas.create.assert_not_called()
         vol_kwargs = workspace.volumes.create.call_args.kwargs
@@ -1198,7 +1198,7 @@ class TestVolumeAutoCreate:
         )
         p.write_bytes(b"payload")
 
-        client.schemas.schema.return_value.ensure_created.assert_called_once()
+        client.schemas.schema.return_value.get_or_create.assert_called_once()
         assert workspace.volumes.create.call_count == 2
 
     def test_already_exists_swallowed(self, workspace, client, service) -> None:
@@ -1243,7 +1243,7 @@ class TestVolumeAutoCreate:
     def test_recovery_reuses_singleton_cache_no_reflood(
         self, workspace, client, service
     ) -> None:
-        # Recovery routes through the idempotent ``Volume.ensure_created``.
+        # Recovery routes through the idempotent ``Volume.get_or_create``.
         # Once the first pass creates the volume, the ``Volume`` singleton
         # caches its info, so a second recovery pass short-circuits on the
         # cached read and does NOT re-hit ``volumes.create`` — no API flood.
@@ -1253,8 +1253,8 @@ class TestVolumeAutoCreate:
         workspace.volumes.create.return_value = _volume_info()
 
         p = VolumePath("/Volumes/cat/sch/vol/sub/file.bin", service=service)
-        p.volume.ensure_created()
-        p.volume.ensure_created()
+        p.volume.get_or_create()
+        p.volume.get_or_create()
 
         workspace.volumes.create.assert_called_once()
         # second pass never even re-read — the cached info answered it
@@ -1686,7 +1686,7 @@ class TestVolumeInfoNotFoundRecovery:
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         with pytest.raises(Exception):
             p.volume_info()
-        client.schemas.schema.return_value.ensure_created.assert_not_called()
+        client.schemas.schema.return_value.get_or_create.assert_not_called()
         workspace.volumes.create.assert_not_called()
 
     def test_propagates_other_errors_unchanged(
@@ -2135,7 +2135,7 @@ class TestUploadVolumeRecovery:
                 )
 
         monkeypatch.setattr(
-            Volume, "ensure_created",
+            Volume, "get_or_create",
             lambda self, **_kw: state.__setitem__("ensure", state["ensure"] + 1) or self,
         )
         p = VolumePath("/Volumes/c/s/v/x.bin", service=service)
@@ -2150,7 +2150,7 @@ class TestUploadVolumeRecovery:
 
         state = {"ensure": 0}
         monkeypatch.setattr(
-            Volume, "ensure_created",
+            Volume, "get_or_create",
             lambda self, **_kw: state.__setitem__("ensure", state["ensure"] + 1) or self,
         )
 
@@ -2163,14 +2163,14 @@ class TestUploadVolumeRecovery:
         assert state["ensure"] == 0
 
     def test_retries_over_volume_visibility_window(self, service, monkeypatch):
-        # ``ensure_created`` returns but the Files edge keeps 404-ing
+        # ``get_or_create`` returns but the Files edge keeps 404-ing
         # "Volume ... does not exist" for a few attempts (eventual
         # consistency). The recovery must keep retrying — not give up after
         # one — until the just-created volume becomes visible.
         from yggdrasil.databricks.volume.volume import Volume
 
         monkeypatch.setattr(time, "sleep", lambda s: None)
-        monkeypatch.setattr(Volume, "ensure_created", lambda self, **_kw: self)
+        monkeypatch.setattr(Volume, "get_or_create", lambda self, **_kw: self)
 
         state = {"attempts": 0}
 

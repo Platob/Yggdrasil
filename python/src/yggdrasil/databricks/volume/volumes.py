@@ -28,6 +28,7 @@ share the same TTL-bounded :class:`VolumeInfo` snapshot.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Iterator, Optional
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
@@ -37,9 +38,53 @@ from yggdrasil.url import URL
 
 from .volume import Volume
 
-__all__ = ["Volumes"]
+__all__ = ["Volumes", "EXTERNAL_LOCATION_SCHEMES", "external_volume_name"]
 
 logger = logging.getLogger(__name__)
+
+#: Cloud object-store URI schemes that designate an **external** volume's
+#: backing location. A first argument starting with one of these (or an explicit
+#: ``storage_location``) routes :meth:`Volumes.get_or_create` to the external
+#: path; anything else is treated as a managed-volume dotted name.
+EXTERNAL_LOCATION_SCHEMES = (
+    "s3://", "s3a://", "s3n://",
+    "abfss://", "abfs://",
+    "gs://", "gcs://",
+    "wasbs://", "wasb://",
+)
+
+
+def _xxh_hex(data: str) -> str:
+    """16-hex xxhash64 of *data* (8-hex xxh32 fallback if xxhash is absent)."""
+    try:
+        import xxhash
+
+        return format(xxhash.xxh64_intdigest(data.encode()), "016x")
+    except ImportError:  # pragma: no cover - xxhash is a runtime dep
+        from yggdrasil.node.ids import _xxh32
+
+        return format(_xxh32(data), "08x")
+
+
+def external_volume_name(storage_location: str, *, prefix: str = "ext") -> str:
+    """A deterministic Unity Catalog volume name for a cloud *storage_location*.
+
+    Keeps the **bucket** readable and appends an **xxhash of the path**, so the
+    same location always maps to the same volume while distinct paths within a
+    bucket stay distinct — e.g. ``s3://my-bucket/raw/events`` →
+    ``ext_my_bucket_9f1c2a3b4d5e6f70``. The result is a valid UC identifier
+    (lower-case alphanumerics + underscore, starts with a letter) and well
+    within UC's 255-char identifier limit regardless of how long the path is."""
+    # Hash the whole normalised URI (trailing slashes stripped) so nothing that
+    # distinguishes two locations is lost — e.g. the ``container@`` authority of
+    # an ``abfss://`` URL, which ``url.host`` drops. The bucket/host is kept only
+    # for human readability.
+    normalised = storage_location.rstrip("/")
+    token = _xxh_hex(normalised)
+    bucket = (URL.from_(storage_location).host or "").lower()
+    safe_bucket = re.sub(r"[^0-9a-z]+", "_", bucket).strip("_")
+    name = f"{prefix}_{safe_bucket}_{token}" if safe_bucket else f"{prefix}_{token}"
+    return name[:255]
 
 
 class Volumes(DatabricksService):
@@ -228,6 +273,94 @@ class Volumes(DatabricksService):
             storage_location=storage_location,
             volume_type=volume_type,
             missing_ok=missing_ok
+        )
+
+    def get_or_create(
+        self,
+        location: "str | Volume | None" = None,
+        *,
+        catalog_name: str | None = None,
+        schema_name: str | None = None,
+        volume_name: str | None = None,
+        storage_location: str | None = None,
+        comment: str | None = None,
+        volume_type=None,
+    ) -> Volume:
+        """Get-or-create a volume — **external** by storage URI, else **managed**
+        by dotted name.
+
+        When the first argument (or *storage_location*) is a cloud object-store
+        URI (``s3://…`` / ``abfss://…`` / ``gs://…`` — see
+        :data:`EXTERNAL_LOCATION_SCHEMES`), returns or creates an **external**
+        volume backed by that location. The volume name is derived
+        deterministically from the bucket + an xxhash of the path
+        (:func:`external_volume_name`) so repeated calls for the same location
+        collapse to the same volume; pass *volume_name* to override it.
+        ``catalog_name`` / ``schema_name`` default to the service scope. (An
+        external location + storage credential covering the URI must already
+        exist in Unity Catalog.)
+
+        Otherwise *location* is a 1-/2-/3-part dotted name (``cat.sch.vol``) and
+        a **managed** volume is returned, created if absent. Mirrors the
+        find-then-create shape of :meth:`Jobs.create_or_update`."""
+        store = storage_location
+        if (
+            store is None
+            and isinstance(location, str)
+            and location.lower().startswith(EXTERNAL_LOCATION_SCHEMES)
+        ):
+            store = location
+
+        if store:
+            cat = catalog_name or self.catalog_name
+            sch = schema_name or self.schema_name
+            if not (cat and sch):
+                raise ValueError(
+                    "external volume needs a catalog + schema — pass "
+                    "catalog_name/schema_name or set defaults on the service."
+                )
+            name = volume_name or external_volume_name(store)
+            existing = self.find(
+                catalog_name=cat, schema_name=sch, volume_name=name, raise_error=False,
+            )
+            if existing is not None:
+                return existing
+            logger.info("creating external volume %s.%s.%s → %s", cat, sch, name, store)
+            return self.create(
+                catalog_name=cat,
+                schema_name=sch,
+                volume_name=name,
+                storage_location=store,
+                volume_type=volume_type or "EXTERNAL",
+                comment=comment,
+                missing_ok=True,
+            )
+
+        c, s, v = self._resolve_parts(
+            location=location,
+            catalog_name=catalog_name,
+            schema_name=schema_name,
+            volume_name=volume_name,
+        )
+        if not (c and s and v):
+            raise ValueError(
+                f"Volumes.get_or_create requires catalog + schema + volume names "
+                f"(got {c!r}, {s!r}, {v!r}). Pass them explicitly, give a cloud "
+                f"storage URI, or set defaults on the service."
+            )
+        existing = self.find(
+            catalog_name=c, schema_name=s, volume_name=v, raise_error=False,
+        )
+        if existing is not None:
+            return existing
+        logger.info("creating managed volume %s.%s.%s", c, s, v)
+        return self.create(
+            catalog_name=c,
+            schema_name=s,
+            volume_name=v,
+            comment=comment,
+            volume_type=volume_type,
+            missing_ok=True,
         )
 
     # ── remote fetch ──────────────────────────────────────────────────────────

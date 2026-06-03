@@ -8,7 +8,7 @@ What this file pins down end-to-end against a real workspace:
   :class:`Volume`, ``/.../x`` to a :class:`VolumePath`) — same
   segment-depth dispatch the unit tests exercise, but proven against
   the live SDK so the URL → resource → SDK call chain doesn't drift.
-- :class:`Schema` lifecycle: ensure_created / use / delete inside a
+- :class:`Schema` lifecycle: get_or_create / use / delete inside a
   catalog the test identity already owns. The test does **not** create
   a catalog — that requires permissions most service principals don't
   have, and the user's environment can't grant them; the catalog is
@@ -105,7 +105,7 @@ class _SchemaFixture(DatabricksIntegrationCase):
             cls.schema = cls.client.schemas(
                 catalog_name=cls.catalog_name,
             ).schema(schema_name=cls.schema_name)
-            cls.schema.ensure_created(
+            cls.schema.get_or_create(
                 comment="yggdrasil DatabricksPath dispatch integration",
             )
         except (DatabricksError, PermissionDenied) as exc:

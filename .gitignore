@@ -22,6 +22,11 @@ parts/
 sdist/
 var/
 wheels/
+# CI-only scratch for the serverless env bundle (publish.yml): the fetched
+# databricks-sdk wheel + the staged release bundle. The env spec itself
+# (environments/ygg/*.yml) IS committed.
+serverless-wheels/
+serverless-bundle/
 share/python-wheels/
 *.egg-info/
 .installed.cfg

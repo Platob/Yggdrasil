@@ -408,12 +408,27 @@ class Path(IO, os.PathLike, ABC):
         ``remove`` and ``unlink`` are thin wrappers over the path-removal
         mode so there is exactly one deletion code path through the IO layer.
         """
+        # Path removal is the default for a no-predicate delete. Only a
+        # *non-None* predicate is a row-level delete — and only that path
+        # reads the leaf back as Arrow batches. A bare ``path.delete()``
+        # (predicate=None) must NEVER fall through to the byte-leaf rewrite:
+        # on a directory / a non-tabular file / a missing path that rewrite
+        # raises ``NotImplementedError: IO has no tabular decoder`` instead
+        # of just removing the object. So no predicate ⇒ remove the file or
+        # folder, full stop.
         if not remove_path and predicate is not None:
             return super()._delete(
                 predicate, missing_ok=missing_ok, wait=wait, **kwargs,
             )
 
         wait = WaitingConfig.from_(wait)
+        # A no-predicate ``.delete()`` is idempotent path removal — an
+        # already-absent path has nothing to delete, so it's a no-op rather
+        # than an error. ``remove`` / ``unlink`` arrive with ``remove_path``
+        # set and still honour an explicit ``missing_ok=False`` (raise on a
+        # ghost path); the implicit Tabular ``.delete()`` contract does not.
+        if not remove_path:
+            missing_ok = True
         # A delete must look at the object's *current* state, not a snapshot a
         # prior read left in the stat cache: an entry cached MISSING (so the
         # delete silently no-ops) or cached the wrong kind (file vs directory)
@@ -457,10 +472,21 @@ class Path(IO, os.PathLike, ABC):
                     if child.is_empty():
                         child._delete(remove_path=True, missing_ok=missing_ok, wait=False)
         else:
+            # Be aggressive about the file-vs-directory verdict: a single
+            # stat probe (especially the off-cluster Files-API heuristic) can
+            # misclassify a leaf, so if the kind-specific remove rejects the
+            # object as the wrong type, retry as the other type rather than
+            # leaving it behind.
             if kind == IOKind.FILE:
-                self._remove_file(missing_ok=missing_ok, wait=wait)
+                try:
+                    self._remove_file(missing_ok=missing_ok, wait=wait)
+                except IsADirectoryError:
+                    self._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait)
             elif kind == IOKind.DIRECTORY:
-                self._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait)
+                try:
+                    self._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait)
+                except NotADirectoryError:
+                    self._remove_file(missing_ok=missing_ok, wait=wait)
 
         # The object is gone: drop the cached FILE/DIRECTORY snapshot the probe
         # above left behind so a follow-up ``exists`` / ``is_file`` re-probes

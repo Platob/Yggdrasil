@@ -56,7 +56,7 @@ def _schema_with_children(
         return handles[tname]
 
     # Patch navigation: tables() → children; target schema build → a stub whose
-    # .table(name) hands back per-name target handles and ensure_created is a no-op.
+    # .table(name) hands back per-name target handles and get_or_create is a no-op.
     tgt = MagicMock(name="tgt-schema")
     tgt.table.side_effect = _target_table
     tgt.full_name.return_value = "dst.s"
@@ -68,9 +68,9 @@ def test_clone_creates_missing_and_skips_present():
     src, tgt, children = _schema_with_children([a, b, c], target_present={"b"})
 
     # Build the target via the real ``type(self)(...)`` → a real UCSchema;
-    # redirect its ``.table`` to our per-name stub and no-op ``ensure_created``.
+    # redirect its ``.table`` to our per-name stub and no-op ``get_or_create``.
     with patch.object(UCSchema, "tables", return_value=iter(children)), \
-         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.get_or_create"), \
          patch.object(UCSchema, "table", side_effect=tgt.table):
         result = src.clone(schema_name="dst")
 
@@ -93,7 +93,7 @@ def test_clone_kind_drift_drops_stale_target_then_recreates():
         [x], target_present={"x"}, target_views=set(),  # target is a table
     )
     with patch.object(UCSchema, "tables", return_value=iter(children)), \
-         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.get_or_create"), \
          patch.object(UCSchema, "table", side_effect=tgt.table):
         result = src.clone(schema_name="dst")  # default IGNORE
     assert result == {"x": "created"}      # recreated, not skipped
@@ -108,7 +108,7 @@ def test_clone_kind_drift_under_error_if_exists_does_not_drop():
     x.clone.side_effect = RuntimeError("already exists")
     src, tgt, children = _schema_with_children([x], target_present={"x"})
     with patch.object(UCSchema, "tables", return_value=iter(children)), \
-         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.get_or_create"), \
          patch.object(UCSchema, "table", side_effect=tgt.table):
         result = src.clone(schema_name="dst", mode=Mode.ERROR_IF_EXISTS)
     assert result["x"].startswith("failed: ")
@@ -119,7 +119,7 @@ def test_clone_excludes_views_when_requested():
     tbl, view = _child("t"), _child("v", is_view=True)
     src, tgt, children = _schema_with_children([tbl, view])
     with patch.object(UCSchema, "tables", return_value=iter(children)), \
-         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.get_or_create"), \
          patch.object(type(src), "table", side_effect=tgt.table):
         result = src.clone(schema_name="dst", include_views=False)
     assert result == {"t": "created"}
@@ -131,7 +131,7 @@ def test_clone_records_per_child_failure_without_aborting():
     bad.clone.side_effect = RuntimeError("permission denied")
     src, tgt, children = _schema_with_children([good, bad])
     with patch.object(UCSchema, "tables", return_value=iter(children)), \
-         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.get_or_create"), \
          patch.object(type(src), "table", side_effect=tgt.table):
         result = src.clone(schema_name="dst")
     assert result["good"] == "created"
@@ -145,7 +145,7 @@ def test_clone_mode_overwrite_recreates_present_and_forwards_to_sub_clones():
     a = _child("a")
     src, tgt, children = _schema_with_children([a], target_present={"a"})
     with patch.object(UCSchema, "tables", return_value=iter(children)), \
-         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.get_or_create"), \
          patch.object(UCSchema, "table", side_effect=tgt.table):
         result = src.clone(schema_name="dst", mode=Mode.OVERWRITE)
     assert result == {"a": "created"}
@@ -157,7 +157,7 @@ def test_clone_mode_ignore_skips_existing():
     a, b = _child("a"), _child("b")
     src, tgt, children = _schema_with_children([a, b], target_present={"a"})
     with patch.object(UCSchema, "tables", return_value=iter(children)), \
-         patch("yggdrasil.databricks.schema.schema.UCSchema.ensure_created"), \
+         patch("yggdrasil.databricks.schema.schema.UCSchema.get_or_create"), \
          patch.object(UCSchema, "table", side_effect=tgt.table):
         result = src.clone(schema_name="dst", mode="ignore")  # string mode-like
     assert result == {"a": "skipped", "b": "created"}

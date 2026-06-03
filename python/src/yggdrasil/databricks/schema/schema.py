@@ -394,7 +394,7 @@ class UCSchema(DatabricksPath):
 
     def _mkdir(self, parents: bool, exist_ok: bool) -> None:
         del parents
-        self.ensure_created() if exist_ok else self.create(missing_ok=False)
+        self.get_or_create() if exist_ok else self.create(missing_ok=False)
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         self.delete(wait=wait, raise_error=not missing_ok)
@@ -670,7 +670,7 @@ class UCSchema(DatabricksPath):
                 elif "not exist" in low or "not found" in low:
                     # Parent catalog missing — create it and retry once.
                     logger.info("Schema %r create failed (%s); ensuring parent catalog", self, exc)
-                    self.catalog.ensure_created()
+                    self.catalog.get_or_create()
                     info = uc.create(**kwargs)
                     object.__setattr__(self, "_infos", info)
                     object.__setattr__(self, "_infos_fetched_at", time.time())
@@ -681,7 +681,7 @@ class UCSchema(DatabricksPath):
         self._persist_stat_cache(self._stat_uncached())
         return self
 
-    def ensure_created(
+    def get_or_create(
         self,
         *,
         comment: str | None = None,
@@ -843,7 +843,7 @@ class UCSchema(DatabricksPath):
                 path_prefix=self.path_prefix,
             )
         )
-        tgt.ensure_created(comment=f"clone of {self.full_name()}")
+        tgt.get_or_create(comment=f"clone of {self.full_name()}")
 
         # ``list_tables`` pre-stores each child's SchemaInfo, so ``is_view`` is
         # free here — no extra round-trip to filter views out.
