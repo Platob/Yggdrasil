@@ -98,7 +98,7 @@ class DatabricksIntegrationCase(unittest.TestCase):
             catalog_name=cls.INTEGRATION_CATALOG,
         ).schema(schema_name=cls.INTEGRATION_SCHEMA)
         try:
-            sch.ensure_created(comment="yggdrasil shared integration fixtures")
+            sch.get_or_create(comment="yggdrasil shared integration fixtures")
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(
                 f"cannot create {cls.INTEGRATION_CATALOG}.{cls.INTEGRATION_SCHEMA}: "
@@ -120,7 +120,7 @@ class DatabricksIntegrationCase(unittest.TestCase):
             schema_name=cls.INTEGRATION_SCHEMA,
         ).volume(volume_name=name)
         try:
-            vol.ensure_created()
+            vol.get_or_create()
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(
                 f"cannot create volume {cls.INTEGRATION_CATALOG}."
@@ -142,7 +142,7 @@ class DatabricksIntegrationCase(unittest.TestCase):
             catalog_name=cls.INTEGRATION_CATALOG,
         ).schema(schema_name=name)
         try:
-            sch.ensure_created(comment="yggdrasil throw-away integration schema")
+            sch.get_or_create(comment="yggdrasil throw-away integration schema")
         except (DatabricksError, PermissionDenied) as exc:
             raise unittest.SkipTest(
                 f"cannot create scratch schema {cls.INTEGRATION_CATALOG}.{name}: "

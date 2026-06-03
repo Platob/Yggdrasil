@@ -420,7 +420,7 @@ class TestMkdirFastPath:
 
         p._mkdir(parents=True, exist_ok=False)
 
-        vol.ensure_created.assert_called_once()
+        vol.get_or_create.assert_called_once()
         assert (fake_volume_root / "newdir").is_dir()
 
     def test_mkdir_oserror_without_volume_triple_propagates(

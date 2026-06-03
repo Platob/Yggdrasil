@@ -650,10 +650,10 @@ class TestTableStoragePathIntegration(_TableFixture):
         expected = self.client.safe_tag_value(self.table_name, repl="_").lower()
         self.assertEqual(first.volume_name, expected)
 
-    def test_staging_volume_ensure_created_round_trips(self) -> None:
+    def test_staging_volume_get_or_create_round_trips(self) -> None:
         volume = self.table.staging_volume
         try:
-            volume.ensure_created(comment="yggdrasil storage path integration")
+            volume.get_or_create(comment="yggdrasil storage path integration")
         except (DatabricksError, PermissionDenied) as exc:
             self._skip(exc, f"Cannot create staging volume {volume.full_name()}")
         try:
@@ -684,7 +684,7 @@ class TestTableStoragePathIntegration(_TableFixture):
 
     def test_insert_volume_path_round_trips_parquet(self) -> None:
         try:
-            self.table.staging_volume.ensure_created()
+            self.table.staging_volume.get_or_create()
         except (DatabricksError, PermissionDenied) as exc:
             self._skip(exc, "Cannot create staging volume")
         path = self.table.insert_volume_path(temporary=False)
@@ -871,7 +871,7 @@ class TestTablePandasIndexIntegration(_TableFixture):
         pd = pytest.importorskip("pandas")
 
         try:
-            self.table.staging_volume.ensure_created()
+            self.table.staging_volume.get_or_create()
         except (DatabricksError, PermissionDenied) as exc:
             self._skip(exc, "Cannot create staging volume")
 

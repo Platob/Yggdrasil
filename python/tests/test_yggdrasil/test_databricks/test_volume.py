@@ -272,7 +272,7 @@ class TestVolumesServiceCreate:
     """``Volumes.create(...)`` resolves the :class:`Volume` and delegates to
     :meth:`Volume.create`, which is **idempotent** (reads first) and
     auto-creates the missing schema / catalog parents through
-    :meth:`UCSchema.ensure_created` when the read reports them missing — never
+    :meth:`UCSchema.get_or_create` when the read reports them missing — never
     punting the recovery to the caller."""
 
     def test_create_is_idempotent_when_volume_exists(self, workspace, client):
@@ -319,7 +319,7 @@ class TestVolumesServiceCreate:
             catalog_name="cat", schema_name="sch", volume_name="vol",
         )
         assert isinstance(v, Volume)
-        client.schemas.schema.return_value.ensure_created.assert_called_once()
+        client.schemas.schema.return_value.get_or_create.assert_called_once()
         assert workspace.volumes.create.call_count == 2
 
     def test_create_skips_parent_ensure_when_create_succeeds(self, workspace, client):
@@ -331,7 +331,7 @@ class TestVolumesServiceCreate:
         Volumes(client=client).create(
             catalog_name="cat", schema_name="sch", volume_name="vol",
         )
-        client.schemas.schema.return_value.ensure_created.assert_not_called()
+        client.schemas.schema.return_value.get_or_create.assert_not_called()
         workspace.volumes.create.assert_called_once()
 
     def test_create_refreshes_stale_missing_stat(self, workspace, client):

@@ -2646,7 +2646,7 @@ class Table(DatabricksPath):
             self.sql.execute(statement, wait=wait)
         except Exception as exc:
             if "SCHEMA_NOT_FOUND" in str(exc):
-                self.schema.ensure_created()
+                self.schema.get_or_create()
             else:
                 raise
 

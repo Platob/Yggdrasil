@@ -121,7 +121,7 @@ class _ClusterIntegrationBase(DatabricksIntegrationCase):
             volume_name=cls.volume_name,
         )
         try:
-            cls.volume.ensure_created(
+            cls.volume.get_or_create(
                 comment="yggdrasil cluster-executor integration volume",
             )
         except DatabricksError as exc:

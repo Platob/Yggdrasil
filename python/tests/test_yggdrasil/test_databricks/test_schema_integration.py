@@ -7,7 +7,7 @@ deeper schema surface that only meaningfully exercises against a live
 Unity Catalog endpoint:
 
 - :class:`Schema` lifecycle — ``create`` with ``comment`` /
-  ``properties``, ``ensure_created`` idempotence, ``update``,
+  ``properties``, ``get_or_create`` idempotence, ``update``,
   ``delete(raise_error=False)`` on a missing schema.
 - :attr:`Schema.infos` lazy fetch + ``clear()`` cache reset round-trip.
 - :class:`Schemas` collection — ``list`` (with glob filter), ``find``
@@ -98,7 +98,7 @@ class _SchemaFixture(DatabricksIntegrationCase):
             cls.schema = cls.client.schemas(
                 catalog_name=cls.catalog_name,
             ).schema(schema_name=cls.schema_name)
-            cls.schema.ensure_created(
+            cls.schema.get_or_create(
                 comment="yggdrasil schema integration",
             )
         except (DatabricksError, PermissionDenied) as exc:
@@ -126,15 +126,15 @@ class _SchemaFixture(DatabricksIntegrationCase):
 
 @pytest.mark.integration
 class TestSchemaLifecycleIntegration(_SchemaFixture):
-    """``create`` / ``ensure_created`` / ``update`` / ``delete`` round-trips."""
+    """``create`` / ``get_or_create`` / ``update`` / ``delete`` round-trips."""
 
     def test_exists_after_create(self) -> None:
         self.assertTrue(self.schema.exists())
 
-    def test_ensure_created_is_idempotent(self) -> None:
-        # Second ensure_created call must NOT raise — the
+    def test_get_or_create_is_idempotent(self) -> None:
+        # Second get_or_create call must NOT raise — the
         # "already exists" path soft-resets the cache and returns self.
-        result = self.schema.ensure_created(
+        result = self.schema.get_or_create(
             comment="yggdrasil schema integration",
         )
         self.assertIs(result, self.schema)
@@ -528,7 +528,7 @@ class TestSchemaRenameIntegration(DatabricksIntegrationCase):
             cls.schema = cls.client.schemas(
                 catalog_name=cls.catalog_name,
             ).schema(schema_name=cls.initial_name)
-            cls.schema.ensure_created(
+            cls.schema.get_or_create(
                 comment="yggdrasil schema rename integration",
             )
         except (DatabricksError, PermissionDenied) as exc:

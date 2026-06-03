@@ -614,7 +614,7 @@ class UCCatalog(DatabricksPath, Singleton):
         self._persist_stat_cache(self._stat_uncached())
         return self
 
-    def ensure_created(
+    def get_or_create(
         self,
         *,
         comment: str | None = None,
