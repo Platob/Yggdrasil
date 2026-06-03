@@ -2064,23 +2064,17 @@ class Table(DatabricksPath):
 
     def _default_external_location(self) -> str:
         """Governed default ``LOCATION`` for an external table created without
-        one: the catalog's UC ``storage_root`` + ``<schema>/<table>``.
+        one: the schema's registered UC storage root + ``tables/<table>``
+        (Databricks' ``__unitystorage`` layout).
 
-        Prefers a schema-scoped storage root when the schema advertises one
-        (Databricks' ``__unitystorage`` layout), else falls back to the
-        catalog storage root via
-        :meth:`DatabricksClient.default_storage_location`.
+        Raises :class:`NotImplementedError` when the schema advertises no
+        storage location — no location is fabricated, so the caller must then
+        pass an explicit ``storage_location``.
         """
-        try:
-            return "%s/tables/%s" % (
-                self.schema_storage_location(table_type=TableType.EXTERNAL),
-                self.table_name,
-            )
-        except NotImplementedError:
-            return self.client.default_storage_location(
-                suffix="%s/%s" % (self.schema_name, self.table_name),
-                catalog_name=self.catalog_name,
-            )
+        return "%s/tables/%s" % (
+            self.schema_storage_location(table_type=TableType.EXTERNAL),
+            self.table_name,
+        )
 
     def sql_create(
         self,

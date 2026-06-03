@@ -2,9 +2,9 @@
 
 ``Table.create`` / ``Table.sql_create`` emit ``CREATE EXTERNAL TABLE …
 USING <fmt> LOCATION '…'`` for external tables, and default the LOCATION to
-the catalog's governed UC ``storage_root`` when the caller omits one. These
-are pure-DDL / pure-resolution checks — no workspace round-trips (the SQL
-surface and the catalog lookup are mocked).
+the schema's governed UC storage root when the caller omits one. These are
+pure-DDL / pure-resolution checks — no workspace round-trips (the SQL surface
+and the schema lookup are mocked).
 """
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 import pytest
 from databricks.sdk.service.catalog import DataSourceFormat
 
-from yggdrasil.databricks.client import _CATALOG_STORAGE_ROOTS
 from yggdrasil.databricks.table.table import Table
 from yggdrasil.data.schema import Schema, field
 
@@ -109,57 +108,26 @@ class TestExternalDDL:
         assert "LOCATION 's3://bucket/loc/ext_tb'" in ddl
 
 
-class TestDefaultStorageLocation:
-    def _client(self, catalog: str, storage_root: str | None):
-        from yggdrasil.databricks.client import DatabricksClient
-
-        c = DatabricksClient(catalog_name=catalog)
-        ws = MagicMock()
-        ws.catalogs.get.return_value = MagicMock(storage_root=storage_root)
-        c.workspace_client = lambda: ws  # type: ignore[method-assign]
-        _CATALOG_STORAGE_ROOTS.pop((c.host, catalog), None)
-        return c
-
-    def test_resolves_catalog_storage_root(self) -> None:
-        c = self._client("cat_a", "s3://root/uc/cat_a")
-        assert c.default_storage_location() == "s3://root/uc/cat_a/"
-        assert c.default_storage_location("s/t") == "s3://root/uc/cat_a/s/t"
-
-    def test_suffix_leading_slash_normalized(self) -> None:
-        c = self._client("cat_b", "s3://root/uc/cat_b/")
-        assert c.default_storage_location("/s/t") == "s3://root/uc/cat_b/s/t"
-
-    def test_explicit_catalog_overrides(self) -> None:
-        c = self._client("cat_c", "s3://root/uc/cat_c")
-        # Override resolves a different catalog (re-mock the lookup).
-        c.workspace_client().catalogs.get.return_value = MagicMock(storage_root="s3://root/uc/other")
-        _CATALOG_STORAGE_ROOTS.pop((c.host, "other"), None)
-        assert c.default_storage_location("x", catalog_name="other") == "s3://root/uc/other/x"
-
-    def test_raises_without_catalog(self) -> None:
-        from yggdrasil.databricks.client import DatabricksClient
-
-        c = DatabricksClient(catalog_name=None)
-        with pytest.raises(ValueError, match="needs a catalog"):
-            c.default_storage_location()
-
-    def test_raises_when_catalog_has_no_storage_root(self) -> None:
-        c = self._client("cat_d", None)
-        with pytest.raises(ValueError, match="no storage_root"):
-            c.default_storage_location()
-
-
 class TestDefaultExternalLocation:
-    def test_falls_back_to_catalog_root_when_schema_has_no_storage(self) -> None:
+    def test_uses_schema_storage_root(self) -> None:
         t = Table(
             service=MagicMock(name="Tables"),
             catalog_name="cat_e", schema_name="sch", table_name="tbl",
         )
-        # Schema advertises no storage location → NotImplementedError → fall
-        # back to the client's catalog-root default.
-        t.schema_storage_location = MagicMock(side_effect=NotImplementedError)  # type: ignore[method-assign]
-        t.client.default_storage_location = MagicMock(return_value="s3://root/uc/cat_e/sch/tbl")  # type: ignore[method-assign]
-        assert t._default_external_location() == "s3://root/uc/cat_e/sch/tbl"
-        t.client.default_storage_location.assert_called_once_with(
-            suffix="sch/tbl", catalog_name="cat_e",
+        t.schema_storage_location = MagicMock(  # type: ignore[method-assign]
+            return_value="s3://root/uc/cat_e/sch",
         )
+        assert t._default_external_location() == "s3://root/uc/cat_e/sch/tables/tbl"
+
+    def test_propagates_when_schema_has_no_storage(self) -> None:
+        t = Table(
+            service=MagicMock(name="Tables"),
+            catalog_name="cat_e", schema_name="sch", table_name="tbl",
+        )
+        # Schema advertises no storage location → NotImplementedError is
+        # surfaced (no catalog-root fabrication); the caller must pin a location.
+        t.schema_storage_location = MagicMock(  # type: ignore[method-assign]
+            side_effect=NotImplementedError,
+        )
+        with pytest.raises(NotImplementedError):
+            t._default_external_location()
