@@ -11,10 +11,12 @@ the field names the Jobs API / ``databricks.sdk`` ``Environment`` uses) whose:
   ``--python`` — so the pure-python ygg wheel installs cleanly and Python
   UDFs run (Spark Connect needs the client and server to share a minor
   Python); and
-* ``dependencies`` install **only wheels, by path** — the ygg wheel and the
-  bundled ``databricks-sdk`` wheel (``--sdk-wheel``). No index requirements:
-  the serverless base image already carries the data stack (pyarrow / …) and
-  nothing is resolved from PyPI on the cluster.
+* ``dependencies`` install **only wheels, by path** — the ygg wheel first,
+  then the bundled dependency wheels gathered from ``--wheel-dir`` /
+  ``--wheel`` (databricks-sdk, polars + its compiled polars-runtime, orjson,
+  xxhash). No index requirements: nothing is resolved from PyPI on the
+  cluster; ``pyarrow`` (and the rest of the data stack) comes from the
+  serverless base image.
 
 Stdlib only — no install of ygg (or its heavy deps) is needed in CI. The
 ``python → serverless environment version`` mapping mirrors
@@ -41,17 +43,35 @@ def serverless_environment_version(python_minor: int) -> str:
     return _PY_MINOR_TO_ENV_VERSION.get(python_minor, SERVERLESS_ENVIRONMENT_VERSION)
 
 
-def build_yaml(
+def collect_wheels(
     version: str,
-    python: str,
-    wheels: "list[str]",
-) -> str:
+    *,
+    wheel_dir: "str | Path | None" = None,
+    extra_wheels: "list[str] | None" = None,
+) -> "list[str]":
+    """The wheel filenames the env installs, by path — ygg wheel first.
+
+    Explicit ``--wheel`` names come next (in order), then every ``*.whl`` in
+    ``--wheel-dir`` (sorted). Order-preserving de-dupe so a wheel passed both
+    ways — or the ygg wheel sitting in the dir — appears once.
+    """
+    wheels = [f"ygg-{version}-py3-none-any.whl"]
+    for name in extra_wheels or []:
+        if name not in wheels:
+            wheels.append(name)
+    if wheel_dir is not None:
+        for path in sorted(Path(wheel_dir).glob("*.whl")):
+            if path.name not in wheels:
+                wheels.append(path.name)
+    return wheels
+
+
+def build_yaml(version: str, python: str, wheels: "list[str]") -> str:
     """Render the serverless ``Environment`` spec as YAML text.
 
-    *wheels* are installed in order, by path — the ygg wheel first, then the
-    bundled ``databricks-sdk`` wheel. Hand-rendered (no PyYAML dependency) —
-    the shape is a single scalar plus a flat string list, so the output is
-    trivially valid YAML.
+    *wheels* are installed in order, by path. Hand-rendered (no PyYAML
+    dependency) — the shape is a single scalar plus a flat string list, so
+    the output is trivially valid YAML.
     """
     minor = int(python.split(".")[1])
     env_version = serverless_environment_version(minor)
@@ -62,10 +82,11 @@ def build_yaml(
         f"# environment_version {env_version} is the Databricks serverless runtime whose",
         f"# Python is {python}, so the pure-python ygg wheel installs cleanly and Python",
         "# UDFs run (Spark Connect needs a matching client Python). Dependencies are",
-        "# wheels installed BY PATH only — the ygg wheel and the bundled databricks-sdk",
-        "# wheel — so nothing is pip-resolved from the index on the cluster; the rest of",
-        "# the data stack (pyarrow / …) comes from the serverless base image. Drop into a",
-        "# serverless job's environments[].spec or a notebook environment specification.",
+        "# wheels installed BY PATH only — the ygg wheel plus the bundled dependency",
+        "# wheels (databricks-sdk, polars + its compiled polars-runtime, orjson, xxhash) —",
+        "# so nothing is pip-resolved from the index on the cluster; pyarrow comes from",
+        "# the serverless base image. Drop into a serverless job's environments[].spec",
+        "# or a notebook environment specification.",
         f'environment_version: "{env_version}"',
         "dependencies:",
     ]
@@ -84,9 +105,13 @@ def main(argv: "list[str] | None" = None) -> int:
         help="ygg version; default reads python/pyproject.toml",
     )
     parser.add_argument(
-        "--sdk-wheel", default=None,
-        help="databricks-sdk wheel filename to bundle by path "
-             "(e.g. databricks_sdk-0.114.0-py3-none-any.whl)",
+        "--wheel-dir", default=None,
+        help="directory of bundled dependency wheels to install by path "
+             "(every *.whl in it is added after the ygg wheel)",
+    )
+    parser.add_argument(
+        "--wheel", action="append", default=[], metavar="NAME",
+        help="explicit bundled wheel filename to install by path (repeatable)",
     )
     parser.add_argument(
         "--pyproject", default=None,
@@ -108,9 +133,7 @@ def main(argv: "list[str] | None" = None) -> int:
     pyproject = tomllib.loads(pyproject_path.read_text())
 
     version = args.version or pyproject["project"]["version"]
-    wheels = [f"ygg-{version}-py3-none-any.whl"]
-    if args.sdk_wheel:
-        wheels.append(args.sdk_wheel)
+    wheels = collect_wheels(version, wheel_dir=args.wheel_dir, extra_wheels=args.wheel)
 
     out_dir = Path(args.out_dir) if args.out_dir else repo_root / "environments" / "ygg"
     out_dir.mkdir(parents=True, exist_ok=True)

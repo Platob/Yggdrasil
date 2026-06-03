@@ -51,52 +51,100 @@ class TestMappingParity:
         assert build_serverless_env.serverless_environment_version(12) == "5"
 
 
+class TestCollectWheels:
+    BUNDLE = [
+        "databricks_sdk-0.114.0-py3-none-any.whl",
+        "orjson-3.11.9-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "polars-1.41.2-py3-none-any.whl",
+        "polars_runtime_32-1.41.2-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "xxhash-3.7.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    ]
+
+    def _stage(self, tmp_path):
+        for name in self.BUNDLE:
+            (tmp_path / name).write_bytes(b"")
+        return tmp_path
+
+    def test_wheel_dir_globs_sorted_after_ygg(self, tmp_path) -> None:
+        wheels = build_serverless_env.collect_wheels(
+            "0.8.49", wheel_dir=self._stage(tmp_path),
+        )
+        assert wheels[0] == "ygg-0.8.49-py3-none-any.whl"
+        assert wheels[1:] == sorted(self.BUNDLE)
+
+    def test_explicit_wheels_come_before_dir(self, tmp_path) -> None:
+        wheels = build_serverless_env.collect_wheels(
+            "0.8.49", wheel_dir=self._stage(tmp_path), extra_wheels=["extra-1.0.whl"],
+        )
+        assert wheels[0] == "ygg-0.8.49-py3-none-any.whl"
+        assert wheels[1] == "extra-1.0.whl"
+
+    def test_order_preserving_dedupe(self, tmp_path) -> None:
+        # The ygg wheel sitting in the dir (and a repeated explicit) appears once.
+        (tmp_path / "ygg-0.8.49-py3-none-any.whl").write_bytes(b"")
+        (tmp_path / "databricks_sdk-0.114.0-py3-none-any.whl").write_bytes(b"")
+        wheels = build_serverless_env.collect_wheels(
+            "0.8.49",
+            wheel_dir=tmp_path,
+            extra_wheels=["databricks_sdk-0.114.0-py3-none-any.whl"],
+        )
+        assert wheels == [
+            "ygg-0.8.49-py3-none-any.whl",
+            "databricks_sdk-0.114.0-py3-none-any.whl",
+        ]
+
+
 class TestBuildYaml:
-    YGG = "ygg-0.8.49-py3-none-any.whl"
-    SDK = "databricks_sdk-0.114.0-py3-none-any.whl"
+    WHEELS = [
+        "ygg-0.8.49-py3-none-any.whl",
+        "databricks_sdk-0.114.0-py3-none-any.whl",
+        "polars-1.41.2-py3-none-any.whl",
+        "polars_runtime_32-1.41.2-cp310-abi3-manylinux_2_17_x86_64.whl",
+        "orjson-3.11.9-cp312-cp312-manylinux_2_17_x86_64.whl",
+        "xxhash-3.7.0-cp312-cp312-manylinux_2_17_x86_64.whl",
+    ]
 
     def test_yaml_is_valid_environment_spec(self) -> None:
-        text = build_serverless_env.build_yaml("0.8.49", "3.12", [self.YGG, self.SDK])
-        spec = yaml.safe_load(text)
+        spec = yaml.safe_load(build_serverless_env.build_yaml("0.8.49", "3.12", self.WHEELS))
         # environment_version is a *string* (the API contract), not an int.
         assert spec["environment_version"] == "5"
         assert isinstance(spec["environment_version"], str)
-        # Wheels only, by path — the ygg wheel then the bundled databricks-sdk
-        # wheel. No index requirements (pyarrow / polars / …) at all.
-        assert spec["dependencies"] == [self.YGG, self.SDK]
+        # Wheels only, by path, ygg first — no index requirements at all.
+        assert spec["dependencies"] == self.WHEELS
 
     def test_dependencies_are_wheels_only(self) -> None:
-        spec = yaml.safe_load(
-            build_serverless_env.build_yaml("0.8.49", "3.12", [self.YGG, self.SDK])
-        )
+        spec = yaml.safe_load(build_serverless_env.build_yaml("0.8.49", "3.12", self.WHEELS))
         assert all(dep.endswith(".whl") for dep in spec["dependencies"])
+        # The compiled polars runtime is bundled, not just the polars shim.
+        assert any(d.startswith("polars_runtime_") for d in spec["dependencies"])
 
     def test_python311_picks_environment_version_two(self) -> None:
-        spec = yaml.safe_load(
-            build_serverless_env.build_yaml("0.8.49", "3.11", [self.YGG, self.SDK])
-        )
+        spec = yaml.safe_load(build_serverless_env.build_yaml("0.8.49", "3.11", self.WHEELS))
         assert spec["environment_version"] == "2"
 
 
 class TestMain:
-    SDK = "databricks_sdk-0.114.0-py3-none-any.whl"
-
     def test_main_writes_versioned_spec(self, tmp_path) -> None:
+        wheel_dir = tmp_path / "wheels"
+        wheel_dir.mkdir()
+        for name in ["databricks_sdk-0.114.0-py3-none-any.whl",
+                     "polars-1.41.2-py3-none-any.whl"]:
+            (wheel_dir / name).write_bytes(b"")
+        out_dir = tmp_path / "out"
         rc = build_serverless_env.main(
             ["--version", "9.9.9", "--python", "3.12",
-             "--sdk-wheel", self.SDK, "--out-dir", str(tmp_path)]
+             "--wheel-dir", str(wheel_dir), "--out-dir", str(out_dir)]
         )
         assert rc == 0
-        out = tmp_path / "ygg-9.9.9-py3.12-serverless.yml"
-        assert out.exists()
-        spec = yaml.safe_load(out.read_text())
+        spec = yaml.safe_load((out_dir / "ygg-9.9.9-py3.12-serverless.yml").read_text())
         assert spec["environment_version"] == "5"
         assert spec["dependencies"] == [
             "ygg-9.9.9-py3-none-any.whl",
-            self.SDK,
+            "databricks_sdk-0.114.0-py3-none-any.whl",
+            "polars-1.41.2-py3-none-any.whl",
         ]
 
-    def test_without_sdk_wheel_only_ygg(self, tmp_path) -> None:
+    def test_without_bundle_only_ygg(self, tmp_path) -> None:
         build_serverless_env.main(
             ["--version", "9.9.9", "--out-dir", str(tmp_path)]
         )

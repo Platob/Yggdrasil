@@ -9,13 +9,14 @@
 #   detect             → reads version, checks ygg on PyPI, decides
 #   build-python       → sdist + pure-Python wheel (uv / setuptools), plus
 #                        the serverless environment spec pairing the wheel +
-#                        the bundled databricks-sdk wheel (both by path) with
+#                        the bundled dependency wheels (databricks-sdk, polars
+#                        + polars-runtime, orjson, xxhash — all by path) with
 #                        the py3.12 Databricks serverless env version
 #                        (scripts/build_serverless_env.py → environments/ygg/)
 #   publish-python     → uploads ygg dist to PyPI
 #   tag                → creates vX.Y.Z git tag + GitHub Release (dist +
-#                        serverless env spec + databricks-sdk wheel), commits
-#                        the spec to environments/ygg/
+#                        serverless env spec + bundled wheels), commits the
+#                        spec to environments/ygg/
 #   cleanup-previous   → opt-in: removes previous tag/release on
 #                        ``!cleanup-prev-release`` commit marker
 #   skip               → summary when publish is intentionally skipped
@@ -225,40 +226,46 @@ jobs:
       - name: Verify dist contents
         run: ls -lh dist/
 
-      # Fetch the databricks-sdk wheel to ship BY PATH alongside the ygg wheel.
-      # Kept OUT of dist/ so it is never uploaded to PyPI by publish-python.
-      - name: Fetch databricks-sdk wheel
-        id: sdk
+      # Fetch the bundled dependency wheels to ship BY PATH alongside the ygg
+      # wheel. The runner is Linux x86_64 / py3.12 — the serverless target — so
+      # a native download yields the correct manylinux cp312 builds (no cross
+      # flags). Kept OUT of dist/ so they are never uploaded to PyPI.
+      - name: Fetch bundled dependency wheels
         run: |
           mkdir -p serverless-wheels
-          python -m pip download databricks-sdk --no-deps --only-binary=:all: -d serverless-wheels
-          SDK_WHEEL=$(basename "$(ls serverless-wheels/databricks_sdk-*.whl)")
-          echo "wheel=$SDK_WHEEL" >> "$GITHUB_OUTPUT"
-          echo "📦 databricks-sdk wheel: $SDK_WHEEL"
+          # Pure-python / no-dep packages — their common transitive deps
+          # (e.g. requests for databricks-sdk) ship in the serverless base image.
+          python -m pip download databricks-sdk orjson xxhash \
+            --no-deps --only-binary=:all: -d serverless-wheels
+          # polars is a thin shim over a compiled runtime — pull the closure
+          # (polars + polars-runtime-XX) so it works with no index install.
+          python -m pip download polars \
+            --only-binary=:all: -d serverless-wheels
+          ls -lh serverless-wheels/
 
       # Alongside the wheel, generate the serverless environment spec — it pairs
-      # this version's ygg wheel with the bundled databricks-sdk wheel (both by
-      # path, no index installs) and the py3.12 serverless environment version.
-      # Written to environments/ygg/. Stdlib only, so no install is required.
+      # this version's ygg wheel with the bundled dependency wheels (all by path,
+      # no index installs) and the py3.12 serverless environment version. Written
+      # to environments/ygg/. Stdlib only, so no install is required.
       - name: Generate serverless environment spec
         run: >-
           python scripts/build_serverless_env.py
           --version "${{ needs.detect.outputs.version }}"
           --python 3.12
-          --sdk-wheel "${{ steps.sdk.outputs.wheel }}"
+          --wheel-dir serverless-wheels
 
       - name: Verify serverless environment spec
         working-directory: ${{ github.workspace }}
         run: cat "environments/ygg/ygg-${{ needs.detect.outputs.version }}-py3.12-serverless.yml"
 
-      # Stage the env spec + the databricks-sdk wheel into one flat directory so
-      # the release assets (and the deploy bundle) are the spec next to its wheels.
+      # Stage the env spec + the bundled wheels into one flat directory so the
+      # release assets (and the deploy bundle) are the spec next to its wheels.
       - name: Stage serverless bundle
         working-directory: ${{ github.workspace }}
         run: |
           mkdir -p serverless-bundle
           cp "environments/ygg/ygg-${{ needs.detect.outputs.version }}-py3.12-serverless.yml" serverless-bundle/
-          cp python/serverless-wheels/databricks_sdk-*.whl serverless-bundle/
+          cp python/serverless-wheels/*.whl serverless-bundle/
           ls -lh serverless-bundle/
 
       - name: Upload python dist artifacts
