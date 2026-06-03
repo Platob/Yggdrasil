@@ -3,14 +3,12 @@
 #
 # environment_version 5 is the Databricks serverless runtime whose
 # Python is 3.12, so the pure-python ygg wheel installs cleanly and Python
-# UDFs run (Spark Connect needs a matching client Python). The ygg wheel installs
-# by name; the rest resolve from the index as platform-correct builds. Drop into a
+# UDFs run (Spark Connect needs a matching client Python). Dependencies are
+# wheels installed BY PATH only — the ygg wheel and the bundled databricks-sdk
+# wheel — so nothing is pip-resolved from the index on the cluster; the rest of
+# the data stack (pyarrow / …) comes from the serverless base image. Drop into a
 # serverless job's environments[].spec or a notebook environment specification.
 environment_version: "5"
 dependencies:
   - ygg-0.8.49-py3-none-any.whl
-  - pyarrow>=20
-  - polars>=1.3
-  - xxhash
-  - orjson>=3.10
-  - databricks-sdk>=0.107
+  - databricks_sdk-0.114.0-py3-none-any.whl

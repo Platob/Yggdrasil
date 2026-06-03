@@ -11,9 +11,10 @@ the field names the Jobs API / ``databricks.sdk`` ``Environment`` uses) whose:
   ``--python`` — so the pure-python ygg wheel installs cleanly and Python
   UDFs run (Spark Connect needs the client and server to share a minor
   Python); and
-* ``dependencies`` install the ygg wheel by name, then ygg's runtime
-  requirements as index packages (so ``pyarrow`` / ``polars`` / ``databricks-sdk``
-  land as platform-correct builds the serverless runtime resolves itself).
+* ``dependencies`` install **only wheels, by path** — the ygg wheel and the
+  bundled ``databricks-sdk`` wheel (``--sdk-wheel``). No index requirements:
+  the serverless base image already carries the data stack (pyarrow / …) and
+  nothing is resolved from PyPI on the cluster.
 
 Stdlib only — no install of ygg (or its heavy deps) is needed in CI. The
 ``python → serverless environment version`` mapping mirrors
@@ -40,26 +41,17 @@ def serverless_environment_version(python_minor: int) -> str:
     return _PY_MINOR_TO_ENV_VERSION.get(python_minor, SERVERLESS_ENVIRONMENT_VERSION)
 
 
-def runtime_dependencies(pyproject: dict, extras: "tuple[str, ...]") -> "list[str]":
-    """The project's declared runtime requirements + the named extras."""
-    project = pyproject["project"]
-    deps = list(project.get("dependencies", []))
-    optional = project.get("optional-dependencies", {})
-    for extra in extras:
-        deps.extend(optional.get(extra, []))
-    return deps
-
-
 def build_yaml(
     version: str,
     python: str,
-    dependencies: "list[str]",
-    wheel: str,
+    wheels: "list[str]",
 ) -> str:
     """Render the serverless ``Environment`` spec as YAML text.
 
-    Hand-rendered (no PyYAML dependency) — the shape is a single scalar plus
-    a flat string list, so the output is trivially valid YAML.
+    *wheels* are installed in order, by path — the ygg wheel first, then the
+    bundled ``databricks-sdk`` wheel. Hand-rendered (no PyYAML dependency) —
+    the shape is a single scalar plus a flat string list, so the output is
+    trivially valid YAML.
     """
     minor = int(python.split(".")[1])
     env_version = serverless_environment_version(minor)
@@ -69,14 +61,15 @@ def build_yaml(
         "#",
         f"# environment_version {env_version} is the Databricks serverless runtime whose",
         f"# Python is {python}, so the pure-python ygg wheel installs cleanly and Python",
-        "# UDFs run (Spark Connect needs a matching client Python). The ygg wheel installs",
-        "# by name; the rest resolve from the index as platform-correct builds. Drop into a",
+        "# UDFs run (Spark Connect needs a matching client Python). Dependencies are",
+        "# wheels installed BY PATH only — the ygg wheel and the bundled databricks-sdk",
+        "# wheel — so nothing is pip-resolved from the index on the cluster; the rest of",
+        "# the data stack (pyarrow / …) comes from the serverless base image. Drop into a",
         "# serverless job's environments[].spec or a notebook environment specification.",
         f'environment_version: "{env_version}"',
         "dependencies:",
-        f"  - {wheel}",
     ]
-    lines.extend(f"  - {dep}" for dep in dependencies)
+    lines.extend(f"  - {wheel}" for wheel in wheels)
     return "\n".join(lines) + "\n"
 
 
@@ -91,16 +84,17 @@ def main(argv: "list[str] | None" = None) -> int:
         help="ygg version; default reads python/pyproject.toml",
     )
     parser.add_argument(
+        "--sdk-wheel", default=None,
+        help="databricks-sdk wheel filename to bundle by path "
+             "(e.g. databricks_sdk-0.114.0-py3-none-any.whl)",
+    )
+    parser.add_argument(
         "--pyproject", default=None,
         help="path to python/pyproject.toml; default resolved from this script",
     )
     parser.add_argument(
         "--out-dir", default=None,
         help="output directory; default <repo>/environments/ygg",
-    )
-    parser.add_argument(
-        "--extras", default="databricks",
-        help="comma-separated pyproject extras folded into dependencies",
     )
     args = parser.parse_args(argv)
 
@@ -114,14 +108,14 @@ def main(argv: "list[str] | None" = None) -> int:
     pyproject = tomllib.loads(pyproject_path.read_text())
 
     version = args.version or pyproject["project"]["version"]
-    extras = tuple(e.strip() for e in args.extras.split(",") if e.strip())
-    dependencies = runtime_dependencies(pyproject, extras)
-    wheel = f"ygg-{version}-py3-none-any.whl"
+    wheels = [f"ygg-{version}-py3-none-any.whl"]
+    if args.sdk_wheel:
+        wheels.append(args.sdk_wheel)
 
     out_dir = Path(args.out_dir) if args.out_dir else repo_root / "environments" / "ygg"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"ygg-{version}-py{args.python}-serverless.yml"
-    out_path.write_text(build_yaml(version, args.python, dependencies, wheel))
+    out_path.write_text(build_yaml(version, args.python, wheels))
 
     try:
         shown = out_path.relative_to(repo_root)

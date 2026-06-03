@@ -52,44 +52,58 @@ class TestMappingParity:
 
 
 class TestBuildYaml:
-    DEPS = ["pyarrow>=20", "polars>=1.3", "databricks-sdk>=0.107"]
+    YGG = "ygg-0.8.49-py3-none-any.whl"
+    SDK = "databricks_sdk-0.114.0-py3-none-any.whl"
 
     def test_yaml_is_valid_environment_spec(self) -> None:
-        text = build_serverless_env.build_yaml(
-            "0.8.49", "3.12", self.DEPS, "ygg-0.8.49-py3-none-any.whl",
-        )
+        text = build_serverless_env.build_yaml("0.8.49", "3.12", [self.YGG, self.SDK])
         spec = yaml.safe_load(text)
         # environment_version is a *string* (the API contract), not an int.
         assert spec["environment_version"] == "5"
         assert isinstance(spec["environment_version"], str)
-        # The ygg wheel installs first, then the runtime deps as index reqs.
-        assert spec["dependencies"][0] == "ygg-0.8.49-py3-none-any.whl"
-        assert spec["dependencies"][1:] == self.DEPS
+        # Wheels only, by path — the ygg wheel then the bundled databricks-sdk
+        # wheel. No index requirements (pyarrow / polars / …) at all.
+        assert spec["dependencies"] == [self.YGG, self.SDK]
+
+    def test_dependencies_are_wheels_only(self) -> None:
+        spec = yaml.safe_load(
+            build_serverless_env.build_yaml("0.8.49", "3.12", [self.YGG, self.SDK])
+        )
+        assert all(dep.endswith(".whl") for dep in spec["dependencies"])
 
     def test_python311_picks_environment_version_two(self) -> None:
         spec = yaml.safe_load(
-            build_serverless_env.build_yaml(
-                "0.8.49", "3.11", self.DEPS, "ygg-0.8.49-py3-none-any.whl",
-            )
+            build_serverless_env.build_yaml("0.8.49", "3.11", [self.YGG, self.SDK])
         )
         assert spec["environment_version"] == "2"
 
 
 class TestMain:
-    def test_main_writes_versioned_spec(self, tmp_path, capsys) -> None:
+    SDK = "databricks_sdk-0.114.0-py3-none-any.whl"
+
+    def test_main_writes_versioned_spec(self, tmp_path) -> None:
         rc = build_serverless_env.main(
-            ["--version", "9.9.9", "--python", "3.12", "--out-dir", str(tmp_path)]
+            ["--version", "9.9.9", "--python", "3.12",
+             "--sdk-wheel", self.SDK, "--out-dir", str(tmp_path)]
         )
         assert rc == 0
         out = tmp_path / "ygg-9.9.9-py3.12-serverless.yml"
         assert out.exists()
         spec = yaml.safe_load(out.read_text())
         assert spec["environment_version"] == "5"
-        assert spec["dependencies"][0] == "ygg-9.9.9-py3-none-any.whl"
-        # The declared runtime deps (pyarrow / polars / …) plus the databricks
-        # extra (databricks-sdk) all land as index requirements.
-        joined = " ".join(spec["dependencies"])
-        assert "pyarrow" in joined and "databricks-sdk" in joined
+        assert spec["dependencies"] == [
+            "ygg-9.9.9-py3-none-any.whl",
+            self.SDK,
+        ]
+
+    def test_without_sdk_wheel_only_ygg(self, tmp_path) -> None:
+        build_serverless_env.main(
+            ["--version", "9.9.9", "--out-dir", str(tmp_path)]
+        )
+        spec = yaml.safe_load(
+            (tmp_path / "ygg-9.9.9-py3.12-serverless.yml").read_text()
+        )
+        assert spec["dependencies"] == ["ygg-9.9.9-py3-none-any.whl"]
 
     def test_main_reads_version_from_pyproject(self, tmp_path) -> None:
         import tomllib
