@@ -1,8 +1,11 @@
 """``TableOptions.engine`` (EngineType) → compute-engine dispatch.
 
 ``engine`` picks YGGDRASIL (native DeltaFolder) / DATABRICKS_SQL_WAREHOUSE /
-SPARK explicitly; ``None`` guesses best (active Spark → SPARK; small Delta
-< 128 MiB → YGGDRASIL; else → DATABRICKS_SQL_WAREHOUSE). A YGGDRASIL pick on
+SPARK explicitly; ``None`` guesses best (active Spark → SPARK; a Delta table
+under its native-path size cap → YGGDRASIL; else → DATABRICKS_SQL_WAREHOUSE).
+The cap is relaxed for EXTERNAL tables (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``,
+4 GiB) since UC vends READ_WRITE creds for them, and kept small
+(``_NATIVE_DELTA_MAX_BYTES``, 128 MiB) for managed tables. A YGGDRASIL pick on
 a table that can't take the native path, or a UC-credential failure, degrades
 to the warehouse.
 """
@@ -23,7 +26,11 @@ from databricks.sdk.service.catalog import (
 from yggdrasil.data.options import CastOptions
 from yggdrasil.enums import EngineType
 from yggdrasil.databricks.table.options import TableOptions
-from yggdrasil.databricks.table.table import Table, _NATIVE_DELTA_MAX_BYTES
+from yggdrasil.databricks.table.table import (
+    Table,
+    _NATIVE_DELTA_MAX_BYTES,
+    _NATIVE_DELTA_MAX_BYTES_EXTERNAL,
+)
 
 WH = EngineType.DATABRICKS_SQL_WAREHOUSE
 YG = EngineType.YGGDRASIL
@@ -133,8 +140,28 @@ class TestResolveEngineGuess:
         assert t._resolve_engine(TableOptions(), write=False) is YG
         assert t._resolve_engine(TableOptions(), write=True) is YG
 
-    def test_large_delta_guesses_warehouse(self, monkeypatch):
+    def test_external_above_small_cap_still_yggdrasil(self, monkeypatch):
+        # The external cap is relaxed: an external Delta table several times the
+        # 128 MiB managed cap still prefers the direct DeltaFolder write.
         t = self._ext()
+        monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
+        monkeypatch.setattr(Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES * 4)
+        assert t._resolve_engine(TableOptions(), write=False) is YG
+        assert t._resolve_engine(TableOptions(), write=True) is YG
+
+    def test_large_external_delta_guesses_warehouse(self, monkeypatch):
+        # At/above the external cap a very large external table still goes to
+        # the warehouse.
+        t = self._ext()
+        monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
+        monkeypatch.setattr(
+            Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES_EXTERNAL,
+        )
+        assert t._resolve_engine(TableOptions(), write=False) is WH
+
+    def test_managed_above_small_cap_guesses_warehouse(self, monkeypatch):
+        # A managed table keeps the small cap: above 128 MiB → warehouse (read).
+        t = _table(TableType.MANAGED, DataSourceFormat.DELTA)
         monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
         monkeypatch.setattr(Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES)
         assert t._resolve_engine(TableOptions(), write=False) is WH
