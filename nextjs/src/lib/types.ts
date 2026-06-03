@@ -379,6 +379,96 @@ export interface Message {
   node_id: string;
 }
 
+// ── Trading ────────────────────────────────────────────────────────────────
+
+export interface IndicatorResult {
+  node_id: string;
+  path: string;
+  column: string;
+  index: (string | number)[];
+  value: (number | null)[];
+  rsi: (number | null)[] | null;
+  macd: (number | null)[] | null;
+  macd_signal: (number | null)[] | null;
+  macd_hist: (number | null)[] | null;
+  bb_upper: (number | null)[] | null;
+  bb_mid: (number | null)[] | null;
+  bb_lower: (number | null)[] | null;
+  atr: (number | null)[] | null;
+  source_rows: number;
+  truncated: boolean;
+}
+
+export interface CorrelationResult {
+  node_id: string;
+  labels: string[];
+  method: string;
+  matrix: (number | null)[][];
+  source_rows: number[];
+}
+
+export interface PortfolioMetrics {
+  total_return: number | null;
+  cagr: number | null;
+  ann_return: number | null;
+  ann_volatility: number | null;
+  sharpe: number | null;
+  sortino: number | null;
+  max_drawdown: number | null;
+  calmar: number | null;
+  beta: number | null;
+  alpha: number | null;
+}
+
+export interface PortfolioResult {
+  node_id: string;
+  labels: string[];
+  weights: number[];
+  index: (string | number)[];
+  portfolio_value: (number | null)[];
+  drawdown: (number | null)[];
+  individual_returns: (number | null)[][];
+  metrics: PortfolioMetrics;
+  correlation_matrix: (number | null)[][];
+  source_rows: number;
+}
+
+export interface VaRResult {
+  node_id: string;
+  path: string;
+  column: string;
+  method: string;
+  confidence: number;
+  horizon: number;
+  var: number | null;
+  cvar: number | null;
+  var_pct: number | null;
+  cvar_pct: number | null;
+  ann_volatility: number | null;
+  source_rows: number;
+}
+
+export interface TradeSignal {
+  index: string | number;
+  action: "BUY" | "SELL" | "HOLD";
+  strength: number;
+  reasons: string[];
+  rsi: number | null;
+  macd_hist: number | null;
+  bb_position: number | null;
+}
+
+export interface SignalResult {
+  node_id: string;
+  path: string;
+  column: string;
+  signals: TradeSignal[];
+  last_action: string;
+  buy_count: number;
+  sell_count: number;
+  source_rows: number;
+}
+
 // ── User ───────────────────────────────────────────────────────────────────
 
 export interface UserCard {

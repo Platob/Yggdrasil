@@ -7,23 +7,28 @@ import type {
   AuditEntry,
   ChannelInfo,
   ClusterStats,
+  CorrelationResult,
   DAGEntry,
   DAGRunEntry,
   FsEntry,
   HealthResponse,
+  IndicatorResult,
   Message,
   ExcelInfo,
   MetricsResponse,
   NodeBackend,
   NodeCard,
   NodeMeta,
+  PortfolioResult,
   PyEnvEntry,
   PyEnvEnvVars,
   PyEnvPackages,
   PyFuncEntry,
   PyFuncRunEntry,
+  SignalResult,
   TopologyResponse,
   UserCard,
+  VaRResult,
 } from "./types";
 import { cachedGet, cachedPost, invalidate, TTL } from "./cache";
 import { downloadBlob } from "./format";
@@ -1033,4 +1038,84 @@ export async function sendMessage(channel: string, content: string): Promise<Mes
 
 export function createMessageStream(channel: string): EventSource {
   return new EventSource(`/api/v2/messenger/${encodeURIComponent(channel)}/stream`);
+}
+
+// ── Trading ─────────────────────────────────────────────────────────────────
+
+export interface IndicatorRequest {
+  path: string;
+  column: string;
+  x?: string;
+  indicators?: string[];
+  rsi_period?: number;
+  macd_fast?: number;
+  macd_slow?: number;
+  macd_signal?: number;
+  bb_period?: number;
+  bb_std?: number;
+  high?: string;
+  low?: string;
+  limit?: number;
+}
+
+export function getIndicators(req: IndicatorRequest, node?: string): Promise<IndicatorResult> {
+  const body = node ? { ...req, node } : req;
+  return cachedPost<IndicatorResult>("/api/v2/trading/indicators", body, TTL.VITAL, () =>
+    jsonFetch<IndicatorResult>("/api/v2/trading/indicators" + (node ? `?node=${encodeURIComponent(node)}` : ""), {
+      method: "POST", body: JSON.stringify(req),
+    })
+  );
+}
+
+export interface PortfolioAsset { path: string; column: string; label?: string; weight?: number; }
+
+export function getPortfolio(
+  assets: PortfolioAsset[],
+  opts?: { periods_per_year?: number; risk_free?: number; limit?: number; node?: string },
+): Promise<PortfolioResult> {
+  const body = { assets, ...opts };
+  return cachedPost<PortfolioResult>("/api/v2/trading/portfolio", body, TTL.VITAL, () =>
+    jsonFetch<PortfolioResult>("/api/v2/trading/portfolio" + (opts?.node ? `?node=${encodeURIComponent(opts.node)}` : ""), {
+      method: "POST", body: JSON.stringify({ assets, ...opts }),
+    })
+  );
+}
+
+export function getCorrelation(
+  paths: string[],
+  column: string,
+  opts?: { labels?: string[]; method?: string; limit?: number; node?: string },
+): Promise<CorrelationResult> {
+  const body = { paths, column, ...opts };
+  return cachedPost<CorrelationResult>("/api/v2/trading/correlation", body, TTL.VITAL, () =>
+    jsonFetch<CorrelationResult>("/api/v2/trading/correlation" + (opts?.node ? `?node=${encodeURIComponent(opts.node)}` : ""), {
+      method: "POST", body: JSON.stringify({ paths, column, ...opts }),
+    })
+  );
+}
+
+export function getVaR(
+  path: string,
+  column: string,
+  opts?: { method?: string; confidence?: number; horizon?: number; periods_per_year?: number; limit?: number; node?: string },
+): Promise<VaRResult> {
+  const body = { path, column, ...opts };
+  return cachedPost<VaRResult>("/api/v2/trading/var", body, TTL.VITAL, () =>
+    jsonFetch<VaRResult>("/api/v2/trading/var" + (opts?.node ? `?node=${encodeURIComponent(opts.node)}` : ""), {
+      method: "POST", body: JSON.stringify({ path, column, ...opts }),
+    })
+  );
+}
+
+export function getSignals(
+  path: string,
+  column: string,
+  opts?: { x?: string; rsi_period?: number; limit?: number; node?: string },
+): Promise<SignalResult> {
+  const body = { path, column, ...opts };
+  return cachedPost<SignalResult>("/api/v2/trading/signals", body, TTL.VITAL, () =>
+    jsonFetch<SignalResult>("/api/v2/trading/signals" + (opts?.node ? `?node=${encodeURIComponent(opts.node)}` : ""), {
+      method: "POST", body: JSON.stringify({ path, column, ...opts }),
+    })
+  );
 }

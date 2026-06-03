@@ -56,11 +56,20 @@ def _safe(v):
 
 
 def _safe_list(arr) -> list:
+    """Convert a numpy array to a JSON-safe Python list (NaN/Inf → None)."""
+    if isinstance(arr, np.ndarray):
+        # Vectorised path: replace NaN/Inf with None in one pass.
+        finite = np.isfinite(arr)
+        out: list = [None] * len(arr)
+        for i, (f, v) in enumerate(zip(finite, arr)):
+            if f:
+                out[i] = float(v)
+        return out
     return [_safe(v) for v in arr]
 
 
 def _rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
-    """Wilder RSI — uses Polars ewm_mean for the smoothed avg-gain/loss (no Python loop)."""
+    """Wilder RSI — uses scipy.signal.lfilter for the smoothed avg-gain/loss."""
     n = len(prices)
     rsi = np.full(n, np.nan)
     if n < period + 1:
@@ -68,25 +77,27 @@ def _rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
     delta = np.diff(prices.astype(float))
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
-    # Wilder smoothing ≡ EMA with alpha=1/period
     alpha = 1.0 / period
-    # Seed from first SMA window
-    ag = float(np.mean(gain[:period]))
-    al = float(np.mean(loss[:period]))
-    # Vectorise the smoothing with a pre-seeded scan using numpy
-    ag_arr = np.empty(n - 1)
-    al_arr = np.empty(n - 1)
-    ag_arr[:period] = np.nan
-    al_arr[:period] = np.nan
-    ag_arr[period - 1] = ag
-    al_arr[period - 1] = al
-    w = 1.0 - alpha
-    for i in range(period, n - 1):
-        ag_arr[i] = ag_arr[i - 1] * w + gain[i] * alpha
-        al_arr[i] = al_arr[i - 1] * w + loss[i] * alpha
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rs = np.where(al_arr > 0, ag_arr / al_arr, 100.0)
-    rsi[1:] = np.where(~np.isnan(ag_arr), 100.0 - 100.0 / (1.0 + rs), np.nan)
+    ag_seed = float(np.mean(gain[:period]))
+    al_seed = float(np.mean(loss[:period]))
+    # Wilder smoothing: process gain[period:] (the n-1-period deltas after the seed window)
+    # rsi[period+1..n-1] ← n-1-period values
+    try:
+        from scipy.signal import lfilter
+        w = 1.0 - alpha
+        ag_arr = lfilter([alpha], [1.0, -w], gain[period:], zi=[ag_seed])[0]
+        al_arr = lfilter([alpha], [1.0, -w], loss[period:], zi=[al_seed])[0]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rs = np.where(al_arr > 0, ag_arr / al_arr, 100.0)
+        rsi[period + 1:] = 100.0 - 100.0 / (1.0 + rs)
+    except ImportError:
+        ag, al = ag_seed, al_seed
+        w = 1.0 - alpha
+        for i in range(period, n - 1):
+            ag = ag * w + gain[i] * alpha
+            al = al * w + loss[i] * alpha
+            rs = ag / al if al > 0 else 100.0
+            rsi[i + 1] = 100.0 - 100.0 / (1.0 + rs)
     return rsi
 
 
@@ -128,29 +139,14 @@ def _macd(prices: np.ndarray, fast=12, slow=26, signal=9):
 
 
 def _bollinger(prices: np.ndarray, period=20, std_mult=2.0):
-    """Bollinger Bands — vectorised via stride-tricks rolling window."""
-    n = len(prices)
-    p = prices.astype(float)
-    mid = np.full(n, np.nan)
-    upper = np.full(n, np.nan)
-    lower = np.full(n, np.nan)
-    if n < period:
-        return upper, mid, lower
-    # Use cumulative sum trick for rolling mean/std: O(n) instead of O(n*period).
-    cs = np.nancumsum(p)
-    cs2 = np.nancumsum(np.where(np.isnan(p), np.nan, p ** 2))
-    # First window
-    for start in range(n - period + 1):
-        end = start + period
-        s1 = cs[end - 1] - (cs[start - 1] if start > 0 else 0.0)
-        s2 = cs2[end - 1] - (cs2[start - 1] if start > 0 else 0.0)
-        m = s1 / period
-        var = s2 / period - m * m
-        s = math.sqrt(max(var * period / (period - 1), 0.0))  # unbiased (ddof=1)
-        i = end - 1
-        mid[i] = m
-        upper[i] = m + std_mult * s
-        lower[i] = m - std_mult * s
+    """Bollinger Bands — uses Polars native rolling_mean/rolling_std (C-level)."""
+    p = pl.Series(prices.astype(float))
+    mid_s = p.rolling_mean(window_size=period)
+    std_s = p.rolling_std(window_size=period)
+    mid = mid_s.to_numpy()
+    std = std_s.to_numpy()
+    upper = mid + std_mult * std
+    lower = mid - std_mult * std
     return upper, mid, lower
 
 
