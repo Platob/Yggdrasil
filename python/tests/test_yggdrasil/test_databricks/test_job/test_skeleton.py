@@ -236,3 +236,36 @@ def test_class_based_flow_overrides_run():
 @flow(name="module-level")
 def module_level_flow(x):
     return x
+
+
+def test_all_environments_attaches_one_env_per_python():
+    from yggdrasil.databricks.job import wheel as W
+
+    @flow(name="multi")
+    def f(x):
+        ...
+
+    f.all_environments = True
+    # simulate a completed deploy build (per-Python wheel matrix stashed)
+    f._ygg_wheels = ["/ws/ygg-1.0-py3-none-any.whl"]
+    f._user_wheels = []
+    f._user_deps = []
+    f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl", "pyarrow>=20")
+    from unittest.mock import patch
+    with patch.object(W, "ygg_runtime_dependencies", return_value=["pyarrow>=20"]):
+        envs = f.environments()
+    keys = [e.environment_key for e in envs]
+    assert keys == ["default", "py310", "py311", "py312", "py313"]
+    by = {e.environment_key: e for e in envs}
+    assert by["py310"].spec.environment_version == "1"
+    assert by["py311"].spec.environment_version == "2"
+
+
+def test_default_only_single_environment_without_flag():
+    @flow(name="single")
+    def f(x):
+        ...
+
+    f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl",)
+    envs = f.environments()
+    assert [e.environment_key for e in envs] == ["default"]

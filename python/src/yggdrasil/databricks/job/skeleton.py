@@ -47,8 +47,6 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar
 
-from yggdrasil.databricks.job.wheel import serverless_environment_version
-
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.concurrent.threading import ThreadJob
     from yggdrasil.databricks.job.job import Job
@@ -154,8 +152,15 @@ class _Runnable:
     extra_dependencies: "tuple[str, ...]" = ("databricks-sdk",)
     #: Seconds to wait for a remote-dispatched run before giving up.
     remote_timeout: float = 3600.0
+    #: Attach a serverless environment for **every** supported Python (keyed
+    #: ``py3XX``) on deploy, not just the local-matched ``default``. The build
+    #: already produces a wheel per Python; this exposes them as job environments.
+    all_environments: bool = False
 
     _wheel_paths: "tuple[str, ...]" = ()
+    _ygg_wheels: "list[str] | None" = None
+    _user_wheels: "list[str]" = ()
+    _user_deps: "list[str]" = ()
     _runner_params: "list[str] | None" = None
     _client: Any = None
 
@@ -270,33 +275,52 @@ class _Runnable:
         return [self._target_ref(), *self._scheduled_params()]
 
     def _serverless_dependencies(self, client: Any) -> list[str]:
-        """Compose the serverless dependency list: the ygg runner image (wheel by
-        path + runtime deps from the index) plus — when this task/flow lives in a
-        *different* package — that package's wheel + its declared deps, so the
-        runner target is importable on the cluster. Editable installs build to a
-        per-user folder and rebuild each deploy; published ones reuse the shared
-        registry."""
+        """Build + upload the serverless wheels **for every Python version** and
+        return the flat dependency list for the *matched* (default) environment.
+
+        Ships the ygg runner image (wheel by path + runtime deps from the index)
+        plus — when this task/flow lives in a *different* package — that package's
+        wheel + its declared deps, so the runner target is importable on the
+        cluster. Editable installs build to a per-user folder and rebuild each
+        deploy; published ones reuse the shared registry. The per-Python wheel
+        sets are stashed for :meth:`environments` to compose the full matrix when
+        :attr:`all_environments` is set."""
         from yggdrasil.databricks.job import wheel as W
 
-        deps: list[str] = []
         editable_ygg = W.is_editable_install("ygg")
-        deps += W.ensure_ygg_wheel(
+        ygg_wheels = W.ensure_ygg_wheels(
             client,
             workspace_dir=(W.user_pypi_dir(client) if editable_ygg else W.WORKSPACE_PYPI_DIR),
             rebuild=editable_ygg,
         )
-        deps += W.ygg_runtime_dependencies()
+        runtime = W.ygg_runtime_dependencies()
 
+        user_wheels: list[str] = []
+        user_deps: list[str] = []
         pkg = self.wheel_package()
         dist = W.distribution_for(pkg)
         if W._norm(dist) != "ygg":
             editable = W.is_editable_install(dist)
             base = W.user_pypi_dir(client) if editable else W.WORKSPACE_PYPI_DIR
-            deps += W.ensure_wheel(
-                client, pkg, workspace_dir=f"{base}/{_slug(dist)}", no_deps=True,
-            )
-            deps += W._project_dependencies(dist, set(self.wheel_extras))
+            user_wheels = W.ensure_wheels(client, pkg, workspace_dir=f"{base}/{_slug(dist)}")
+            user_deps = W._project_dependencies(dist, set(self.wheel_extras))
 
+        self._ygg_wheels, self._user_wheels, self._user_deps = ygg_wheels, user_wheels, user_deps
+        # Flat deps for the default (local-matched) environment.
+        deps = [W.wheel_for_python(ygg_wheels)] + runtime
+        if user_wheels:
+            deps += [W.wheel_for_python(user_wheels)] + user_deps
+        seen: set[str] = set()
+        return [d for d in deps if not (d in seen or seen.add(d))]
+
+    def _python_dependencies(self, python: str) -> list[str]:
+        """The dependency list for a specific *python* — the wheels matching it
+        (by path) + runtime/user index deps (composed from the stashed matrix)."""
+        from yggdrasil.databricks.job import wheel as W
+
+        deps = [W.wheel_for_python(self._ygg_wheels, python)] + W.ygg_runtime_dependencies()
+        if self._user_wheels:
+            deps += [W.wheel_for_python(self._user_wheels, python)] + list(self._user_deps)
         seen: set[str] = set()
         return [d for d in deps if not (d in seen or seen.add(d))]
 
@@ -319,24 +343,37 @@ class _Runnable:
         return dependency
 
     def environments(self) -> Optional[list]:
-        """Serverless environment list (Python-matched runtime +
-        :meth:`effective_dependencies`), or ``None`` when not serverless."""
+        """Serverless environment list, or ``None`` when not serverless.
+
+        Always carries a ``"default"`` env (the local-matched runtime +
+        :meth:`effective_dependencies`). When :attr:`all_environments` is set and
+        the per-Python wheels have been built (post-:meth:`deploy`), also appends
+        one env per :data:`~yggdrasil.databricks.job.wheel.SUPPORTED_PYTHONS`
+        (keyed ``py3XX``) so a task can run under any Python by environment key."""
         if not self.serverless:
             return None
         from databricks.sdk.service.compute import Environment
         from databricks.sdk.service.jobs import JobEnvironment
+        from yggdrasil.databricks.job import wheel as W
 
-        return [
-            JobEnvironment(
-                environment_key=self.environment_key,
+        def env(key: str, deps: list, python: "str | None") -> Any:
+            return JobEnvironment(
+                environment_key=key,
                 spec=Environment(
                     environment_version=(
-                        self.environment_version or serverless_environment_version()
+                        self.environment_version or W.serverless_environment_version(python)
                     ),
-                    dependencies=self.effective_dependencies(),
+                    dependencies=deps,
                 ),
             )
-        ]
+
+        envs = [env(self.environment_key, self.effective_dependencies(), None)]
+        if self.all_environments and getattr(self, "_ygg_wheels", None):
+            envs += [
+                env(W.environment_key_for(v), self._python_dependencies(v), v)
+                for v in W.SUPPORTED_PYTHONS
+            ]
+        return envs
 
     def tasks(self) -> list:
         """The single serverless python-wheel task that runs ``ygg-run``."""

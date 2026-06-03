@@ -57,3 +57,19 @@ def _demo_flow(x: int) -> int:
 def _adder(a: int, b: int) -> int:
     assert a + b == 42
     return a + b
+
+
+def test_main_injects_databricks_client_and_sets_current():
+    import sys
+    from unittest.mock import MagicMock, patch
+    module = sys.modules[__name__]
+    if hasattr(module, "databricks"):       # a prior runner call may have injected one
+        del module.databricks
+    sentinel = MagicMock(name="client")
+    with patch("yggdrasil.databricks.client.DatabricksClient") as DC:
+        DC.return_value = sentinel
+        rc = runner.main([f"{__name__}:_adder", "2", "40"])
+    assert rc == 0
+    DC.set_current.assert_called_once_with(sentinel)
+    # injected as a module global so a bare `databricks` in the body resolves
+    assert module.databricks is sentinel

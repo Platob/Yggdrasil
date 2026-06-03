@@ -31,17 +31,25 @@ __all__ = [
     "WORKSPACE_PYPI_DIR",
     "WORKSPACE_WHL_DIR",
     "SERVERLESS_ENVIRONMENT_VERSION",
+    "SERVERLESS_ENVIRONMENT_VERSIONS",
+    "SUPPORTED_PYTHONS",
     "serverless_environment_version",
+    "environment_key_for",
+    "wheel_for_python",
     "is_editable_install",
     "user_pypi_dir",
     "synthesize_project",
     "build_wheel",
+    "build_wheels_for_versions",
     "upload_wheel",
     "ensure_wheel",
+    "ensure_wheels",
     "deployed_wheels",
     "ensure_ygg_wheel",
+    "ensure_ygg_wheels",
     "ygg_runtime_dependencies",
     "ygg_environment",
+    "ygg_environments",
 ]
 
 #: Root of the workspace's PyPI-like wheel registry. Each distribution gets a
@@ -61,21 +69,58 @@ WORKSPACE_WHL_DIR = WORKSPACE_PYPI_DIR
 #: isn't one we map to an older runtime.
 SERVERLESS_ENVIRONMENT_VERSION = "5"
 
+#: Python minor versions we build wheels / environments for ("a wheel for every
+#: Python version, same for environments"). Pure-python projects collapse to a
+#: single ``py3-none-any`` wheel reused across all of them.
+SUPPORTED_PYTHONS: "tuple[str, ...]" = ("3.10", "3.11", "3.12", "3.13")
 
-def serverless_environment_version() -> str:
+#: Known serverless environment-version ↔ Python map. Configurable; a Python not
+#: listed here resolves to the latest (:data:`SERVERLESS_ENVIRONMENT_VERSION`).
+SERVERLESS_ENVIRONMENT_VERSIONS: "dict[str, str]" = {"3.10": "1", "3.11": "2"}
+
+
+def _py_minor(python: "str | None" = None) -> str:
+    """Normalize a Python version to ``"3.X"`` (defaults to the local interpreter;
+    accepts ``"3.11"``, ``"311"``, ``"py311"``, ``"3.11.7"``)."""
+    if python is None:
+        return f"3.{sys.version_info[1]}"
+    digits = re.sub(r"[^0-9.]", "", python)
+    parts = digits.split(".")
+    if len(parts) >= 2:
+        return f"{parts[0]}.{parts[1]}"
+    if digits.startswith("3") and len(digits) >= 3:  # "311" → "3.11"
+        return f"3.{digits[1:]}"
+    return digits or f"3.{sys.version_info[1]}"
+
+
+def serverless_environment_version(python: "str | None" = None) -> str:
     """The Databricks serverless environment version whose runtime **Python
-    matches the local interpreter**.
+    matches** *python* (default: the local interpreter).
 
     Matching matters twice over: a locally-built ygg wheel installs cleanly, and
     Python UDFs run (Spark Connect requires the client and server to share a
-    minor Python version). Mapping: 3.10 → ``"1"``, 3.11 → ``"2"``, anything
-    else → the latest :data:`SERVERLESS_ENVIRONMENT_VERSION` (``"5"``)."""
-    minor = sys.version_info[1]
-    if minor == 10:
-        return "1"
-    if minor == 11:
-        return "2"
-    return SERVERLESS_ENVIRONMENT_VERSION
+    minor Python version). Mapping comes from :data:`SERVERLESS_ENVIRONMENT_VERSIONS`
+    (3.10 → ``"1"``, 3.11 → ``"2"``); anything else → the latest
+    :data:`SERVERLESS_ENVIRONMENT_VERSION` (``"5"``)."""
+    return SERVERLESS_ENVIRONMENT_VERSIONS.get(_py_minor(python), SERVERLESS_ENVIRONMENT_VERSION)
+
+
+def environment_key_for(python: str) -> str:
+    """The serverless ``environment_key`` for a Python version (``3.11`` →
+    ``"py311"``)."""
+    return "py" + _py_minor(python).replace(".", "")
+
+
+def wheel_for_python(wheels: "list", python: "str | None" = None) -> str:
+    """Pick the wheel matching *python* from *wheels* (paths/str): a version-tagged
+    ``cp3XX`` build if present, else the universal ``py3-none-any`` wheel (a
+    pure-python project), else the first. Returns a string path."""
+    tag = "cp" + _py_minor(python).replace(".", "")
+    items = [str(w) for w in wheels]
+    return next(
+        (w for w in items if tag in w),
+        next((w for w in items if "-py3-none-any.whl" in w), items[0] if items else ""),
+    )
 
 
 def is_editable_install(dist: str) -> bool:
@@ -301,6 +346,52 @@ def build_wheel(
     return wheels
 
 
+def build_wheels_for_versions(
+    package: str,
+    *,
+    versions: "tuple[str, ...] | list[str]" = SUPPORTED_PYTHONS,
+    extras: "tuple[str, ...] | list[str]" = (),
+    dest_dir: "str | Path | None" = None,
+) -> list[Path]:
+    """Build *package* **once per Python version** (``uv build --python X.Y``) and
+    return the unique wheels.
+
+    A pure-python project yields a single ``py3-none-any`` wheel — built once and
+    reused for every version (we stop after the first universal wheel). A package
+    with native extensions yields a distinct ``cp3XX`` wheel per Python, so the
+    registry carries a wheel for every version. Needs ``uv`` (it downloads the
+    requested interpreters); without it, falls back to one wheel for the current
+    interpreter."""
+    project = synthesize_project(package, extras=extras)
+    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-wheels-"))
+    seen: set[str] = set()
+    wheels: list[Path] = []
+    for version in versions:
+        try:
+            subprocess.run(
+                ["uv", "build", "--wheel", "--python", version,
+                 "--out-dir", str(out), str(project)],
+                check=True,
+            )
+        except FileNotFoundError:
+            logger.info("uv not found — building one wheel for the current interpreter")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "wheel", str(project),
+                 "--no-deps", "--wheel-dir", str(out)],
+                check=True,
+            )
+        for whl in sorted(out.glob("*.whl")):
+            if whl.name not in seen:
+                seen.add(whl.name)
+                wheels.append(whl)
+        # A universal wheel is identical for every Python — no need to rebuild.
+        if any(n.endswith("-py3-none-any.whl") for n in seen):
+            break
+    if not wheels:
+        raise FileNotFoundError(f"no wheels produced in {out}")
+    return wheels
+
+
 def upload_wheel(client: Any, wheel: "str | Path", *, workspace_dir: str = WORKSPACE_WHL_DIR) -> str:
     """Upload *wheel* to *workspace_dir*; return its workspace path."""
     from yggdrasil.databricks.path import DatabricksPath
@@ -330,6 +421,22 @@ def ensure_wheel(
     wheels = build_wheel(
         package, extras=extras, requirements=requirements, no_deps=no_deps,
     )
+    return [upload_wheel(client, w, workspace_dir=workspace_dir) for w in wheels]
+
+
+def ensure_wheels(
+    client: Any,
+    package: str,
+    *,
+    versions: "tuple[str, ...] | list[str]" = SUPPORTED_PYTHONS,
+    workspace_dir: str = WORKSPACE_WHL_DIR,
+    extras: "tuple[str, ...] | list[str]" = (),
+) -> list[str]:
+    """Build the live *package* **for every Python version** (:func:`build_wheels_for_versions`)
+    and upload every produced wheel to *workspace_dir*; return their workspace
+    paths. Pure-python packages collapse to a single ``py3-none-any`` wheel. Built
+    fresh each call so the deployed job ships current code."""
+    wheels = build_wheels_for_versions(package, versions=versions, extras=extras)
     return [upload_wheel(client, w, workspace_dir=workspace_dir) for w in wheels]
 
 
@@ -398,8 +505,30 @@ def ensure_ygg_wheel(
     :func:`ygg_environment`) from the workspace index, so they land as
     platform-correct builds rather than wheels bundled from the deploying host
     (which a different serverless platform / python can't install)."""
+    wheels = ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=rebuild)
+    return [wheel_for_python(wheels)]
+
+
+def ensure_ygg_wheels(
+    client: Any,
+    *,
+    versions: "tuple[str, ...] | list[str]" = SUPPORTED_PYTHONS,
+    workspace_dir: str = WORKSPACE_PYPI_DIR,
+    rebuild: bool = False,
+) -> list[str]:
+    """Get-or-build the live ``yggdrasil`` wheel **for every Python version** and
+    deploy them all into the PyPI-like registry under ``<workspace_dir>/ygg/``.
+
+    Pure-python ygg yields one ``py3-none-any`` wheel reused across versions; a
+    native build would yield a ``cp3XX`` wheel each. On the first call for a
+    version the wheels are built and uploaded; later calls find and reuse them
+    (:func:`deployed_wheels`). ``rebuild=True`` forces a fresh build.
+
+    Returns the workspace paths of all ygg wheels — a serverless env installs the
+    one matching its Python **by path** (:func:`wheel_for_python`) while resolving
+    runtime deps from the index (see :func:`ygg_environment`)."""
     version = ilmd.version("ygg")
-    # PyPI-like: one folder per distribution; versions are distinct files in it.
+    # PyPI-like: one folder per distribution; versions/tags are distinct files.
     dist_dir = f"{workspace_dir.rstrip('/')}/ygg"
 
     if not rebuild:
@@ -407,16 +536,12 @@ def ensure_ygg_wheel(
             client, "ygg", version, workspace_dir=dist_dir, dist_only=True,
         )
         if existing:
-            logger.info("reusing deployed ygg %s wheel at %s", version, dist_dir)
+            logger.info("reusing %d deployed ygg %s wheel(s) at %s", len(existing), version, dist_dir)
             return existing
-        logger.info("no ygg %s wheel at %s — building", version, dist_dir)
+        logger.info("no ygg %s wheel at %s — building for %s", version, dist_dir, list(versions))
 
-    return ensure_wheel(
-        client, "ygg",
-        workspace_dir=dist_dir,
-        extras=("databricks",),
-        no_deps=True,
-    )
+    wheels = build_wheels_for_versions("ygg", versions=versions, extras=("databricks",))
+    return [upload_wheel(client, w, workspace_dir=dist_dir) for w in wheels]
 
 
 def ygg_runtime_dependencies() -> list[str]:
@@ -483,3 +608,44 @@ def ygg_environment(
             dependencies=dependencies,
         ),
     )
+
+
+def ygg_environments(
+    client: Any,
+    *,
+    versions: "tuple[str, ...] | list[str]" = SUPPORTED_PYTHONS,
+    default_python: "str | None" = None,
+    rebuild: bool = False,
+    workspace_dir: str = WORKSPACE_PYPI_DIR,
+) -> list:
+    """A serverless ``JobEnvironment`` **for every Python version** — the matrix
+    counterpart of :func:`ygg_environment`.
+
+    Returns ``[default, py310, py311, py312, py313]``: a ``"default"`` env pinned
+    to *default_python* (the local interpreter unless given) plus one keyed
+    ``py3XX`` per :data:`SUPPORTED_PYTHONS`, each pairing the matching ygg wheel
+    (:func:`wheel_for_python`, installed by path) with the runtime deps from the
+    index. Attach the whole list to a job's ``environments=[...]`` and point each
+    task at the ``environment_key`` for the Python it needs; the default keeps the
+    local-matched behaviour."""
+    from databricks.sdk.service.compute import Environment
+    from databricks.sdk.service.jobs import JobEnvironment
+
+    wheels = ensure_ygg_wheels(
+        client, versions=versions, workspace_dir=workspace_dir, rebuild=rebuild,
+    )
+    runtime = ygg_runtime_dependencies()
+    default_python = _py_minor(default_python)
+
+    def _env(key: str, python: str) -> Any:
+        return JobEnvironment(
+            environment_key=key,
+            spec=Environment(
+                environment_version=serverless_environment_version(python),
+                dependencies=[wheel_for_python(wheels, python)] + runtime,
+            ),
+        )
+
+    envs = [_env("default", default_python)]
+    envs += [_env(environment_key_for(v), v) for v in versions]
+    return envs

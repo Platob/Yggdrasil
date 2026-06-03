@@ -85,6 +85,18 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     ensure_console_logging()  # surface ygg logs in the job task output
     logger.info("ygg-run target=%s", ns.target)
 
+    import importlib
+
+    # A ready-to-use client for the task: registered as the process-wide current
+    # client (so DatabricksClient.current() returns it everywhere) and injected as
+    # a module global ``databricks`` in the target's module, so a bare
+    # ``databricks.sql(...)`` in the body just works — built once, reused.
+    client = DatabricksClient()
+    DatabricksClient.set_current(client)
+    module = importlib.import_module(ns.target.partition(":")[0])
+    if not hasattr(module, "databricks"):
+        setattr(module, "databricks", client)
+
     obj = resolve_target(ns.target)
     if isinstance(obj, type):  # class-based flow → instantiate
         obj = obj()
@@ -96,9 +108,6 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         fn = getattr(obj, "run", obj)
     runner = getattr(obj, "local", obj)
 
-    # The client is only needed to read/write the workspace payload+result; a
-    # scheduled run with plain string params needs none.
-    client = DatabricksClient() if (ns.payload or ns.result) else None
     if ns.payload:
         raw = DatabricksPath.from_(ns.payload, client=client).read_bytes()
         args, kwargs = pickle.loads(raw)

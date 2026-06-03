@@ -190,23 +190,23 @@ class TestWheel:
         assert 'name = "ygg"' in py and 'include = ["yggdrasil*"]' in py
 
     def test_ensure_ygg_wheel_builds_into_version_subdir_when_absent(self):
-        # No deployed wheel for the current version → build (--no-deps, via
-        # ensure_wheel) into the version-scoped subfolder of the shared path.
+        # No deployed wheel for the current version → build per-Python wheels and
+        # upload them into the version-scoped subfolder; ensure_ygg_wheel returns
+        # the single matched wheel.
         client = MagicMock()
         with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
              patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=[]) as dw, \
-             patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=["/ws/x.whl"]) as ew:
+             patch("yggdrasil.databricks.job.wheel.build_wheels_for_versions",
+                   return_value=[Path("/tmp/ygg-9.9-py3-none-any.whl")]) as bw, \
+             patch("yggdrasil.databricks.job.wheel.upload_wheel",
+                   side_effect=lambda c, w, *, workspace_dir: f"{workspace_dir}/{w.name}") as up:
             out = wheel.ensure_ygg_wheel(client, workspace_dir="/ws/job")
         dw.assert_called_once_with(
             client, "ygg", "9.9", workspace_dir="/ws/job/ygg", dist_only=True,
         )
-        ew.assert_called_once_with(
-            client, "ygg",
-            workspace_dir="/ws/job/ygg",
-            extras=("databricks",),
-            no_deps=True,
-        )
-        assert out == ["/ws/x.whl"]
+        bw.assert_called_once_with("ygg", versions=wheel.SUPPORTED_PYTHONS, extras=("databricks",))
+        up.assert_called_once()
+        assert out == ["/ws/job/ygg/ygg-9.9-py3-none-any.whl"]
 
     def test_ensure_ygg_wheel_reuses_deployed_wheel(self):
         # A wheel already deployed for the current version is reused — no build.
@@ -226,16 +226,14 @@ class TestWheel:
         client = MagicMock()
         with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
              patch("yggdrasil.databricks.job.wheel.deployed_wheels") as dw, \
-             patch("yggdrasil.databricks.job.wheel.ensure_wheel", return_value=["/ws/x.whl"]) as ew:
+             patch("yggdrasil.databricks.job.wheel.build_wheels_for_versions",
+                   return_value=[Path("/tmp/ygg-9.9-py3-none-any.whl")]) as bw, \
+             patch("yggdrasil.databricks.job.wheel.upload_wheel",
+                   side_effect=lambda c, w, *, workspace_dir: f"{workspace_dir}/{w.name}"):
             out = wheel.ensure_ygg_wheel(client, workspace_dir="/ws/job", rebuild=True)
         dw.assert_not_called()                 # rebuild bypasses the reuse probe
-        ew.assert_called_once_with(
-            client, "ygg",
-            workspace_dir="/ws/job/ygg",
-            extras=("databricks",),
-            no_deps=True,
-        )
-        assert out == ["/ws/x.whl"]
+        bw.assert_called_once_with("ygg", versions=wheel.SUPPORTED_PYTHONS, extras=("databricks",))
+        assert out == ["/ws/job/ygg/ygg-9.9-py3-none-any.whl"]
 
     def test_deployed_wheels_dist_only_and_full(self):
         client = MagicMock()
@@ -406,3 +404,50 @@ def test_synthesize_descends_when_finder_gives_project_root(tmp_path):
         sys.modules.pop("demo", None)
     assert (proj / "demo" / "__init__.py").exists()    # single-nested
     assert not (proj / "demo" / "demo").exists()       # not double-nested
+
+
+# --------------------------------------------------------------------------- #
+# per-Python wheel matrix + environments
+# --------------------------------------------------------------------------- #
+class TestVersionMatrix:
+    def test_serverless_environment_version_table_and_fallback(self):
+        assert wheel.serverless_environment_version("3.10") == "1"
+        assert wheel.serverless_environment_version("3.11") == "2"
+        assert wheel.serverless_environment_version("3.12") == wheel.SERVERLESS_ENVIRONMENT_VERSION
+        assert wheel.serverless_environment_version("py313") == wheel.SERVERLESS_ENVIRONMENT_VERSION
+
+    def test_environment_key_for(self):
+        assert wheel.environment_key_for("3.11") == "py311"
+        assert wheel.environment_key_for("3.12.4") == "py312"
+
+    def test_wheel_for_python_prefers_tag_else_universal(self):
+        native = ["/x/p-1-cp310-cp310-linux.whl", "/x/p-1-cp311-cp311-linux.whl"]
+        assert wheel.wheel_for_python(native, "3.11").endswith("cp311-cp311-linux.whl")
+        universal = ["/x/p-1-py3-none-any.whl"]
+        assert wheel.wheel_for_python(universal, "3.13") == "/x/p-1-py3-none-any.whl"
+
+    def test_build_wheels_for_versions_stops_after_universal(self):
+        # A universal py3-none-any wheel is built once and reused for every Python.
+        def _build(*a, **k):
+            out = Path(k.get("out-dir") if False else "/")  # not used
+        with patch("yggdrasil.databricks.job.wheel.synthesize_project", return_value=Path("/synth")), \
+             patch("yggdrasil.databricks.job.wheel.subprocess.run") as run, \
+             patch("yggdrasil.databricks.job.wheel.tempfile.mkdtemp", return_value="/out"), \
+             patch("pathlib.Path.glob", return_value=[Path("/out/ygg-1.0-py3-none-any.whl")]):
+            wheels = wheel.build_wheels_for_versions("yggdrasil", versions=("3.10", "3.11", "3.12"))
+        assert run.call_count == 1                       # stopped after universal wheel
+        assert [w.name for w in wheels] == ["ygg-1.0-py3-none-any.whl"]
+        assert run.call_args.args[0][:3] == ["uv", "build", "--wheel"]
+        assert "3.10" in run.call_args.args[0]           # built --python 3.10 first
+
+    def test_ygg_environments_one_per_python_plus_default(self):
+        ws = ["/ws/ygg-1.0-py3-none-any.whl"]
+        with patch.object(wheel, "ensure_ygg_wheels", return_value=ws), \
+             patch.object(wheel, "ygg_runtime_dependencies", return_value=["pyarrow>=20"]):
+            envs = wheel.ygg_environments("CLIENT", default_python="3.11")
+        assert [e.environment_key for e in envs] == ["default", "py310", "py311", "py312", "py313"]
+        by_key = {e.environment_key: e for e in envs}
+        assert by_key["default"].spec.environment_version == "2"     # 3.11
+        assert by_key["py310"].spec.environment_version == "1"
+        assert by_key["py312"].spec.environment_version == wheel.SERVERLESS_ENVIRONMENT_VERSION
+        assert by_key["py311"].spec.dependencies == ws + ["pyarrow>=20"]
