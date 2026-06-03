@@ -2487,6 +2487,36 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
             cursor=cursor,
         )
 
+    def head(self, size: int, *, offset: int = 0) -> bytes:
+        """Peek the first ``size`` bytes from ``offset`` (default 0).
+
+        A bounded positional read off the front of the object that
+        leaves the internal cursor (:meth:`tell`) untouched — ``head``
+        composes with cursor reads without disturbing them. ``size``
+        is clamped to what's available, so a short object (or one
+        shorter than ``offset + size``) returns fewer bytes rather
+        than raising; ``size < 0`` reads from ``offset`` to EOF.
+        """
+        if size < 0:
+            return self.read_bytes(-1, offset)
+        start = _resolve_pos(offset, self.size)
+        n = max(0, min(size, self.size - start))
+        return self.read_bytes(n, start)
+
+    def tail(self, size: int) -> bytes:
+        """Peek the last ``size`` bytes, leaving the cursor untouched.
+
+        The end-anchored companion to :meth:`head` — a bounded
+        positional read off the back of the object. ``size`` is
+        clamped to the object's length, so requesting more than
+        exists (or ``size < 0``) returns the whole object. The
+        internal cursor (:meth:`tell`) is not moved.
+        """
+        total = self.size
+        if size < 0 or size >= total:
+            return self.read_bytes(-1, 0)
+        return self.read_bytes(size, total - size)
+
     # ------------------------------------------------------------------
     # Cursorless read/write primitives — IO subclasses add cursor
     # ------------------------------------------------------------------

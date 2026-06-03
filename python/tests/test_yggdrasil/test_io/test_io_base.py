@@ -185,6 +185,55 @@ class TestPositional:
 
 
 # ---------------------------------------------------------------------------
+# head / tail — bounded positional peeks that leave the cursor put
+# ---------------------------------------------------------------------------
+
+
+class TestHeadTail:
+
+    def test_head_reads_front(self) -> None:
+        assert _cursor(b"abcdef").head(3) == b"abc"
+
+    def test_tail_reads_back(self) -> None:
+        assert _cursor(b"abcdef").tail(3) == b"def"
+
+    def test_head_does_not_move_cursor(self) -> None:
+        b = _cursor(b"abcdef")
+        b.seek(4)
+        assert b.head(2) == b"ab"
+        assert b.tell() == 4
+
+    def test_tail_does_not_move_cursor(self) -> None:
+        b = _cursor(b"abcdef")
+        b.seek(2)
+        assert b.tail(2) == b"ef"
+        assert b.tell() == 2
+
+    def test_head_clamps_to_size(self) -> None:
+        assert _cursor(b"abc").head(100) == b"abc"
+
+    def test_tail_clamps_to_size(self) -> None:
+        assert _cursor(b"abc").tail(100) == b"abc"
+
+    def test_head_with_offset(self) -> None:
+        assert _cursor(b"abcdef").head(2, offset=2) == b"cd"
+
+    def test_head_negative_reads_to_eof(self) -> None:
+        assert _cursor(b"abcdef").head(-1, offset=2) == b"cdef"
+
+    def test_tail_negative_reads_whole(self) -> None:
+        assert _cursor(b"abcdef").tail(-1) == b"abcdef"
+
+    def test_head_zero_returns_empty(self) -> None:
+        assert _cursor(b"abc").head(0) == b""
+
+    def test_empty_object(self) -> None:
+        b = _cursor(b"")
+        assert b.head(4) == b""
+        assert b.tail(4) == b""
+
+
+# ---------------------------------------------------------------------------
 # Seek
 # ---------------------------------------------------------------------------
 
