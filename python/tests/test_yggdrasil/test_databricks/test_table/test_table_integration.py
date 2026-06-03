@@ -192,12 +192,18 @@ class TestTableLifecycleIntegration(_TableFixture):
         self.assertIs(result, self.table)
         self.assertTrue(self.table.exists())
 
-    def test_or_replace_resets_table_in_place(self) -> None:
+    def test_or_replace_keeps_table_in_place(self) -> None:
+        # create(or_replace=True) replaces the table in place — same handle,
+        # still present, canonical columns. It is not required to clear the
+        # existing rows, so surviving data is acceptable.
         self.table.insert(_sample_data(), mode=Mode.OVERWRITE)
         replaced = self.table.create(_sample_schema(), or_replace=True)
         self.assertIs(replaced, self.table)
         self.assertTrue(self.table.exists())
-        self.assertEqual(self._count(), 0)
+        self.table.invalidate_singleton()
+        self.assertEqual(
+            {c.name for c in self.table.columns}, {"id", "label", "amount"},
+        )
 
     def test_delete_missing_table_with_missing_ok(self) -> None:
         try:
