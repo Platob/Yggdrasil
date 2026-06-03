@@ -371,45 +371,20 @@ class TestVolumePathDelegation:
 # --------------------------------------------------------------------------- #
 from unittest.mock import patch  # noqa: E402
 
-from yggdrasil.databricks.volume.volumes import external_volume_name  # noqa: E402
-
-
-class TestExternalVolumeName:
-    def test_keeps_bucket_and_hashes_path(self):
-        n = external_volume_name("s3://my-bucket/raw/events")
-        assert n.startswith("ext_my_bucket_")
-        assert len(n.rsplit("_", 1)[-1]) == 16            # xxh64 → 16 hex
-
-    def test_deterministic_and_path_sensitive(self):
-        assert external_volume_name("s3://b/x") == external_volume_name("s3://b/x/")
-        assert external_volume_name("s3://b/x") != external_volume_name("s3://b/y")
-
-    def test_distinguishes_abfss_containers(self):
-        a = external_volume_name("abfss://c1@acct.dfs.core.windows.net/data")
-        b = external_volume_name("abfss://c2@acct.dfs.core.windows.net/data")
-        assert a != b                                     # container kept via raw-URI hash
-
-    def test_valid_identifier_and_bounded_length(self):
-        n = external_volume_name("s3://Bucket.With-Dots/" + "seg/" * 200)
-        assert (n[0].isalpha() or n[0] == "_")
-        assert all(ch.isalnum() or ch == "_" for ch in n)
-        assert len(n) <= 255
-
 
 class TestGetOrCreate:
-    def test_external_miss_creates_external_with_derived_name(self, client):
+    def test_external_miss_creates_external_with_explicit_name(self, client):
         svc = Volumes(client=client, catalog_name="main", schema_name="ext")
         created = object()
         with patch.object(Volumes, "find", return_value=None) as find, \
              patch.object(Volumes, "create", return_value=created) as create:
-            out = svc.get_or_create("s3://my-bucket/raw/events")
+            out = svc.get_or_create("s3://my-bucket/raw/events", volume_name="events")
         assert out is created
-        name = external_volume_name("s3://my-bucket/raw/events")
         find.assert_called_once_with(
-            catalog_name="main", schema_name="ext", volume_name=name, raise_error=False,
+            catalog_name="main", schema_name="ext", volume_name="events", raise_error=False,
         )
         ckw = create.call_args.kwargs
-        assert (ckw["catalog_name"], ckw["schema_name"], ckw["volume_name"]) == ("main", "ext", name)
+        assert (ckw["catalog_name"], ckw["schema_name"], ckw["volume_name"]) == ("main", "ext", "events")
         assert ckw["storage_location"] == "s3://my-bucket/raw/events"
         assert ckw["volume_type"] == "EXTERNAL"
 
@@ -418,7 +393,7 @@ class TestGetOrCreate:
         existing = object()
         with patch.object(Volumes, "find", return_value=existing), \
              patch.object(Volumes, "create") as create:
-            out = svc.get_or_create("s3://b/p")
+            out = svc.get_or_create("s3://b/p", volume_name="myvol")
         assert out is existing
         create.assert_not_called()
 
@@ -428,14 +403,19 @@ class TestGetOrCreate:
              patch.object(Volumes, "create", return_value=object()) as create:
             svc.get_or_create("ignored", storage_location="s3://b/p/q", volume_name="myvol")
         ckw = create.call_args.kwargs
-        assert ckw["volume_name"] == "myvol"              # explicit override wins
+        assert ckw["volume_name"] == "myvol"              # explicit name
         assert ckw["storage_location"] == "s3://b/p/q"
         assert ckw["volume_type"] == "EXTERNAL"
+
+    def test_external_requires_volume_name(self, client):
+        svc = Volumes(client=client, catalog_name="main", schema_name="ext")
+        with pytest.raises(ValueError, match="volume_name"):
+            svc.get_or_create("s3://b/p")                 # no derived name anymore
 
     def test_external_requires_catalog_and_schema(self, client):
         svc = Volumes(client=client)                      # no defaults
         with pytest.raises(ValueError):
-            svc.get_or_create("s3://b/p")
+            svc.get_or_create("s3://b/p", volume_name="myvol")
 
     def test_managed_dotted_name_miss_creates_managed(self, client):
         svc = Volumes(client=client)
