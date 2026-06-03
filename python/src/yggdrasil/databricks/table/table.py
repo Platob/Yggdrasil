@@ -20,6 +20,7 @@ on write keep the cache fresh without fan-out invalidation.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import logging
 import re
 import time
@@ -1481,8 +1482,12 @@ class Table(DatabricksPath):
             return False
 
     @property
-    def table_id(self) -> str:
-        return self.infos.table_id
+    def table_id(self) -> str | None:
+        """The table's Unity Catalog id, or ``None`` when the table doesn't
+        exist (resolved with ``default=None`` so a missing table reads as
+        ``None`` instead of raising)."""
+        infos = self.read_infos(default=None)
+        return infos.table_id if infos is not None else None
 
     @staticmethod
     def _is_fresh(fetched_at: float | None) -> bool:
@@ -1951,6 +1956,23 @@ class Table(DatabricksPath):
         if add_col_statement is not None:
             second_phase.append(add_col_statement)
 
+        # DROP / RENAME COLUMN need Delta name column mapping; without it the
+        # ALTER fails with DELTA_UNSUPPORTED_(DROP|RENAME)_COLUMN. Enable it up
+        # front (idempotent — and it upgrades the table protocol when needed)
+        # whenever the evolution drops or renames a column, so the batches
+        # below don't fail. Skipped when the table already has it on.
+        if (drop_names or rename_statements) and (
+            (self.infos.properties or {}).get("delta.columnMapping.mode") != "name"
+        ):
+            logger.info(
+                "Enabling Delta name column mapping on %r to satisfy "
+                "DROP/RENAME COLUMN", self,
+            )
+            self.sql.execute(
+                f"{alter_table} SET TBLPROPERTIES "
+                f"('delta.columnMapping.mode' = 'name')"
+            )
+
         executed = False
         if first_phase:
             self.sql.execute_many(first_phase, parallel=True)
@@ -2047,23 +2069,17 @@ class Table(DatabricksPath):
 
     def _default_external_location(self) -> str:
         """Governed default ``LOCATION`` for an external table created without
-        one: the catalog's UC ``storage_root`` + ``<schema>/<table>``.
+        one: the schema's registered UC storage root + ``tables/<table>``
+        (Databricks' ``__unitystorage`` layout).
 
-        Prefers a schema-scoped storage root when the schema advertises one
-        (Databricks' ``__unitystorage`` layout), else falls back to the
-        catalog storage root via
-        :meth:`DatabricksClient.default_storage_location`.
+        Raises :class:`NotImplementedError` when the schema advertises no
+        storage location — no location is fabricated, so the caller must then
+        pass an explicit ``storage_location``.
         """
-        try:
-            return "%s/tables/%s" % (
-                self.schema_storage_location(table_type=TableType.EXTERNAL),
-                self.table_name,
-            )
-        except NotImplementedError:
-            return self.client.default_storage_location(
-                suffix="%s/%s" % (self.schema_name, self.table_name),
-                catalog_name=self.catalog_name,
-            )
+        return "%s/tables/%s" % (
+            self.schema_storage_location(table_type=TableType.EXTERNAL),
+            self.table_name,
+        )
 
     def sql_create(
         self,
@@ -3198,11 +3214,12 @@ class Table(DatabricksPath):
 
         For an **external** table the staging volume is created *external*
         too, rooted on the schema's storage location — the segment before
-        ``__unitystorage`` — and keyed by the table's UC id:
-        ``<schema_root>/uc/tables/<table_id>``. That keeps staged Parquet on
-        the same governed external location as the table instead of a
-        fabricated client default location. A managed table keeps the default
-        (managed) create path, materialised lazily on first write.
+        ``__unitystorage`` — and keyed by a deterministic hash of the table's
+        fully-qualified name: ``<schema_root>/uc/tables/<hash>``. That keeps
+        staged Parquet on the same governed external location as the table
+        (and resolves the same way before the table exists, unlike the UC
+        ``table_id``). A managed table keeps the default (managed) create
+        path, materialised lazily on first write.
 
         Kept off the :attr:`staging_volume` property on purpose — resolving
         ``infos`` / creating a volume on a bare handle read is too surprising;
@@ -3210,11 +3227,19 @@ class Table(DatabricksPath):
         actually imminent.
         """
         volume = self.staging_volume
-        if self.infos.table_type == TableType.EXTERNAL:
+        # A table that doesn't exist yet (staging Parquet before the
+        # create/insert) has no ``infos`` — treat it as the managed default
+        # path rather than letting the remote lookup raise.
+        info = self.read_infos(default=None)
+        if info is not None and info.table_type == TableType.EXTERNAL:
             root = self.schema_storage_location().split("/__unitystorage")[0].rstrip("/")
+            key = hashlib.blake2b(
+                f"{self.catalog_name}.{self.schema_name}.{self.table_name}".encode("utf-8"),
+                digest_size=16,
+            ).hexdigest()
             volume.get_or_create(
                 volume_type="EXTERNAL",
-                storage_location=f"{root}/uc/tables/{self.table_id}",
+                storage_location=f"{root}/uc/tables/{key}",
             )
         return volume
 

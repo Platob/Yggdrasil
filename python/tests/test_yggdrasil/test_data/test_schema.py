@@ -559,7 +559,7 @@ class TestAutotag:
         ts_tags = out["created_at"].tags or {}
         assert ts_tags[b"type_name"] == b"timestamp"
         assert ts_tags[b"unit"] == b"us"
-        assert ts_tags[b"tz"] == b"UTC"
+        assert ts_tags[b"tz"] == b"Etc/UTC"
 
         assert out.metadata is not None
         assert out.metadata[b"t:layer"] == b"silver"

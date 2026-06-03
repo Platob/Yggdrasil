@@ -59,7 +59,7 @@ class TestTimestampPhysicalType(DeltaTestCase):
         schema = self._written_parquet_schema(t)
         ts = schema.field("ts").type
         self.assertEqual(ts.unit, "us")
-        self.assertEqual(ts.tz, "UTC")
+        self.assertEqual(ts.tz, "Etc/UTC")
 
     def test_micros_timestamp_unchanged(self) -> None:
         t = self.pa.table({

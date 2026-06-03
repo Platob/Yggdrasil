@@ -25,6 +25,7 @@ The schema is dropped through the :meth:`safe_drop_schema` guard.
 """
 from __future__ import annotations
 
+import os
 import secrets
 import unittest
 from typing import Any, ClassVar
@@ -81,16 +82,25 @@ class TestDeltaSqlInterop(DatabricksIntegrationCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        # An EXTERNAL Delta table needs an explicit, writable cloud location;
+        # source it from the workspace's registered external location. EXTERNAL
+        # (not managed) is required for the DeltaFolder-write → SQL-read
+        # direction: UC only vends READ_WRITE temporary credentials for
+        # external tables (managed tables vend READ, so a direct ``_delta_log``
+        # commit would 403).
+        location_base = os.environ.get(
+            "DATABRICKS_INTEGRATION_EXTERNAL_LOCATION", "",
+        ).strip()
+        if not location_base:
+            raise unittest.SkipTest(
+                "DATABRICKS_INTEGRATION_EXTERNAL_LOCATION not set — needed for "
+                "the external Delta table this suite writes through."
+            )
         cls.schema = cls.scratch_schema()
         name = f"yg_delta_{secrets.token_hex(4)}"
         cls.full = f"{cls.INTEGRATION_CATALOG}.{cls.schema.schema_name}.{name}"
-        # An EXTERNAL Delta table at a writable location under the workspace's
-        # registered external location. EXTERNAL (not managed) is required for
-        # the DeltaFolder-write → SQL-read direction: UC only vends READ_WRITE
-        # temporary credentials for external tables (managed tables vend READ,
-        # so a direct ``_delta_log`` commit would 403).
-        cls.location = cls.client.default_storage_location(
-            f"ygg_integration/delta/{name}_{secrets.token_hex(4)}"
+        cls.location = "%s/ygg_integration/delta/%s_%s" % (
+            location_base.rstrip("/"), name, secrets.token_hex(4),
         )
         try:
             cls.table = cls.client.tables.table(cls.full)

@@ -49,7 +49,7 @@ class TestTimestampTypeArrowSafety:
         out = TimestampType.from_arrow_type(pa.timestamp("us", tz="UTC"))
 
         assert out.unit == "us"
-        assert out.tz == "UTC"
+        assert out.tz == "Etc/UTC"
 
 
 class TestDurationTypeArrowSafety:

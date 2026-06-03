@@ -58,7 +58,7 @@ class TestParse:
         assert Timezone.from_(tz) is tz
 
     def test_parse_none_returns_utc(self):
-        assert Timezone.from_(None) == Timezone("UTC")
+        assert Timezone.from_(None) == Timezone("Etc/UTC")
 
     def test_parse_zoneinfo(self):
         zi = ZoneInfo("Europe/Paris")
@@ -95,8 +95,8 @@ class TestParseStr:
         assert Timezone.from_("GMT").iana == "GMT"
 
     def test_alias_z(self):
-        # Z is not in IANA, resolved via alias → UTC
-        assert Timezone.from_("Z").iana == "UTC"
+        # Z is not in IANA, resolved via alias → Etc/UTC
+        assert Timezone.from_("Z").iana == "Etc/UTC"
 
     def test_alias_jst(self):
         # JST may be a valid IANA name; if so, returned as-is
@@ -131,8 +131,8 @@ class TestParseStr:
         assert tz.iana == "Etc/GMT+8"
 
     def test_offset_zero_returns_utc(self):
-        assert Timezone.from_("+00:00").iana == "UTC"
-        assert Timezone.from_("-00:00").iana == "UTC"
+        assert Timezone.from_("+00:00").iana == "Etc/UTC"
+        assert Timezone.from_("-00:00").iana == "Etc/UTC"
 
     def test_non_hour_aligned_raises(self):
         with pytest.raises(ValueError, match="non-hour-aligned"):
@@ -147,7 +147,7 @@ class TestParseStr:
             Timezone.from_("Narnia/Wardrobe")
 
     def test_whitespace_stripped(self):
-        assert Timezone.from_("  UTC  ").iana == "UTC"
+        assert Timezone.from_("  UTC  ").iana == "Etc/UTC"
 
     def test_non_string_raises(self):
         with pytest.raises(TypeError, match="Cannot derive Timezone"):
@@ -217,7 +217,7 @@ class TestFromExtended:
         assert Timezone.from_(aware).iana == "Europe/Paris"
 
     def test_from_tzinfo(self):
-        assert Timezone.from_(dt.timezone.utc).iana == "UTC"
+        assert Timezone.from_(dt.timezone.utc).iana == "Etc/UTC"
 
     def test_from_tzinfo_fixed_offset(self):
         offset = dt.timezone(dt.timedelta(hours=3))
@@ -247,7 +247,7 @@ class TestFromExtended:
 class TestConstants:
 
     def test_utc(self):
-        assert Timezone.UTC.iana == "UTC"
+        assert Timezone.UTC.iana == "Etc/UTC"
 
     def test_cet(self):
         assert Timezone.CET.iana == "Europe/Paris"
@@ -607,7 +607,7 @@ class TestArrowIntegration:
     def test_arrow_timestamp_type_default_unit(self):
         t = Timezone.UTC.arrow_timestamp_type()
         assert t.unit == "us"
-        assert t.tz == "UTC"
+        assert t.tz == "Etc/UTC"
 
 
 # ===========================================================================
@@ -633,7 +633,7 @@ class TestPolarsIntegration:
         values = result.to_list()
         assert values[0] == "Europe/Paris"       # CEST → alias
         assert values[1] == "America/New_York"   # EDT → alias
-        assert values[2] == "UTC"
+        assert values[2] == "Etc/UTC"
         assert values[3] is None
         assert values[4] is None
 
@@ -646,7 +646,7 @@ class TestPolarsIntegration:
         df = pl.DataFrame({"tz": ["CEST", "UTC"]})
         expr = Timezone.polars_normalize(pl.col("tz"))
         result = df.select(expr).to_series()
-        assert result.to_list() == ["Europe/Paris", "UTC"]
+        assert result.to_list() == ["Europe/Paris", "Etc/UTC"]
 
     def test_polars_normalize_unsupported_return_value(self):
         s = pl.Series("tz", ["UTC"])
@@ -695,7 +695,7 @@ class TestEdgeCases:
         assert tz.iana == "Etc/GMT-3"
 
     def test_parse_utc_without_offset(self):
-        assert Timezone.from_("UTC").iana == "UTC"
+        assert Timezone.from_("UTC").iana == "Etc/UTC"
 
     def test_multiple_alias_forms_converge(self):
         """ET, EDT should resolve to America/New_York via alias."""

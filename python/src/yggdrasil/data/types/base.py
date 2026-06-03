@@ -1246,9 +1246,9 @@ class DataType(BaseChildrenFields, ABC):
             if tz in {"ntz", "without_time_zone"}:
                 tz = None
             elif tz in {"ltz", "with_time_zone"}:
-                tz = "UTC"
+                tz = "Etc/UTC"
             else:
-                tz = tz or "UTC"
+                tz = tz or "Etc/UTC"
             return TimestampType(unit=meta.unit or "us", tz=tz)
 
         if parsed.type_id == DataTypeId.DURATION or parsed.name in {

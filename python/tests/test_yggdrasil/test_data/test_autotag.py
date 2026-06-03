@@ -76,7 +76,7 @@ class TestDataTypeAutotag:
 
         assert utc[b"type_name"] == b"timestamp"
         assert utc[b"unit"] == b"us"
-        assert utc[b"tz"] == b"UTC"
+        assert utc[b"tz"] == b"Etc/UTC"
 
     def test_timestamp_omits_tz_when_naive(self) -> None:
         naive = TimestampType(unit="ns").autotag()
@@ -182,7 +182,7 @@ class TestSchemaAutotag:
         ts_tags = out["created_at"].tags or {}
         assert ts_tags[b"type_name"] == b"timestamp"
         assert ts_tags[b"unit"] == b"us"
-        assert ts_tags[b"tz"] == b"UTC"
+        assert ts_tags[b"tz"] == b"Etc/UTC"
 
         # Schema-level tag prefix gets the ``t:`` namespace.
         assert out.metadata is not None

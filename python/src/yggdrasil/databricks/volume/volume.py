@@ -32,7 +32,6 @@ methods to force a fresh ``volumes.read`` immediately.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any, ClassVar, Iterator, Mapping, Optional, TYPE_CHECKING
 
@@ -720,13 +719,11 @@ class Volume(DatabricksPath):
 
             is_external = volume_type == "EXTERNAL"
 
-        if is_external:
-            if not storage_location:
-                storage_location = self.client.default_storage_location(
-                    suffix=f".ygg/uc/volumes/{os.urandom(8).hex()}"
-                )
-        else:
+        if not is_external:
             storage_location = None
+        # An external volume requires an explicit ``storage_location``; when the
+        # caller doesn't pin one the Files/UC API rejects the create — no
+        # location is fabricated on their behalf.
 
         kwargs: dict[str, Any] = {
             "catalog_name": self.catalog_name,

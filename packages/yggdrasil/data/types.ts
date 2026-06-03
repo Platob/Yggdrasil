@@ -228,7 +228,7 @@ export class TimeType extends DataType {
 }
 export class TimestampType extends DataType {
   readonly id = DataTypeId.TIMESTAMP; readonly name: string;
-  constructor(readonly unit: TimeUnit = "us", readonly tz: string | null = "UTC") {
+  constructor(readonly unit: TimeUnit = "us", readonly tz: string | null = "Etc/UTC") {
     super(); this.name = `timestamp[${unit}${tz ? "," + tz : ""}]`;
   }
   toArrow() { return new arrow.Timestamp(ARROW_UNIT[this.unit], this.tz ?? undefined); }

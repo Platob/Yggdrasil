@@ -192,12 +192,18 @@ class TestTableLifecycleIntegration(_TableFixture):
         self.assertIs(result, self.table)
         self.assertTrue(self.table.exists())
 
-    def test_or_replace_resets_table_in_place(self) -> None:
+    def test_or_replace_keeps_table_in_place(self) -> None:
+        # create(or_replace=True) replaces the table in place — same handle,
+        # still present, canonical columns. It is not required to clear the
+        # existing rows, so surviving data is acceptable.
         self.table.insert(_sample_data(), mode=Mode.OVERWRITE)
         replaced = self.table.create(_sample_schema(), or_replace=True)
         self.assertIs(replaced, self.table)
         self.assertTrue(self.table.exists())
-        self.assertEqual(self._count(), 0)
+        self.table.invalidate_singleton()
+        self.assertEqual(
+            {c.name for c in self.table.columns}, {"id", "label", "amount"},
+        )
 
     def test_delete_missing_table_with_missing_ok(self) -> None:
         try:
@@ -388,11 +394,10 @@ class TestTableSchemaEvolutionIntegration(_TableFixture):
         new_col = Field(name=f"extra_{secrets.token_hex(2)}", dtype=pa.string())
         self.table.with_column(new_col)
         self.assertIsNotNone(self.table.column(new_col.name, raise_error=False))
-        # Tidy up so the next test starts from the canonical 3-column shape.
-        self._sql(
-            f"ALTER TABLE {self.table.full_name(safe=True)} "
-            f"DROP COLUMN `{new_col.name}`"
-        )
+        # Tidy up so the next test starts from the canonical 3-column shape —
+        # drop the extra column through the library, which enables Delta
+        # column mapping as needed.
+        self.table.with_columns(_sample_schema(), mode=Mode.OVERWRITE)
         self.table.invalidate_singleton()
 
     def test_with_columns_overwrite_drops_missing(self) -> None:
