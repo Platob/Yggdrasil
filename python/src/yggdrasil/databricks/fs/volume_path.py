@@ -805,6 +805,11 @@ class VolumePath(DatabricksPath):
         directly, so a read / write can skip the Files-API hop and the UC
         quota burn. The probe is side-effect-free and never raises into the
         I/O flow; only ``s3://`` locations are served directly today.
+
+        A UC-managed storage layout (``__unitystorage`` / ``__unitycatalog`` in
+        the path) is governed by Unity Catalog — direct ``PutObject`` is denied
+        there — so direct **writes** are disabled for such locations and routed
+        through the Files API; reads may still go direct.
         """
         if self._split_volume() is None:
             return None  # path too shallow to address a volume
@@ -817,6 +822,8 @@ class VolumePath(DatabricksPath):
             raw = vol.storage_location()
             if not (URL.from_str(raw).scheme or "").startswith("s3"):
                 return None
+            if write and ("__unitystorage" in raw or "__unitycatalog" in raw):
+                return None  # UC-managed storage — direct writes denied
             root = vol.aws(mode=Mode.AUTO if write else Mode.READ_ONLY).s3.path(raw)
         except Exception as exc:  # type / location / credential resolution
             logger.debug("external storage path unavailable for %r: %s", self, exc)

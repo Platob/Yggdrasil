@@ -2258,6 +2258,19 @@ class TestExternalStorageGating:
         with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
             assert p._external_storage_file(write=True) is None
 
+    def test_write_disabled_on_uc_managed_storage_layout(self) -> None:
+        # A ``__unitystorage`` / ``__unitycatalog`` path is UC-managed storage —
+        # direct PUTs are denied, so writes route through the Files API while
+        # reads can still go direct.
+        for marker in ("__unitystorage", "__unitycatalog"):
+            p = self._vp()
+            vol, _root, sentinel = self._volume(
+                location=f"s3://bkt/metastore/{marker}/catalogs/x/vol",
+            )
+            with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
+                assert p._external_storage_file(write=True) is None
+                assert p._external_storage_file(write=False) is sentinel
+
     def test_read_scope_uses_read_only_credentials(self) -> None:
         from yggdrasil.enums import Mode
         p = self._vp()
