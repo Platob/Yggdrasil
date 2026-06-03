@@ -925,28 +925,35 @@ class Table(DatabricksPath):
 
     def _delta_total_bytes(self) -> "int | None":
         """The Delta table's on-disk byte size (sum of active ``AddFile``
-        sizes from the ``_delta_log``), or ``None`` if it can't be resolved."""
+        sizes from the ``_delta_log``), or ``None`` if it can't be resolved.
+
+        Sizes with *read* credentials — this only informs the routing guess,
+        so it must not need write access."""
         try:
-            return self.delta().snapshot().total_bytes
+            return self.delta(write=False).snapshot().total_bytes
         except Exception:
             return None
 
-    def _native_delta_folder(self) -> "DeltaFolder | None":
-        """Build the :meth:`delta` DeltaFolder and force its UC credentials to
-        vend (by reading the ``_delta_log`` snapshot), so any failure surfaces
-        here — *before* a write consumes its batch stream.
+    def _native_delta_folder(self, *, write: bool) -> "DeltaFolder | None":
+        """Build the :meth:`delta` DeltaFolder for a read or a write and force
+        its UC credentials to vend (by reading the ``_delta_log`` snapshot), so
+        any failure surfaces here — *before* a write consumes its batch stream.
 
-        Returns ``None`` when storage / credential resolution fails, so the
-        caller transparently falls back to Databricks (the SQL warehouse)."""
+        The credential scope follows the operation: ``write=False`` vends
+        ``READ``, ``write=True`` vends ``READ_WRITE``. That matters because a
+        principal can hold read but not write on a table — a read still
+        succeeds natively, while a write whose ``READ_WRITE`` vend is denied
+        returns ``None`` here so the caller falls back to Databricks (the SQL
+        warehouse)."""
         try:
-            folder = self.delta()
+            folder = self.delta(write=write)
             folder.snapshot(fresh=True)  # triggers UC temp-cred vending + log read
             return folder
         except Exception as exc:  # noqa: BLE001 — any vend/IO failure → fall back
             logger.warning(
-                "Native Delta path unavailable for %r (%s: %s); "
+                "Native Delta %s path unavailable for %r (%s: %s); "
                 "falling back to Databricks.",
-                self, type(exc).__name__, exc,
+                "write" if write else "read", self, type(exc).__name__, exc,
             )
             return None
 
@@ -956,7 +963,7 @@ class Table(DatabricksPath):
         # ``_native_delta_folder`` probes UC credentials first, returning None
         # (and falling us through to the warehouse) if they can't vend.
         if self._native_delta(options, write=False):
-            folder = self._native_delta_folder()
+            folder = self._native_delta_folder(write=False)
             if folder is not None:
                 yield from folder._read_arrow_batches(folder.check_options(options))
                 return
@@ -988,7 +995,7 @@ class Table(DatabricksPath):
         # credential probe runs *before* ``batches`` is consumed, so a vend
         # failure falls back to the SQL insert below with the stream intact.
         if self._native_delta(options, write=True):
-            folder = self._native_delta_folder()
+            folder = self._native_delta_folder(write=True)
             if folder is not None:
                 folder.write_arrow_batches(batches, options=options)
                 return
@@ -3417,20 +3424,34 @@ class Table(DatabricksPath):
 
         return infos.storage_location
 
-    def storage_path(self) -> "Path | None":
+    def storage_path(self, *, write: "bool | None" = None) -> "Path | None":
         """Return the table's backing storage as an addressable :class:`Path`.
 
         For a Delta table, ``tbl.storage_path()`` yields a Path that
         contains the parquet data files plus the ``_delta_log``
         transaction directory — ``list(tbl.storage_path().iterdir())``
         is the natural way to inspect the on-disk layout.
+
+        ``write`` picks the UC temporary-credential scope the Path's
+        :class:`AWSClient` vends — important because a principal can hold
+        read but not write on a table:
+
+        - ``None`` (default) — the operation default for the table type
+          (``READ`` for managed, ``READ_WRITE`` for external);
+        - ``False`` — ``READ`` (least-privilege; reads a table you can't write);
+        - ``True`` — ``READ_WRITE`` (collapses to ``READ`` for managed, which
+          UC never vends write creds for).
         """
         location = self.storage_location()
         if location is None:
             return None
-        return self.aws().s3.path(location)
+        if write is None:
+            aws = self.aws()
+        else:
+            aws = self.aws(TableOperation.READ_WRITE if write else TableOperation.READ)
+        return aws.s3.path(location)
 
-    def delta(self) -> "DeltaFolder":
+    def delta(self, *, write: "bool | None" = None) -> "DeltaFolder":
         """Return a :class:`~yggdrasil.io.delta.DeltaFolder` over this table's
         backing storage — the native Delta read/write surface.
 
@@ -3441,10 +3462,14 @@ class Table(DatabricksPath):
         (``tbl.delta().read_arrow_table()``) or commit
         (``tbl.delta().write_arrow_table(t, mode=Mode.APPEND)``) straight
         against the transaction log, bypassing the warehouse.
+
+        ``write`` flows to :meth:`storage_path` to scope the vended
+        credentials — ``write=False`` for a read-only handle (works even when
+        the caller can't write the table), ``write=True`` for a commit.
         """
         from yggdrasil.io.delta import DeltaFolder
 
-        path = self.storage_path()
+        path = self.storage_path(write=write)
         if path is None:
             raise FileNotFoundError(
                 f"{self!r} has no resolvable storage_location for a DeltaFolder."

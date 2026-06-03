@@ -12,7 +12,12 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock
 
-from databricks.sdk.service.catalog import DataSourceFormat, TableInfo, TableType
+from databricks.sdk.service.catalog import (
+    DataSourceFormat,
+    TableInfo,
+    TableOperation,
+    TableType,
+)
 
 from yggdrasil.data.options import CastOptions
 from yggdrasil.databricks.table.options import TableOptions
@@ -109,19 +114,19 @@ class TestGuessDispatch:
 
 class TestCredentialFallback:
     """A UC-credential / storage failure makes the native probe return None,
-    so the caller falls back to Databricks."""
+    so the caller falls back to Databricks. The probe vends the credential
+    scope that matches the operation (read vs read-write)."""
 
     def test_probe_returns_none_on_credential_error(self):
         t = _table(TableType.EXTERNAL, DataSourceFormat.DELTA)
-        t.delta = MagicMock(side_effect=PermissionDenied_like())
-        assert t._native_delta_folder() is None
+        t.delta = MagicMock(side_effect=RuntimeError("could not generate credentials"))
+        assert t._native_delta_folder(write=True) is None
 
     def test_probe_returns_folder_when_snapshot_ok(self):
         t = _table(TableType.EXTERNAL, DataSourceFormat.DELTA)
         folder = MagicMock()
-        folder.snapshot.return_value = MagicMock()
         t.delta = MagicMock(return_value=folder)
-        assert t._native_delta_folder() is folder
+        assert t._native_delta_folder(write=False) is folder
         folder.snapshot.assert_called_once()
 
     def test_probe_returns_none_when_snapshot_raises(self):
@@ -129,8 +134,53 @@ class TestCredentialFallback:
         folder = MagicMock()
         folder.snapshot.side_effect = RuntimeError("403 vend failed")
         t.delta = MagicMock(return_value=folder)
-        assert t._native_delta_folder() is None
+        assert t._native_delta_folder(write=True) is None
+
+    def test_read_probe_vends_read_scope_write_probe_vends_write(self):
+        # The probe must ask delta() for the matching credential scope, so a
+        # read works even when the principal can't write.
+        t = _table(TableType.EXTERNAL, DataSourceFormat.DELTA)
+        t.delta = MagicMock(return_value=MagicMock())
+        t._native_delta_folder(write=False)
+        t._native_delta_folder(write=True)
+        assert t.delta.call_args_list[0].kwargs == {"write": False}
+        assert t.delta.call_args_list[1].kwargs == {"write": True}
+
+    def test_write_denied_but_read_ok_falls_back_on_write_only(self):
+        # READ_WRITE vend denied, READ vend fine — read native, write falls back.
+        t = _table(TableType.EXTERNAL, DataSourceFormat.DELTA)
+
+        def delta(*, write):
+            f = MagicMock()
+            if write:
+                f.snapshot.side_effect = RuntimeError("403: no write creds")
+            return f
+
+        t.delta = MagicMock(side_effect=delta)
+        assert t._native_delta_folder(write=False) is not None
+        assert t._native_delta_folder(write=True) is None
 
 
-def PermissionDenied_like():
-    return RuntimeError("could not generate temporary credentials")
+class TestStoragePathCredentialScope:
+    """``storage_path(write=...)`` asks ``aws`` for the matching UC scope."""
+
+    def _t(self):
+        t = _table(TableType.EXTERNAL, DataSourceFormat.DELTA)
+        t.storage_location = MagicMock(return_value="s3://b/x")
+        t.aws = MagicMock()
+        return t
+
+    def test_write_false_requests_read(self):
+        t = self._t()
+        t.storage_path(write=False)
+        t.aws.assert_called_once_with(TableOperation.READ)
+
+    def test_write_true_requests_read_write(self):
+        t = self._t()
+        t.storage_path(write=True)
+        t.aws.assert_called_once_with(TableOperation.READ_WRITE)
+
+    def test_write_none_uses_table_type_default(self):
+        t = self._t()
+        t.storage_path(write=None)
+        t.aws.assert_called_once_with()
