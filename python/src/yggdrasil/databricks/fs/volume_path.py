@@ -791,6 +791,42 @@ class VolumePath(DatabricksPath):
         :meth:`Volume.storage_path` — see there for the semantics."""
         return self.volume.storage_path(mode=mode, region=region, refresh=refresh)
 
+    def _external_storage_file(self, *, write: bool) -> "Any | None":
+        """The cloud storage :class:`Path` for *this* file when direct storage
+        access is permitted for the backing volume — else ``None`` (caller uses
+        the Files API).
+
+        Gated up front on the Unity Catalog prerequisite, checked before any
+        I/O: the volume is EXTERNAL **and** the current user holds
+        ``EXTERNAL USE SCHEMA`` on its schema
+        (:meth:`UCSchema.can_use_external`, cached on the shared schema
+        singleton — one grants lookup decides for the whole process). When
+        granted, an EXTERNAL volume's backing cloud location is reachable
+        directly, so a read / write can skip the Files-API hop and the UC
+        quota burn. The probe is side-effect-free and never raises into the
+        I/O flow; only ``s3://`` locations are served directly today.
+        """
+        if self._split_volume() is None:
+            return None  # path too shallow to address a volume
+        try:
+            vol = self.volume
+            if (vol.volume_type or "").upper() != "EXTERNAL":
+                return None
+            if not vol.schema.can_use_external():
+                return None
+            raw = vol.storage_location()
+            if not (URL.from_str(raw).scheme or "").startswith("s3"):
+                return None
+            root = vol.aws(mode=Mode.AUTO if write else Mode.READ_ONLY).s3.path(raw)
+        except Exception as exc:  # type / location / credential resolution
+            logger.debug("external storage path unavailable for %r: %s", self, exc)
+            return None
+        # Path of this entry *under* the volume root (segments past cat/sch/vol).
+        rel = "/".join(
+            p for p in (self.url.path or "").lstrip("/").split("/")[3:] if p
+        )
+        return (root / rel) if rel else root
+
     def temporary_credentials(
         self,
         *,
@@ -1270,6 +1306,28 @@ class VolumePath(DatabricksPath):
                     except OSError:
                         pass
                 return memoryview(data)
+        # Direct-storage fast path (EXTERNAL volume + EXTERNAL USE SCHEMA):
+        # read straight off the cloud storage path, skipping the Files API.
+        # ``S3Path._read_mv`` honours the same (n, pos) range contract and
+        # raises ``FileNotFoundError`` for a missing key.
+        sf = self._external_storage_file(write=False)
+        if sf is not None:
+            try:
+                mv = sf._read_mv(n, pos)
+            except FileNotFoundError:
+                raise FileNotFoundError(self.full_path())
+            except Exception as exc:  # vend / GetObject failure → fall back
+                logger.warning(
+                    "external storage read failed for %r (%s: %s); "
+                    "using the Files API", self, type(exc).__name__, exc,
+                )
+                self.volume.schema.mark_external_unusable()
+            else:
+                if n < 0 and pos == 0 and not self._stat_cached:
+                    self._persist_stat_cache(
+                        IOStats(size=len(mv), kind=IOKind.FILE, mtime=time.time())
+                    )
+                return mv
         api_path = self.api_path
         # Critical: a bounded / offset read (``n > 0`` or ``pos > 0``)
         # asks for a *slice*, so send an HTTP ``Range`` header and let
@@ -1461,6 +1519,37 @@ class VolumePath(DatabricksPath):
                         mtime=time.time())
             )
             return int(max(size, -1))
+        # Direct-storage fast path (EXTERNAL volume + EXTERNAL USE SCHEMA):
+        # PUT straight to the cloud storage path, skipping the Files API.
+        # Materialise to bytes once so a failure can replay the same body
+        # through the Files API fallback (``content`` is rebound to them).
+        sf = self._external_storage_file(write=True)
+        if sf is not None:
+            if hasattr(content, "read"):
+                if hasattr(content, "seek"):
+                    try:
+                        content.seek(0)
+                    except Exception:
+                        pass
+                payload = content.read()
+                payload = payload.encode() if isinstance(payload, str) else bytes(payload)
+                content = payload
+            else:
+                payload = bytes(content)
+            try:
+                sf._upload(payload)
+            except Exception as exc:  # vend / PutObject failure → fall back
+                logger.warning(
+                    "external storage write failed for %r (%s: %s); "
+                    "using the Files API", self, type(exc).__name__, exc,
+                )
+                self.volume.schema.mark_external_unusable()
+            else:
+                self._persist_stat_cache(
+                    IOStats(size=len(payload), kind=IOKind.FILE,
+                            mtime=time.time(), media_type=self.media_type)
+                )
+                return len(payload)
         # Off-cluster: PUT the whole object through the Files REST API.
         # Read the source fully into bytes so transient / parent-recovery
         # retries replay the same body verbatim.
@@ -1533,6 +1622,25 @@ class VolumePath(DatabricksPath):
                 IOStats(kind=IOKind.FILE, size=size, mtime=time.time())
             )
             return size
+        # Direct-storage fast path (EXTERNAL volume + EXTERNAL USE SCHEMA):
+        # stream straight to the cloud storage path. ``S3Path._upload_stream``
+        # reads the holder in bounded chunks (multipart past its threshold).
+        sf = self._external_storage_file(write=True)
+        if sf is not None:
+            try:
+                sf._upload_stream(source)
+            except Exception as exc:  # vend / PutObject failure → fall back
+                logger.warning(
+                    "external storage write failed for %r (%s: %s); "
+                    "using the Files API", self, type(exc).__name__, exc,
+                )
+                self.volume.schema.mark_external_unusable()
+            else:
+                self._persist_stat_cache(
+                    IOStats(size=size, kind=IOKind.FILE,
+                            mtime=time.time(), media_type=self.media_type)
+                )
+                return size
         # Past the single-PUT ceiling, presigned multipart needs the bytes;
         # materialise only in that (already very large) case.
         if size >= self.MULTIPART_MIN_SIZE and self._try_multipart_upload(
