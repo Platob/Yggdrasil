@@ -24,6 +24,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import MutableMapping
 from typing import Any, Dict, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal, ClassVar
 
 import pyarrow as pa
@@ -417,6 +418,104 @@ def _build_ygg_properties(schema_info: DataSchema) -> dict[str, str]:
         seen.add(name)
         props[_ygg_schema_key(name)] = f.to_json(to_bytes=False)
     return props
+
+
+class TableProperties(MutableMapping):
+    """Live, mutable view of a table's Unity Catalog ``TBLPROPERTIES``.
+
+    A ``dict``-like façade bound to a :class:`Table`. Reads resolve the
+    table's cached :attr:`Table.infos` (a remote fetch only when the cache is
+    cold/stale); writes issue ``ALTER TABLE|VIEW … SET/UNSET TBLPROPERTIES``
+    immediately so the catalog is always the source of truth — there's no
+    local copy to drift.
+
+    Every mutation diffs against the current value first, so a useless remote
+    call is skipped when:
+
+    - assigning a key the value it already holds (``props['k'] = 'v'`` where
+      ``props['k'] == 'v'``), and
+    - :meth:`update` is handed only no-op pairs (it batches the *changed*
+      keys into a single ``SET TBLPROPERTIES`` and does nothing if none
+      changed).
+
+    Deleting an absent key raises ``KeyError`` without a round trip.
+    """
+
+    __slots__ = ("_table",)
+
+    def __init__(self, table: "Table") -> None:
+        self._table = table
+
+    def _current(self) -> Dict[str, str]:
+        """A snapshot copy of the catalog's current properties."""
+        return dict(self._table.infos.properties or {})
+
+    def _keyword(self) -> str:
+        """``VIEW`` for view-shaped securables, else ``TABLE`` — for the DDL."""
+        return "VIEW" if self._table.infos.table_type in _VIEW_TABLE_TYPES else "TABLE"
+
+    def _set(self, items: Dict[str, str]) -> None:
+        assignments = ", ".join(
+            f"'{escape_sql_string(k)}' = '{escape_sql_string(v)}'"
+            for k, v in items.items()
+        )
+        self._table.sql.execute(
+            f"ALTER {self._keyword()} {self._table.full_name(safe=True)} "
+            f"SET TBLPROPERTIES ({assignments})",
+            wait=True,
+        )
+        self._table.invalidate_singleton(remove_global=True)
+
+    # ── MutableMapping read protocol ─────────────────────────────────────
+    def __getitem__(self, key: str) -> str:
+        return self._current()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._current())
+
+    def __len__(self) -> int:
+        return len(self._current())
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._current()
+
+    # ── mutation — value-diff guarded ────────────────────────────────────
+    def __setitem__(self, key: str, value: Any) -> None:
+        value = _coerce_tag_str(value)
+        if self._current().get(key) == value:
+            return  # unchanged — don't pay for a remote ALTER
+        self._set({key: value})
+
+    def __delitem__(self, key: str) -> None:
+        if key not in self._current():
+            raise KeyError(key)
+        self._table.sql.execute(
+            f"ALTER {self._keyword()} {self._table.full_name(safe=True)} "
+            f"UNSET TBLPROPERTIES IF EXISTS ('{escape_sql_string(key)}')",
+            wait=True,
+        )
+        self._table.invalidate_singleton(remove_global=True)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        """Batch-apply only the keys whose value actually changes.
+
+        Coerces ``args``/``kwargs`` like ``dict.update``, drops keys already
+        at the requested value, and emits a single ``SET TBLPROPERTIES`` for
+        whatever remains (nothing at all when every pair is a no-op).
+        """
+        incoming: Dict[str, Any] = {}
+        incoming.update(*args, **kwargs)
+        current = self._current()
+        changed = {
+            k: _coerce_tag_str(v)
+            for k, v in incoming.items()
+            if current.get(k) != _coerce_tag_str(v)
+        }
+        if changed:
+            self._set(changed)
+
+    def __repr__(self) -> str:
+        return f"TableProperties({self._current()!r})"
 
 
 # ===========================================================================
@@ -1521,6 +1620,21 @@ class Table(DatabricksPath):
         )
         # Drop the cached infos so a follow-up ``owner`` read re-fetches.
         self.invalidate_singleton(remove_global=True)
+
+    @property
+    def properties(self) -> TableProperties:
+        """Live, mutable view of the table's Unity Catalog ``TBLPROPERTIES``.
+
+        Returns a :class:`TableProperties` (a ``MutableMapping``): reads resolve
+        cached :attr:`infos`, while item assignment / deletion / :meth:`dict.update`
+        transparently issue ``ALTER … SET/UNSET TBLPROPERTIES`` — skipping the
+        remote call whenever the value is already what's requested::
+
+            t.properties["delta.appendOnly"] = "true"   # one ALTER
+            t.properties["delta.appendOnly"] = "true"   # no-op, no network
+            del t.properties["stale.key"]               # UNSET … IF EXISTS
+        """
+        return TableProperties(self)
 
     # ── view name aliases — old ``view_name`` callers stay working ───────────
 
