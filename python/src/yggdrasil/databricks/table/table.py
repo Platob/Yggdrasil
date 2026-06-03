@@ -57,6 +57,7 @@ from yggdrasil.databricks.sql.sql_utils import (
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
+from yggdrasil.enums.engine_name import EngineName
 from yggdrasil.execution.expr import (
     Predicate,
 )
@@ -95,7 +96,7 @@ _VIEW_TABLE_TYPES: frozenset[TableType] = frozenset({
     TableType.METRIC_VIEW,
 })
 
-# Below this on-disk size, ``use_databricks=None`` reads/writes a Delta table
+# Below this on-disk size, the ``engine=None`` guess reads/writes a Delta table
 # natively (DeltaFolder); at or above it the SQL warehouse parallelises the
 # scan/commit better. Matches Delta's default target file size.
 _NATIVE_DELTA_MAX_BYTES: int = 128 * 1024 * 1024
@@ -868,25 +869,11 @@ class Table(DatabricksPath):
 
         return query
 
-    def _native_delta(self, options: CastOptions, *, write: bool) -> bool:
-        """Decide whether to use the native :meth:`delta` DeltaFolder (``True``)
-        or the SQL warehouse (``False``) for this read / write.
-
-        Only Delta tables with resolvable storage qualify; a native *write*
-        additionally needs an *external* table (UC vends READ_WRITE creds only
-        for external — a managed-Delta commit would 403, so it stays on SQL).
-
-        ``options.use_databricks`` then selects:
-
-        - ``True``  → Databricks / warehouse (``False``);
-        - ``False`` → native DeltaFolder (``True``);
-        - ``None``  → guess: an active Spark session → Databricks; else a small
-          table (``< _NATIVE_DELTA_MAX_BYTES`` on disk) → native, a larger one
-          → Databricks (the warehouse parallelises big scans/writes better).
-
-        A ``True`` here only *picks* the native path — the read/write then
-        probes UC credentials and falls back to Databricks if they can't vend.
-        """
+    def _delta_capable(self, *, write: bool) -> bool:
+        """True when a native :meth:`delta` DeltaFolder read (or write) is
+        possible: a Delta table with resolvable storage — and, for a write, an
+        *external* one (UC vends READ_WRITE creds only for external; a managed
+        commit would 403)."""
         try:
             infos = self.infos
         except Exception:
@@ -899,18 +886,31 @@ class Table(DatabricksPath):
             return False
         if write and infos.table_type != TableType.EXTERNAL:
             return False
+        return True
 
-        use_databricks = getattr(options, "use_databricks", None)
-        if use_databricks is True:
-            return False
-        if use_databricks is False:
-            return True
+    def _resolve_engine(self, options: CastOptions, *, write: bool) -> "EngineName":
+        """Resolve the compute engine for this read / write.
 
-        # use_databricks is None → guess.
+        ``options.engine`` selects explicitly (an :class:`EngineName` or alias);
+        ``YGGDRASIL`` on a table that can't take the native path degrades to the
+        warehouse rather than erroring. ``None`` **guesses best**: an active
+        Spark session → ``SPARK``; else a small Delta table
+        (``< _NATIVE_DELTA_MAX_BYTES`` on disk) → ``YGGDRASIL``; else →
+        ``DATABRICKS_SQL_WAREHOUSE`` (it parallelises big scans/writes better).
+        """
+        engine = EngineName.from_(getattr(options, "engine", None))
+        if engine is not None:
+            if engine == EngineName.YGGDRASIL and not self._delta_capable(write=write):
+                return EngineName.DATABRICKS_SQL_WAREHOUSE
+            return engine
+
         if self._has_active_spark(options):
-            return False
-        size = self._delta_total_bytes()
-        return size is not None and size < _NATIVE_DELTA_MAX_BYTES
+            return EngineName.SPARK
+        if self._delta_capable(write=write):
+            size = self._delta_total_bytes()
+            if size is not None and size < _NATIVE_DELTA_MAX_BYTES:
+                return EngineName.YGGDRASIL
+        return EngineName.DATABRICKS_SQL_WAREHOUSE
 
     @staticmethod
     def _has_active_spark(options: CastOptions) -> bool:
@@ -935,19 +935,37 @@ class Table(DatabricksPath):
             return None
 
     def _native_delta_folder(self, *, write: bool) -> "DeltaFolder | None":
-        """Build the :meth:`delta` DeltaFolder for a read or a write and force
-        its UC credentials to vend (by reading the ``_delta_log`` snapshot), so
-        any failure surfaces here — *before* a write consumes its batch stream.
+        """Build the :meth:`delta` DeltaFolder for a read or a write and verify
+        the actual access, so any failure surfaces here — *before* a write
+        consumes its batch stream.
 
-        The credential scope follows the operation: ``write=False`` vends
-        ``READ``, ``write=True`` vends ``READ_WRITE``. That matters because a
-        principal can hold read but not write on a table — a read still
-        succeeds natively, while a write whose ``READ_WRITE`` vend is denied
-        returns ``None`` here so the caller falls back to Databricks (the SQL
-        warehouse)."""
+        The credential scope follows the operation (``write=False`` → ``READ``,
+        ``write=True`` → ``READ_WRITE``) because a principal can hold read but
+        not write on a table. Verification:
+
+        - **read** — read the ``_delta_log`` snapshot (a GetObject), which also
+          forces the credential vend;
+        - **write** — additionally touch + remove a tiny probe object under the
+          table root (a real PutObject). UC sometimes vends ``READ_WRITE``
+          credentials whose underlying S3 session policy still *denies* writes,
+          and reading the log only exercises GetObject — so the probe is the
+          only way to learn the write would 403.
+
+        Returns ``None`` on any failure, so the caller transparently falls back
+        to Databricks (the SQL warehouse)."""
         try:
             folder = self.delta(write=write)
-            folder.snapshot(fresh=True)  # triggers UC temp-cred vending + log read
+            folder.snapshot(fresh=True)  # vend + verify READ (GetObject)
+            if write:
+                # Verify PutObject actually works. ``_ygg/`` is outside Delta's
+                # ``_delta_log`` / data-file scan, so the transient marker is
+                # invisible to readers; remove it best-effort afterwards.
+                probe = folder.path / ("_ygg/.write_probe_%s" % uuid.uuid4().hex)
+                probe.write_bytes(b"")
+                try:
+                    probe.remove(missing_ok=True)
+                except Exception:
+                    pass
             return folder
         except Exception as exc:  # noqa: BLE001 — any vend/IO failure → fall back
             logger.warning(
@@ -958,21 +976,24 @@ class Table(DatabricksPath):
             return None
 
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
-        # Delta table the router picks native for → read straight off the
-        # ``_delta_log`` + parquet via our DeltaFolder, bypassing the warehouse.
-        # ``_native_delta_folder`` probes UC credentials first, returning None
-        # (and falling us through to the warehouse) if they can't vend.
-        if self._native_delta(options, write=False):
+        engine = self._resolve_engine(options, write=False)
+
+        # YGGDRASIL → read straight off the ``_delta_log`` + parquet via our
+        # DeltaFolder. ``_native_delta_folder`` probes UC credentials first,
+        # returning None (and falling through to the warehouse) on a vend error.
+        if engine == EngineName.YGGDRASIL:
             folder = self._native_delta_folder(write=False)
             if folder is not None:
                 yield from folder._read_arrow_batches(folder.check_options(options))
                 return
+            engine = EngineName.DATABRICKS_SQL_WAREHOUSE
 
         options = options.with_source(source=self.collect_schema())
         query = self._options_to_sql(options)
+        sql_engine = "spark" if engine == EngineName.SPARK else "api"
 
         try:
-            execution = self.sql.execute(query)
+            execution = self.sql.execute(query, engine=sql_engine)
         except Exception:
             if not self.exists() and options.target:
                 self.create(options.target)
@@ -990,20 +1011,26 @@ class Table(DatabricksPath):
         batches: Iterable[pa.RecordBatch],
         options: CastOptions
     ) -> None:
-        # External Delta table the router picks native for → commit straight to
-        # the ``_delta_log`` via our DeltaFolder, bypassing the warehouse. The
-        # credential probe runs *before* ``batches`` is consumed, so a vend
+        engine = self._resolve_engine(options, write=True)
+
+        # YGGDRASIL → commit straight to the ``_delta_log`` via our DeltaFolder.
+        # The credential probe runs *before* ``batches`` is consumed, so a vend
         # failure falls back to the SQL insert below with the stream intact.
-        if self._native_delta(options, write=True):
+        if engine == EngineName.YGGDRASIL:
             folder = self._native_delta_folder(write=True)
             if folder is not None:
                 folder.write_arrow_batches(batches, options=options)
                 return
+            engine = EngineName.DATABRICKS_SQL_WAREHOUSE
 
         options = options.with_target(self.collect_schema(options))
 
-        return self.insert(
+        # SPARK vs the SQL warehouse, via the staged-Parquet insert path which
+        # takes an explicit ``engine`` (so the choice is honoured even when a
+        # Spark session is reachable in-process).
+        return self.arrow_insert(
             batches,
+            engine="spark" if engine == EngineName.SPARK else "api",
             mode=options.mode,
             match_by=options.match_by_keys,
             update_column_names=options.update_column_names,
