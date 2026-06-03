@@ -1951,6 +1951,23 @@ class Table(DatabricksPath):
         if add_col_statement is not None:
             second_phase.append(add_col_statement)
 
+        # DROP / RENAME COLUMN need Delta name column mapping; without it the
+        # ALTER fails with DELTA_UNSUPPORTED_(DROP|RENAME)_COLUMN. Enable it up
+        # front (idempotent — and it upgrades the table protocol when needed)
+        # whenever the evolution drops or renames a column, so the batches
+        # below don't fail. Skipped when the table already has it on.
+        if (drop_names or rename_statements) and (
+            (self.infos.properties or {}).get("delta.columnMapping.mode") != "name"
+        ):
+            logger.info(
+                "Enabling Delta name column mapping on %r to satisfy "
+                "DROP/RENAME COLUMN", self,
+            )
+            self.sql.execute(
+                f"{alter_table} SET TBLPROPERTIES "
+                f"('delta.columnMapping.mode' = 'name')"
+            )
+
         executed = False
         if first_phase:
             self.sql.execute_many(first_phase, parallel=True)

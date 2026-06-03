@@ -90,7 +90,8 @@ class TestDeltaSqlInterop(DatabricksIntegrationCase):
         # temporary credentials for external tables (managed tables vend READ,
         # so a direct ``_delta_log`` commit would 403).
         cls.location = cls.client.default_storage_location(
-            f"ygg_integration/delta/{name}_{secrets.token_hex(4)}"
+            f"ygg_integration/delta/{name}_{secrets.token_hex(4)}",
+            catalog_name=cls.INTEGRATION_CATALOG,
         )
         try:
             cls.table = cls.client.tables.table(cls.full)

@@ -388,11 +388,10 @@ class TestTableSchemaEvolutionIntegration(_TableFixture):
         new_col = Field(name=f"extra_{secrets.token_hex(2)}", dtype=pa.string())
         self.table.with_column(new_col)
         self.assertIsNotNone(self.table.column(new_col.name, raise_error=False))
-        # Tidy up so the next test starts from the canonical 3-column shape.
-        self._sql(
-            f"ALTER TABLE {self.table.full_name(safe=True)} "
-            f"DROP COLUMN `{new_col.name}`"
-        )
+        # Tidy up so the next test starts from the canonical 3-column shape —
+        # drop the extra column through the library, which enables Delta
+        # column mapping as needed.
+        self.table.with_columns(_sample_schema(), mode=Mode.OVERWRITE)
         self.table.invalidate_singleton()
 
     def test_with_columns_overwrite_drops_missing(self) -> None:
