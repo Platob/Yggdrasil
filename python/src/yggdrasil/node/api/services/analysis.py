@@ -89,7 +89,15 @@ def _safe(v):
 
 
 def _safe_list(series: pl.Series) -> list:
-    return [_safe(v) for v in series.to_list()]
+    """Convert a Polars float series to a JSON-safe list, replacing NaN/Inf with None."""
+    import numpy as np
+    arr = series.cast(pl.Float64, strict=False).to_numpy()
+    finite = np.isfinite(arr)
+    out: list = [None] * len(arr)
+    for i, (f, v) in enumerate(zip(finite, arr)):
+        if f:
+            out[i] = float(v)
+    return out
 
 
 class AnalysisService:
