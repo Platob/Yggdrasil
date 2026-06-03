@@ -367,6 +367,48 @@ class TestMkdirFastPath:
         with pytest.raises(FileExistsError):
             p._mkdir(parents=False, exist_ok=False)
 
+    def test_mkdir_creates_volume_when_mount_makedirs_fails(
+        self, fake_volume_root, service, monkeypatch,
+    ):
+        # The kernel mount can't materialize a missing UC volume — only
+        # dirs inside one. When ``os.makedirs`` fails (volume absent),
+        # ``_mkdir`` must ensure the volume exists (like the Files-API
+        # path) and retry, rather than surfacing the raw OSError.
+        p = VolumePath("/Volumes/cat/sch/vol/newdir", service=service)
+
+        calls = {"makedirs": 0}
+        real_makedirs = vp_module.os.makedirs
+
+        def flaky_makedirs(path, exist_ok=False):
+            calls["makedirs"] += 1
+            if calls["makedirs"] == 1:
+                raise OSError("Operation not permitted: volume missing")
+            return real_makedirs(path, exist_ok=exist_ok)
+
+        monkeypatch.setattr(vp_module.os, "makedirs", flaky_makedirs)
+        vol = MagicMock()
+        monkeypatch.setattr(VolumePath, "volume", property(lambda self: vol))
+
+        p._mkdir(parents=True, exist_ok=False)
+
+        vol.ensure_created.assert_called_once()
+        assert (fake_volume_root / "newdir").is_dir()
+
+    def test_mkdir_oserror_without_volume_triple_propagates(
+        self, fake_volume_root, service, monkeypatch,
+    ):
+        # A non-volume path (no ``cat/sch/vol`` triple) has nothing to
+        # ensure — the OSError must propagate untouched.
+        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
+        monkeypatch.setattr(VolumePath, "_split_volume", lambda self: None)
+
+        def boom(path, exist_ok=False):
+            raise OSError("nope")
+
+        monkeypatch.setattr(vp_module.os, "makedirs", boom)
+        with pytest.raises(OSError):
+            p._mkdir(parents=True, exist_ok=False)
+
 
 class TestRemoveFileFastPath:
 

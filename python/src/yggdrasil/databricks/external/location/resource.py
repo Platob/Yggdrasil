@@ -209,11 +209,24 @@ class ExternalLocation(DatabricksResource, ProxyPathMixin, Singleton):
                 f"(got {scheme!r} in {url!r})"
             )
         from yggdrasil.enums.aws import AWSRegion
+        from yggdrasil.enums import Mode
 
         region = AWSRegion.from_text(url)
-        # The path carries its own credentials — an AWS client vended by this
-        # location's storage credential — so it can read/write standalone.
-        aws = self.credential.aws_client(region=str(region) if region else None)
+        # Vend through the **path**-credentials endpoint scoped to this
+        # location's URL. The service-credential endpoint
+        # (``credential.aws_client``) only accepts SERVICE-purpose
+        # credentials and rejects the STORAGE credential that backs an
+        # external location; the path endpoint is the one UC honours for
+        # storage URLs. Mode follows the location's read-only flag so a
+        # writable location vends ``PATH_READ_WRITE`` and supports
+        # standalone read+write (e.g. a DeltaFolder over the prefix).
+        from yggdrasil.databricks.aws import AWSDatabricksPathCredentials
+
+        provider = AWSDatabricksPathCredentials(url, client=self.client)
+        # Any non-read-only mode resolves to the writable UC operation
+        # (``PATH_READ_WRITE``) in ``_operation_for``.
+        mode = Mode.READ_ONLY if self.read_only else Mode.OVERWRITE
+        aws = provider.aws_client(mode=mode, region=str(region) if region else None)
         return aws.s3.path(url)
 
     # The whole filesystem surface (ls / read_* / write_* / stat / exists /

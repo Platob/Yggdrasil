@@ -9,11 +9,13 @@ from .insert import (
     make_sql_select,
     stage_async_insert,
 )
+from .options import TableOptions
 from .table import Table
 from .tables import Tables
 
 __all__ = [
     "Table",
+    "TableOptions",
     "Tables",
     "DatabricksTableInsert",
     "DatabricksInsertBatch",

@@ -209,9 +209,18 @@ class ArrowIPCFile(IO[bytes, ArrowIPCOptions]):
                 except pa.ArrowInvalid:
                     return super()._read_arrow_table(options)
                 table = reader.read_all()
+                # Push the projection down before the cast: ``select`` is a
+                # zero-copy view that keeps only the wanted columns, so on a
+                # memory-mapped file the dropped columns' data pages are never
+                # faulted in (mirrors the per-batch projection in
+                # ``_read_arrow_batches``). Without this, ``read_all`` carries
+                # every column into the cast even when the target wants a few.
+                columns = self._projection_columns(options, table.schema.names)
+                if columns is not None:
+                    table = table.select(columns)
         except FileNotFoundError:
             return super()._read_arrow_table(options)
-        # Projection (+ fill / reshape to the target) is applied by the cast.
+        # Remaining fill / reshape to the target is applied by the cast.
         table = options.cast_arrow_table(table)
         table = options.apply_post_read_table(table)
         if options.row_limit is not None and table.num_rows > options.row_limit:

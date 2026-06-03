@@ -379,58 +379,61 @@ class Path(IO, os.PathLike, ABC):
         )
         return self
 
-    def unlink(self, missing_ok: bool = True, wait: WaitingConfigArg = True) -> None:
-        """Remove the leaf — pathlib-compatible: refuses directories.
-
-        Mirrors :meth:`pathlib.Path.unlink`: succeeds for files,
-        raises :class:`IsADirectoryError` for directories so callers
-        don't accidentally recursive-delete via ``unlink``. Use
-        :meth:`remove` for the directory case.
-        """
-        # A delete must look at the object's *current* state, not a
-        # snapshot a prior read left in the stat cache: an entry cached
-        # MISSING (so unlink silently no-ops) or cached the wrong kind
-        # (file vs directory) is exactly how a deletion appears not to
-        # work. Drop the cached stat so the probe below hits the backend.
-        self._stat_cached = None
-        self._stat_cached_at = 0.0
-        kind = self._stat().kind
-        if kind == IOKind.DIRECTORY:
-            raise IsADirectoryError(
-                f"{self.full_path()!r} is a directory — use ``remove()`` "
-                "for the recursive-delete path; ``unlink`` is files-only."
-            )
-        # We've just established the kind; delete the file directly rather
-        # than routing through ``remove()`` (which would re-clear the cache
-        # and re-stat — a wasted backend round trip on remote paths).
-        if kind == IOKind.MISSING:
-            if not missing_ok:
-                raise FileNotFoundError(f"{self.full_path()!r} does not exist")
-            return
-        self._remove_file(missing_ok=missing_ok, wait=WaitingConfig.from_(wait))
-        self.invalidate_singleton()
-
-    def remove(
+    def _delete(
         self,
+        predicate: "Any" = None,
+        *,
+        remove_path: bool = False,
         recursive: bool = True,
+        files_only: bool = False,
         missing_ok: bool = True,
         wait: WaitingConfigArg = True,
         fresher_than: Optional[TimeLike] = None,
         older_than: Optional[TimeLike] = None,
-    ) -> "Path":
-        # Decide what to delete from the backend's *current* state — a
-        # stale cached stat (MISSING after an external create, or the
-        # wrong kind) would make the remove no-op or take the wrong
-        # branch. ``unlink`` already cleared the cache; do it here too so
-        # a direct ``remove()`` call is equally fresh.
+        **kwargs: Any,
+    ) -> int:
+        """The single deletion primitive for a path — backends override
+        *this* (and nothing else) to customise removal.
+
+        Two modes, both centralised here:
+
+        - **path removal** — ``remove_path=True`` (set by :meth:`remove` /
+          :meth:`unlink` / :meth:`rm`) *or* a ``None`` *predicate* removes the
+          backing object itself: the file, or the whole subtree when
+          ``recursive``. ``files_only`` refuses a directory (``unlink``
+          semantics). Honours the ``fresher_than`` / ``older_than`` window.
+        - **row delete** — a non-``None`` *predicate* deletes matching rows,
+          delegated to the byte-leaf rewrite via :class:`IO`.
+
+        ``remove`` and ``unlink`` are thin wrappers over the path-removal
+        mode so there is exactly one deletion code path through the IO layer.
+        """
+        if not remove_path and predicate is not None:
+            return super()._delete(
+                predicate, missing_ok=missing_ok, wait=wait, **kwargs,
+            )
+
+        wait = WaitingConfig.from_(wait)
+        # A delete must look at the object's *current* state, not a snapshot a
+        # prior read left in the stat cache: an entry cached MISSING (so the
+        # delete silently no-ops) or cached the wrong kind (file vs directory)
+        # is exactly how a deletion appears not to work. Drop the cached stat
+        # so the probe below hits the backend.
         self._stat_cached = None
         self._stat_cached_at = 0.0
         stat = self._stat()
         kind = stat.kind
-        wait = WaitingConfig.from_(wait)
 
-        if kind == IOKind.MISSING and not missing_ok:
-            raise FileNotFoundError(f"{self.full_path()!r} does not exist")
+        if kind == IOKind.MISSING:
+            if not missing_ok:
+                raise FileNotFoundError(f"{self.full_path()!r} does not exist")
+            return 0
+
+        if files_only and kind == IOKind.DIRECTORY:
+            raise IsADirectoryError(
+                f"{self.full_path()!r} is a directory — use ``remove()`` "
+                "for the recursive-delete path; ``unlink`` is files-only."
+            )
 
         if fresher_than or older_than:
             fresher_than = IOStats.normalize_timestamp(fresher_than, default=0.0)
@@ -443,32 +446,64 @@ class Path(IO, os.PathLike, ABC):
                     self._remove_file(missing_ok=missing_ok, wait=wait)
             elif kind == IOKind.DIRECTORY:
                 for child in self.ls(recursive=False):
-                    child.remove(
+                    child._delete(
+                        remove_path=True,
                         recursive=recursive,
                         missing_ok=missing_ok,
                         wait=wait,
                         fresher_than=fresher_than,
                         older_than=older_than,
                     )
-
                     if child.is_empty():
-                        child.remove(missing_ok=missing_ok, wait=False)
-
+                        child._delete(remove_path=True, missing_ok=missing_ok, wait=False)
         else:
             if kind == IOKind.FILE:
                 self._remove_file(missing_ok=missing_ok, wait=wait)
             elif kind == IOKind.DIRECTORY:
                 self._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait)
 
-        # The object is gone: drop the cached FILE/DIRECTORY snapshot the
-        # probe above left behind so a follow-up ``exists`` / ``is_file``
-        # re-probes the backend instead of reporting the deleted path as
-        # still present. Backends already invalidate inside their
-        # ``_remove_*`` hooks; doing it here too makes the contract hold
-        # for any backend regardless of that discipline.
-        if kind != IOKind.MISSING:
-            self.invalidate_singleton()
+        # The object is gone: drop the cached FILE/DIRECTORY snapshot the probe
+        # above left behind so a follow-up ``exists`` / ``is_file`` re-probes
+        # the backend instead of reporting the deleted path as still present.
+        self.invalidate_singleton()
+        return 0
 
+    def unlink(self, missing_ok: bool = True, wait: WaitingConfigArg = True) -> None:
+        """Remove the leaf — pathlib-compatible: refuses directories.
+
+        Mirrors :meth:`pathlib.Path.unlink`: succeeds for files, raises
+        :class:`IsADirectoryError` for directories so callers don't
+        accidentally recursive-delete via ``unlink``. Use :meth:`remove`
+        for the directory case. Thin wrapper over :meth:`_delete`'s
+        path-removal mode.
+        """
+        self._delete(
+            remove_path=True, files_only=True, recursive=False,
+            missing_ok=missing_ok, wait=wait,
+        )
+
+    def remove(
+        self,
+        recursive: bool = True,
+        missing_ok: bool = True,
+        wait: WaitingConfigArg = True,
+        fresher_than: Optional[TimeLike] = None,
+        older_than: Optional[TimeLike] = None,
+    ) -> "Path":
+        """Remove this path — the file, or the whole subtree when *recursive*.
+
+        Thin wrapper over :meth:`_delete`'s path-removal mode (the single
+        deletion primitive). ``fresher_than`` / ``older_than`` scope the
+        removal to children inside that mtime window.
+        """
+        self._delete(
+            remove_path=True,
+            recursive=recursive,
+            missing_ok=missing_ok,
+            wait=wait,
+            fresher_than=fresher_than,
+            older_than=older_than,
+        )
         return self
 
     rm = remove

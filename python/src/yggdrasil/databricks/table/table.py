@@ -24,6 +24,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import MutableMapping
 from typing import Any, Dict, Optional, Union, TYPE_CHECKING, Mapping, Iterable, Iterator, Literal, ClassVar
 
 import pyarrow as pa
@@ -40,6 +41,7 @@ from yggdrasil.concurrent.threading import Job
 from yggdrasil.data import Field
 from yggdrasil.data.data_utils import safe_constraint_name
 from yggdrasil.data.options import CastOptions
+from yggdrasil.databricks.table.options import TableOptions
 from yggdrasil.data.schema import Schema as DataSchema, Schema
 from yggdrasil.data.statement import PreparedStatement, StatementResult
 from yggdrasil.databricks.client import DatabricksClient
@@ -48,13 +50,16 @@ from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.databricks.sql.sql_utils import (
     MAX_TABLE_NAME_LEN,
     quote_ident,
+    quote_principal,
     quote_qualified_ident,
+    requalify_table_refs,
     safe_table_name,
     sql_literal, escape_sql_string,
 )
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
+from yggdrasil.enums.engine_type import EngineType
 from yggdrasil.execution.expr import (
     Predicate,
 )
@@ -92,6 +97,11 @@ _VIEW_TABLE_TYPES: frozenset[TableType] = frozenset({
     TableType.MATERIALIZED_VIEW,
     TableType.METRIC_VIEW,
 })
+
+# Below this on-disk size, the ``engine=None`` guess reads/writes a Delta table
+# natively (DeltaFolder); at or above it the SQL warehouse parallelises the
+# scan/commit better. Matches Delta's default target file size.
+_NATIVE_DELTA_MAX_BYTES: int = 128 * 1024 * 1024
 
 
 def _coerce_tag_str(value: Any) -> str:
@@ -410,6 +420,104 @@ def _build_ygg_properties(schema_info: DataSchema) -> dict[str, str]:
     return props
 
 
+class TableProperties(MutableMapping):
+    """Live, mutable view of a table's Unity Catalog ``TBLPROPERTIES``.
+
+    A ``dict``-like façade bound to a :class:`Table`. Reads resolve the
+    table's cached :attr:`Table.infos` (a remote fetch only when the cache is
+    cold/stale); writes issue ``ALTER TABLE|VIEW … SET/UNSET TBLPROPERTIES``
+    immediately so the catalog is always the source of truth — there's no
+    local copy to drift.
+
+    Every mutation diffs against the current value first, so a useless remote
+    call is skipped when:
+
+    - assigning a key the value it already holds (``props['k'] = 'v'`` where
+      ``props['k'] == 'v'``), and
+    - :meth:`update` is handed only no-op pairs (it batches the *changed*
+      keys into a single ``SET TBLPROPERTIES`` and does nothing if none
+      changed).
+
+    Deleting an absent key raises ``KeyError`` without a round trip.
+    """
+
+    __slots__ = ("_table",)
+
+    def __init__(self, table: "Table") -> None:
+        self._table = table
+
+    def _current(self) -> Dict[str, str]:
+        """A snapshot copy of the catalog's current properties."""
+        return dict(self._table.infos.properties or {})
+
+    def _keyword(self) -> str:
+        """``VIEW`` for view-shaped securables, else ``TABLE`` — for the DDL."""
+        return "VIEW" if self._table.infos.table_type in _VIEW_TABLE_TYPES else "TABLE"
+
+    def _set(self, items: Dict[str, str]) -> None:
+        assignments = ", ".join(
+            f"'{escape_sql_string(k)}' = '{escape_sql_string(v)}'"
+            for k, v in items.items()
+        )
+        self._table.sql.execute(
+            f"ALTER {self._keyword()} {self._table.full_name(safe=True)} "
+            f"SET TBLPROPERTIES ({assignments})",
+            wait=True,
+        )
+        self._table.invalidate_singleton(remove_global=True)
+
+    # ── MutableMapping read protocol ─────────────────────────────────────
+    def __getitem__(self, key: str) -> str:
+        return self._current()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._current())
+
+    def __len__(self) -> int:
+        return len(self._current())
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._current()
+
+    # ── mutation — value-diff guarded ────────────────────────────────────
+    def __setitem__(self, key: str, value: Any) -> None:
+        value = _coerce_tag_str(value)
+        if self._current().get(key) == value:
+            return  # unchanged — don't pay for a remote ALTER
+        self._set({key: value})
+
+    def __delitem__(self, key: str) -> None:
+        if key not in self._current():
+            raise KeyError(key)
+        self._table.sql.execute(
+            f"ALTER {self._keyword()} {self._table.full_name(safe=True)} "
+            f"UNSET TBLPROPERTIES IF EXISTS ('{escape_sql_string(key)}')",
+            wait=True,
+        )
+        self._table.invalidate_singleton(remove_global=True)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        """Batch-apply only the keys whose value actually changes.
+
+        Coerces ``args``/``kwargs`` like ``dict.update``, drops keys already
+        at the requested value, and emits a single ``SET TBLPROPERTIES`` for
+        whatever remains (nothing at all when every pair is a no-op).
+        """
+        incoming: Dict[str, Any] = {}
+        incoming.update(*args, **kwargs)
+        current = self._current()
+        changed = {
+            k: _coerce_tag_str(v)
+            for k, v in incoming.items()
+            if current.get(k) != _coerce_tag_str(v)
+        }
+        if changed:
+            self._set(changed)
+
+    def __repr__(self) -> str:
+        return f"TableProperties({self._current()!r})"
+
+
 # ===========================================================================
 # Table — per-table resource
 # ===========================================================================
@@ -580,7 +688,7 @@ class Table(DatabricksPath):
 
     @classmethod
     def options_class(cls) -> type[CastOptions]:
-        return CastOptions
+        return TableOptions
 
     @classmethod
     def safe_name(cls, raw: str | None) -> str:
@@ -861,12 +969,131 @@ class Table(DatabricksPath):
 
         return query
 
+    def _delta_capable(self, *, write: bool) -> bool:
+        """True when a native :meth:`delta` DeltaFolder read (or write) is
+        possible: a Delta table with resolvable storage — and, for a write, an
+        *external* one (UC vends READ_WRITE creds only for external; a managed
+        commit would 403)."""
+        try:
+            infos = self.infos
+        except Exception:
+            return False
+        if (
+            infos.table_type in _VIEW_TABLE_TYPES
+            or infos.data_source_format != DataSourceFormat.DELTA
+            or not infos.storage_location
+        ):
+            return False
+        if write and infos.table_type != TableType.EXTERNAL:
+            return False
+        return True
+
+    def _resolve_engine(self, options: CastOptions, *, write: bool) -> "EngineType":
+        """Resolve the compute engine for this read / write.
+
+        ``options.engine`` selects explicitly (an :class:`EngineType` or alias);
+        ``YGGDRASIL`` on a table that can't take the native path degrades to the
+        warehouse rather than erroring. ``None`` **guesses best**: an active
+        Spark session → ``SPARK``; else a small Delta table
+        (``< _NATIVE_DELTA_MAX_BYTES`` on disk) → ``YGGDRASIL``; else →
+        ``DATABRICKS_SQL_WAREHOUSE`` (it parallelises big scans/writes better).
+        """
+        engine = EngineType.from_(getattr(options, "engine", None))
+        if engine is not None:
+            if engine == EngineType.YGGDRASIL and not self._delta_capable(write=write):
+                return EngineType.DATABRICKS_SQL_WAREHOUSE
+            return engine
+
+        if self._has_active_spark(options):
+            return EngineType.SPARK
+        if self._delta_capable(write=write):
+            size = self._delta_total_bytes()
+            if size is not None and size < _NATIVE_DELTA_MAX_BYTES:
+                return EngineType.YGGDRASIL
+        return EngineType.DATABRICKS_SQL_WAREHOUSE
+
+    @staticmethod
+    def _has_active_spark(options: CastOptions) -> bool:
+        """True when a Spark session is bound on *options* or active in-process."""
+        if getattr(options, "spark_session", None) is not None:
+            return True
+        try:
+            from pyspark.sql import SparkSession
+            return SparkSession.getActiveSession() is not None
+        except Exception:
+            return False
+
+    def _delta_total_bytes(self) -> "int | None":
+        """The Delta table's on-disk byte size (sum of active ``AddFile``
+        sizes from the ``_delta_log``), or ``None`` if it can't be resolved.
+
+        Sizes with *read* credentials — this only informs the routing guess,
+        so it must not need write access."""
+        try:
+            return self.delta(write=False).snapshot().total_bytes
+        except Exception:
+            return None
+
+    def _native_delta_folder(self, *, write: bool) -> "DeltaFolder | None":
+        """Build the :meth:`delta` DeltaFolder for a read or a write and verify
+        the actual access, so any failure surfaces here — *before* a write
+        consumes its batch stream.
+
+        The credential scope follows the operation (``write=False`` → ``READ``,
+        ``write=True`` → ``READ_WRITE``) because a principal can hold read but
+        not write on a table. Verification:
+
+        - **read** — read the ``_delta_log`` snapshot (a GetObject), which also
+          forces the credential vend;
+        - **write** — additionally touch + remove a tiny probe object under the
+          table root (a real PutObject). UC sometimes vends ``READ_WRITE``
+          credentials whose underlying S3 session policy still *denies* writes,
+          and reading the log only exercises GetObject — so the probe is the
+          only way to learn the write would 403.
+
+        Returns ``None`` on any failure, so the caller transparently falls back
+        to Databricks (the SQL warehouse)."""
+        try:
+            folder = self.delta(write=write)
+            folder.snapshot(fresh=True)  # vend + verify READ (GetObject)
+            if write:
+                # Verify PutObject actually works. ``_ygg/`` is outside Delta's
+                # ``_delta_log`` / data-file scan, so the transient marker is
+                # invisible to readers; remove it best-effort afterwards.
+                probe = folder.path / ("_ygg/.write_probe_%s" % uuid.uuid4().hex)
+                probe.write_bytes(b"")
+                try:
+                    probe.remove(missing_ok=True)
+                except Exception:
+                    pass
+            return folder
+        except Exception as exc:  # noqa: BLE001 — any vend/IO failure → fall back
+            logger.warning(
+                "Native Delta %s path unavailable for %r (%s: %s); "
+                "falling back to Databricks.",
+                "write" if write else "read", self, type(exc).__name__, exc,
+            )
+            return None
+
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
+        engine = self._resolve_engine(options, write=False)
+
+        # YGGDRASIL → read straight off the ``_delta_log`` + parquet via our
+        # DeltaFolder. ``_native_delta_folder`` probes UC credentials first,
+        # returning None (and falling through to the warehouse) on a vend error.
+        if engine == EngineType.YGGDRASIL:
+            folder = self._native_delta_folder(write=False)
+            if folder is not None:
+                yield from folder._read_arrow_batches(folder.check_options(options))
+                return
+            engine = EngineType.DATABRICKS_SQL_WAREHOUSE
+
         options = options.with_source(source=self.collect_schema())
         query = self._options_to_sql(options)
+        sql_engine = "spark" if engine == EngineType.SPARK else "api"
 
         try:
-            execution = self.sql.execute(query)
+            execution = self.sql.execute(query, engine=sql_engine)
         except Exception:
             if not self.exists() and options.target:
                 self.create(options.target)
@@ -884,10 +1111,26 @@ class Table(DatabricksPath):
         batches: Iterable[pa.RecordBatch],
         options: CastOptions
     ) -> None:
+        engine = self._resolve_engine(options, write=True)
+
+        # YGGDRASIL → commit straight to the ``_delta_log`` via our DeltaFolder.
+        # The credential probe runs *before* ``batches`` is consumed, so a vend
+        # failure falls back to the SQL insert below with the stream intact.
+        if engine == EngineType.YGGDRASIL:
+            folder = self._native_delta_folder(write=True)
+            if folder is not None:
+                folder.write_arrow_batches(batches, options=options)
+                return
+            engine = EngineType.DATABRICKS_SQL_WAREHOUSE
+
         options = options.with_target(self.collect_schema(options))
 
-        return self.insert(
+        # SPARK vs the SQL warehouse, via the staged-Parquet insert path which
+        # takes an explicit ``engine`` (so the choice is honoured even when a
+        # Spark session is reachable in-process).
+        return self.arrow_insert(
             batches,
+            engine="spark" if engine == EngineType.SPARK else "api",
             mode=options.mode,
             match_by=options.match_by_keys,
             update_column_names=options.update_column_names,
@@ -1318,6 +1561,19 @@ class Table(DatabricksPath):
         return self.table_type in _VIEW_TABLE_TYPES
 
     @property
+    def is_delta(self) -> bool:
+        """True for a Delta-backed table (``USING DELTA``), from cached infos.
+
+        Reads the cached ``infos`` only — never a network round trip; returns
+        ``False`` until the table has been resolved at least once. Views are
+        never Delta.
+        """
+        cached = self._infos
+        if cached is None or self.is_view:
+            return False
+        return cached.data_source_format == DataSourceFormat.DELTA
+
+    @property
     def is_materialized_view(self) -> bool:
         return self.table_type == TableType.MATERIALIZED_VIEW
 
@@ -1339,6 +1595,46 @@ class Table(DatabricksPath):
         """Upstream dependencies declared by a view (cached only)."""
         cached = self._infos
         return cached.view_dependencies if cached is not None else None
+
+    @property
+    def owner(self) -> Optional[str]:
+        """The table's Unity Catalog owner principal (user / group / SP).
+
+        Resolves ``infos`` (a remote read if not cached), mirroring
+        :attr:`Catalog.owner` / :attr:`Schema.owner`. Assigning re-owners the
+        securable via ``ALTER TABLE|VIEW … OWNER TO``.
+        """
+        return self.infos.owner
+
+    @owner.setter
+    def owner(self, principal: str) -> None:
+        if not principal:
+            raise ValueError("owner must be a non-empty principal name")
+        # ALTER VIEW for view-shaped securables, ALTER TABLE otherwise — resolve
+        # ``infos`` so the keyword is correct even on a never-inspected handle.
+        keyword = "VIEW" if self.infos.table_type in _VIEW_TABLE_TYPES else "TABLE"
+        logger.debug("Re-owning %s %r → %s", keyword, self, principal)
+        self.sql.execute(
+            f"ALTER {keyword} {self.full_name(safe=True)} "
+            f"OWNER TO {quote_principal(principal)}"
+        )
+        # Drop the cached infos so a follow-up ``owner`` read re-fetches.
+        self.invalidate_singleton(remove_global=True)
+
+    @property
+    def properties(self) -> TableProperties:
+        """Live, mutable view of the table's Unity Catalog ``TBLPROPERTIES``.
+
+        Returns a :class:`TableProperties` (a ``MutableMapping``): reads resolve
+        cached :attr:`infos`, while item assignment / deletion / :meth:`dict.update`
+        transparently issue ``ALTER … SET/UNSET TBLPROPERTIES`` — skipping the
+        remote call whenever the value is already what's requested::
+
+            t.properties["delta.appendOnly"] = "true"   # one ALTER
+            t.properties["delta.appendOnly"] = "true"   # no-op, no network
+            del t.properties["stale.key"]               # UNSET … IF EXISTS
+        """
+        return TableProperties(self)
 
     # ── view name aliases — old ``view_name`` callers stay working ───────────
 
@@ -1672,7 +1968,7 @@ class Table(DatabricksPath):
             table_type = TableType.EXTERNAL if storage_location else TableType.MANAGED
 
         if data_source_format is None:
-            data_source_format = DataSourceFormat.DELTA if table_type == TableType.MANAGED else DataSourceFormat.PARQUET
+            data_source_format = DataSourceFormat.DELTA
 
         if self.exists():
             data_source_format = self.infos.data_source_format
@@ -1696,15 +1992,29 @@ class Table(DatabricksPath):
                 comment=comment,
                 missing_ok=missing_ok,
                 properties=properties,
-                or_replace=mode == Mode.OVERWRITE and table_type == TableType.MANAGED,
+                or_replace=mode == Mode.OVERWRITE,
+                data_source_format=data_source_format,
+                record_ygg_properties=record_ygg_properties,
+            )
+        elif table_type == TableType.EXTERNAL:
+            # An external table is created via DDL — ``CREATE EXTERNAL TABLE
+            # … USING <fmt> LOCATION '…'`` — so the LOCATION is recorded and
+            # (for Delta) the ``_delta_log`` is initialised at that path.
+            # Default the location to the catalog's governed storage root
+            # when the caller didn't pin one.
+            if not storage_location:
+                storage_location = self._default_external_location()
+            result = self.sql_create(
+                definition,
+                storage_location=storage_location,
+                comment=comment,
+                missing_ok=missing_ok,
+                properties=properties,
+                or_replace=mode == Mode.OVERWRITE,
+                data_source_format=data_source_format,
                 record_ygg_properties=record_ygg_properties,
             )
         else:
-            if table_type == TableType.EXTERNAL and not storage_location:
-                storage_location = (
-                    self.schema_storage_location(table_type=table_type)
-                    + "/tables/%s" % self.table_name
-                )
             result = self.api_create(
                 definition=definition,
                 storage_location=storage_location,
@@ -1717,6 +2027,26 @@ class Table(DatabricksPath):
             )
 
         return result
+
+    def _default_external_location(self) -> str:
+        """Governed default ``LOCATION`` for an external table created without
+        one: the catalog's UC ``storage_root`` + ``<schema>/<table>``.
+
+        Prefers a schema-scoped storage root when the schema advertises one
+        (Databricks' ``__unitystorage`` layout), else falls back to the
+        catalog storage root via
+        :meth:`DatabricksClient.default_storage_location`.
+        """
+        try:
+            return "%s/tables/%s" % (
+                self.schema_storage_location(table_type=TableType.EXTERNAL),
+                self.table_name,
+            )
+        except NotImplementedError:
+            return self.client.default_storage_location(
+                suffix="%s/%s" % (self.schema_name, self.table_name),
+                catalog_name=self.catalog_name,
+            )
 
     def sql_create(
         self,
@@ -1768,6 +2098,11 @@ class Table(DatabricksPath):
 
         table_definitions = column_definitions + constraint_clauses
 
+        # A bound ``storage_location`` makes this external. We don't emit the
+        # ``EXTERNAL`` keyword — the ``LOCATION`` clause below is what makes the
+        # table external (this is the form Databricks itself generates), and it
+        # composes cleanly with ``CLUSTER BY`` / ``OR REPLACE``.
+        external = storage_location is not None
         if or_replace:
             create_kw = "CREATE OR REPLACE TABLE"
         elif missing_ok:
@@ -1790,6 +2125,19 @@ class Table(DatabricksPath):
             sql_parts.append(
                 "CLUSTER BY (" + ", ".join(quote_ident(c.name) for c in cluster_by) + ")"
             )
+        elif external:
+            # CLUSTER BY AUTO is UC *managed*-only (Databricks rejects it on an
+            # external table with CLUSTER_BY_AUTO_UNSUPPORTED_TABLE_TYPE_ERROR),
+            # so specify explicit liquid-clustering columns instead — the
+            # primary key when present, else the first column (liquid clustering
+            # caps at 4 keys). Callers can override via partition / cluster tags.
+            default_cluster = (primary_keys or effective_fields[:1])[:4]
+            if default_cluster:
+                sql_parts.append(
+                    "CLUSTER BY ("
+                    + ", ".join(quote_ident(c.name) for c in default_cluster)
+                    + ")"
+                )
         else:
             sql_parts.append("CLUSTER BY AUTO")
 
@@ -2589,6 +2937,15 @@ class Table(DatabricksPath):
                     f" view_definition. Run ``create_view(query=...)``"
                     f" against the target directly with explicit SQL."
                 )
+            # Re-point the inner query at the target: the stored
+            # ``view_definition`` references the *source* catalog/schema, so a
+            # cross-schema clone must requalify those prefixes or the cloned
+            # view would still read the source's tables.
+            select_text = requalify_table_refs(
+                select_text,
+                source=(self.catalog_name, self.schema_name),
+                target=(target_catalog, target_schema),
+            )
             cloned = Table(
                 service=tables,
                 catalog_name=target_catalog,
@@ -3234,20 +3591,34 @@ class Table(DatabricksPath):
 
         return infos.storage_location
 
-    def storage_path(self) -> "Path | None":
+    def storage_path(self, *, write: "bool | None" = None) -> "Path | None":
         """Return the table's backing storage as an addressable :class:`Path`.
 
         For a Delta table, ``tbl.storage_path()`` yields a Path that
         contains the parquet data files plus the ``_delta_log``
         transaction directory — ``list(tbl.storage_path().iterdir())``
         is the natural way to inspect the on-disk layout.
+
+        ``write`` picks the UC temporary-credential scope the Path's
+        :class:`AWSClient` vends — important because a principal can hold
+        read but not write on a table:
+
+        - ``None`` (default) — the operation default for the table type
+          (``READ`` for managed, ``READ_WRITE`` for external);
+        - ``False`` — ``READ`` (least-privilege; reads a table you can't write);
+        - ``True`` — ``READ_WRITE`` (collapses to ``READ`` for managed, which
+          UC never vends write creds for).
         """
         location = self.storage_location()
         if location is None:
             return None
-        return self.aws().s3.path(location)
+        if write is None:
+            aws = self.aws()
+        else:
+            aws = self.aws(TableOperation.READ_WRITE if write else TableOperation.READ)
+        return aws.s3.path(location)
 
-    def delta(self) -> "DeltaFolder":
+    def delta(self, *, write: "bool | None" = None) -> "DeltaFolder":
         """Return a :class:`~yggdrasil.io.delta.DeltaFolder` over this table's
         backing storage — the native Delta read/write surface.
 
@@ -3258,10 +3629,14 @@ class Table(DatabricksPath):
         (``tbl.delta().read_arrow_table()``) or commit
         (``tbl.delta().write_arrow_table(t, mode=Mode.APPEND)``) straight
         against the transaction log, bypassing the warehouse.
+
+        ``write`` flows to :meth:`storage_path` to scope the vended
+        credentials — ``write=False`` for a read-only handle (works even when
+        the caller can't write the table), ``write=True`` for a commit.
         """
         from yggdrasil.io.delta import DeltaFolder
 
-        path = self.storage_path()
+        path = self.storage_path(write=write)
         if path is None:
             raise FileNotFoundError(
                 f"{self!r} has no resolvable storage_location for a DeltaFolder."

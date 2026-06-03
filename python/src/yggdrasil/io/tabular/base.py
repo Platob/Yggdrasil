@@ -567,6 +567,22 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
     mime_type: "ClassVar[MimeType | None]" = None
 
+    #: Whether :meth:`_read_arrow_table` returns a freshly-decoded table
+    #: whose buffers no one else holds — so a consumer may destroy it in
+    #: place (``to_pandas(self_destruct=True)``) to halve peak memory.
+    #: True for every backend that decodes a new table per read (parquet,
+    #: arrow-ipc, csv, pickle, warehouse, …). In-memory holders that hand
+    #: back a *cached* table shared with the live instance override this to
+    #: False so the cache survives the conversion.
+    _READ_TABLE_OWNED: "ClassVar[bool]" = True
+
+    #: Whether :meth:`scan_polars_frame`'s registered IO source is *pure* —
+    #: two reads of this leaf inside one polars plan yield identical data,
+    #: so polars may de-duplicate the scan. False by default (a file on disk
+    #: can change between reads); leaves whose content is immutable for their
+    #: lifetime (a terminal SQL statement's result) override True.
+    _SCAN_IS_PURE: "ClassVar[bool]" = False
+
     #: Lifetime of a seeded :attr:`_stat_cached` entry. ``None`` (the
     #: default) trusts a seeded snapshot until it is explicitly
     #: invalidated — right for in-memory and local-filesystem holders.
@@ -1713,7 +1729,18 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         )
 
     def _read_polars_frame(self, options: O) -> "pl.DataFrame":
-        return polars_module().from_arrow(self._read_arrow_table(options))  # type: ignore[return-value]
+        # ``rechunk=False`` keeps polars from copying every column into a
+        # single contiguous chunk on ingest. The Arrow table arrives
+        # already chunked (one chunk per read flush / spill part), and the
+        # default ``rechunk=True`` memcpy's the whole result to coalesce
+        # them — pure overhead in both time and peak memory. Skipping it
+        # lets the frame share the Arrow buffers zero-copy (numeric columns)
+        # or copy once during conversion (everything else); polars handles
+        # a multi-chunk frame transparently, and any op that genuinely wants
+        # one chunk can ``.rechunk()`` on demand.
+        return polars_module().from_arrow(  # type: ignore[return-value]
+            self._read_arrow_table(options), rechunk=False,
+        )
 
     def scan_polars_frame(
         self, options: "O | None" = None, **kwargs: Any,
@@ -1723,7 +1750,58 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         )
 
     def _scan_polars_frame(self, options: O) -> "pl.LazyFrame":
-        return polars_module().scan_pyarrow_dataset(self._read_arrow_dataset(options))
+        """Pure-lazy, re-collectable :class:`~polars.LazyFrame` over this leaf.
+
+        Replaces ``scan_pyarrow_dataset`` over a one-shot
+        :class:`pa.RecordBatchReader` — a frame that drained on the first
+        ``collect`` and eagerly pulled the whole source the moment polars
+        planned the scan. This registers a polars *IO plugin* whose generator
+        re-opens the batch stream on every collect, so the frame is:
+
+        - **Lazy** — building the scan reads nothing; the schema is probed
+          only when polars asks, and no batch is fetched until ``collect``.
+        - **Re-collectable** — each collect re-runs the read.
+        - **Pushdown-aware** — polars hands the source its projection
+          (``with_columns``), ``predicate`` and ``n_rows``. We *push the
+          projection into the read* by narrowing the target, so column-pruning
+          backends (parquet column chunks, Arrow-IPC ``select``, …) only touch
+          the requested columns; rows are filtered as they stream; and the
+          stream stops once the row budget is met. ``with_columns`` already
+          carries every column the predicate needs (polars' contract), so the
+          narrowed read still satisfies the filter.
+        """
+        pl = polars_module()
+
+        def schema() -> "pl.Schema":
+            return self.collect_schema(options).to_polars_schema()
+
+        def source(
+            with_columns: "list[str] | None",
+            predicate: "Any | None",
+            n_rows: "int | None",
+            batch_size: "int | None",
+        ) -> "Iterator[pl.DataFrame]":
+            read_options = options
+            if with_columns is not None:
+                base = options.target if options.target is not None else self.collect_schema(options)
+                read_options = options.with_target(base.select(with_columns))
+            remaining = n_rows
+            for batch in self._read_arrow_batches(read_options):
+                frame = pl.from_arrow(batch)
+                if with_columns is not None:
+                    frame = frame.select(with_columns)
+                if predicate is not None:
+                    frame = frame.filter(predicate)
+                if remaining is not None:
+                    if frame.height >= remaining:
+                        yield frame.head(remaining)
+                        return
+                    remaining -= frame.height
+                yield frame
+
+        return pl.io.plugins.register_io_source(
+            source, schema=schema, is_pure=self._SCAN_IS_PURE,
+        )
 
     def write_polars_frame(
         self,
@@ -1783,8 +1861,22 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         placeholders map back to the unnamed levels they came from.
         """
         table = self._read_arrow_table(options)
-        df = table.to_pandas()
-        levels = _collect_index_levels(table.schema)
+        schema = table.schema  # metadata only — safe to read post-destruct
+        if self._READ_TABLE_OWNED:
+            # ``self_destruct=True`` (with its required ``split_blocks=True``)
+            # frees each Arrow column the instant it's converted into pandas,
+            # instead of holding the whole Arrow table alongside the finished
+            # DataFrame — roughly halves peak memory on a wide table. Sound
+            # only because this backend's ``_read_arrow_table`` returns a
+            # freshly-decoded, solely-owned table; ``table`` must not be
+            # touched for data afterwards, hence the ``del``.
+            df = table.to_pandas(split_blocks=True, self_destruct=True)
+            del table
+        else:
+            # Shared/cached table (in-memory holder): destroying it would
+            # corrupt later reads, so take the plain, copy-once conversion.
+            df = table.to_pandas()
+        levels = _collect_index_levels(schema)
         if not levels:
             return df
         levels.sort()

@@ -133,7 +133,6 @@ class S3Bucket(ExploreUrlRepr, RemotePath):
         self._bucket = bucket
         self._service = service
         self._http = http
-        self._ls_cache: Optional[ExpiringDict] = None
         self._initialized = True
 
     # -- service / client plumbing ------------------------------------
@@ -225,22 +224,6 @@ class S3Bucket(ExploreUrlRepr, RemotePath):
             deleted += len(batch)
         return deleted
 
-    # -- listing cache (shared by every key under the bucket) ---------
-    @property
-    def ls_cache(self) -> ExpiringDict:
-        if self._ls_cache is None:
-            self._ls_cache = ExpiringDict(default_ttl=_STAT_CACHE_TTL, max_size=10_000)
-        return self._ls_cache
-
-    def invalidate_ls_cache(self, prefix: "str | None" = None) -> None:
-        if self._ls_cache is None:
-            return
-        if prefix is None:
-            self._ls_cache.clear()
-            return
-        for k in [k for k in self._ls_cache if str(k).startswith(prefix)]:
-            self._ls_cache.pop(k, None)
-
     # -- RemotePath surface for the bucket root -----------------------
     def _stat_uncached(self) -> IOStats:
         return IOStats(size=0, mtime=0.0, kind=IOKind.DIRECTORY, mode=0)
@@ -274,7 +257,6 @@ class S3Bucket(ExploreUrlRepr, RemotePath):
         del missing_ok, wait
         if recursive:
             self.delete_prefix("")
-        self.invalidate_ls_cache()
 
     def _from_url(self, url: URL) -> "RemotePath":
         return S3Path(url=url, service=self._service, s3_bucket=self)
@@ -462,33 +444,18 @@ class S3Path(ExploreUrlRepr, RemotePath):
     # Listing (redirects to the bucket)
     # ==================================================================
     def _ls(self, recursive: bool = False, *, singleton_ttl: Any = False) -> Iterator["S3Path"]:
+        # Always a fresh ``ListObjectsV2`` — no listing cache. Correctness
+        # depends on seeing concurrent / external mutations (e.g. a Delta
+        # ``_delta_log`` commit written by a warehouse / Spark / another
+        # writer) immediately; a TTL'd listing silently served stale results.
         prefix = self.key if (not self.key or self.key.endswith("/")) else self.key + "/"
-        cache = self.s3_bucket.ls_cache
-        cache_key = (prefix, recursive)
-        cached = cache.get(cache_key)
-        if cached is not None:
-            for key in cached:
-                yield self._make_child(key, singleton_ttl=singleton_ttl)
-            return
-        collected: "list[str] | None" = []
         for key in self.s3_bucket.iter_keys(prefix, delimiter=None if recursive else "/"):
-            if collected is not None:
-                if len(collected) < 10_000:
-                    collected.append(key)
-                else:
-                    collected = None  # too big to cache — keep streaming
             yield self._make_child(key, singleton_ttl=singleton_ttl)
-        if collected is not None:
-            cache[cache_key] = collected
 
     def _make_child(self, key: str, *, singleton_ttl: Any = False) -> "S3Path":
         cleaned = key.lstrip("/")
         url = self.url._replace_path("/" + cleaned if cleaned else "/")
         return S3Path(url=url, service=self._service, s3_bucket=self._s3_bucket, singleton_ttl=singleton_ttl)
-
-    def _invalidate_parent_ls(self) -> None:
-        if self._s3_bucket is not None:
-            self._s3_bucket.invalidate_ls_cache()
 
     def invalidate_singleton(self, remove_global: bool = True) -> None:
         super().invalidate_singleton(remove_global=remove_global)
@@ -508,7 +475,6 @@ class S3Path(ExploreUrlRepr, RemotePath):
                 raise
             return
         self.invalidate_singleton()
-        self._invalidate_parent_ls()
 
     def _remove_dir(self, recursive: bool, missing_ok: bool, wait: WaitingConfig) -> None:
         del wait
@@ -520,7 +486,6 @@ class S3Path(ExploreUrlRepr, RemotePath):
                 if not missing_ok:
                     raise
             self.invalidate_singleton()
-            self._invalidate_parent_ls()
             return
         prefix = self.key if self.key.endswith("/") else self.key + "/"
         try:
@@ -529,7 +494,6 @@ class S3Path(ExploreUrlRepr, RemotePath):
             if not missing_ok:
                 raise
         self.invalidate_singleton()
-        self._invalidate_parent_ls()
 
     # ==================================================================
     # Holder I/O — read / upload
@@ -574,7 +538,6 @@ class S3Path(ExploreUrlRepr, RemotePath):
         self._persist_stat_cache(
             IOStats(size=size, kind=IOKind.FILE, mtime=time.time(), media_type=self.media_type)
         )
-        self._invalidate_parent_ls()
         return size
 
     def _upload_stream(self, source: Any) -> int:
@@ -600,7 +563,6 @@ class S3Path(ExploreUrlRepr, RemotePath):
         self._persist_stat_cache(
             IOStats(size=size, kind=IOKind.FILE, mtime=time.time(), media_type=self.media_type)
         )
-        self._invalidate_parent_ls()
         return size
 
     def reserve(self, n: int) -> None:

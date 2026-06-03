@@ -782,7 +782,12 @@ class SQLWarehouse(
                 itry += 1
 
         result.set_api_response(response)
-        LOGGER.info("Started %r", result)
+        # A statement that succeeds within ``wait_timeout`` comes back already
+        # terminal — ``set_api_response`` has logged "finished", so a "Started"
+        # line here would be a second, backwards log. Bypass it when the inner
+        # response is already done; only a still-running statement logs Started.
+        if not result.done:
+            LOGGER.info("Started %r", result)
         result.iteration = 1
         return result
 

@@ -200,6 +200,13 @@ class ArrowTabular(Tabular[CastOptions]):
 
     _FINAL_TABULAR_IO: ClassVar[bool] = True
 
+    #: ``_read_arrow_table`` returns the holder's *cached* table by
+    #: reference (zero-copy) — shared with this live instance and reused by
+    #: every later read. A consumer must not destroy it (no
+    #: ``to_pandas(self_destruct=True)``), or subsequent reads see freed
+    #: buffers. See :attr:`Tabular._READ_TABLE_OWNED`.
+    _READ_TABLE_OWNED: ClassVar[bool] = False
+
     @classmethod
     def default_media_type(cls) -> Optional[MimeType]:
         # In-memory containers don't claim a wire format; returning

@@ -353,6 +353,140 @@ class TestConcurrentRetry(DeltaTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Optimistic-concurrency rebase / merge-on-conflict
+# ---------------------------------------------------------------------------
+
+
+class TestRebaseOnConflict(DeltaTestCase):
+    """The commit loop rebases a blind append onto an advanced HEAD instead
+    of blindly redoing the write, and reserves
+    :class:`ConcurrentDeltaCommitError` for genuine logical conflicts.
+
+    These drive the rebase against a *real* smuggled rival commit (no
+    network) by intercepting the first ``_commit_atomic`` so the writer is
+    forced onto the rebase path, then letting the second attempt land for
+    real against the advanced log.
+    """
+
+    def _land_rival_append(self, d: DeltaFolder, rows: list[int]) -> None:
+        """Land a concurrent APPEND directly in *d*'s log via a sibling.
+
+        Writes the rival batch to a throwaway DeltaFolder seeded from the
+        same version-0 metadata, then copies its newest commit JSON over —
+        a real AddFile the rebaser must replay and commute past.
+        """
+        import shutil
+        rival = self.delta_io(f"rival_{rows[0]}")
+        # Seed identical schema/version so the smuggled commit slots in.
+        rival.write_arrow_table(self.pa.table({"id": [0]}))  # v0
+        rival.write_arrow_batches(
+            self.pa.table({"id": rows}).to_batches(),
+            options=DeltaOptions(mode=Mode.APPEND),
+        )  # v1
+        # The smuggled commit is the rival's v1 only — copy just the parquet
+        # that commit adds (its AddFile path is table-relative, so it must
+        # physically exist under our root to resolve).
+        import json
+        src_commit = (rival.path / "_delta_log" / f"{1:020d}.json").full_path()
+        with open(src_commit) as fh:
+            for line in fh:
+                obj = json.loads(line)
+                if "add" in obj:
+                    rel = obj["add"]["path"]
+                    shutil.copy((rival.path / rel).full_path(),
+                                (d.path / rel).full_path())
+        head = d.snapshot(fresh=True).version
+        name = f"{head + 1:020d}.json"
+        dst = (d.path / "_delta_log" / name).full_path()
+        shutil.copy(src_commit, dst)
+        d.refresh()
+
+    def test_append_rebases_without_redo(self) -> None:
+        d = self.delta_io("ours")
+        d.write_arrow_table(self.pa.table({"id": [1]}))  # v0
+
+        # Intercept the first commit: simulate "rival grabbed v1 just now"
+        # by smuggling a rival append AND failing our first atomic create.
+        attempts = {"n": 0}
+        orig_commit = d._commit_atomic
+        write_calls = {"n": 0}
+        orig_write = d._write_parts
+
+        def _counting_write(*a, **k):
+            write_calls["n"] += 1
+            return orig_write(*a, **k)
+
+        def _flaky(version, actions):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                # Land the rival at the version we were about to take.
+                self._land_rival_append(d, [10, 11])
+                raise FileExistsError(f"race at v{version}")
+            return orig_commit(version, actions)
+
+        d._commit_atomic = _flaky  # type: ignore[assignment]
+        d._write_parts = _counting_write  # type: ignore[assignment]
+        d.write_arrow_batches(
+            self.pa.table({"id": [2]}).to_batches(),
+            options=DeltaOptions(mode=Mode.APPEND, commit_retry_backoff=0),
+        )
+
+        # Data files were written exactly once — the rebase reused them
+        # rather than re-running the write on the conflict.
+        self.assertEqual(write_calls["n"], 1)
+        snap = d.snapshot(fresh=True)
+        # v0 (ours) + v1 (rival) + v2 (our rebased append).
+        self.assertEqual(snap.version, 2)
+        out = d.read_arrow_table()
+        # No lost writes: ours + rival both present.
+        self.assertEqual(sorted(out.column("id").to_pylist()), [1, 2, 10, 11])
+
+    def test_concurrent_overwrite_raises_logical_conflict(self) -> None:
+        d = self.delta_io("ours_ow")
+        d.write_arrow_table(self.pa.table({"id": [1, 2, 3]}))  # v0
+
+        attempts = {"n": 0}
+        orig_commit = d._commit_atomic
+
+        def _flaky(version, actions):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                self._land_rival_append(d, [10])
+                raise FileExistsError(f"race at v{version}")
+            return orig_commit(version, actions)
+
+        d._commit_atomic = _flaky  # type: ignore[assignment]
+        with self.assertRaises(ConcurrentDeltaCommitError) as ctx:
+            d.write_arrow_batches(
+                self.pa.table({"id": [99]}).to_batches(),
+                options=DeltaOptions(mode=Mode.OVERWRITE, commit_retry_backoff=0),
+            )
+        self.assertEqual(ctx.exception.conflict, "overwrite-vs-concurrent-write")
+
+    def test_exhaustion_raises_concurrent_commit_error(self) -> None:
+        d = self.delta_io("exhaust")
+        d.write_arrow_table(self.pa.table({"id": [1]}))
+
+        attempts = {"n": 0}
+
+        def always_race(version, actions):
+            attempts["n"] += 1
+            raise FileExistsError(f"race at v{version}")
+
+        d._commit_atomic = always_race  # type: ignore[assignment]
+        with self.assertRaises(ConcurrentDeltaCommitError) as ctx:
+            d.write_arrow_batches(
+                self.pa.table({"id": [2]}).to_batches(),
+                options=DeltaOptions(
+                    mode=Mode.APPEND, commit_max_retries=2,
+                    commit_retry_backoff=0, commit_retry_jitter=0),
+            )
+        # 1 initial + 2 retries; exhaustion carries no logical conflict.
+        self.assertEqual(attempts["n"], 3)
+        self.assertIsNone(ctx.exception.conflict)
+
+
+# ---------------------------------------------------------------------------
 # Unsigned integer reinterpretation
 # ---------------------------------------------------------------------------
 

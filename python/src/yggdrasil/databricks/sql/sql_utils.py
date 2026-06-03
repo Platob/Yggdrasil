@@ -293,6 +293,65 @@ def quote_principal(name: str) -> str:
     return quote_ident(str(name).strip())
 
 
+def requalify_table_refs(
+    text: str,
+    *,
+    source: tuple[str | None, str | None],
+    target: tuple[str | None, str | None],
+) -> str:
+    """Rewrite ``catalog.schema`` table-reference prefixes in SQL *text*.
+
+    Used when cloning a **view** to a new schema: the source's stored
+    ``view_definition`` keeps pointing at the source catalog/schema, so the
+    clone must re-point the inner query at the target. *source* / *target*
+    are ``(catalog, schema)`` tuples.
+
+    Rewrites, on identifier boundaries (so a longer name that merely contains
+    the catalog/schema as a substring is left alone), both quoting styles:
+
+    - a 3-part prefix ``<src_cat>.<src_sch>.`` → ```​`tgt_cat`.`tgt_sch`.``​``
+    - a bare 2-part prefix ``<src_sch>.`` (catalog implied by the view's home)
+      → ```​`tgt_sch`.``​`` — but never the ``<src_sch>`` segment of a
+      *different* catalog's 3-part name (it's guarded by the leading-boundary
+      lookbehind, which rejects a preceding ``.`` / backtick).
+
+    Returns *text* unchanged when ``source == target`` (or either is missing
+    a schema). This is deliberately textual — it does not parse the SQL — so
+    it preserves the definition verbatim apart from the requalified prefixes.
+    """
+    src_cat, src_sch = source
+    tgt_cat, tgt_sch = target
+    if not text or not src_sch or not tgt_sch:
+        return text
+    if (src_cat, src_sch) == (tgt_cat, tgt_sch):
+        return text
+
+    def _part(name: str) -> str:
+        # Match the name backticked or bare, exactly.
+        esc = re.escape(name)
+        return r"(?:`%s`|%s)" % (esc, esc)
+
+    # Leading boundary: not part of (or the tail of) a longer / already-
+    # qualified identifier.
+    lb = r"(?<![\w`.])"
+
+    if src_cat is not None and tgt_cat is not None:
+        tgt3 = f"{quote_ident(tgt_cat)}.{quote_ident(tgt_sch)}."
+        text = re.sub(
+            lb + _part(src_cat) + r"\." + _part(src_sch) + r"\.",
+            lambda _m: tgt3,
+            text,
+        )
+
+    tgt2 = f"{quote_ident(tgt_sch)}."
+    text = re.sub(
+        lb + _part(src_sch) + r"\.",
+        lambda _m: tgt2,
+        text,
+    )
+    return text
+
+
 def sql_literal(value: Any) -> str:
     """Convert a Python value into a Databricks SQL literal string."""
     if isinstance(value, (bytes, bytearray, memoryview)):

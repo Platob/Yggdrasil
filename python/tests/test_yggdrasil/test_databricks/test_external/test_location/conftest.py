@@ -2,7 +2,7 @@
 client, plus its in-memory store."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from databricks.sdk.errors import NotFound
@@ -36,16 +36,32 @@ def service(store):
     client.base_url = URL.from_("https://dbc-x.cloud.databricks.com")
     api = client.workspace_client.return_value.external_locations
 
-    # The inner storage path is vended by the location's storage credential:
-    # client.credentials.credential(name).aws_client(region).s3.path(url).
-    # Wire that chain to a fake-backed S3Path so delegation hits an in-memory S3.
+    # The inner storage path is vended by the location's *path* credential
+    # (UC ``generate_temporary_path_credentials`` scoped to the URL — the
+    # only endpoint that works for an external location's STORAGE
+    # credential; the service-credential endpoint rejects it). The resource
+    # builds it via ``AWSDatabricksPathCredentials(url, client=...)
+    # .aws_client(mode, region).s3.path(url)``. Patch the provider's
+    # ``aws_client`` to hand back a fake-backed S3 client so delegation hits
+    # an in-memory S3 without a live workspace round-trip.
     def _s3_path(url):
         bucket = url.split("://", 1)[1].split("/", 1)[0]
         return wire_s3_path(fake, url, bucket=bucket)
 
     aws = MagicMock()
     aws.s3.path.side_effect = _s3_path
-    client.credentials.credential.return_value.aws_client.return_value = aws
+
+    path_cred_calls: list = []
+
+    def _aws_client(self, *, mode=None, region=None):
+        path_cred_calls.append((self.url, mode, region))
+        return aws
+
+    patcher = patch(
+        "yggdrasil.databricks.aws.AWSDatabricksPathCredentials.aws_client",
+        new=_aws_client,
+    )
+    patcher.start()
 
     def _get(name, **k):
         if name not in store:
@@ -69,4 +85,8 @@ def service(store):
     api.delete.side_effect = lambda name, **k: store.pop(name, None)
     svc = ExternalLocations(client=client)
     svc._fake = fake  # the in-memory S3 backing the inner storage paths
-    return svc
+    svc._path_cred_calls = path_cred_calls  # (url, mode, region) per vend
+    try:
+        yield svc
+    finally:
+        patcher.stop()

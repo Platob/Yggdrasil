@@ -665,6 +665,9 @@ class WarehouseStatementResult(StatementResult):
 
     _PREPARED_CLASS = WarehousePreparedStatement
     _FINAL_TABULAR_IO: ClassVar[bool] = True
+    #: A terminal statement's result is immutable, so the registered polars
+    #: IO source is pure — polars may de-duplicate the scan within a plan.
+    _SCAN_IS_PURE: ClassVar[bool] = True
 
     @classmethod
     def default_media_type(cls) -> "MimeType | None":
@@ -1026,16 +1029,55 @@ class WarehouseStatementResult(StatementResult):
         pending: List[pa.RecordBatch] = []
         pending_bytes = 0
         yielded_any = False
-        total_rows = 0
-        total_batches = 0
-        total_bytes = 0
 
-        def fetch_batches(url: str) -> Iterator[pa.RecordBatch]:
-            # ``preload_content=False`` keeps the session's
-            # :class:`MemoryStream` lazy — bytes pull through the
-            # decoder pipeline on demand instead of buffering the full
-            # payload (chunks can run hundreds of MB) up front. We
-            # stream straight into Arrow's IPC reader instead.
+        # Manifest carries every chunk's index + the result totals up
+        # front, so we never walk the ``next_chunk`` linked list (one
+        # serial SDK round-trip per page) to discover what to fetch.
+        manifest = self.manifest
+        total_chunks = (manifest.total_chunk_count if manifest is not None else 0) or 0
+        total_rows = (manifest.total_row_count if manifest is not None else 0) or 0
+        total_bytes = (manifest.total_byte_count if manifest is not None else 0) or 0
+
+        # Presigned URLs the initial result already carried (usually chunk
+        # 0). Key by chunk index — falling back to ``ResultData.chunk_index
+        # + position`` when a link omits its own index — so a pre-resolved
+        # URL is reused instead of re-fetched by ``get_statement_result_chunk_n``.
+        result_data = self.result
+        start_index = (result_data.chunk_index if result_data is not None else 0) or 0
+        preresolved: dict[int, str] = {}
+        for offset, link in enumerate(
+            (result_data.external_links if result_data is not None else None) or []
+        ):
+            if link.external_link:
+                idx = link.chunk_index if link.chunk_index is not None else start_index + offset
+                preresolved[idx] = link.external_link
+
+        statement_execution = self.client.workspace_client().statement_execution
+
+        def fetch_chunk(chunk_index: int) -> "List[pa.RecordBatch]":
+            # Resolve this chunk's presigned URL — in the worker thread, so
+            # resolution for many chunks overlaps — unless the initial
+            # result already carried it. Each ``get_statement_result_chunk_n``
+            # is independent per index, so this no longer serializes on the
+            # linked list.
+            url = preresolved.get(chunk_index)
+            if url is None:
+                data = statement_execution.get_statement_result_chunk_n(
+                    statement_id=self.statement_id, chunk_index=chunk_index,
+                )
+                for link in (data.external_links or []):
+                    if link.external_link and (url is None or link.chunk_index == chunk_index):
+                        url = link.external_link
+                        if link.chunk_index == chunk_index:
+                            break
+            if not url:
+                return []
+
+            # Download + decode the whole chunk *here*, in the worker, so N
+            # chunks transfer concurrently. ``preload_content=False`` streams
+            # the body through Arrow's IPC reader; ``read_all`` materializes
+            # the chunk into Arrow-owned buffers (independent of the HTTP
+            # response, which we then drain + release).
             resp = http.fetch(
                 "GET", url,
                 preload_content=False,
@@ -1045,14 +1087,10 @@ class WarehouseStatementResult(StatementResult):
                 if resp.status >= 400:
                     raise RuntimeError(f"GET {url} failed: {resp.status}")
                 with pa.input_stream(resp) as src:
-                    reader = pipc.open_stream(src)
-                    for batch in reader:
-                        yield batch
+                    return pipc.open_stream(src).read_all().to_batches()
             finally:
-                # Drain anything Arrow didn't consume so the connection
-                # can return to the session's idle cache cleanly;
-                # ``release_conn`` alone won't recycle a partially-read
-                # response.
+                # Drain anything left so the connection recycles cleanly;
+                # ``release_conn`` alone won't recycle a partially-read body.
                 try:
                     resp.drain_conn()
                 except Exception:
@@ -1060,15 +1098,11 @@ class WarehouseStatementResult(StatementResult):
                 resp.release_conn()
 
         def jobs() -> Iterable[Job]:
-            nonlocal total_rows, total_batches, total_bytes
-
-            for link in self.external_links():
-                if link.external_link:
-                    if logger.isEnabledFor(logging.INFO):
-                        total_batches += 1
-                        total_rows += link.row_count or 0
-                        total_bytes += link.byte_count or 0
-                    yield Job.make(fetch_batches, link.external_link)
+            # Manifest chunk count is authoritative; fall back to whatever
+            # the initial result carried for API shapes that omit it.
+            indices = range(total_chunks) if total_chunks else sorted(preresolved)
+            for chunk_index in indices:
+                yield Job.make(fetch_chunk, chunk_index)
 
         def raw_batches() -> Iterator[pa.RecordBatch]:
             with JobPoolExecutor.from_(max_workers) as ex:
@@ -1112,12 +1146,17 @@ class WarehouseStatementResult(StatementResult):
             yield from _empty_arrow_batches(options.target.to_arrow_schema())
         else:
             logger.info(
-                "Statement %r streamed %d batches / %d rows / %d bytes",
-                self, total_batches, total_rows, total_bytes,
+                "Statement %r streamed %d chunks / %d rows / %d bytes",
+                self, total_chunks, total_rows, total_bytes,
             )
 
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: CastOptions) -> None:
         raise NotImplementedError("Cannot write to Databricks SQL")
+
+    # ``scan_polars_frame`` is the generic, pure-lazy, re-collectable,
+    # pushdown-aware IO-plugin scan on :class:`Tabular` — backed here by the
+    # parallel external-link streaming :meth:`_read_arrow_batches`, with
+    # ``_SCAN_IS_PURE = True`` (a terminal result is immutable).
 
 
 # ---------------------------------------------------------------------------

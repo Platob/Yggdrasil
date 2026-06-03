@@ -171,6 +171,77 @@ class TestFolderOps:
         assert missing.exists() is False
 
 
+class TestDeletionCentralization:
+    """``remove`` / ``unlink`` / ``rm`` and whole-asset ``delete`` all route
+    through the single ``_delete`` primitive (path-removal mode)."""
+
+    def test_unlink_removes_file(self, tmp_path):
+        f = LocalPath(str(tmp_path / "f.txt"))
+        f.touch()
+        f.unlink()
+        assert f.exists() is False
+
+    def test_unlink_refuses_directory(self, tmp_path):
+        d = LocalPath(str(tmp_path / "d"))
+        d.mkdir()
+        (LocalPath(str(tmp_path / "d" / "c.txt"))).touch()
+        with pytest.raises(IsADirectoryError):
+            d.unlink()
+        assert d.exists() is True  # untouched
+
+    def test_remove_recursive_directory(self, tmp_path):
+        d = LocalPath(str(tmp_path / "tree"))
+        d.mkdir()
+        LocalPath(str(tmp_path / "tree" / "a.txt")).touch()
+        LocalPath(str(tmp_path / "tree" / "b.txt")).touch()
+        d.remove(recursive=True)
+        assert d.exists() is False
+
+    def test_rm_is_remove(self):
+        assert Path.rm is Path.remove
+
+    def test_delete_no_predicate_removes_leaf(self, tmp_path):
+        # Whole-asset delete (no predicate) converges with path removal.
+        f = LocalPath(str(tmp_path / "g.bin"))
+        f.write_bytes(b"data")
+        f.delete()
+        assert f.exists() is False
+
+    def test_remove_routes_through_delete_remove_path(self, tmp_path, monkeypatch):
+        f = LocalPath(str(tmp_path / "h.txt"))
+        f.touch()
+        seen = {}
+        orig = LocalPath._delete
+
+        def spy(self, predicate=None, **kw):
+            seen.update(kw)
+            return orig(self, predicate, **kw)
+
+        monkeypatch.setattr(LocalPath, "_delete", spy)
+        f.remove()
+        assert seen.get("remove_path") is True
+
+    def test_unlink_routes_through_delete_files_only(self, tmp_path, monkeypatch):
+        f = LocalPath(str(tmp_path / "i.txt"))
+        f.touch()
+        seen = {}
+        orig = LocalPath._delete
+
+        def spy(self, predicate=None, **kw):
+            seen.update(kw)
+            return orig(self, predicate, **kw)
+
+        monkeypatch.setattr(LocalPath, "_delete", spy)
+        f.unlink()
+        assert seen.get("remove_path") is True
+        assert seen.get("files_only") is True
+
+    def test_missing_ok_false_raises(self, tmp_path):
+        missing = LocalPath(str(tmp_path / "nope.txt"))
+        with pytest.raises(FileNotFoundError):
+            missing.remove(missing_ok=False)
+
+
 # ---------------------------------------------------------------------------
 # TestTransfer — Path-to-Path byte copy
 # ---------------------------------------------------------------------------

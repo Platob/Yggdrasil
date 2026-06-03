@@ -9,6 +9,12 @@ Catalog's temporary-credentials APIs:
 - :class:`AWSDatabricksTableCredentials` — vended through
   ``temporary_table_credentials.generate_temporary_table_credentials``,
   scoped to a table id.
+- :class:`AWSDatabricksPathCredentials` — vended through
+  ``temporary_path_credentials.generate_temporary_path_credentials``,
+  scoped to a storage URL. This is the only endpoint that vends
+  creds for an external location's **storage** credential (the
+  service-credential endpoint rejects those), so it backs
+  :class:`~yggdrasil.databricks.external.location.resource.ExternalLocation`.
 
 Each provider is a process-wide singleton per resource id and
 handles **both read and write modes internally** —
@@ -36,7 +42,9 @@ from yggdrasil.aws.provider import AwsCredentialsProvider
 from yggdrasil.enums import Mode, ModeLike
 
 if TYPE_CHECKING:
-    from databricks.sdk.service.catalog import TableOperation, VolumeOperation
+    from databricks.sdk.service.catalog import (
+        PathOperation, TableOperation, VolumeOperation,
+    )
 
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.client import DatabricksClient
@@ -45,6 +53,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AWSDatabricksVolumeCredentials",
     "AWSDatabricksTableCredentials",
+    "AWSDatabricksPathCredentials",
 ]
 
 
@@ -432,6 +441,84 @@ class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
             self.workspace.temporary_table_credentials
             .generate_temporary_table_credentials(
                 table_id=self.table_id,
+                operation=operation,
+            )
+        )
+
+
+class AWSDatabricksPathCredentials(_DatabricksCredentialsBase):
+    """Refreshable AWS creds for a Unity Catalog storage URL.
+
+    Singleton-cached per ``url``. Vends through
+    ``temporary_path_credentials.generate_temporary_path_credentials``,
+    which — unlike the service-credential endpoint — works for the
+    **storage** credential backing an external location. One provider
+    serves read (``PATH_READ``) and write (``PATH_READ_WRITE``) modes;
+    the requested mode resolves at :meth:`get_credentials` /
+    :meth:`aws_client` time.
+
+    The URL is normalised to a directory prefix (trailing ``/``) so
+    every key under the same external-location prefix collapses to one
+    provider, one refresh cycle, and one boto session.
+    """
+
+    _RESOURCE_NAME = "url"
+
+    @staticmethod
+    def _normalize(url: str) -> str:
+        # UC vends per-prefix; a trailing slash keeps siblings on one
+        # provider and matches how the location addresses its base.
+        text = str(url)
+        return text if text.endswith("/") else text + "/"
+
+    def __new__(
+        cls,
+        url: str,
+        *,
+        client: Any = None,
+    ) -> "AWSDatabricksPathCredentials":
+        return super().__new__(cls, cls._normalize(url))
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        client: Any = None,
+    ) -> None:
+        if getattr(self, "_initialized", False):
+            if client is not None:
+                self._client = client
+            return
+        normalized = self._normalize(url)
+        super().__init__(normalized, client=client)
+        self.url: str = normalized
+
+    def __getnewargs__(self):
+        return (self.url,)
+
+    def __getstate__(self):
+        return {"url": self.url}
+
+    def __setstate__(self, state):
+        if getattr(self, "_initialized", False):
+            return
+        url = self._normalize(state["url"])
+        super().__setstate__({"key": url})
+        self.url = url
+        self._client = None
+        self._client_cache = {}
+
+    def _operation_for(self, mode: Mode) -> "PathOperation":
+        from databricks.sdk.service.catalog import PathOperation
+        if mode is Mode.READ_ONLY:
+            return PathOperation.PATH_READ
+        return PathOperation.PATH_READ_WRITE
+
+    def _generate(self, operation: "PathOperation") -> Any:
+        return (
+            self.workspace.temporary_path_credentials
+            .generate_temporary_path_credentials(
+                url=self.url,
                 operation=operation,
             )
         )

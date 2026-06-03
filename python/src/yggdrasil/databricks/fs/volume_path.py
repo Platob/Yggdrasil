@@ -1053,10 +1053,13 @@ class VolumePath(DatabricksPath):
             "Creating volume directory %r (parents=%s, exist_ok=%s)",
             self, parents, exist_ok,
         )
-        # Cluster fast path — mkdir on the kernel mount. The mount
-        # auto-materializes intermediate UC volume directories the
-        # same way the Files API does, so ``parents=True`` maps
-        # cleanly onto ``os.makedirs``.
+        # Cluster fast path — mkdir on the kernel mount. The mount only
+        # materializes directories *inside* an already-existing UC volume;
+        # it can't create the volume securable itself (that's a catalog
+        # object, not a plain directory). So when ``os.makedirs`` fails
+        # against a missing volume, recover exactly like the Files-API path:
+        # ``Volume.ensure_created`` (volume + any missing catalog/schema),
+        # then retry the mkdir off the now-present mount.
         if _local_mount_available():
             api_path = self.api_path
             try:
@@ -1067,6 +1070,17 @@ class VolumePath(DatabricksPath):
             except FileExistsError:
                 if not exist_ok:
                     raise
+            except OSError as exc:
+                if self._split_volume() is None:
+                    raise
+                logger.debug(
+                    "mkdir via kernel mount %r failed (%r) — ensuring volume "
+                    "exists, then retrying", api_path, exc,
+                )
+                self.volume.ensure_created()
+                self._retry_until_volume_visible(
+                    lambda: os.makedirs(api_path, exist_ok=True)
+                )
             self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
             logger.debug("mkdir via kernel mount: %r", api_path)
             return

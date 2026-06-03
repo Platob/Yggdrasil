@@ -26,12 +26,27 @@ def test_lazy_info_single_fetch(service):
 
 def test_path_is_a_credential_backed_s3path(service):
     from yggdrasil.aws.fs.path import S3Path
+    from yggdrasil.enums import Mode
 
     p = service.get("raw_zone").path
     assert isinstance(p, S3Path)
     assert p.bucket == "my-bucket" and p.key == "raw/"
-    # built via the storage credential's AWS client.
-    service.client.credentials.credential.assert_called_with("prod-cred")
+    # Built via the URL-scoped path-credentials provider (not the storage
+    # credential's service endpoint). A writable location vends a non-read
+    # mode (resolves to PATH_READ_WRITE) for the location's URL.
+    assert service._path_cred_calls, "path-credentials provider was not used"
+    url, mode, _region = service._path_cred_calls[-1]
+    assert url == "s3://my-bucket/raw/"
+    assert mode is Mode.OVERWRITE  # writable location
+
+
+def test_read_only_location_vends_read_mode(service):
+    from yggdrasil.enums import Mode
+
+    _ = service.get("ro_zone").path
+    url, mode, _region = service._path_cred_calls[-1]
+    assert url == "s3://other/ro/"
+    assert mode is Mode.READ_ONLY  # read-only location
 
 
 def test_filesystem_ops_mirror_to_inner_path(service):

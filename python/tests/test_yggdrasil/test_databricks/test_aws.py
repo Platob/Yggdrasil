@@ -428,3 +428,57 @@ class TestExternalUseSchemaSelfGrant:
         with pytest.raises(PermissionDenied):
             p.get_credentials()
         client.schemas.schema.assert_not_called()
+
+
+# ===========================================================================
+# Path provider — UC ``generate_temporary_path_credentials`` scoped to a URL
+# ===========================================================================
+
+
+def _path_client(creds=None):
+    client = MagicMock()
+    ws = client.workspace_client.return_value
+    gen = ws.temporary_path_credentials.generate_temporary_path_credentials
+    gen.return_value = creds or _aws_creds_response()
+    return client, gen
+
+
+class TestPathCredentials:
+    def test_url_normalized_to_trailing_slash(self) -> None:
+        from yggdrasil.databricks.aws import AWSDatabricksPathCredentials
+        client, _ = _path_client()
+        p = AWSDatabricksPathCredentials("s3://b/p", client=client)
+        assert p.url == "s3://b/p/"
+        assert p.key == "s3://b/p/"
+
+    def test_same_url_collapses_to_one_instance(self) -> None:
+        from yggdrasil.databricks.aws import AWSDatabricksPathCredentials
+        client, _ = _path_client()
+        a = AWSDatabricksPathCredentials("s3://b/p", client=client)
+        b = AWSDatabricksPathCredentials("s3://b/p/", client=client)
+        assert a is b  # trailing slash normalises to one key
+
+    def test_read_mode_hits_path_read(self) -> None:
+        from yggdrasil.databricks.aws import AWSDatabricksPathCredentials
+        from yggdrasil.enums import Mode
+        client, gen = _path_client()
+        p = AWSDatabricksPathCredentials("s3://b/p/", client=client)
+        p.get_credentials(Mode.READ_ONLY)
+        _, kwargs = gen.call_args
+        assert _op_token(kwargs["operation"]) == "PATH_READ"
+        assert kwargs["url"] == "s3://b/p/"
+
+    def test_write_mode_hits_path_read_write(self) -> None:
+        from yggdrasil.databricks.aws import AWSDatabricksPathCredentials
+        from yggdrasil.enums import Mode
+        client, gen = _path_client()
+        p = AWSDatabricksPathCredentials("s3://b/p/", client=client)
+        p.get_credentials(Mode.OVERWRITE)
+        _, kwargs = gen.call_args
+        assert _op_token(kwargs["operation"]) == "PATH_READ_WRITE"
+
+    def test_pickle_round_trip_returns_singleton(self) -> None:
+        from yggdrasil.databricks.aws import AWSDatabricksPathCredentials
+        client, _ = _path_client()
+        p = AWSDatabricksPathCredentials("s3://b/p/", client=client)
+        assert pickle.loads(pickle.dumps(p)) is p
