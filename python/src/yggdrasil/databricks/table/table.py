@@ -49,6 +49,7 @@ from yggdrasil.databricks.path import DatabricksPath
 from yggdrasil.databricks.sql.sql_utils import (
     MAX_TABLE_NAME_LEN,
     quote_ident,
+    quote_principal,
     quote_qualified_ident,
     requalify_table_refs,
     safe_table_name,
@@ -1495,6 +1496,31 @@ class Table(DatabricksPath):
         """Upstream dependencies declared by a view (cached only)."""
         cached = self._infos
         return cached.view_dependencies if cached is not None else None
+
+    @property
+    def owner(self) -> Optional[str]:
+        """The table's Unity Catalog owner principal (user / group / SP).
+
+        Resolves ``infos`` (a remote read if not cached), mirroring
+        :attr:`Catalog.owner` / :attr:`Schema.owner`. Assigning re-owners the
+        securable via ``ALTER TABLE|VIEW … OWNER TO``.
+        """
+        return self.infos.owner
+
+    @owner.setter
+    def owner(self, principal: str) -> None:
+        if not principal:
+            raise ValueError("owner must be a non-empty principal name")
+        # ALTER VIEW for view-shaped securables, ALTER TABLE otherwise — resolve
+        # ``infos`` so the keyword is correct even on a never-inspected handle.
+        keyword = "VIEW" if self.infos.table_type in _VIEW_TABLE_TYPES else "TABLE"
+        logger.debug("Re-owning %s %r → %s", keyword, self, principal)
+        self.sql.execute(
+            f"ALTER {keyword} {self.full_name(safe=True)} "
+            f"OWNER TO {quote_principal(principal)}"
+        )
+        # Drop the cached infos so a follow-up ``owner`` read re-fetches.
+        self.invalidate_singleton(remove_global=True)
 
     # ── view name aliases — old ``view_name`` callers stay working ───────────
 
