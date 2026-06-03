@@ -348,3 +348,61 @@ class TestWheel:
         assert fake_job.exists(), "console script not installed by the wheel"
         out = subprocess.run([str(fake_job)], check=True, capture_output=True, text=True)
         assert _MARKER in out.stdout
+
+
+# --------------------------------------------------------------------------- #
+# editable detection + per-user pypi folder
+# --------------------------------------------------------------------------- #
+class TestEditableAndUserPypi:
+    def test_is_editable_install_reads_direct_url(self):
+        dist = MagicMock()
+        dist.read_text.return_value = '{"url": "file:///x", "dir_info": {"editable": true}}'
+        with patch("yggdrasil.databricks.job.wheel.ilmd.distribution", return_value=dist):
+            assert wheel.is_editable_install("anything") is True
+
+    def test_is_editable_install_false_for_regular(self):
+        dist = MagicMock()
+        dist.read_text.return_value = None
+        dist.files = []
+        with patch("yggdrasil.databricks.job.wheel.ilmd.distribution", return_value=dist):
+            assert wheel.is_editable_install("anything") is False
+
+    def test_is_editable_install_missing_dist(self):
+        import importlib.metadata as ilmd
+        with patch(
+            "yggdrasil.databricks.job.wheel.ilmd.distribution",
+            side_effect=ilmd.PackageNotFoundError,
+        ):
+            assert wheel.is_editable_install("nope") is False
+
+    def test_user_pypi_dir_uses_current_user(self):
+        client = MagicMock()
+        client.workspace_client.return_value.current_user.me.return_value.user_name = "me@x.io"
+        assert wheel.user_pypi_dir(client) == "/Workspace/Users/me@x.io/pypi"
+
+
+def test_synthesize_descends_when_finder_gives_project_root(tmp_path):
+    # Editable finders can surface a package with __file__=None and __path__ set
+    # to the *project root* (no __init__ there) — synthesize must descend into the
+    # package dir so the build doesn't double-nest (pkg/pkg/__init__.py).
+    import sys
+    import types
+
+    root = tmp_path / "proj"
+    (root / "demo").mkdir(parents=True)
+    (root / "demo" / "__init__.py").write_text("# pkg\n")
+    (root / "demo" / "mod.py").write_text("x = 1\n")
+    fake = types.ModuleType("demo")
+    fake.__file__ = None
+    fake.__path__ = [str(root)]                       # project ROOT, not the pkg dir
+    sys.modules["demo"] = fake                         # so import_module('demo') finds it
+    meta = {"Name": "demo", "Version": "0.0.1"}
+    try:
+        with patch("yggdrasil.databricks.job.wheel.ilmd.metadata", return_value=meta), \
+             patch("yggdrasil.databricks.job.wheel.ilmd.requires", return_value=[]), \
+             patch("yggdrasil.databricks.job.wheel.ilmd.entry_points", return_value=[]):
+            proj = wheel.synthesize_project("demo", dest_dir=str(tmp_path / "out"))
+    finally:
+        sys.modules.pop("demo", None)
+    assert (proj / "demo" / "__init__.py").exists()    # single-nested
+    assert not (proj / "demo" / "demo").exists()       # not double-nested

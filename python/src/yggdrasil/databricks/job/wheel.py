@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata as ilmd
+import json
 import logging
 import re
 import shutil
@@ -31,6 +32,8 @@ __all__ = [
     "WORKSPACE_WHL_DIR",
     "SERVERLESS_ENVIRONMENT_VERSION",
     "serverless_environment_version",
+    "is_editable_install",
+    "user_pypi_dir",
     "synthesize_project",
     "build_wheel",
     "upload_wheel",
@@ -73,6 +76,43 @@ def serverless_environment_version() -> str:
     if minor == 11:
         return "2"
     return SERVERLESS_ENVIRONMENT_VERSION
+
+
+def is_editable_install(dist: str) -> bool:
+    """True when *dist* is installed in **editable / development** mode (``pip``
+    or ``uv pip install -e``).
+
+    Editable installs change under a fixed version, so their built wheel is sent
+    to a per-user folder (:func:`user_pypi_dir`) and rebuilt on every deploy —
+    rather than cached+shared in the workspace registry, where a stale build for
+    the same version would shadow fresh code. The signal is ``direct_url.json``'s
+    ``dir_info.editable`` (written by pip/uv for ``-e`` installs); an
+    ``__editable__`` finder/``.pth`` is the fallback."""
+    try:
+        d = ilmd.distribution(dist)
+    except ilmd.PackageNotFoundError:
+        return False
+    raw = d.read_text("direct_url.json")
+    if raw:
+        try:
+            info = json.loads(raw)
+        except ValueError:
+            info = {}
+        dir_info = info.get("dir_info")
+        if isinstance(dir_info, dict) and dir_info.get("editable"):
+            return True
+    for f in d.files or []:
+        if f.name.startswith("__editable__"):
+            return True
+    return False
+
+
+def user_pypi_dir(client: Any) -> str:
+    """The current user's private PyPI-like wheel folder
+    (``/Workspace/Users/<me>/pypi``) — where **editable / dev** builds land so a
+    developer's iterations don't collide with others in the shared registry."""
+    user = client.workspace_client().current_user.me().user_name
+    return f"/Workspace/Users/{user}/pypi"
 
 
 def _norm(name: str) -> str:
@@ -155,7 +195,27 @@ def synthesize_project(
             raise
         package, dist = packages[0], name
         module = importlib.import_module(package)
-    pkg_dir = Path(module.__file__).resolve().parent
+    # A regular package exposes ``__file__`` (its ``__init__``); an editable /
+    # namespace package served by a finder may not — fall back to the ``__path__``
+    # entry that actually holds the package's ``__init__`` (an editable finder can
+    # also surface the *project root*, whose basename matches — copying that would
+    # double-nest the package, so the ``__init__`` check is what disambiguates).
+    pkg_file = getattr(module, "__file__", None)
+    if pkg_file:
+        pkg_dir = Path(pkg_file).resolve().parent
+    else:
+        candidates = [Path(p).resolve() for p in getattr(module, "__path__", []) or []]
+        pkg_dir = next(
+            (p for p in candidates if (p / "__init__.py").exists()),
+            candidates[0] if candidates else None,
+        )
+        if pkg_dir is None:
+            raise ModuleNotFoundError(f"cannot locate on-disk files for package {package!r}")
+    # An editable finder can hand back the *project root* (no ``__init__`` here, but
+    # ``<root>/<package>/__init__.py`` one level down) — descend so the copy below
+    # doesn't double-nest the package (``pkg/pkg/__init__.py``).
+    if not (pkg_dir / "__init__.py").exists() and (pkg_dir / package / "__init__.py").exists():
+        pkg_dir = pkg_dir / package
     meta = ilmd.metadata(dist)
 
     out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-synth-"))

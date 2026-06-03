@@ -125,6 +125,7 @@ Documentation = "https://platob.github.io/Yggdrasil/"
 
 [project.scripts]
 ygg = "yggdrasil.cli.main:main"
+ygg-run = "yggdrasil.databricks.job.runner:main"
 
 # ── setuptools ────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
