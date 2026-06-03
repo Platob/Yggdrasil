@@ -7,9 +7,14 @@
 # Jobs
 # ----
 #   detect             → reads version, checks ygg on PyPI, decides
-#   build-python       → sdist + pure-Python wheel (uv / setuptools)
+#   build-python       → sdist + pure-Python wheel (uv / setuptools), plus
+#                        the serverless environment spec pairing the wheel
+#                        with the py3.12 Databricks serverless env version
+#                        (scripts/build_serverless_env.py → environments/ygg/)
 #   publish-python     → uploads ygg dist to PyPI
-#   tag                → creates vX.Y.Z git tag + GitHub Release
+#   tag                → creates vX.Y.Z git tag + GitHub Release (dist +
+#                        serverless env spec), commits the spec to
+#                        environments/ygg/
 #   cleanup-previous   → opt-in: removes previous tag/release on
 #                        ``!cleanup-prev-release`` commit marker
 #   skip               → summary when publish is intentionally skipped
@@ -219,11 +224,30 @@ jobs:
       - name: Verify dist contents
         run: ls -lh dist/
 
+      # Alongside the wheel, generate the serverless environment spec that
+      # pairs this version's wheel with the Databricks serverless environment
+      # version whose Python is 3.12 — written to environments/ygg/. Stdlib
+      # only, so no install is required here.
+      - name: Generate serverless environment spec
+        run: python scripts/build_serverless_env.py --version "${{ needs.detect.outputs.version }}" --python 3.12
+
+      - name: Verify serverless environment spec
+        working-directory: ${{ github.workspace }}
+        run: cat "environments/ygg/ygg-${{ needs.detect.outputs.version }}-py3.12-serverless.yml"
+
       - name: Upload python dist artifacts
         uses: actions/upload-artifact@v4
         with:
           name: python-dist-${{ needs.detect.outputs.version }}
           path: python/dist/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload serverless environment spec
+        uses: actions/upload-artifact@v4
+        with:
+          name: serverless-env-${{ needs.detect.outputs.version }}
+          path: environments/ygg/ygg-${{ needs.detect.outputs.version }}-py3.12-serverless.yml
           retention-days: 7
           if-no-files-found: error
 
@@ -321,6 +345,12 @@ jobs:
           name: python-dist-${{ needs.detect.outputs.version }}
           path: release/
 
+      - name: Download serverless environment spec
+        uses: actions/download-artifact@v4
+        with:
+          name: serverless-env-${{ needs.detect.outputs.version }}
+          path: release/
+
       - name: List release assets
         run: ls -lh release/
 
@@ -334,6 +364,32 @@ jobs:
             --title "Release ${TAG}" \
             --generate-notes \
             --verify-tag
+
+      # Commit the generated serverless env spec back into environments/ygg/
+      # so the repo carries a per-version catalog. Runs after the Release is
+      # cut so a push race never blocks publishing — a non-fast-forward push
+      # only warns. The publish trigger's path filter excludes environments/**,
+      # so this push does not re-run the workflow.
+      - name: Commit serverless environment spec to environments/ygg
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          SPEC="environments/ygg/ygg-${VERSION}-py3.12-serverless.yml"
+          mkdir -p "environments/ygg"
+          cp "release/ygg-${VERSION}-py3.12-serverless.yml" "$SPEC"
+          if git diff --quiet -- "$SPEC"; then
+            echo "ℹ️  $SPEC already up to date — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$SPEC"
+          git commit -m "chore(environments): add serverless env spec for ygg ${VERSION}"
+          if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+            echo "📦 Committed $SPEC to ${GITHUB_REF_NAME}"
+          else
+            echo "::warning ::Could not push $SPEC to ${GITHUB_REF_NAME} (branch moved?); the spec is still attached to the Release."
+          fi
 
       - name: Write release summary
         env:
