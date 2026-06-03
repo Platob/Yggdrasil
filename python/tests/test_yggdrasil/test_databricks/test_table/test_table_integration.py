@@ -17,7 +17,7 @@ that only meaningfully exercises against a live Unity Catalog endpoint:
 - :meth:`Table.rename` / :meth:`Table.clone` round-trips.
 - View shape — :meth:`Table.create_view`, :attr:`Table.is_view`,
   :attr:`Table.view_definition`, view rename.
-- Storage-path surface and the async-insert drop → loader round-trip.
+- Storage-path surface.
 
 Skip rules
 ----------
@@ -71,8 +71,6 @@ __all__ = [
     "TestTableCloneIntegration",
     "TestTableViewIntegration",
     "TestTableStoragePathIntegration",
-    "TestTableAsyncInsertIntegration",
-    "TestTableAsyncInsertLogPathIntegration",
     "TestTablePandasIndexIntegration",
 ]
 
@@ -664,17 +662,6 @@ class TestTableStoragePathIntegration(_TableFixture):
             except Exception:
                 pass
 
-    def test_staging_folder_paths_root_under_volume(self) -> None:
-        tmp = self.table.staging_folder(temporary=True)
-        async_path = self.table.staging_folder(async_write=True)
-        self.assertIsInstance(tmp, VolumePath)
-        self.assertIsInstance(async_path, VolumePath)
-        # Folder layout is part of the staging contract.
-        self.assertTrue(tmp.full_path().rstrip("/").endswith(".sql/tmp"))
-        self.assertTrue(async_path.full_path().rstrip("/").endswith(".sql/async/insert"))
-        self.assertTrue(tmp.temporary)
-        self.assertFalse(async_path.temporary)
-
     def test_insert_volume_path_is_unique_per_call(self) -> None:
         a, b = self.table.insert_volume_path(), self.table.insert_volume_path()
         self.assertNotEqual(a.full_path(), b.full_path())
@@ -726,131 +713,6 @@ class TestTableStoragePathIntegration(_TableFixture):
             self._skip(exc, "storage_location unavailable (non-AWS workspace?)")
         self.assertIsNotNone(path)
         self.assertTrue(str(path.full_path()))
-
-
-@pytest.mark.integration
-class TestTableAsyncInsertIntegration(_TableFixture):
-    """``Table.stage_insert`` drop → loader aggregate-load round-trip.
-
-    :meth:`Table.stage_insert` stages the Parquet to the table's tmp path and
-    drops a JSON operation log (no warehouse statement); ``load_async`` then
-    reads the log, builds one aggregated load per ``(target, mode)`` group,
-    loads it, and clears the consumed log + data. The loader is driven directly
-    — the live file-arrival job (``Table.async_job()``) is not exercised here.
-    """
-
-    table_prefix = "yg_async"
-
-    def setUp(self) -> None:
-        super().setUp()
-        # The class table is shared across the async tests — start each from
-        # empty so row-count assertions are order-independent.
-        self.table.insert(_sample_data().slice(0, 0), mode=Mode.OVERWRITE)
-
-    def test_async_overwrite_replaces_rows(self) -> None:
-        from yggdrasil.databricks.table.insert import load_async, logs_path
-
-        try:
-            self.table.insert(_sample_data(), mode=Mode.APPEND)
-        except (DatabricksError, PermissionDenied) as exc:
-            self._skip(exc, "seed insert failed")
-        self.assertEqual(self._count(), 3)
-
-        overwrite_rows = pa.table({
-            "id": pa.array([9], type=pa.int64()),
-            "label": pa.array(["z"], type=pa.string()),
-            "amount": pa.array([9.5], type=pa.float64()),
-        })
-        try:
-            self.table.stage_insert(overwrite_rows, mode=Mode.OVERWRITE)
-        except (DatabricksError, PermissionDenied) as exc:
-            self._skip(exc, "async insert failed")
-
-        load_async(self.client.tables, logs_path(self.table), wait=True)
-        self.assertEqual(self._count(), 1)
-
-    def test_async_rejects_merge_mode(self) -> None:
-        with self.assertRaises(ValueError):
-            self.table.stage_insert(_sample_data(), mode=Mode.MERGE)
-
-    def test_stage_insert_check_job_creates_loader_job(self) -> None:
-        # ``check_job=True`` must get-or-create the file-arrival loader job so
-        # the staged data can be picked up. We verify the job exists, then drive
-        # the load inline (the real scheduled job is never triggered/polled).
-        from yggdrasil.databricks.table.insert import load_async, logs_path
-
-        try:
-            log_path = self.table.stage_insert(
-                _sample_data(), mode=Mode.APPEND, check_job=True,
-            )
-        except (DatabricksError, PermissionDenied) as exc:
-            self._skip(exc, "Cannot stage async insert / create loader job")
-
-        # The loader job exists now — fetch it through the public surface.
-        try:
-            job = self.table.async_job()
-        except (DatabricksError, PermissionDenied) as exc:
-            self._skip(exc, "Test identity cannot create / read jobs")
-        self.assertIsNotNone(job)
-        self.assertTrue(log_path.exists())
-
-        # Drive the load inline to confirm the staged rows actually land —
-        # we never trigger or poll the live scheduled job.
-        load_async(self.client.tables, logs_path(self.table), wait=True)
-        self.assertEqual(self._count(), 3)
-
-
-@pytest.mark.integration
-class TestTableAsyncInsertLogPathIntegration(_TableFixture):
-    """Isolated log-path lifecycle for ``Table.stage_insert`` → ``load_async``.
-
-    Carved out of :class:`TestTableAsyncInsertIntegration` onto its own
-    throw-away table (``yg_async_log``) so the full drop-log →
-    loader-consumes → log+data-cleared round-trip can be iterated on its
-    own — ``pytest ...::TestTableAsyncInsertLogPathIntegration`` boots one
-    table and runs one assertion-dense test, no sibling async cases.
-    """
-
-    table_prefix = "yg_async_log"
-
-    def setUp(self) -> None:
-        super().setUp()
-        # Single-test class, but keep the empty-start invariant so a re-run
-        # after a partial failure (table left with rows) is order-independent.
-        self.table.insert(_sample_data().slice(0, 0), mode=Mode.OVERWRITE)
-
-    def test_async_drop_then_loader_appends(self) -> None:
-        from yggdrasil.databricks.table.insert import (
-            DatabricksTableInsert, load_async, logs_path,
-        )
-
-        try:
-            log_path = self.table.stage_insert(_sample_data(), mode=Mode.APPEND)
-        except (DatabricksError, PermissionDenied) as exc:
-            self._skip(exc, "async insert needs volume write access")
-
-        self.assertTrue(log_path.exists())
-        op = DatabricksTableInsert.from_log(log_path)
-        self.assertEqual(op.target, self.table.full_name())
-        self.assertEqual(op.mode, Mode.APPEND)
-        # the staged Parquet lives exactly where the log's uniform URL says
-        data_path = op.data_path(self.table.client)
-        self.assertTrue(data_path.exists())
-
-        # run the loader: aggregate + load, then clear the consumed log + data
-        processed = load_async(self.client.tables, logs_path(self.table), wait=True)
-        self.assertEqual(processed, 1)
-        self.assertEqual(self._count(), 3)
-        # The loader deletes the log + data through its *own* path handles, so
-        # these producer-side handles still hold a fresh (60s TTL) ``FILE`` stat
-        # from staging them — ``VolumePath`` keeps a per-instance stat cache and
-        # two handles to the same path don't share it. Drop the cached view so
-        # ``exists()`` re-probes the server (the deletion is out-of-band from
-        # these handles' perspective, exactly like the real cross-process job).
-        log_path.invalidate_singleton()
-        data_path.invalidate_singleton()
-        self.assertFalse(log_path.exists())
-        self.assertFalse(data_path.exists())
 
 
 @pytest.mark.integration

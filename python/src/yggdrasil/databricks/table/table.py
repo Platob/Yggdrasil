@@ -103,6 +103,12 @@ _VIEW_TABLE_TYPES: frozenset[TableType] = frozenset({
 # scan/commit better. Matches Delta's default target file size.
 _NATIVE_DELTA_MAX_BYTES: int = 128 * 1024 * 1024
 
+# EXTERNAL Delta tables prefer the direct storage-path write across a much
+# larger range: UC vends READ_WRITE credentials for external tables, so the
+# native DeltaFolder commit avoids a warehouse round-trip. Only very large
+# external tables fall back to the warehouse.
+_NATIVE_DELTA_MAX_BYTES_EXTERNAL: int = 4 * 1024 * 1024 * 1024
+
 
 def _coerce_tag_str(value: Any) -> str:
     """Coerce a tag key/value to a UTF-8 string.
@@ -994,9 +1000,15 @@ class Table(DatabricksPath):
         ``options.engine`` selects explicitly (an :class:`EngineType` or alias);
         ``YGGDRASIL`` on a table that can't take the native path degrades to the
         warehouse rather than erroring. ``None`` **guesses best**: an active
-        Spark session → ``SPARK``; else a small Delta table
-        (``< _NATIVE_DELTA_MAX_BYTES`` on disk) → ``YGGDRASIL``; else →
+        Spark session → ``SPARK``; else a Delta table small enough on disk →
+        ``YGGDRASIL`` (the direct DeltaFolder read/write); else →
         ``DATABRICKS_SQL_WAREHOUSE`` (it parallelises big scans/writes better).
+
+        The native-path size cap depends on the table type: an **EXTERNAL**
+        Delta table (UC vends READ_WRITE credentials for it) prefers the direct
+        storage-path write across a much larger range
+        (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``); a managed table keeps the
+        smaller ``_NATIVE_DELTA_MAX_BYTES`` cap.
         """
         engine = EngineType.from_(getattr(options, "engine", None))
         if engine is not None:
@@ -1007,8 +1019,13 @@ class Table(DatabricksPath):
         if self._has_active_spark(options):
             return EngineType.SPARK
         if self._delta_capable(write=write):
+            cap = (
+                _NATIVE_DELTA_MAX_BYTES_EXTERNAL
+                if self.infos.table_type == TableType.EXTERNAL
+                else _NATIVE_DELTA_MAX_BYTES
+            )
             size = self._delta_total_bytes()
-            if size is not None and size < _NATIVE_DELTA_MAX_BYTES:
+            if size is not None and size < cap:
                 return EngineType.YGGDRASIL
         return EngineType.DATABRICKS_SQL_WAREHOUSE
 
@@ -3035,36 +3052,7 @@ class Table(DatabricksPath):
         return_data: bool = False,
         **kwargs
     ) -> "Tabular | None":
-        """Insert *data* into this table — thin wrapper over :meth:`insert_into`.
-
-        ``wait=False`` switches to the **async drop** path
-        (:func:`~yggdrasil.databricks.table.insert.stage_async_insert`): the
-        staged Parquet + a JSON operation log are written under the table's
-        ``.sql/async`` area and a file-arrival job (:meth:`async_job`)
-        aggregates and loads them later — no warehouse statement runs here.
-        ``OVERWRITE`` / ``APPEND`` (no keys) and ``MERGE`` / ``UPSERT`` (with
-        ``match_by`` keys) qualify; anything else (or a query / Spark source)
-        falls through to the normal synchronous path.
-
-        On the ``wait=False`` path, ``check_job`` (forwarded via ``**kwargs``):
-        if True, get-or-create the async file-arrival loader job for this table
-        so the staged data actually gets picked up — same as calling
-        :meth:`stage_insert` directly.
-        """
-        from yggdrasil.databricks.table.insert import ASYNC_MODES, stage_async_insert
-
-        mode_enum = Mode.from_(mode, default=Mode.APPEND)
-        keyed = mode_enum in (Mode.MERGE, Mode.UPSERT)
-        async_supported = (mode_enum in ASYNC_MODES and not match_by) or (
-            keyed and match_by
-        )
-        if (
-            wait is False
-            and async_supported
-            and not isinstance(data, (PreparedStatement, StatementResult))
-            and not PreparedStatement.looks_like_query(data)
-        ):
-            return stage_async_insert(self, data, mode=mode, match_by=match_by, **kwargs)
+        """Insert *data* into this table — thin wrapper over :meth:`insert_into`."""
         return self.insert_into(
             data,
             mode=mode,
@@ -3080,33 +3068,18 @@ class Table(DatabricksPath):
         self,
         data: Any,
         *,
-        mode: ModeLike = None,
-        match_by: Optional[list[str]] = None,
         cast_options: Optional[CastOptions] = None,
-        check_job: bool = False,
     ) -> VolumePath:
-        """Stage an async insert and return the op-log path — no warehouse run.
+        """Stage *data* as Parquet under this table's staging area; return the
+        :class:`VolumePath` it landed at — no warehouse statement runs.
 
-        Writes *data* as Parquet to this table's staging area and drops a JSON
-        operation log under ``.sql/async/logs``; no SQL statement runs on a
-        warehouse here. The file-arrival loader job (:meth:`async_job`)
-        aggregates the staged logs and loads them into the table later.
-
-        ``check_job``: if True, get-or-create the async file-arrival loader job
-        for this table so the staged data will actually be picked up. Thin
-        wrapper over
-        :func:`~yggdrasil.databricks.table.insert.stage_async_insert`.
+        Mints a fresh staging path via :meth:`insert_volume_path` and writes
+        *data* there with the caller's ``cast_options``. Use this to pre-stage
+        rows for a later load without driving the insert SQL.
         """
-        from yggdrasil.databricks.table.insert import stage_async_insert
-
-        return stage_async_insert(
-            self,
-            data,
-            mode=mode,
-            match_by=match_by,
-            cast_options=cast_options,
-            check_job=check_job,
-        )
+        path = self.insert_volume_path(self, temporary=False)
+        path.write_table(data, cast_options, mode=Mode.OVERWRITE)
+        return path
 
     # =========================================================================
     # insert_into — top-level dispatcher (arrow / spark / sql paths)
@@ -3220,12 +3193,41 @@ class Table(DatabricksPath):
             schema_name=self.schema_name,
         ).volume(value)
 
+    def ensure_staging_volume(self) -> "Volume":
+        """Get-or-create this table's staging :class:`Volume` and return it.
+
+        For an **external** table the staging volume is created *external*
+        too, rooted on the schema's storage location — the segment before
+        ``__unitystorage`` — and keyed by the table's UC id:
+        ``<schema_root>/uc/tables/<table_id>``. That keeps staged Parquet on
+        the same governed external location as the table instead of a
+        fabricated client default location. A managed table keeps the default
+        (managed) create path, materialised lazily on first write.
+
+        Kept off the :attr:`staging_volume` property on purpose — resolving
+        ``infos`` / creating a volume on a bare handle read is too surprising;
+        creation belongs at the staging-folder boundary where a write is
+        actually imminent.
+        """
+        volume = self.staging_volume
+        if self.infos.table_type == TableType.EXTERNAL:
+            root = self.schema_storage_location().split("/__unitystorage")[0].rstrip("/")
+            volume.get_or_create(
+                volume_type="EXTERNAL",
+                storage_location=f"{root}/uc/tables/{self.table_id}",
+            )
+        return volume
+
     def staging_folder(
         self,
         temporary: bool = False,
     ) -> VolumePath:
-        """Return the staging folder for this table."""
-        return self.staging_volume.path(".sql/tmp", temporary=temporary)
+        """Return the staging folder for this table.
+
+        Ensures the staging volume exists first (external for an external
+        table — see :meth:`ensure_staging_volume`).
+        """
+        return self.ensure_staging_volume().path(".sql/tmp", temporary=temporary)
 
     def insert_volume_path(
         self,
@@ -3248,32 +3250,12 @@ class Table(DatabricksPath):
         target = target if target is not None else self
         seed = uuid.uuid4().hex[:8]
         leaf = f"tmp-{int(time.time() * 1000)}-{seed}.parquet"
-        staging_volume = target.staging_volume if staging_volume is None else staging_volume
+        staging_volume = target.ensure_staging_volume() if staging_volume is None else staging_volume
 
         return staging_volume.path(
             f".sql/tmp/{leaf}",
             temporary=temporary,
         )
-
-    # =========================================================================
-    # async insert — drop Parquet + an operation log; a file-arrival job loads
-    # =========================================================================
-
-    def async_job(self, *, rebuild: bool = False) -> Any:
-        """Get-or-create the file-arrival loader job for this table; return it.
-
-        An existing job is returned as-is; otherwise one is created — resolving
-        the full ygg wheel bundle for the current version (reusing an
-        already-deployed bundle when present, else building + uploading it) and
-        upserting a serverless job that watches ``.sql/async/logs`` and
-        aggregates the operation logs ``insert(..., wait=False)`` drops into one
-        load per target (an OVERWRITE supersedes everything staged before it).
-        Pass ``rebuild=True`` to force a redeploy.
-        See :func:`~yggdrasil.databricks.table.insert.ensure_async_job`.
-        """
-        from yggdrasil.databricks.table.insert import ensure_async_job
-
-        return ensure_async_job(self, rebuild=rebuild)
 
     def arrow_insert(
         self,

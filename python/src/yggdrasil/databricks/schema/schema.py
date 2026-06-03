@@ -287,6 +287,12 @@ class UCSchema(DatabricksPath):
         self._infos_ttl = infos_ttl
         self._infos = infos
         self._infos_fetched_at = infos_fetched_at
+        # Tri-state cache of "does the current user hold EXTERNAL USE SCHEMA on
+        # this schema?" — the UC prerequisite for direct cloud-storage access to
+        # external securables under it. ``None`` until first checked, then
+        # ``True`` / ``False``. Cached here because the schema is a singleton,
+        # so one ``grants.get_effective`` answers for the whole process.
+        self._can_use_external = None
         self._initialized = True
 
     # ── Path / Holder primitives — Schema is logical, not byte-shaped ─────────
@@ -509,6 +515,8 @@ class UCSchema(DatabricksPath):
                 pass
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
+        # A delete / rename / explicit clear can change the grant picture too.
+        object.__setattr__(self, "_can_use_external", None)
 
     def clear(self) -> "UCSchema":
         """Public alias for :meth:`_reset_cache`; returns ``self``."""
@@ -1039,6 +1047,56 @@ class UCSchema(DatabricksPath):
             **kwargs,
         )
         return tuple(response.privilege_assignments or ())
+
+    def can_use_external(self, *, refresh: bool = False) -> bool:
+        """True when the current user holds ``EXTERNAL USE SCHEMA`` on this
+        schema (directly or inherited from the catalog / metastore).
+
+        That privilege is Unity Catalog's prerequisite for touching an external
+        securable's backing cloud storage directly — so callers gate a direct
+        storage-path read / write on it and otherwise fall back to the Files
+        API. The result is cached on this (singleton) schema, so a single
+        ``grants.get_effective`` decides for the whole process; ``refresh``
+        forces a re-check. Any lookup failure (no current-user, denied grants
+        read, …) resolves to ``False`` without raising — the safe default is
+        "go through the Files API".
+        """
+        cached = self._can_use_external
+        if cached is not None and not refresh:
+            return cached
+
+        granted = False
+        try:
+            current = self.client.iam.users.current_user
+            principal = (
+                getattr(current, "email", None)
+                or getattr(current, "username", None)
+                or getattr(current, "name", None)
+            )
+            if principal:
+                for assignment in self.effective_permissions(principal=principal):
+                    privileges = assignment.privileges or ()
+                    if Privilege.EXTERNAL_USE_SCHEMA in privileges or any(
+                        getattr(p, "value", str(p)) == Privilege.EXTERNAL_USE_SCHEMA.value
+                        for p in privileges
+                    ):
+                        granted = True
+                        break
+        except Exception as exc:  # no current-user / denied grants read / …
+            logger.debug(
+                "EXTERNAL USE SCHEMA check failed for %r (%s) — assuming no",
+                self, exc,
+            )
+            granted = False
+
+        object.__setattr__(self, "_can_use_external", granted)
+        return granted
+
+    def mark_external_unusable(self) -> None:
+        """Record that direct external-storage access didn't actually work for
+        this schema (e.g. the grant is present but the bucket policy denied the
+        I/O) so callers stop re-trying it and route through the Files API."""
+        object.__setattr__(self, "_can_use_external", False)
 
     def grant(
         self,

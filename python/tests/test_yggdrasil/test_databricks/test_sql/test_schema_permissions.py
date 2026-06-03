@@ -192,6 +192,65 @@ class TestPermissionsRead:
         )
 
 
+class TestCanUseExternal:
+
+    @staticmethod
+    def _current_user(service, *, email="alice@example.com"):
+        service.client.iam.users.current_user = SimpleNamespace(
+            email=email, username=None, name=None,
+        )
+
+    def _effective(self, workspace, privileges):
+        workspace.grants.get_effective.return_value = SimpleNamespace(
+            privilege_assignments=[
+                PrivilegeAssignment(principal="alice@example.com", privileges=privileges),
+            ],
+        )
+
+    def test_granted_when_external_use_schema_present(self, schema, service, workspace) -> None:
+        self._current_user(service)
+        self._effective(workspace, [Privilege.USE_SCHEMA, Privilege.EXTERNAL_USE_SCHEMA])
+        assert schema.can_use_external() is True
+
+    def test_not_granted_when_absent(self, schema, service, workspace) -> None:
+        self._current_user(service)
+        self._effective(workspace, [Privilege.USE_SCHEMA, Privilege.SELECT])
+        assert schema.can_use_external() is False
+
+    def test_result_is_cached(self, schema, service, workspace) -> None:
+        self._current_user(service)
+        self._effective(workspace, [Privilege.EXTERNAL_USE_SCHEMA])
+        assert schema.can_use_external() is True
+        assert schema.can_use_external() is True  # second call hits the cache
+        workspace.grants.get_effective.assert_called_once()
+
+    def test_refresh_re_checks(self, schema, service, workspace) -> None:
+        self._current_user(service)
+        self._effective(workspace, [Privilege.EXTERNAL_USE_SCHEMA])
+        assert schema.can_use_external() is True
+        assert schema.can_use_external(refresh=True) is True
+        assert workspace.grants.get_effective.call_count == 2
+
+    def test_grants_read_failure_returns_false(self, schema, service, workspace) -> None:
+        # A denied / failed grants read → safe default is "no, use the Files API".
+        self._current_user(service)
+        workspace.grants.get_effective.side_effect = RuntimeError("denied")
+        assert schema.can_use_external() is False
+
+    def test_no_usable_principal_returns_false(self, schema, service, workspace) -> None:
+        # current_user resolves to nothing identifiable → no grants lookup, False.
+        service.client.iam.users.current_user = SimpleNamespace(
+            email=None, username=None, name=None,
+        )
+        assert schema.can_use_external() is False
+        workspace.grants.get_effective.assert_not_called()
+
+    def test_mark_external_unusable_pins_false_without_relookup(self, schema, service, workspace) -> None:
+        schema.mark_external_unusable()
+        assert schema.can_use_external() is False
+        workspace.grants.get_effective.assert_not_called()
+
+
 class TestUpdatePermissions:
 
     def test_filters_no_op_changes(self, schema, workspace) -> None:

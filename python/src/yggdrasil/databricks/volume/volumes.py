@@ -28,7 +28,6 @@ share the same TTL-bounded :class:`VolumeInfo` snapshot.
 from __future__ import annotations
 
 import logging
-import re
 from typing import Iterator, Optional
 
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
@@ -38,7 +37,7 @@ from yggdrasil.url import URL
 
 from .volume import Volume
 
-__all__ = ["Volumes", "EXTERNAL_LOCATION_SCHEMES", "external_volume_name"]
+__all__ = ["Volumes", "EXTERNAL_LOCATION_SCHEMES"]
 
 logger = logging.getLogger(__name__)
 
@@ -52,39 +51,6 @@ EXTERNAL_LOCATION_SCHEMES = (
     "gs://", "gcs://",
     "wasbs://", "wasb://",
 )
-
-
-def _xxh_hex(data: str) -> str:
-    """16-hex xxhash64 of *data* (8-hex xxh32 fallback if xxhash is absent)."""
-    try:
-        import xxhash
-
-        return format(xxhash.xxh64_intdigest(data.encode()), "016x")
-    except ImportError:  # pragma: no cover - xxhash is a runtime dep
-        from yggdrasil.node.ids import _xxh32
-
-        return format(_xxh32(data), "08x")
-
-
-def external_volume_name(storage_location: str, *, prefix: str = "ext") -> str:
-    """A deterministic Unity Catalog volume name for a cloud *storage_location*.
-
-    Keeps the **bucket** readable and appends an **xxhash of the path**, so the
-    same location always maps to the same volume while distinct paths within a
-    bucket stay distinct — e.g. ``s3://my-bucket/raw/events`` →
-    ``ext_my_bucket_9f1c2a3b4d5e6f70``. The result is a valid UC identifier
-    (lower-case alphanumerics + underscore, starts with a letter) and well
-    within UC's 255-char identifier limit regardless of how long the path is."""
-    # Hash the whole normalised URI (trailing slashes stripped) so nothing that
-    # distinguishes two locations is lost — e.g. the ``container@`` authority of
-    # an ``abfss://`` URL, which ``url.host`` drops. The bucket/host is kept only
-    # for human readability.
-    normalised = storage_location.rstrip("/")
-    token = _xxh_hex(normalised)
-    bucket = (URL.from_(storage_location).host or "").lower()
-    safe_bucket = re.sub(r"[^0-9a-z]+", "_", bucket).strip("_")
-    name = f"{prefix}_{safe_bucket}_{token}" if safe_bucket else f"{prefix}_{token}"
-    return name[:255]
 
 
 class Volumes(DatabricksService):
@@ -292,13 +258,10 @@ class Volumes(DatabricksService):
         When the first argument (or *storage_location*) is a cloud object-store
         URI (``s3://…`` / ``abfss://…`` / ``gs://…`` — see
         :data:`EXTERNAL_LOCATION_SCHEMES`), returns or creates an **external**
-        volume backed by that location. The volume name is derived
-        deterministically from the bucket + an xxhash of the path
-        (:func:`external_volume_name`) so repeated calls for the same location
-        collapse to the same volume; pass *volume_name* to override it.
-        ``catalog_name`` / ``schema_name`` default to the service scope. (An
-        external location + storage credential covering the URI must already
-        exist in Unity Catalog.)
+        volume backed by that location. ``volume_name`` is required and names
+        the volume explicitly; ``catalog_name`` / ``schema_name`` default to the
+        service scope. (An external location + storage credential covering the
+        URI must already exist in Unity Catalog.)
 
         Otherwise *location* is a 1-/2-/3-part dotted name (``cat.sch.vol``) and
         a **managed** volume is returned, created if absent. Mirrors the
@@ -319,7 +282,12 @@ class Volumes(DatabricksService):
                     "external volume needs a catalog + schema — pass "
                     "catalog_name/schema_name or set defaults on the service."
                 )
-            name = volume_name or external_volume_name(store)
+            if not volume_name:
+                raise ValueError(
+                    "external volume needs an explicit volume_name — pass "
+                    "volume_name=... (no name is derived from the storage URI)."
+                )
+            name = volume_name
             existing = self.find(
                 catalog_name=cat, schema_name=sch, volume_name=name, raise_error=False,
             )

@@ -6,8 +6,6 @@ Subcommands::
     ygg databricks warehouses list/get/create/delete
     ygg databricks job list/get/run/runs/logs/cancel/repair/delete
     ygg databricks fs ls/cat/write/put/get/mkdir/rm/stat/cp/mv  (Workspace/Volumes/DBFS)
-    ygg databricks table async_insert --table-name … --data …
-    ygg databricks table execute_insert --logs … | --log-file …
 """
 from __future__ import annotations
 
@@ -20,7 +18,6 @@ from .services import (
     ClustersCommand,
     FSCommand,
     JobsCommand,
-    TablesCommand,
     WarehousesCommand,
 )
 
@@ -61,7 +58,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ClustersCommand.register(subparsers)
     FSCommand.register(subparsers)
     JobsCommand.register(subparsers)
-    TablesCommand.register(subparsers)
     WarehousesCommand.register(subparsers)
 
     args = parser.parse_args(argv)
