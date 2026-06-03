@@ -95,7 +95,7 @@ _VIEW_TABLE_TYPES: frozenset[TableType] = frozenset({
     TableType.METRIC_VIEW,
 })
 
-# Below this on-disk size, ``use_warehouse=None`` reads/writes a Delta table
+# Below this on-disk size, ``use_databricks=None`` reads/writes a Delta table
 # natively (DeltaFolder); at or above it the SQL warehouse parallelises the
 # scan/commit better. Matches Delta's default target file size.
 _NATIVE_DELTA_MAX_BYTES: int = 128 * 1024 * 1024
@@ -876,13 +876,16 @@ class Table(DatabricksPath):
         additionally needs an *external* table (UC vends READ_WRITE creds only
         for external — a managed-Delta commit would 403, so it stays on SQL).
 
-        ``options.use_warehouse`` then selects:
+        ``options.use_databricks`` then selects:
 
-        - ``True``  → warehouse (``False``);
+        - ``True``  → Databricks / warehouse (``False``);
         - ``False`` → native DeltaFolder (``True``);
-        - ``None``  → guess: an active Spark session → warehouse; else a small
+        - ``None``  → guess: an active Spark session → Databricks; else a small
           table (``< _NATIVE_DELTA_MAX_BYTES`` on disk) → native, a larger one
-          → warehouse (the warehouse parallelises big scans/writes better).
+          → Databricks (the warehouse parallelises big scans/writes better).
+
+        A ``True`` here only *picks* the native path — the read/write then
+        probes UC credentials and falls back to Databricks if they can't vend.
         """
         try:
             infos = self.infos
@@ -897,13 +900,13 @@ class Table(DatabricksPath):
         if write and infos.table_type != TableType.EXTERNAL:
             return False
 
-        use_warehouse = getattr(options, "use_warehouse", None)
-        if use_warehouse is True:
+        use_databricks = getattr(options, "use_databricks", None)
+        if use_databricks is True:
             return False
-        if use_warehouse is False:
+        if use_databricks is False:
             return True
 
-        # use_warehouse is None → guess.
+        # use_databricks is None → guess.
         if self._has_active_spark(options):
             return False
         size = self._delta_total_bytes()
@@ -928,13 +931,35 @@ class Table(DatabricksPath):
         except Exception:
             return None
 
+    def _native_delta_folder(self) -> "DeltaFolder | None":
+        """Build the :meth:`delta` DeltaFolder and force its UC credentials to
+        vend (by reading the ``_delta_log`` snapshot), so any failure surfaces
+        here — *before* a write consumes its batch stream.
+
+        Returns ``None`` when storage / credential resolution fails, so the
+        caller transparently falls back to Databricks (the SQL warehouse)."""
+        try:
+            folder = self.delta()
+            folder.snapshot(fresh=True)  # triggers UC temp-cred vending + log read
+            return folder
+        except Exception as exc:  # noqa: BLE001 — any vend/IO failure → fall back
+            logger.warning(
+                "Native Delta path unavailable for %r (%s: %s); "
+                "falling back to Databricks.",
+                self, type(exc).__name__, exc,
+            )
+            return None
+
     def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
         # Delta table the router picks native for → read straight off the
         # ``_delta_log`` + parquet via our DeltaFolder, bypassing the warehouse.
+        # ``_native_delta_folder`` probes UC credentials first, returning None
+        # (and falling us through to the warehouse) if they can't vend.
         if self._native_delta(options, write=False):
-            folder = self.delta()
-            yield from folder._read_arrow_batches(folder.check_options(options))
-            return
+            folder = self._native_delta_folder()
+            if folder is not None:
+                yield from folder._read_arrow_batches(folder.check_options(options))
+                return
 
         options = options.with_source(source=self.collect_schema())
         query = self._options_to_sql(options)
@@ -959,10 +984,14 @@ class Table(DatabricksPath):
         options: CastOptions
     ) -> None:
         # External Delta table the router picks native for → commit straight to
-        # the ``_delta_log`` via our DeltaFolder, bypassing the warehouse.
+        # the ``_delta_log`` via our DeltaFolder, bypassing the warehouse. The
+        # credential probe runs *before* ``batches`` is consumed, so a vend
+        # failure falls back to the SQL insert below with the stream intact.
         if self._native_delta(options, write=True):
-            self.delta().write_arrow_batches(batches, options=options)
-            return
+            folder = self._native_delta_folder()
+            if folder is not None:
+                folder.write_arrow_batches(batches, options=options)
+                return
 
         options = options.with_target(self.collect_schema(options))
 
