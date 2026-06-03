@@ -207,6 +207,49 @@ class TestDeletionCentralization:
         f.delete()
         assert f.exists() is False
 
+    def test_delete_no_predicate_removes_directory(self, tmp_path):
+        # ``delete()`` (no predicate) on a directory removes the whole tree —
+        # it must NOT try to read the directory back as a tabular leaf.
+        d = LocalPath(str(tmp_path / "tree"))
+        d.mkdir()
+        LocalPath(str(tmp_path / "tree" / "a.bin")).write_bytes(b"a")
+        LocalPath(str(tmp_path / "tree" / "b.txt")).write_bytes(b"b")
+        d.delete()
+        assert d.exists() is False
+
+    def test_delete_no_predicate_never_reads_arrow_batches(self, tmp_path, monkeypatch):
+        # Regression: a bare ``path.delete()`` used to fall through to the
+        # byte-leaf row rewrite, which reads Arrow batches and blows up with
+        # ``NotImplementedError: IO has no tabular decoder`` on a directory /
+        # non-tabular file / missing path. No predicate ⇒ pure path removal.
+        from yggdrasil.io.holder import IO
+
+        def boom(self, *a, **k):
+            raise AssertionError("delete read Arrow batches for a no-predicate delete")
+
+        monkeypatch.setattr(IO, "_read_arrow_batches", boom)
+
+        # directory
+        d = LocalPath(str(tmp_path / "dir"))
+        d.mkdir()
+        LocalPath(str(tmp_path / "dir" / "x.bin")).write_bytes(b"x")
+        d.delete()
+        assert d.exists() is False
+
+        # non-tabular plain file
+        f = LocalPath(str(tmp_path / "blob.other"))
+        f.write_bytes(b"\x00\x01\x02not-a-table")
+        f.delete()
+        assert f.exists() is False
+
+    def test_delete_no_predicate_is_idempotent_on_missing(self, tmp_path):
+        # ``delete()`` (no predicate) on an already-absent path is a no-op:
+        # the goal — "this path is gone" — is already met. ``remove`` /
+        # ``unlink`` keep the strict ``missing_ok=False`` contract (below).
+        ghost = LocalPath(str(tmp_path / "never" / "here.other"))
+        ghost.delete()  # must not raise, must not read Arrow batches
+        assert ghost.exists() is False
+
     def test_remove_routes_through_delete_remove_path(self, tmp_path, monkeypatch):
         f = LocalPath(str(tmp_path / "h.txt"))
         f.touch()
