@@ -20,6 +20,7 @@ on write keep the cache fresh without fan-out invalidation.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import logging
 import re
 import time
@@ -1481,8 +1482,12 @@ class Table(DatabricksPath):
             return False
 
     @property
-    def table_id(self) -> str:
-        return self.infos.table_id
+    def table_id(self) -> str | None:
+        """The table's Unity Catalog id, or ``None`` when the table doesn't
+        exist (resolved with ``default=None`` so a missing table reads as
+        ``None`` instead of raising)."""
+        infos = self.read_infos(default=None)
+        return infos.table_id if infos is not None else None
 
     @staticmethod
     def _is_fresh(fetched_at: float | None) -> bool:
@@ -3209,11 +3214,12 @@ class Table(DatabricksPath):
 
         For an **external** table the staging volume is created *external*
         too, rooted on the schema's storage location — the segment before
-        ``__unitystorage`` — and keyed by the table's UC id:
-        ``<schema_root>/uc/tables/<table_id>``. That keeps staged Parquet on
-        the same governed external location as the table instead of a
-        fabricated client default location. A managed table keeps the default
-        (managed) create path, materialised lazily on first write.
+        ``__unitystorage`` — and keyed by a deterministic hash of the table's
+        fully-qualified name: ``<schema_root>/uc/tables/<hash>``. That keeps
+        staged Parquet on the same governed external location as the table
+        (and resolves the same way before the table exists, unlike the UC
+        ``table_id``). A managed table keeps the default (managed) create
+        path, materialised lazily on first write.
 
         Kept off the :attr:`staging_volume` property on purpose — resolving
         ``infos`` / creating a volume on a bare handle read is too surprising;
@@ -3227,9 +3233,13 @@ class Table(DatabricksPath):
         info = self.read_infos(default=None)
         if info is not None and info.table_type == TableType.EXTERNAL:
             root = self.schema_storage_location().split("/__unitystorage")[0].rstrip("/")
+            key = hashlib.blake2b(
+                f"{self.catalog_name}.{self.schema_name}.{self.table_name}".encode("utf-8"),
+                digest_size=16,
+            ).hexdigest()
             volume.get_or_create(
                 volume_type="EXTERNAL",
-                storage_location=f"{root}/uc/tables/{self.table_id}",
+                storage_location=f"{root}/uc/tables/{key}",
             )
         return volume
 
