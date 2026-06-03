@@ -43,6 +43,36 @@ class Snapshot:
                 else:         snap.domain_metadata[a.domain] = a
         return snap
 
+    def advanced(self, log: DeltaLog, commit_files: "Iterable[Path]",
+                 version: int) -> "Snapshot":
+        """Return a new snapshot = *this* state + the actions in *commit_files*.
+
+        Used to advance a cached snapshot to a newer ``version`` by replaying
+        only the commits after it — no checkpoint read, no re-reading the
+        prior commits. *commit_files* are the (ascending) commit JSONs for
+        versions ``(self.version, version]`` (see :meth:`DeltaLog.commits_after`).
+        """
+        snap = Snapshot(
+            version=version, table_root=self.table_root,
+            protocol=self.protocol, metadata=self.metadata,
+            active_files=dict(self.active_files), txns=dict(self.txns),
+            domain_metadata=dict(self.domain_metadata),
+        )
+        seg = LogSegment(
+            version=version, checkpoint_version=self.version,
+            checkpoint_files=(), commit_files=tuple(commit_files), checkpoint_kind="none",
+        )
+        for a in log.replay(seg):
+            if isinstance(a, Protocol):    snap.protocol = a
+            elif isinstance(a, Metadata):  snap.metadata = a
+            elif isinstance(a, AddFile):   snap.active_files[a.path] = a
+            elif isinstance(a, RemoveFile): snap.active_files.pop(a.path, None)
+            elif isinstance(a, Txn):       snap.txns[a.app_id] = a.version
+            elif isinstance(a, DomainMetadata):
+                if a.removed: snap.domain_metadata.pop(a.domain, None)
+                else:         snap.domain_metadata[a.domain] = a
+        return snap
+
     @property
     def partition_columns(self) -> "List[str]":
         return list(self.metadata.partition_columns) if self.metadata else []

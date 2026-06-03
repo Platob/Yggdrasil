@@ -82,6 +82,23 @@ class DeltaLog:
                 if v is not None and v > max_v: max_v = v
         return max_v
 
+    def commits_after(self, base_version: int) -> "Tuple[Path, ...]":
+        """Commit-JSON paths with version > *base_version*, ascending.
+
+        Drives an *incremental* snapshot advance: apply just these commits on
+        top of a cached snapshot, without re-reading the checkpoint or the
+        prior commits."""
+        pairs = []
+        for name in self._list_log_dir():
+            if not (name.endswith(".json") and not name.startswith("_") and ".checkpoint." not in name):
+                continue
+            v = version_from_log_name(name)
+            if v is not None and v > base_version:
+                pairs.append((v, name))
+        pairs.sort(key=lambda t: t[0])
+        return tuple(self.log_path / name for _v, name in pairs)
+
+
     def segment(self, version: "Optional[int]" = None) -> LogSegment:
         listing = self._list_log_dir()
         last_ck = self.read_last_checkpoint()

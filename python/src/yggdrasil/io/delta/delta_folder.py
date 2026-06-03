@@ -107,6 +107,12 @@ class _CommitPlan:
 _INLINE_DV_MAX_ROWS = 4096
 _SIGNED_FOR_UINT = {8: pa.int8, 16: pa.int16, 32: pa.int32, 64: pa.int64}
 
+#: How long a cached latest :class:`Snapshot` is trusted before
+#: ``snapshot()`` re-checks the ``_delta_log`` (and incrementally applies any
+#: new commits). Bounds how stale a long-lived reader can be vs. an external
+#: writer without an explicit ``fresh=True`` / :meth:`refresh`.
+_SNAPSHOT_TTL = 30.0
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class DeltaOptions(FolderOptions):
@@ -156,6 +162,7 @@ class DeltaFolder(Folder):
         super().__init__(data, path=path, tabular_parent=tabular_parent, **kwargs)
         self._log = DeltaLog(self.path)
         self._snapshot: "Optional[Snapshot]" = None
+        self._snapshot_at: float = 0.0
 
     def __repr__(self) -> str:
         return f"DeltaFolder(path={self.path!r})"
@@ -163,6 +170,7 @@ class DeltaFolder(Folder):
     def refresh(self) -> "DeltaFolder":
         self._log.invalidate()
         self._snapshot = None
+        self._snapshot_at = 0.0
         return self
 
     @property
@@ -171,20 +179,44 @@ class DeltaFolder(Folder):
 
     def snapshot(self, version: "Optional[int]" = None, *,
                  fresh: bool = False) -> Snapshot:
-        # ``fresh`` must re-read from storage, not just rebuild from the cached
-        # log: ``DeltaFolder`` is a location-keyed singleton, so a snapshot
-        # taken before an *external* commit (a warehouse / Spark INSERT, another
-        # writer) would otherwise be replayed from the stale ``_delta_log``
-        # listing. Invalidate the log too — same as :meth:`refresh`.
-        if fresh:
-            self._log.invalidate()
-            self._snapshot = None
+        """Collapsed table state at ``version`` (default: latest).
+
+        The latest snapshot is cached for :data:`_SNAPSHOT_TTL` seconds. Past
+        the TTL the cache is *advanced incrementally* — we re-list the
+        ``_delta_log`` (always a fresh ListObjectsV2; there's no listing cache)
+        and replay only the commits written since the cached version, instead
+        of re-reading the checkpoint and every commit. ``fresh=True`` forces a
+        full re-read from storage (used on the commit / write-credential
+        paths, where a clean rebuild is cheaper to reason about than trusting
+        the cached state). ``DeltaFolder`` is a location-keyed singleton, so
+        without this an *external* commit (a warehouse / Spark INSERT, another
+        writer) would be invisible until the process restarted.
+        """
         if version is not None:
             return Snapshot.from_log(self._log, version)
-        if self._snapshot is not None:
+
+        now = time.monotonic()
+        if not fresh and self._snapshot is not None and (now - self._snapshot_at) <= _SNAPSHOT_TTL:
             return self._snapshot
-        self._snapshot = Snapshot.from_log(self._log, None)
-        return self._snapshot
+
+        # Re-list the log fresh, then either full-rebuild (fresh / cold) or
+        # advance the cached snapshot by the new commits only.
+        self._log.invalidate()
+        base = self._snapshot
+        if fresh or base is None:
+            snap = Snapshot.from_log(self._log, None)
+        else:
+            latest = self._log.latest_version()
+            if latest == base.version:
+                snap = base                       # nothing new — just reset the clock
+            elif latest > base.version:
+                snap = base.advanced(self._log, self._log.commits_after(base.version), latest)
+            else:
+                snap = Snapshot.from_log(self._log, None)  # log shrank (recreated) → rebuild
+
+        self._snapshot = snap
+        self._snapshot_at = now
+        return snap
 
     def _collect_schema(self, options: DeltaOptions):
         snap = self.snapshot(options.version)
