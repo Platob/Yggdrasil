@@ -723,7 +723,8 @@ class Volume(DatabricksPath):
         if is_external:
             if not storage_location:
                 storage_location = self.client.default_storage_location(
-                    suffix=f".ygg/uc/volumes/{os.urandom(8).hex()}"
+                    suffix=f".ygg/uc/volumes/{os.urandom(8).hex()}",
+                    catalog_name=self.catalog_name,
                 )
         else:
             storage_location = None

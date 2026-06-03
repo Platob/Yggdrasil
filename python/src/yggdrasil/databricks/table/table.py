@@ -3210,7 +3210,11 @@ class Table(DatabricksPath):
         actually imminent.
         """
         volume = self.staging_volume
-        if self.infos.table_type == TableType.EXTERNAL:
+        # A table that doesn't exist yet (staging Parquet before the
+        # create/insert) has no ``infos`` — treat it as the managed default
+        # path rather than letting the remote lookup raise.
+        info = self.read_infos(default=None)
+        if info is not None and info.table_type == TableType.EXTERNAL:
             root = self.schema_storage_location().split("/__unitystorage")[0].rstrip("/")
             volume.get_or_create(
                 volume_type="EXTERNAL",
