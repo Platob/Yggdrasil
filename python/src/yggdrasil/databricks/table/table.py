@@ -49,6 +49,7 @@ from yggdrasil.databricks.sql.sql_utils import (
     MAX_TABLE_NAME_LEN,
     quote_ident,
     quote_qualified_ident,
+    requalify_table_refs,
     safe_table_name,
     sql_literal, escape_sql_string,
 )
@@ -2633,6 +2634,15 @@ class Table(DatabricksPath):
                     f" view_definition. Run ``create_view(query=...)``"
                     f" against the target directly with explicit SQL."
                 )
+            # Re-point the inner query at the target: the stored
+            # ``view_definition`` references the *source* catalog/schema, so a
+            # cross-schema clone must requalify those prefixes or the cloned
+            # view would still read the source's tables.
+            select_text = requalify_table_refs(
+                select_text,
+                source=(self.catalog_name, self.schema_name),
+                target=(target_catalog, target_schema),
+            )
             cloned = Table(
                 service=tables,
                 catalog_name=target_catalog,
