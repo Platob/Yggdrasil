@@ -1000,16 +1000,25 @@ class Table(DatabricksPath):
 
         ``options.engine`` selects explicitly (an :class:`EngineType` or alias);
         ``YGGDRASIL`` on a table that can't take the native path degrades to the
-        warehouse rather than erroring. ``None`` **guesses best**: an active
-        Spark session → ``SPARK``; else a Delta table small enough on disk →
-        ``YGGDRASIL`` (the direct DeltaFolder read/write); else →
-        ``DATABRICKS_SQL_WAREHOUSE`` (it parallelises big scans/writes better).
+        warehouse rather than erroring. ``None`` **guesses best** — but the
+        native DeltaFolder path is only ever *auto*-selected for a **read**:
 
-        The native-path size cap depends on the table type: an **EXTERNAL**
-        Delta table (UC vends READ_WRITE credentials for it) prefers the direct
-        storage-path write across a much larger range
-        (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``); a managed table keeps the
-        smaller ``_NATIVE_DELTA_MAX_BYTES`` cap.
+        - an active Spark session → ``SPARK``;
+        - else, **read only**, a Delta table small enough on disk →
+          ``YGGDRASIL`` (the direct DeltaFolder read);
+        - else → ``DATABRICKS_SQL_WAREHOUSE``.
+
+        A **write** never auto-routes to the native storage-path commit just
+        because the table is an external Delta table — that bypasses the
+        warehouse (and its governance / staging) silently. By default a write
+        goes through the staging-volume + SQL warehouse path; the direct
+        DeltaFolder commit must be requested explicitly with
+        ``engine=YGGDRASIL`` (``"native"`` / ``"ygg"``).
+
+        The native read-path size cap depends on the table type: an
+        **EXTERNAL** Delta table (UC vends READ_WRITE credentials for it) reads
+        direct across a much larger range (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``);
+        a managed table keeps the smaller ``_NATIVE_DELTA_MAX_BYTES`` cap.
         """
         engine = EngineType.from_(getattr(options, "engine", None))
         if engine is not None:
@@ -1019,7 +1028,8 @@ class Table(DatabricksPath):
 
         if self._has_active_spark(options):
             return EngineType.SPARK
-        if self._delta_capable(write=write):
+        # Auto native (YGGDRASIL) is read-only; a write opts in explicitly.
+        if not write and self._delta_capable(write=False):
             cap = (
                 _NATIVE_DELTA_MAX_BYTES_EXTERNAL
                 if self.infos.table_type == TableType.EXTERNAL
@@ -1132,8 +1142,11 @@ class Table(DatabricksPath):
         engine = self._resolve_engine(options, write=True)
 
         # YGGDRASIL → commit straight to the ``_delta_log`` via our DeltaFolder.
-        # The credential probe runs *before* ``batches`` is consumed, so a vend
-        # failure falls back to the SQL insert below with the stream intact.
+        # Only ever reached when the caller asked for it explicitly
+        # (``engine=YGGDRASIL``) — a write never auto-routes here off the
+        # table being external (see ``_resolve_engine``). The credential probe
+        # runs *before* ``batches`` is consumed, so a vend failure falls back
+        # to the SQL insert below with the stream intact.
         if engine == EngineType.YGGDRASIL:
             folder = self._native_delta_folder(write=True)
             if folder is not None:
@@ -3304,16 +3317,7 @@ class Table(DatabricksPath):
         safe_merge: bool = False,
         staging_volume: "Volume | None" = None
     ) -> "StatementBatch | Tabular | None":
-        """Insert *data* into this table.
-
-        Fast path: an EXTERNAL Delta table that's directly writable per its
-        existing Unity Catalog metadata takes a native storage-path write —
-        the rows are committed straight to the table's ``_delta_log`` via
-        DeltaFolder, with no Volume staging or warehouse INSERT. This is used
-        only for the plain APPEND / OVERWRITE / TRUNCATE shape (no keyed MERGE,
-        maintenance, ``return_data``, or forced ``engine``); everything else,
-        and any table the metadata can't confirm writable, falls back to the
-        classic warehouse SQL path with staged Parquet.
+        """Insert through the warehouse SQL path with staged Parquet.
 
         ``safe_merge`` controls keyed-write strategy:
 
@@ -3348,42 +3352,6 @@ class Table(DatabricksPath):
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
-
-        # Storage-path write — when the (just-ensured) target is directly
-        # writable per its *existing* Unity Catalog metadata (an EXTERNAL Delta
-        # table with a resolvable ``storage_location``, decided by
-        # ``_delta_capable`` off the cached ``infos`` — no warehouse round
-        # trip), commit the rows straight to the table's storage path via
-        # DeltaFolder instead of staging Parquet + running an INSERT.
-        #
-        # Scoped to the plain APPEND / OVERWRITE / TRUNCATE shape whose
-        # DeltaFolder semantics match the SQL path exactly; a keyed MERGE,
-        # maintenance (ZORDER / VACUUM / OPTIMIZE), a schema-evolving update
-        # set, ``return_data``, or an explicitly forced ``engine`` all keep the
-        # classic warehouse path below. ``_native_delta_folder`` vends + probes
-        # the write credential up front and returns ``None`` on any failure, so
-        # a location the metadata *claims* is writable but isn't falls back
-        # here before a single row is consumed.
-        if (
-            engine is None
-            and not match_by
-            and not update_column_names
-            and not zorder_by
-            and not optimize_after_merge
-            and vacuum_hours is None
-            and not safe_merge
-            and not return_data
-            and mode_enum in (Mode.AUTO, Mode.APPEND, Mode.OVERWRITE, Mode.TRUNCATE)
-            and target._delta_capable(write=True)
-        ):
-            folder = target._native_delta_folder(write=True)
-            if folder is not None:
-                logger.debug(
-                    "arrow_insert: native storage-path write for %r (mode=%s)",
-                    target, mode_enum.name,
-                )
-                folder.write_table(data, cast_options, mode=mode_enum)
-                return None
 
         wait = WaitingConfig.from_(wait)
         staging = self.insert_volume_path(target, temporary=bool(wait), staging_volume=staging_volume)
