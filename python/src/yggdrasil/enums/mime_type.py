@@ -1068,6 +1068,13 @@ class MimeTypes:
         )
     )
 
+    PARQUET_FOLDER = MimeType.define(
+        MimeType(
+            "PARQUET_FOLDER",
+            "inode/directory+parquet",
+        )
+    )
+
     DELTA_FOLDER = MimeType.define(
         MimeType(
             "DELTA_FOLDER",
