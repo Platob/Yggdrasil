@@ -21,7 +21,7 @@ Usage::
     DATABRICKS_HOST=... DATABRICKS_TOKEN=... \\
     uv run --extra dev --extra aws python \\
       benchmarks/databricks/bench_databricks_volume_external_storage.py \\
-      --base s3://odp-aws-dls3-eu-central-1-p-apps/3mv/ygg \\
+      --base s3://odp-aws-dls3-eu-central-1-a-apps/3mv/ygg \\
       --catalog trading_tgp_dev --schema ygg_bench \\
       --size-kib 256 --files 8 --repeat 3
 """
@@ -61,7 +61,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base", default=os.environ.get(
         "YGG_TEST_EXTERNAL_LOCATION",
-        "s3://odp-aws-dls3-eu-central-1-p-apps/3mv/ygg"))
+        "s3://odp-aws-dls3-eu-central-1-a-apps/3mv/ygg"))  # -a-apps = dev
     ap.add_argument("--catalog", default=os.environ.get(
         "DATABRICKS_INTEGRATION_CATALOG", "trading_tgp_dev"))
     ap.add_argument("--schema", default="ygg_bench")
