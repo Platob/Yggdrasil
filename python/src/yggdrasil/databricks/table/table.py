@@ -3213,15 +3213,28 @@ class Table(DatabricksPath):
         data: Any,
         *,
         cast_options: Optional[CastOptions] = None,
-    ) -> VolumePath:
-        """Stage *data* as Parquet under this table's staging area; return the
-        :class:`VolumePath` it landed at — no warehouse statement runs.
+    ) -> "Path":
+        """Stage *data* as Parquet under this table's **Auto Loader staging
+        area** and return the path it landed at — no warehouse statement runs.
 
-        Mints a fresh staging path via :meth:`insert_volume_path` and writes
-        *data* there with the caller's ``cast_options``. Use this to pre-stage
-        rows for a later load without driving the insert SQL.
+        Writes a fresh, uniquely-named Parquet file directly under
+        :meth:`stage_storage_path` — the cloud-storage path a deployed
+        :meth:`auto_loader` job watches — so staged rows are ingested with no
+        extra wiring: ``stage_insert`` → Auto Loader → table. Falls back to the
+        Files-API volume staging (:meth:`staging_folder`) when a direct cloud
+        path isn't available (e.g. a managed table without external staging),
+        preserving a stage-for-later-load there.
         """
-        path = self.insert_volume_path(self, temporary=False)
+        leaf = f"insert-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.parquet"
+        try:
+            root = self.stage_storage_path()
+        except Exception:  # noqa: BLE001 — degrade to Files-API volume staging
+            logger.debug(
+                "stage_insert: direct cloud staging unavailable for %s; "
+                "using volume staging", self, exc_info=True,
+            )
+            root = self.staging_folder(temporary=False)
+        path = root / leaf
         path.write_table(data, cast_options, mode=Mode.OVERWRITE)
         return path
 

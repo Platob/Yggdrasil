@@ -4,8 +4,8 @@ ingestion job with a file-arrival trigger.
 End-to-end against a real workspace:
 
 1. provision an EXTERNAL Delta table at a writable S3 prefix;
-2. stage a Parquet file through :meth:`Table.stage_storage_path` (a direct
-   cloud-storage Path — the file lands in S3, not via the Files API);
+2. stage Parquet through :meth:`Table.stage_insert` — which lands files in the
+   direct cloud-storage Auto Loader staging path (S3, not the Files API);
 3. deploy the Auto Loader job (``file_arrival`` trigger on the staging path,
    leveraging the ygg wheel + serverless environment); and
 4. run it once and assert the staged rows were ingested into the table.
@@ -160,11 +160,13 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         if not os.environ.get("YGG_TEST_AUTOLOADER_RUN"):
             self.skipTest("set YGG_TEST_AUTOLOADER_RUN=1 to run the live ingestion sweep")
 
-        # Stage 100 small Parquet files into the cloud staging area.
+        # Stage 100 inserts via stage_insert — it lands each Parquet file
+        # directly under the Auto Loader staging path, so the pipeline is
+        # stage_insert → Auto Loader → table with no extra wiring.
         n = int(os.environ.get("YGG_TEST_AUTOLOADER_N", "100"))
         for i in range(n):
-            (self.stage / f"batch_{i:04d}_{secrets.token_hex(2)}.parquet").write_table(
-                pa.table({"id": [i], "v": [f"r{i}"]}), mode=Mode.OVERWRITE)
+            staged = self.table.stage_insert(pa.table({"id": [i], "v": [f"r{i}"]}))
+            assert staged.full_path().startswith(self.source.rstrip("/"))
         assert len(list(self.stage.iterdir())) >= n
 
         # Get-or-create twice — the warm second call reuses the deployed bundle
