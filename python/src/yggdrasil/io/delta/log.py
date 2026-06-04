@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import dataclasses
 from typing import TYPE_CHECKING, Iterable, Iterator, List, Mapping, Optional, Tuple
 
@@ -21,6 +22,10 @@ __all__ = ["DeltaLog", "LogSegment"]
 
 _VERSION_FMT = "{:020d}"
 _CONTENT_CACHE_MAX_BYTES = 1 * 1024 * 1024
+#: Cap on concurrent log-file GETs. Delta replay reads many small, independent
+#: files (commit JSONs, checkpoint sidecars); on object stores each open() is a
+#: high-latency round-trip, so fan them out rather than read serially.
+_MAX_FETCH_WORKERS = 32
 _content_cache: ExpiringDict[str, bytes] = ExpiringDict(default_ttl=60.0, max_size=1024)
 
 
@@ -100,8 +105,17 @@ class DeltaLog:
 
 
     def segment(self, version: "Optional[int]" = None) -> LogSegment:
-        listing = self._list_log_dir()
-        last_ck = self.read_last_checkpoint()
+        # The directory listing and the ``_last_checkpoint`` pointer are two
+        # independent object-store round-trips — overlap them (each memoizes a
+        # distinct attribute, so the two threads don't race).
+        if self._listing is None and self._last_checkpoint is None:
+            with cf.ThreadPoolExecutor(max_workers=2) as ex:
+                ck_future = ex.submit(self.read_last_checkpoint)
+                listing = self._list_log_dir()
+                last_ck = ck_future.result()
+        else:
+            listing = self._list_log_dir()
+            last_ck = self.read_last_checkpoint()
         ck_hint = int(last_ck["version"]) if last_ck and "version" in last_ck else -1
 
         all_commits = sorted(
@@ -180,17 +194,22 @@ class DeltaLog:
 
     def replay_raw(self, segment: LogSegment) -> "Iterator[Mapping[str, object]]":
         if segment.checkpoint_files:
+            import io as _io
             import pyarrow.parquet as pq
+
+            # Local files read straight from disk (mmap); remote checkpoint /
+            # sidecar parquet are fetched concurrently, then parsed in order.
+            remote = [p for p in segment.checkpoint_files
+                      if not getattr(p, "is_local_path", False)]
+            remote_blobs = iter(_read_cached_many(remote))
             for path in segment.checkpoint_files:
-                try:
-                    local = path.full_path() if getattr(path, "is_local_path", False) else None
-                    if local:
-                        table = pq.read_table(local)
-                    else:
-                        import io as _io
-                        with path.open("rb") as bio:
-                            table = pq.read_table(_io.BytesIO(bio.read()))
-                except FileNotFoundError: continue
+                if getattr(path, "is_local_path", False):
+                    try: table = pq.read_table(path.full_path())
+                    except FileNotFoundError: continue
+                else:
+                    raw = next(remote_blobs)
+                    if raw is None: continue          # missing → skip
+                    table = pq.read_table(_io.BytesIO(raw))
                 cols = table.column_names
                 if not cols or table.num_rows == 0: continue
                 mat = [table.column(c).to_pylist() for c in cols]
@@ -199,19 +218,25 @@ class DeltaLog:
                         if mat[ci][ri] is not None:
                             yield {col: mat[ci][ri]}; break
 
-        for commit in segment.commit_files:
-            try: blob = _read_cached(commit).decode("utf-8")
-            except FileNotFoundError: continue
-            for line in blob.splitlines():
+        # Commit JSONs are small and independent — prefetch them concurrently
+        # (one S3 GET each otherwise serialises the whole replay), then parse in
+        # ascending version order so later commits still override earlier ones.
+        for blob in _read_cached_many(segment.commit_files):
+            if blob is None: continue                 # missing → skip
+            for line in blob.decode("utf-8").splitlines():
                 line = line.strip()
                 if not line: continue
                 try: yield ygg_json.loads(line)
                 except Exception: continue
 
 
-def _read_cached(path: "Path") -> bytes:
+def _cache_key(path: "Path") -> str:
     fn = getattr(path, "full_path", None)
-    key = fn() if callable(fn) else str(path)
+    return fn() if callable(fn) else str(path)
+
+
+def _read_cached(path: "Path") -> bytes:
+    key = _cache_key(path)
     cached = _content_cache.get(key)
     if cached is not None: return cached
     with path.open("rb") as bio:
@@ -219,3 +244,50 @@ def _read_cached(path: "Path") -> bytes:
     if len(raw) <= _CONTENT_CACHE_MAX_BYTES:
         _content_cache[key] = raw
     return raw
+
+
+def _read_cached_many(paths: "Iterable[Path]") -> "List[Optional[bytes]]":
+    """Bytes for each path, in input order; cache-misses fetched concurrently.
+
+    Delta replay reads many small, independent files (commit JSONs, checkpoint
+    sidecars). On an object store each ``open()`` is a high-latency GET, so
+    reading them serially dominates snapshot time. Resolve the content cache
+    first, then fan the misses across a bounded thread pool (the per-request
+    HTTP / boto clients are independent), preserving order for deterministic
+    replay. A missing file (concurrently checkpointed away) maps to ``None`` —
+    the caller skips it, matching the previous per-file ``FileNotFoundError``.
+
+    The cache write happens here on the calling thread (workers only do the
+    blocking read), so the shared cache is never mutated from multiple threads.
+    """
+    paths = list(paths)
+    out: "List[Optional[bytes]]" = [None] * len(paths)
+    misses: "List[Tuple[int, Path, str]]" = []
+    for i, p in enumerate(paths):
+        key = _cache_key(p)
+        cached = _content_cache.get(key)
+        if cached is not None:
+            out[i] = cached
+        else:
+            misses.append((i, p, key))
+    if not misses:
+        return out
+
+    def _fetch(item: "Tuple[int, Path, str]") -> "Tuple[int, str, Optional[bytes]]":
+        i, p, key = item
+        try:
+            with p.open("rb") as bio:
+                return i, key, bio.read()
+        except FileNotFoundError:
+            return i, key, None
+
+    if len(misses) == 1:
+        results = [_fetch(misses[0])]
+    else:
+        with cf.ThreadPoolExecutor(max_workers=min(len(misses), _MAX_FETCH_WORKERS)) as ex:
+            results = list(ex.map(_fetch, misses))
+    for i, key, raw in results:
+        if raw is not None and len(raw) <= _CONTENT_CACHE_MAX_BYTES:
+            _content_cache[key] = raw
+        out[i] = raw
+    return out
