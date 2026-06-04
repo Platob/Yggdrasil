@@ -62,7 +62,7 @@ class TestTableAutoLoader:
         trigger = Flow.call_args.kwargs["trigger"]
         # A file-arrival trigger pointed at the source path.
         assert trigger is not None
-        assert trigger.file_arrival.url == "s3://bkt/landing"
+        assert trigger.file_arrival.url == "s3://bkt/landing/"
 
     def test_deploy_false_returns_flow_without_creating(self):
         tbl = _table()
@@ -154,4 +154,4 @@ class TestStageStoragePathAndDefaultSource:
         params = Flow.call_args.kwargs["parameters"]
         assert params[1] == "s3://bkt/3mv/ygg/stage"            # source = staging storage path
         trig = Flow.call_args.kwargs["trigger"]
-        assert trig.file_arrival.url == "s3://bkt/3mv/ygg/stage"  # file trigger on it
+        assert trig.file_arrival.url == "s3://bkt/3mv/ygg/stage/"  # file trigger on it

@@ -3159,8 +3159,12 @@ class Table(DatabricksPath):
             from databricks.sdk.service.jobs import (
                 FileArrivalTriggerConfiguration, TriggerSettings,
             )
+            # The file-arrival trigger URL must be a directory — Databricks
+            # rejects it unless it ends with '/'.
             trigger = TriggerSettings(
-                file_arrival=FileArrivalTriggerConfiguration(url=str(source)),
+                file_arrival=FileArrivalTriggerConfiguration(
+                    url=str(source).rstrip("/") + "/",
+                ),
             )
 
         job_name = name or "ygg_autoloader_" + re.sub(

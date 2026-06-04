@@ -139,7 +139,7 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         settings = job.settings
         # File-arrival trigger pointed at the staging storage path.
         assert settings.trigger is not None
-        assert settings.trigger.file_arrival.url == self.source
+        assert settings.trigger.file_arrival.url == self.source.rstrip("/") + "/"
         # Single python-wheel task running the ygg auto-loader entry point.
         task = settings.tasks[0]
         assert task.python_wheel_task.package_name == "ygg"
