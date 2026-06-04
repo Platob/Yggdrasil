@@ -594,44 +594,21 @@ class UCSchema(DatabricksPath):
     def storage_root(self) -> Optional[str]:
         return self.infos.storage_root
 
-    #: Schema-property key under which yggdrasil records this schema's staging
-    #: root, so a table reads it straight from the schema metadata instead of
-    #: re-deriving it from the storage location on every staging operation.
-    STAGING_PATH_PROPERTY: ClassVar[str] = "ygg.staging_path"
+    def staging_location(self) -> Optional[str]:
+        """Derive the schema's staging root, ``<root>/uc/tables``.
 
-    def staging_location(self, *, create: bool = True) -> Optional[str]:
-        """The schema's yggdrasil staging root, persisted in schema properties.
-
-        Returns the :attr:`STAGING_PATH_PROPERTY` value when the schema already
-        carries it — a table then gets its staging root straight from the
-        cached metadata, no re-derivation. Otherwise derives it from the
-        schema's storage location (the governed external root before
-        ``/__unitystorage``, suffixed ``/uc/tables``) and, when *create* is
-        ``True``, stamps it onto the schema properties (best-effort — a missing
-        ALTER grant just means the next caller re-derives it). Returns ``None``
-        when the schema has no resolvable storage location (e.g. a managed
-        schema), so the caller falls back to the default managed staging path.
+        ``<root>`` is the governed external storage location before the managed
+        ``/__unitystorage`` segment. Returns ``None`` when the schema has no
+        resolvable storage location (e.g. a managed schema). This is a pure
+        derivation — the resolved per-table staging root is recorded on the
+        **table** (the ``ygg.staging_root`` TBLPROPERTY,
+        :meth:`Table.staging_root`), not in schema metadata.
         """
         info = self.read_infos(default=None)
-        if info is None:
-            return None
-        props = dict(getattr(info, "properties", None) or {})
-        existing = props.get(self.STAGING_PATH_PROPERTY)
-        if existing:
-            return existing
-        location = getattr(info, "storage_location", None)
+        location = getattr(info, "storage_location", None) if info else None
         if not location:
             return None
-        staging = location.split("/__unitystorage")[0].rstrip("/") + "/uc/tables"
-        if create:
-            try:
-                self.update(properties={**props, self.STAGING_PATH_PROPERTY: staging})
-            except Exception:
-                logger.debug(
-                    "Stamping staging path on schema %r failed; will re-derive",
-                    self, exc_info=True,
-                )
-        return staging
+        return location.split("/__unitystorage")[0].rstrip("/") + "/uc/tables"
 
     # ── navigation ────────────────────────────────────────────────────────────
 

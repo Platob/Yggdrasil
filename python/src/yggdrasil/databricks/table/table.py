@@ -3222,19 +3222,56 @@ class Table(DatabricksPath):
             schema_name=self.schema_name,
         ).volume(value)
 
+    #: TBLPROPERTY under which a table records its resolved external staging
+    #: root URL, so later inserts read it straight from the table metadata
+    #: instead of re-deriving it from the schema storage location.
+    STAGING_ROOT_PROPERTY: ClassVar[str] = "ygg.staging_root"
+
+    def staging_root(self) -> "str | None":
+        """This table's external staging root URL, recorded in TBLPROPERTIES.
+
+        Returns the ``ygg.staging_root`` property when the table already
+        carries it — read straight from cached :attr:`infos`, no re-derivation.
+        Otherwise derives ``<schema-staging-root>/<table-hash>`` (the schema's
+        governed external root via :meth:`UCSchema.staging_location`, plus a
+        deterministic per-table hash so the location is stable and collision
+        free) and best-effort stamps it onto the table's TBLPROPERTIES — a
+        missing ALTER grant just means the next caller re-derives it. Returns
+        ``None`` when the schema exposes no staging root (e.g. a managed
+        table), so the caller falls back to the default managed staging path.
+        """
+        existing = (self.infos.properties or {}).get(self.STAGING_ROOT_PROPERTY)
+        if existing:
+            return existing
+        base = self.schema.staging_location()
+        if not base:
+            return None
+        key = hashlib.blake2b(
+            f"{self.catalog_name}.{self.schema_name}.{self.table_name}".encode("utf-8"),
+            digest_size=16,
+        ).hexdigest()
+        root = f"{base.rstrip('/')}/{key}"
+        try:
+            self.properties[self.STAGING_ROOT_PROPERTY] = root
+        except Exception:
+            logger.debug(
+                "Recording %s on %r failed; will re-derive next time",
+                self.STAGING_ROOT_PROPERTY, self, exc_info=True,
+            )
+        return root
+
     def ensure_staging_volume(self) -> "Volume":
         """Get-or-create this table's staging :class:`Volume` and return it.
 
         For an **external** table the staging volume is created *external* too,
-        rooted on the schema's staging path — :meth:`UCSchema.staging_location`,
-        which records ``<schema_root>/uc/tables`` in the schema metadata so it's
-        read straight from properties rather than re-derived every time — and
-        keyed by a deterministic hash of the table's fully-qualified name:
-        ``<staging_root>/<hash>``. That keeps staged Parquet on the same
-        governed external location as the table (and resolves the same way
-        before the table exists, unlike the UC ``table_id``). A managed table
-        (or a schema with no resolvable staging path) keeps the default
-        (managed) create path, materialised lazily on first write.
+        at the table's :meth:`staging_root` — ``<schema_root>/uc/tables/<hash>``,
+        recorded in the table's TBLPROPERTIES so it's read straight from the
+        table metadata rather than re-derived every time. That keeps staged
+        Parquet on the same governed external location as the table (and
+        resolves the same way before the table exists, unlike the UC
+        ``table_id``). A managed table (or one whose schema exposes no staging
+        root) keeps the default (managed) create path, materialised lazily on
+        first write.
 
         Kept off the :attr:`staging_volume` property on purpose — resolving
         ``infos`` / creating a volume on a bare handle read is too surprising;
@@ -3247,15 +3284,11 @@ class Table(DatabricksPath):
         # path rather than letting the remote lookup raise.
         info = self.read_infos(default=None)
         if info is not None and info.table_type == TableType.EXTERNAL:
-            staging_root = self.schema.staging_location()
-            if staging_root:
-                key = hashlib.blake2b(
-                    f"{self.catalog_name}.{self.schema_name}.{self.table_name}".encode("utf-8"),
-                    digest_size=16,
-                ).hexdigest()
+            root = self.staging_root()
+            if root:
                 volume.get_or_create(
                     volume_type="EXTERNAL",
-                    storage_location=f"{staging_root.rstrip('/')}/{key}",
+                    storage_location=root,
                 )
         return volume
 
