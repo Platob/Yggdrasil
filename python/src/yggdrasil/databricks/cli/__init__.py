@@ -6,6 +6,7 @@ Subcommands::
     ygg databricks warehouses list/get/create/delete
     ygg databricks job list/get/run/runs/logs/cancel/repair/delete
     ygg databricks fs ls/cat/write/put/get/mkdir/rm/stat/cp/mv  (Workspace/Volumes/DBFS)
+    ygg databricks deploy [ygg|wheel <package>|environment]  (wheels + serverless env configs)
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from typing import Any, Optional, Sequence
 
 from .services import (
     ClustersCommand,
+    DeployCommand,
     FSCommand,
     JobsCommand,
     WarehousesCommand,
@@ -56,6 +58,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     subparsers = parser.add_subparsers(dest="command")
     ClustersCommand.register(subparsers)
+    DeployCommand.register(subparsers)
     FSCommand.register(subparsers)
     JobsCommand.register(subparsers)
     WarehousesCommand.register(subparsers)
