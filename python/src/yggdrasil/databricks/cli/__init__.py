@@ -4,6 +4,7 @@ Subcommands::
 
     ygg databricks clusters list/get/create/delete
     ygg databricks warehouses list/get/create/delete
+    ygg databricks sql query/export   (run SQL; export --statement-id/--query → --target)
     ygg databricks job list/get/run/runs/logs/cancel/repair/delete
     ygg databricks fs ls/cat/write/put/get/mkdir/rm/stat/cp/mv  (Workspace/Volumes/DBFS)
     ygg databricks wheel build/upload/deploy/list  (workspace PyPI-like wheel registry)
@@ -23,6 +24,7 @@ from .services import (
     FSCommand,
     JobsCommand,
     SeedCommand,
+    SQLCommand,
     WarehousesCommand,
     WheelCommand,
 )
@@ -66,6 +68,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     FSCommand.register(subparsers)
     JobsCommand.register(subparsers)
     SeedCommand.register(subparsers)
+    SQLCommand.register(subparsers)
     WarehousesCommand.register(subparsers)
     WheelCommand.register(subparsers)
 

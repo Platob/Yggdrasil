@@ -22,6 +22,7 @@ ygg databricks <group> <action> [flags]
 |---|---|
 | [`clusters`](#clusters) | All-purpose compute clusters — list/get/create/delete/start/stop |
 | [`warehouses`](#warehouses) | SQL warehouses — list/get/create/delete/start/stop |
+| [`sql`](#sql) | Run SQL and export results — query/export (incl. `export --statement-id`) |
 | [`job`](#jobs) | Jobs & runs — list/get/run/runs/logs/cancel/repair/delete |
 | [`fs`](#filesystem-fs) | Files across Workspace / Volumes / DBFS — ls/cat/write/put/get/mkdir/rm/stat/cp/mv |
 | [`wheel`](#wheels-wheel) | Wheel registry — build/upload/deploy/list in the workspace PyPI-like index |
@@ -211,6 +212,69 @@ ygg databricks warehouses delete --id 0abc123def456789
 ygg databricks warehouses start --name analytics
 ygg databricks warehouses stop  --id 0abc123def456789
 ```
+
+---
+
+## SQL
+
+Run SQL against the workspace's SQL warehouse and **export results to a
+file** — locally, to a Volume/DBFS/Workspace path, or to `s3://`.
+
+```bash
+ygg databricks sql <action> [flags]
+```
+
+Both actions accept warehouse routing and bind params:
+
+| Flag | Purpose |
+|---|---|
+| `--warehouse-id` / `--warehouse-name` | Run on a specific warehouse (default: the workspace default) |
+| `--param k=v` | Bind a `:name` parameter (repeatable) — never f-string user values |
+| `--format` | Override the export format (`csv`/`parquet`/`arrow`/`ndjson`/`json`) |
+
+### `sql query`
+
+Execute a statement and either **preview** it (default: a 50-row
+preview, printed as clean rows so it stays pipeable) or write the full
+result to `--target`. It echoes the **`statement_id`** to stderr so you can
+re-export the same result later without re-running.
+
+```bash
+ygg databricks sql query "SELECT * FROM main.default.orders LIMIT 50"
+ygg databricks sql query "SELECT * FROM main.default.orders" --target orders.parquet
+ygg databricks sql query "SELECT * FROM t WHERE id = :id" --param id=42 --limit 1000
+```
+
+Aliased as `sql exec` / `sql run`.
+
+### `sql export`
+
+Write a result to `--target`, sourced either from an **already-executed
+statement** (`--statement-id`) or from a query run on the spot
+(`--query`). The Databricks Statement Execution API keeps a finished
+result available for a window, so re-fetching by id costs no re-run.
+
+```bash
+# Re-fetch a prior statement's result and write it out
+ygg databricks sql export --statement-id 01ef0a2b-… --target /Volumes/main/default/stg/out.csv
+
+# Run-and-export in one step
+ygg databricks sql export --query "SELECT * FROM main.default.orders" --target out.parquet
+
+# Force a format when the target has no usable extension
+ygg databricks sql export --statement-id 01ef… --target ./result --format parquet
+```
+
+The export **format** is taken from the target's extension (`.csv`,
+`.parquet`, `.arrow`, `.ndjson`, `.json`) unless `--format` overrides it.
+A target shaped like `dbfs:/…`, `/Volumes/…`, or `/Workspace/…` is written
+into the workspace; anything else (local path, `s3://…`) goes through the
+generic path layer.
+
+!!! tip "query → export workflow"
+    `sql query` prints the `statement_id`; capture it and hand it to
+    `sql export --statement-id` to materialise the same result in any
+    format/destination without paying for the query twice.
 
 ---
 
@@ -627,7 +691,7 @@ There are two surfaces in the tree:
 
 - **`yggdrasil.databricks.cli`** — the working `ygg databricks` CLI
   documented above. Each group is a small command class
-  (`ClustersCommand`, `WarehousesCommand`, `JobsCommand`, `FSCommand`,
+  (`ClustersCommand`, `WarehousesCommand`, `SQLCommand`, `JobsCommand`, `FSCommand`,
   `WheelCommand`, `DeployCommand`, `SeedCommand`) that registers an argparse sub-parser and dispatches
   straight into the service layer. To add a group, write a class with a
   `register(subparsers)` classmethod and add it to

@@ -8,6 +8,7 @@ from .deploy import DeployCommand
 from .fs import FSCommand
 from .jobs import JobsCommand
 from .seed import SeedCommand
+from .sql import SQLCommand
 from .warehouses import WarehousesCommand
 from .wheel import WheelCommand
 
@@ -17,6 +18,7 @@ __all__ = [
     "FSCommand",
     "JobsCommand",
     "SeedCommand",
+    "SQLCommand",
     "WarehousesCommand",
     "WheelCommand",
 ]
