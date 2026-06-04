@@ -160,6 +160,7 @@ nav:
       - Bot & Mesh: guides/bot.md
       - Execution Plans & SQL: guides/plan.md
       - Databricks: guides/databricks.md
+      - Databricks CLI: guides/databricks-cli.md
       - Development: guides/development.md
   - Module Walkthrough:
       - Index: modules.md

@@ -97,6 +97,9 @@ pip install ygg
 - :material-database: **[Databricks](guides/databricks.md)**
   SQL, Unity Catalog, Compute, DBFS/Volumes, Secrets, IAM.
 
+- :material-console: **[Databricks CLI](guides/databricks-cli.md)**
+  `ygg databricks` — clusters, warehouses, jobs, fs, deploy.
+
 - :material-tools: **[Development](guides/development.md)**
   Tests, lint, docs, optional dependencies.
 
