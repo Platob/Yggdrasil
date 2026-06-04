@@ -979,8 +979,13 @@ class Table(DatabricksPath):
     def _delta_capable(self, *, write: bool) -> bool:
         """True when a native :meth:`delta` DeltaFolder read (or write) is
         possible: a Delta table with resolvable storage — and, for a write, an
-        *external* one (UC vends READ_WRITE creds only for external; a managed
-        commit would 403)."""
+        *external* one on a non-UC-managed location.
+
+        UC vends READ_WRITE creds only for external tables (a managed commit
+        would 403), and a ``__unitycatalog`` storage layout is Unity-Catalog
+        governed even when the table is "external" — direct ``PutObject`` there
+        is denied, so the storage path is **not writable**: a write must route
+        through the warehouse instead of a direct DeltaFolder commit."""
         try:
             infos = self.infos
         except Exception:
@@ -992,6 +997,8 @@ class Table(DatabricksPath):
         ):
             return False
         if write and infos.table_type != TableType.EXTERNAL:
+            return False
+        if write and "__unitycatalog" in infos.storage_location:
             return False
         return True
 

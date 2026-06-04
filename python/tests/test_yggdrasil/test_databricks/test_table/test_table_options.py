@@ -104,6 +104,30 @@ def _table(table_type, fmt, storage="s3://b/x"):
     return t
 
 
+class TestDeltaCapable:
+    """``_delta_capable`` — when the storage path is natively read/writable."""
+
+    def test_plain_external_is_read_and_write_capable(self):
+        t = _table(TableType.EXTERNAL, DataSourceFormat.DELTA, storage="s3://b/ext/t")
+        assert t._delta_capable(write=False) is True
+        assert t._delta_capable(write=True) is True
+
+    def test_uc_managed_external_is_not_writable(self):
+        # A ``__unitycatalog`` layout is UC-governed: direct PutObject is denied,
+        # so the storage path is not writable even though the table is external.
+        # Reads may still go direct.
+        t = _table(
+            TableType.EXTERNAL, DataSourceFormat.DELTA,
+            storage="s3://b/metastore/__unitycatalog/catalogs/c/tables/t",
+        )
+        assert t._delta_capable(write=False) is True
+        assert t._delta_capable(write=True) is False
+
+    def test_managed_is_not_writable(self):
+        t = _table(TableType.MANAGED, DataSourceFormat.DELTA)
+        assert t._delta_capable(write=True) is False
+
+
 class TestResolveEngineExplicit:
     def test_explicit_engines_pass_through(self):
         t = _table(TableType.EXTERNAL, DataSourceFormat.DELTA)
