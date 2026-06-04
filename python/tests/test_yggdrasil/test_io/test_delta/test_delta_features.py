@@ -279,15 +279,15 @@ class TestEngineBridges(DeltaTestCase):
 
 
 # ---------------------------------------------------------------------------
-# make_new_version=False — write data files without committing a version
+# write_new_version=False — write data files without committing a version
 # ---------------------------------------------------------------------------
 
 
-class TestMakeNewVersion(DeltaTestCase):
+class TestWriteNewVersion(DeltaTestCase):
     def _opts(self, **kw):
         from yggdrasil.io.delta import DeltaOptions
 
-        return DeltaOptions(make_new_version=False, **kw)
+        return DeltaOptions(write_new_version=False, **kw)
 
     def _log_commits(self, d):
         return sorted(
@@ -320,7 +320,7 @@ class TestMakeNewVersion(DeltaTestCase):
         d = self.delta_io()
         d.write_arrow_table(self.pa.table({"id": [1, 2, 3]}))
         before = d.snapshot(fresh=True).version
-        d.write_arrow_table(self.pa.table({"id": [4, 5, 6]}))  # default make_new_version=True
+        d.write_arrow_table(self.pa.table({"id": [4, 5, 6]}))  # default write_new_version=True
         self.assertEqual(d.snapshot(fresh=True).version, before + 1)
         self.assertEqual(sorted(d.read_arrow_table().column("id").to_pylist()),
                          [1, 2, 3, 4, 5, 6])
