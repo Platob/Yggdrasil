@@ -2,81 +2,91 @@
 
 ## When to use
 
-The user asks to create a job, schedule a pipeline, run a function as
-a Databricks task, set up a cron schedule, or use `@task` / `@flow`.
+The user asks to create a job, schedule a pipeline, run a function as a
+Databricks task, set up a cron schedule, or use `@task` / `@flow`.
 
-## Run existing jobs
+## Run an existing job
 
 ```python
 from yggdrasil.databricks import DatabricksClient
 
 dbc = DatabricksClient()
-job = dbc.jobs.get(name="my-pipeline")
-job.run_now()
-job.wait()
-job.last_run.result_state  # SUCCESS / FAILED
+job = dbc.jobs.get(name="my-pipeline")    # or dbc.jobs.get(job_id=123)
+
+run = job.run()                # → JobRun (awaitable). Or: job.run_and_wait()
+run.wait()
+run.result_state               # SUCCESS / FAILED / CANCELED / ...
+run.duration_seconds
 ```
 
-## Create a job with `@task` / `@flow`
+Pass parameters when triggering:
 
 ```python
-from yggdrasil.databricks.workflow import flow, task, secret
+job.run(parameters={"date": "2026-05-23"})          # job-level params
+job.run(notebook_params={"date": "2026-05-23"})     # notebook widgets
+job.run(python_params=["--date", "2026-05-23"])     # wheel/script argv
+```
+
+## Define a job with `@task` / `@flow`
+
+Import the decorators from `yggdrasil.databricks.job` (Prefect-style):
+
+```python
+from yggdrasil.databricks.job import task, flow
 
 @task
 def ingest(date: str) -> str:
     from yggdrasil.databricks import DatabricksClient
     dbc = DatabricksClient()
-    (dbc.dataset(f"SELECT * FROM vendor.raw WHERE date = '{date}'")
-     .map(clean)
-     .to_table("main.curated.events"))
+    dbc.dataset(f"SELECT * FROM vendor.raw WHERE date = '{date}'") \
+       .map(clean).to_table("main.curated.events")
     return "main.curated.events"
 
 @task(retries=2)
-def load(path: str, api_key: str = secret("vendor", "api-key")) -> None:
+def publish(table: str) -> None:
     ...
 
-@flow(name="daily-ingest", schedule="0 2 * * *")
+@flow(name="daily-ingest")
 def daily(date: str = "2025-01-01"):
-    p = ingest(date)
-    load(p)
+    table = ingest(date)
+    publish(table)
 
-daily.deploy()                  # upsert Databricks Job
-daily.run(date="2026-05-23")    # trigger it
+daily.deploy(dbc)              # trace the body, stage tasks, upsert the Job
+daily(date="2026-05-23")       # run it
 ```
 
-- `@task` runs unchanged locally (for testing) and as a Databricks
-  task inside a `@flow` trace.
-- `@flow.deploy()` traces the body, stages tasks, upserts the Job.
-- `secret("scope", "key")` resolves at runtime — cleartext never
-  lives on disk.
+- A `@task` / `@flow` **runs in-process when called inside Databricks**
+  (for testing) and is dispatched as a real Databricks run otherwise.
+  `daily.local(...)` forces in-process; `daily.submit(...)` runs it in the
+  background and returns a `Future`.
+- `@task` options: `name`, `key`, `retries`, `retry_delay_seconds`,
+  `depends_on=(...)` (task keys for an explicit DAG edge).
+- Flows/tasks default to **serverless** compute and ship your live code as
+  a wheel — no manual cluster wiring.
 
-## Stage a callable directly (no decorator)
+## Define a job with explicit tasks
+
+When you'd rather build the task list yourself:
 
 ```python
-job = dbc.jobs.create_or_update(
+from databricks.sdk.service.jobs import Task, NotebookTask
+
+dbc.jobs.create_or_update(
     name="orders_etl",
-    tasks=[],
-    **dbc.jobs.userinfo_defaults(),   # git source, notifications, tags
+    tasks=[
+        Task(task_key="ingest", notebook_task=NotebookTask(notebook_path="/…/ingest")),
+        Task(task_key="load",   depends_on=[{"task_key": "ingest"}],
+             notebook_task=NotebookTask(notebook_path="/…/load")),
+    ],
 )
-
-# Single task
-job.pytask(ingest_fn, "2026-01-01", task_key="ingest").create()
-
-# Multi-task DAG
-extract = job.pytask(extract_fn, task_key="extract").create()
-transform = job.pytask(
-    transform_fn,
-    task_key="transform",
-    depends_on=["extract"],
-).create()
-load = job.pytask(load_fn, task_key="load", depends_on=["transform"]).create()
 ```
 
-`pytask` extracts the function source, stages a `.py` runner in
-Workspace, and AST-walks imports to resolve pip dependencies
-automatically.
+`create_or_update` upserts by name (creates if absent, updates if present).
 
 ## Schedules
+
+Schedules use the SDK's `CronSchedule` (quartz), passed to
+`create_or_update(schedule=...)` or to `@flow(trigger=...)`:
 
 ```python
 from databricks.sdk.service.jobs import CronSchedule
@@ -84,10 +94,7 @@ from databricks.sdk.service.jobs import CronSchedule
 dbc.jobs.create_or_update(
     name="hourly_ingest",
     tasks=[...],
-    schedule=CronSchedule(
-        quartz_cron_expression="0 0 * * * ?",  # every hour
-        timezone_id="UTC",
-    ),
+    schedule=CronSchedule(quartz_cron_expression="0 0 * * * ?", timezone_id="UTC"),
 )
 ```
 
@@ -98,30 +105,37 @@ dbc.jobs.create_or_update(
 | Daily at 02:30 UTC | `0 30 2 * * ?` |
 | Weekdays at 09:00 | `0 0 9 ? * MON-FRI` |
 
-## Compute
-
-Default is **serverless** (fast cold start, internal pipelines).
-Use a **classic cluster** for ingestion that hits the public internet:
+## Inspect runs
 
 ```python
-job.pytask(
-    ingest_fn,
-    task_key="ingest",
-    existing_cluster_id="0123-...",  # cluster with internet egress
-).create()
+run = dbc.job_runs.get(run_id=987654321)
+run.state; run.result_state; run.state_message
+run.debug()                    # human-readable dump: state + DAG + task logs/stderr
+run.logs(task_key="ingest")    # one task's output
+run.cancel()
+run.repair(rerun_tasks=["load"], wait=True)   # rerun failed tasks
+
+for r in job.list_runs(active_only=True):
+    print(r.run_id, r.state)
 ```
 
 ## Secrets
 
 ```python
-val = dbc.secrets.get("my-scope", "db-password")
-dbc.secrets["my-scope/db-password"]  # dict-like access
+dbc.secrets.create_secret("db-password", "<value>", scope="vendor")
+
+dbc.secrets["vendor/db-password"].svalue()     # read the string value
 ```
 
 ## Don'ts
 
-- Don't sleep-poll a job — `job.wait()` does exponential backoff.
-- Don't `ws.jobs.create(...)` directly — use
+- **No `yggdrasil.databricks.workflow` module** — import `task` / `flow`
+  from `yggdrasil.databricks.job`.
+- **No `secret("scope", "key")` helper** — read via `dbc.secrets`.
+- **No `job.pytask(...)`** — use `@task` / `@flow`, or
+  `dbc.jobs.create_or_update(name, tasks=[...])` with SDK `Task` objects.
+- It's `job.run()` (not `run_now()`), and `@flow(trigger=CronSchedule(...))`
+  (not a `schedule="0 2 * * *"` string).
+- Don't sleep-poll a run — `run.wait()` does the backoff.
+- Don't `dbc.workspace_client().jobs.create(...)` — use
   `dbc.jobs.create_or_update()`.
-- Don't hand-write the `.py` runner — `pytask` stages it for you.
-- Don't list pip deps manually — `auto_dependencies` walks the AST.
