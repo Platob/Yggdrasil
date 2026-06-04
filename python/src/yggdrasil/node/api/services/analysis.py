@@ -783,11 +783,14 @@ class AnalysisService:
             h = df[req.atr_high].cast(pl.Float64, strict=False)
             lo_s = df[req.atr_low].cast(pl.Float64, strict=False)
             pc = prices.shift(1)
-            tr = pl.max_horizontal([
-                (h - lo_s).abs(),
-                (h - pc).abs(),
-                (lo_s - pc).abs(),
-            ])
+            # True range = max(high-low, |high-prev_close|, |low-prev_close|);
+            # max_horizontal is an Expr, so evaluate it against a frame to get a
+            # Series, then Wilder-smooth it (alpha = 1/14).
+            tr = pl.select(
+                pl.max_horizontal(
+                    (h - lo_s).abs(), (h - pc).abs(), (lo_s - pc).abs()
+                ).alias("tr")
+            )["tr"]
             atr_vals = _safe_list(tr.ewm_mean(alpha=1.0 / 14, ignore_nulls=True))
 
         source_rows = lf.select(pl.len()).collect(engine="streaming").item()
