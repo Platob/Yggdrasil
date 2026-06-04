@@ -126,3 +126,32 @@ class TestAutoLoadEntryPoint:
         spark.sql.assert_not_called()  # no DESCRIBE DETAIL when checkpoint given
         writer.option.assert_any_call("checkpointLocation", "s3://ckpt")
         writer.trigger.assert_called_once_with(processingTime="1 minute")
+
+
+class TestStageStoragePathAndDefaultSource:
+    def test_stage_storage_path_resolves_volume_storage(self):
+        from yggdrasil.enums import Mode
+        tbl = _table()
+        vol = MagicMock()
+        root = MagicMock()
+        sentinel = object()
+        root.__truediv__.return_value = sentinel
+        vol.storage_path.return_value = root
+        with patch.object(Table, "ensure_staging_volume", return_value=vol):
+            out = tbl.stage_storage_path()
+        assert out is sentinel
+        assert vol.storage_path.call_args.kwargs["mode"] is Mode.AUTO
+        root.__truediv__.assert_called_once_with(".ygg/stage")
+
+    def test_auto_loader_defaults_source_to_stage_storage_path(self):
+        tbl = _table()
+        stage = MagicMock()
+        stage.full_path.return_value = "s3://bkt/3mv/ygg/stage"
+        with patch.object(Table, "stage_storage_path", return_value=stage), \
+                patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader(file_arrival=True)  # no source
+
+        params = Flow.call_args.kwargs["parameters"]
+        assert params[1] == "s3://bkt/3mv/ygg/stage"            # source = staging storage path
+        trig = Flow.call_args.kwargs["trigger"]
+        assert trig.file_arrival.url == "s3://bkt/3mv/ygg/stage"  # file trigger on it

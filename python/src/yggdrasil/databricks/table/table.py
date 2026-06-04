@@ -3102,7 +3102,7 @@ class Table(DatabricksPath):
 
     def auto_loader(
         self,
-        source: str,
+        source: "str | None" = None,
         *,
         name: "str | None" = None,
         file_format: str = "parquet",
@@ -3125,6 +3125,9 @@ class Table(DatabricksPath):
 
         Args:
             source: Cloud path Auto Loader watches (``s3://…`` / ``/Volumes/…``).
+                ``None`` (default) uses this table's cloud staging area
+                (:meth:`stage_storage_path`), so files staged there are ingested
+                with no explicit wiring.
             name: Job name override (default ``ygg_autoloader_<full_name>``).
             file_format: ``cloudFiles.format`` (parquet / json / csv / avro / …).
             checkpoint: Streaming checkpoint + schema location; ``None`` lets the
@@ -3146,6 +3149,11 @@ class Table(DatabricksPath):
         """
         from yggdrasil.databricks.job.skeleton import Flow
         from yggdrasil.databricks.table.auto_loader import auto_load
+
+        if source is None:
+            # Default to the table's own cloud staging area, so files staged
+            # via the storage path are ingested with no explicit wiring.
+            source = self.stage_storage_path().full_path()
 
         if file_arrival and trigger is None:
             from databricks.sdk.service.jobs import (
@@ -3378,6 +3386,22 @@ class Table(DatabricksPath):
         table — see :meth:`ensure_staging_volume`).
         """
         return self.ensure_staging_volume().path(".sql/tmp", temporary=temporary)
+
+    def stage_storage_path(self, *, sub: str = ".ygg/stage") -> "Path":
+        """The staging area as a direct **cloud storage** :class:`Path`.
+
+        :meth:`staging_folder` hands back a ``/Volumes/...`` :class:`VolumePath`
+        (Files-API addressable); this resolves the *same* external staging
+        volume to its backing object-store location (an ``s3://...``
+        :class:`~yggdrasil.aws.fs.path.S3Path` carrying the volume's vended
+        credentials), so staged files land straight in cloud storage and the
+        path is a plain cloud URL — exactly what Auto Loader (``cloudFiles``)
+        watches. Used as the default :meth:`auto_loader` *source*.
+
+        ``sub`` is the prefix under the volume root the staged files live at.
+        """
+        root = self.ensure_staging_volume().storage_path(mode=Mode.AUTO)
+        return (root / sub) if sub else root
 
     def insert_volume_path(
         self,
