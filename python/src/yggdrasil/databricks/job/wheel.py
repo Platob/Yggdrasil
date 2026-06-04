@@ -335,6 +335,14 @@ def build_wheel(
             )
     else:
         logger.info("building wheel (+ dependencies) for %s into %s (pip)", package, out)
+        # Bundling the dependency closure needs pip (uv build can't); uv-created
+        # venvs ship without it, so bootstrap one in-place via ensurepip first.
+        if subprocess.run(
+            [sys.executable, "-m", "pip", "--version"],
+            capture_output=True,
+        ).returncode != 0:
+            logger.info("pip not present in %s — bootstrapping via ensurepip", sys.executable)
+            subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=True)
         subprocess.run(
             [sys.executable, "-m", "pip", "wheel", str(project), *requirements,
              "--wheel-dir", str(out)],
