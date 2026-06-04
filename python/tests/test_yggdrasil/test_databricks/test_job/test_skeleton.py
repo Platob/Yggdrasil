@@ -269,3 +269,60 @@ def test_default_only_single_environment_without_flag():
     f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl",)
     envs = f.environments()
     assert [e.environment_key for e in envs] == ["default"]
+
+
+def test_named_base_environment_referenced_when_present():
+    @flow(name="yellowjob")
+    def f(x):
+        ...
+
+    # Simulate a deploy that wrote a reusable base env + a user-package layer.
+    f._base_environment_path = "/Workspace/Shared/ygg/environments/yellow.env.yaml"
+    f._user_layer = ["/ws/userpkg-2.0-py3-none-any.whl", "requests==2"]
+    f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl",)  # inline fallback, unused here
+
+    envs = f.environments()
+    assert len(envs) == 1
+    spec = envs[0].spec
+    assert spec.base_environment == "/Workspace/Shared/ygg/environments/yellow.env.yaml"
+    # base env carries the version → not set alongside it; only the layer rides on top.
+    assert spec.environment_version is None
+    assert spec.dependencies == ["/ws/userpkg-2.0-py3-none-any.whl", "requests==2"]
+
+
+def test_named_base_environment_empty_layer_is_none():
+    @flow(name="yellowonly")
+    def f(x):
+        ...
+
+    f._base_environment_path = "/Workspace/Shared/ygg/environments/yellow.env.yaml"
+    f._user_layer = []  # ygg-only job — nothing layered on top
+    envs = f.environments()
+    assert envs[0].spec.dependencies is None
+
+
+def test_serverless_dependencies_writes_base_env_and_splits_layer():
+    from yggdrasil.databricks.job import wheel as W
+
+    @flow(name="splitjob")
+    def f(x):
+        ...
+
+    f.base_environment_name = "yellow"
+    client = object()
+    with patch.object(W, "is_editable_install", return_value=False), \
+         patch.object(W, "distribution_for", return_value="ygg"), \
+         patch.object(W, "_norm", side_effect=lambda s: s), \
+         patch.object(W, "ensure_ygg_wheels", return_value=["/ws/ygg-1.0-py3-none-any.whl"]), \
+         patch.object(W, "wheel_for_python", side_effect=lambda wheels, *a: wheels[0]), \
+         patch.object(W, "ygg_runtime_dependencies", return_value=["pyarrow>=20"]), \
+         patch.object(W, "ensure_named_environment", return_value="/ws/env/yellow.env.yaml") as ene:
+        flat = f._serverless_dependencies(client)
+
+    # The shared ygg image (wheel + runtime) was written to the named env...
+    ene.assert_called_once()
+    assert ene.call_args.kwargs["dependencies"] == ["/ws/ygg-1.0-py3-none-any.whl", "pyarrow>=20"]
+    assert f._base_environment_path == "/ws/env/yellow.env.yaml"
+    assert f._user_layer == []                       # ygg-only → no layer
+    # ...and the flat fallback list is the union (here just the image).
+    assert flat == ["/ws/ygg-1.0-py3-none-any.whl", "pyarrow>=20"]

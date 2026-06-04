@@ -7,6 +7,7 @@ from .clusters import ClustersCommand
 from .deploy import DeployCommand
 from .fs import FSCommand
 from .jobs import JobsCommand
+from .tables import TablesCommand
 from .warehouses import WarehousesCommand
 
 __all__ = [
@@ -14,5 +15,6 @@ __all__ = [
     "DeployCommand",
     "FSCommand",
     "JobsCommand",
+    "TablesCommand",
     "WarehousesCommand",
 ]

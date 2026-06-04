@@ -48,6 +48,7 @@ __all__ = [
     "ensure_ygg_wheel",
     "ensure_ygg_wheels",
     "ensure_bundle",
+    "ensure_named_environment",
     "ygg_runtime_dependencies",
     "ygg_environment",
     "ygg_environments",
@@ -65,6 +66,11 @@ WORKSPACE_PYPI_DIR = "/Workspace/Shared/pypi"
 
 #: Back-compat alias — the registry root (was an isolated ``.ygg/whl`` path).
 WORKSPACE_WHL_DIR = WORKSPACE_PYPI_DIR
+
+#: Where reusable serverless **base environments** (``<name>.env.yaml``) live —
+#: a job references one by file path via ``Environment.base_environment`` instead
+#: of inlining the whole dependency list (see :func:`ensure_named_environment`).
+WORKSPACE_ENV_DIR = "/Workspace/Shared/ygg/environments"
 
 #: Latest serverless environment version — the fallback when the local Python
 #: isn't one we map to an older runtime.
@@ -587,6 +593,48 @@ def ensure_bundle(
     logger.info("building full %s %s bundle (project + deps) -> %s", dist, version, dist_dir)
     wheels = build_wheel(package, extras=extras, no_deps=False)
     return [upload_wheel(client, w, workspace_dir=dist_dir) for w in wheels]
+
+
+def ensure_named_environment(
+    client: Any,
+    name: str = "yellow",
+    *,
+    dependencies: "list[str] | tuple[str, ...]",
+    environment_version: "str | None" = None,
+    workspace_dir: str = WORKSPACE_ENV_DIR,
+) -> str:
+    """Create-or-update a reusable serverless **base environment** *name* as an
+    ``env.yaml`` in the workspace and return its path.
+
+    A serverless job can reference this file via
+    ``Environment.base_environment`` instead of inlining the whole dependency
+    list — so one shared, named environment (e.g. ``yellow``) is defined once and
+    every ygg job points at it. The file is the documented serverless env spec::
+
+        environment_version: '5'
+        dependencies:
+          - /Workspace/Shared/pypi/ygg/ygg-0.8.52-py3-none-any.whl
+          - pyarrow==...
+
+    Written (overwritten) on every call — upsert semantics, so redeploying keeps
+    *name* pointing at the current image. *dependencies* are wheel workspace paths
+    and/or pip requirement lines."""
+    from yggdrasil.databricks.path import DatabricksPath
+
+    version = environment_version or serverless_environment_version()
+    lines = [f"environment_version: '{version}'", "dependencies:"]
+    lines += [f"  - {dep}" for dep in dependencies]
+    body = "\n".join(lines) + "\n"
+
+    dest = f"{workspace_dir.rstrip('/')}/{name}.env.yaml"
+    path = DatabricksPath.from_(dest, client=client)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    logger.info(
+        "wrote serverless base environment %r -> %s (%d deps, env v%s)",
+        name, dest, len(dependencies), version,
+    )
+    return dest
 
 
 def ygg_runtime_dependencies() -> list[str]:

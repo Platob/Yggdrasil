@@ -162,6 +162,27 @@ class TestWheel:
         bw.assert_called_once_with("yggdrasil", extras=["databricks"], requirements=(), no_deps=False)
         assert dests == ["/ws/job/ygg-1.0-py3-none-any.whl", "/ws/job/pyarrow-1-py3-none-any.whl"]
 
+    def test_ensure_named_environment_writes_env_yaml_and_returns_path(self):
+        client = MagicMock()
+        path = MagicMock()
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.job.wheel.serverless_environment_version", return_value="5"):
+            DP.from_.return_value = path
+            dest = wheel.ensure_named_environment(
+                client, "yellow",
+                dependencies=["/ws/pypi/ygg-1.0-py3-none-any.whl", "pyarrow==1"],
+            )
+        assert dest == "/Workspace/Shared/ygg/environments/yellow.env.yaml"
+        DP.from_.assert_called_once_with(dest, client=client)
+        path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
+        body = path.write_text.call_args.args[0]
+        assert body == (
+            "environment_version: '5'\n"
+            "dependencies:\n"
+            "  - /ws/pypi/ygg-1.0-py3-none-any.whl\n"
+            "  - pyarrow==1\n"
+        )
+
     def test_import_packages_for_inverts_distribution_for(self):
         # ``ygg`` (pip/dist name) → its top-level import package ``yggdrasil``.
         assert wheel.import_packages_for("ygg") == ["yggdrasil"]

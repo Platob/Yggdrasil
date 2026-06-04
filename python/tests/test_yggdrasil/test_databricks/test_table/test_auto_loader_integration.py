@@ -144,6 +144,15 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         task = settings.tasks[0]
         assert task.python_wheel_task.package_name == "ygg"
         assert self.table.full_name() in task.python_wheel_task.parameters
+        # The serverless env references the reusable "yellow" base environment
+        # (written to the workspace) rather than inlining the dependency list.
+        env = settings.environments[0]
+        assert env.spec.base_environment is not None
+        assert env.spec.base_environment.endswith("yellow.env.yaml")
+        # base_environment carries the version → no inline version, and an
+        # ygg-only job layers nothing on top.
+        assert env.spec.environment_version is None
+        assert not env.spec.dependencies
 
     def test_ingestion_smoke(self) -> None:
         # Heavy: builds + ships the ygg wheel and runs a serverless cloudFiles

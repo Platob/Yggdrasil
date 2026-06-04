@@ -5,6 +5,7 @@ Subcommands::
     ygg databricks clusters list/get/create/delete
     ygg databricks warehouses list/get/create/delete
     ygg databricks job list/get/run/runs/logs/cancel/repair/delete
+    ygg databricks tables autoload <catalog.schema.table>  (cloudFiles ingestion job)
     ygg databricks fs ls/cat/write/put/get/mkdir/rm/stat/cp/mv  (Workspace/Volumes/DBFS)
     ygg databricks deploy [ygg|wheel <package>|environment]  (wheels + serverless env configs)
 """
@@ -20,6 +21,7 @@ from .services import (
     DeployCommand,
     FSCommand,
     JobsCommand,
+    TablesCommand,
     WarehousesCommand,
 )
 
@@ -61,6 +63,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     DeployCommand.register(subparsers)
     FSCommand.register(subparsers)
     JobsCommand.register(subparsers)
+    TablesCommand.register(subparsers)
     WarehousesCommand.register(subparsers)
 
     args = parser.parse_args(argv)

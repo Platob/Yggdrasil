@@ -77,6 +77,23 @@ class TestTableAutoLoader:
             tbl.auto_loader("s3://x", deploy=False)
         assert Flow.call_args.kwargs["name"] == "[YGG][AUTOLOADER] cat.sch.tbl"
 
+    def test_defaults_bundle_and_yellow_environment(self):
+        tbl = _table()
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://x", deploy=False)
+        flow = Flow.return_value
+        assert flow.bundle_dependencies is True
+        assert flow.base_environment_name == "yellow"
+
+    def test_environment_override_and_disable(self):
+        tbl = _table()
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://x", environment="green", deploy=False)
+        assert Flow.return_value.base_environment_name == "green"
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://x", environment=None, deploy=False)
+        assert Flow.return_value.base_environment_name is None
+
 
 class TestAutoLoadEntryPoint:
     def _spark(self, *, location="s3://bkt/tbl"):

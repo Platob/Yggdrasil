@@ -3111,6 +3111,7 @@ class Table(DatabricksPath):
         file_arrival: bool = False,
         trigger: "Any" = None,
         bundle_dependencies: bool = True,
+        environment: "str | None" = "yellow",
         deploy: bool = True,
     ) -> "Any":
         """Get-or-create a Databricks **Auto Loader** ingestion job for this table.
@@ -3146,6 +3147,11 @@ class Table(DatabricksPath):
                 installs with **zero PyPI access** ("0 pip install"); ``False``
                 ships only the ygg wheel and resolves deps from the workspace
                 index at install.
+            environment: Name of a reusable serverless **base environment** to
+                create-or-update and reference (default ``"yellow"``) — the ygg
+                image is written once to ``<name>.env.yaml`` in the workspace and
+                the job points at it by path, so jobs share one cached env.
+                ``None`` inlines the dependency list on the job instead.
             deploy: ``True`` (default) get-or-creates the job now and returns the
                 :class:`~yggdrasil.databricks.job.job.Job`; ``False`` returns the
                 configured (un-deployed) :class:`Flow` for inspection / a manual
@@ -3186,6 +3192,9 @@ class Table(DatabricksPath):
         # Ship the whole dependency closure as wheels so the serverless env
         # installs with zero PyPI access ("0 pip install").
         flow.bundle_dependencies = bundle_dependencies
+        # Reference a reusable, named serverless base environment (default
+        # "yellow") — written once, shared across ygg jobs — when set.
+        flow.base_environment_name = environment
         return flow.deploy(self.client) if deploy else flow
 
     def stage_insert(
