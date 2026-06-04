@@ -125,30 +125,53 @@ class TestStagingVolumeExternal:
         assert isinstance(vol, Volume)
         goc.assert_not_called()
 
-    def test_external_table_creates_external_under_table_id(self) -> None:
+    def test_external_table_creates_external_under_schema_staging_root(self) -> None:
         """For an external table, ``ensure_staging_volume`` get-or-creates an
-        **external** volume rooted at the schema storage location (the segment
-        before ``__unitystorage``) + ``/uc/tables/<table_id>`` — never the
-        client default storage location."""
+        **external** volume rooted at the schema's staging path (read straight
+        from :meth:`UCSchema.staging_location`, which the schema records in its
+        metadata) + ``/<hash>`` — never the client default storage location."""
+        import hashlib
+        from types import SimpleNamespace
+
+        from yggdrasil.databricks.schema.schema import UCSchema
+
         tbl = _table("cat", "sch", "tbl")
         with patch.object(
-            Table, "infos", new_callable=PropertyMock,
-        ) as infos, patch.object(
-            Table, "schema_storage_location",
-            return_value="s3://bkt/meta/__unitystorage/catalogs/x/schemas/y",
+            Table, "read_infos",
+            return_value=SimpleNamespace(table_type=TableType.EXTERNAL),
         ), patch.object(
-            Table, "table_id", new_callable=PropertyMock, return_value="tid-123",
-        ), patch.object(
+            UCSchema, "staging_location", return_value="s3://bkt/meta/uc/tables",
+        ) as staging, patch.object(
             Volume, "get_or_create",
         ) as goc:
-            infos.return_value.table_type = TableType.EXTERNAL
             vol = tbl.ensure_staging_volume()
 
+        staging.assert_called_once()  # read the schema-metadata staging root
         assert isinstance(vol, Volume)
         goc.assert_called_once()
         kw = goc.call_args.kwargs
         assert kw["volume_type"] == "EXTERNAL"
-        assert kw["storage_location"] == "s3://bkt/meta/uc/tables/tid-123"
+        key = hashlib.blake2b(b"cat.sch.tbl", digest_size=16).hexdigest()
+        assert kw["storage_location"] == f"s3://bkt/meta/uc/tables/{key}"
+
+    def test_external_table_without_staging_root_stays_managed(self) -> None:
+        # No resolvable schema staging path → fall back to the managed default.
+        from types import SimpleNamespace
+
+        from yggdrasil.databricks.schema.schema import UCSchema
+
+        tbl = _table("cat", "sch", "tbl")
+        with patch.object(
+            Table, "read_infos",
+            return_value=SimpleNamespace(table_type=TableType.EXTERNAL),
+        ), patch.object(
+            UCSchema, "staging_location", return_value=None,
+        ), patch.object(
+            Volume, "get_or_create",
+        ) as goc:
+            tbl.ensure_staging_volume()
+
+        goc.assert_not_called()
 
     def test_managed_table_skips_external_create(self) -> None:
         """A managed table leaves the staging volume to the default (managed)

@@ -3225,14 +3225,16 @@ class Table(DatabricksPath):
     def ensure_staging_volume(self) -> "Volume":
         """Get-or-create this table's staging :class:`Volume` and return it.
 
-        For an **external** table the staging volume is created *external*
-        too, rooted on the schema's storage location — the segment before
-        ``__unitystorage`` — and keyed by a deterministic hash of the table's
-        fully-qualified name: ``<schema_root>/uc/tables/<hash>``. That keeps
-        staged Parquet on the same governed external location as the table
-        (and resolves the same way before the table exists, unlike the UC
-        ``table_id``). A managed table keeps the default (managed) create
-        path, materialised lazily on first write.
+        For an **external** table the staging volume is created *external* too,
+        rooted on the schema's staging path — :meth:`UCSchema.staging_location`,
+        which records ``<schema_root>/uc/tables`` in the schema metadata so it's
+        read straight from properties rather than re-derived every time — and
+        keyed by a deterministic hash of the table's fully-qualified name:
+        ``<staging_root>/<hash>``. That keeps staged Parquet on the same
+        governed external location as the table (and resolves the same way
+        before the table exists, unlike the UC ``table_id``). A managed table
+        (or a schema with no resolvable staging path) keeps the default
+        (managed) create path, materialised lazily on first write.
 
         Kept off the :attr:`staging_volume` property on purpose — resolving
         ``infos`` / creating a volume on a bare handle read is too surprising;
@@ -3245,15 +3247,16 @@ class Table(DatabricksPath):
         # path rather than letting the remote lookup raise.
         info = self.read_infos(default=None)
         if info is not None and info.table_type == TableType.EXTERNAL:
-            root = self.schema_storage_location().split("/__unitystorage")[0].rstrip("/")
-            key = hashlib.blake2b(
-                f"{self.catalog_name}.{self.schema_name}.{self.table_name}".encode("utf-8"),
-                digest_size=16,
-            ).hexdigest()
-            volume.get_or_create(
-                volume_type="EXTERNAL",
-                storage_location=f"{root}/uc/tables/{key}",
-            )
+            staging_root = self.schema.staging_location()
+            if staging_root:
+                key = hashlib.blake2b(
+                    f"{self.catalog_name}.{self.schema_name}.{self.table_name}".encode("utf-8"),
+                    digest_size=16,
+                ).hexdigest()
+                volume.get_or_create(
+                    volume_type="EXTERNAL",
+                    storage_location=f"{staging_root.rstrip('/')}/{key}",
+                )
         return volume
 
     def staging_folder(
