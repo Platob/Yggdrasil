@@ -29,15 +29,17 @@ The bound :class:`DatabricksClient` is mutable: every constructor
 call updates the live binding so refreshes that follow a client
 rotation pick up the fresh workspace auth.
 
-Vended credentials are also cached in a Databricks **secret scope**
-(``ygg_aws_credentials`` by default; override via
-``YGG_DATABRICKS_CREDS_SECRET_SCOPE``, or set it empty to disable),
-keyed by ``(resource, mode)``. A later resolution — in this process,
-on a Spark executor, or in a fresh run — reuses a still-valid cached
-credential instead of re-vending it from Unity Catalog; an in-process
-memo short-circuits repeat calls without even reading the secret. The
-whole layer is best-effort: any Secrets-API failure falls back to a
-fresh UC vend, so it never blocks credential resolution.
+Vended credentials are also cached in a Databricks **secret scope, one
+per resource** — ``aws.<kind>.<resource>`` (e.g.
+``aws.volume.cat.sch.vol`` / ``aws.table.cat.sch.tbl``), with the
+credentials stored under a single ``credentials`` key (a read/write map).
+A later resolution — in this process, on a Spark executor, or in a fresh
+run — reuses a still-valid cached credential instead of re-vending it from
+Unity Catalog; an in-process memo short-circuits repeat calls without even
+reading the secret. The ``aws`` prefix is overridable via
+``YGG_DATABRICKS_CREDS_SECRET_PREFIX`` (set it empty to disable
+persistence). The whole layer is best-effort: any Secrets-API failure
+falls back to a fresh UC vend, so it never blocks credential resolution.
 """
 
 from __future__ import annotations
@@ -130,6 +132,9 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
     """
 
     _RESOURCE_NAME: ClassVar[str] = ""
+    #: Short, human-readable kind stamped into the per-resource secret scope
+    #: name (``aws.<kind>.<resource>``). Overridden per subclass.
+    _RESOURCE_KIND: ClassVar[str] = "resource"
     DEFAULT_MODE: ClassVar[Mode] = Mode.READ_ONLY
 
     def __init__(
@@ -137,6 +142,7 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         key: str,
         *,
         client: Any = None,
+        resource_url: "str | None" = None,
     ) -> None:
         # ``AwsCredentialsProvider.__init__`` is idempotent — re-entry
         # just rebinds the live client so refreshes after a workspace
@@ -144,9 +150,15 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         if getattr(self, "_initialized", False):
             if client is not None:
                 self._client = client
+            if resource_url and not getattr(self, "_resource_url", None):
+                self._resource_url = str(resource_url)
             return
         super().__init__(key)
         self._client: Any = client
+        # Readable resource identity (the volume / table UC name, or the
+        # storage URL) used to name the per-resource secret scope; falls
+        # back to ``key`` (the UC id) when not supplied.
+        self._resource_url: "Optional[str]" = str(resource_url) if resource_url else None
         # Cache key is the *resolved* mode + region.
         self._client_cache: "dict[tuple[Mode, Optional[str]], AWSClient]" = {}
 
@@ -226,45 +238,70 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
     # Secrets-backed persistence of vended credentials
     # ------------------------------------------------------------------
     #
-    # Temporary credentials are cached in a Databricks secret scope, keyed by
-    # ``(resource, mode)``, so a later resolution — in this process or another
-    # (a Spark executor, a fresh run) — reuses a still-valid credential instead
-    # of re-vending it from Unity Catalog. An in-process memo short-circuits
-    # repeat calls without even reading the secret.
+    # Temporary credentials are cached in a Databricks secret scope, **one per
+    # resource** (``aws.<kind>.<resource>``), under a single ``credentials``
+    # key whose value is a ``{mode: creds}`` map. A later resolution — in this
+    # process or another (a Spark executor, a fresh run) — reuses a still-valid
+    # credential instead of re-vending it from Unity Catalog. An in-process
+    # memo short-circuits repeat calls without even reading the secret.
     #
     # All of it is **best-effort**: any Secrets-API failure (scope missing, no
     # permission, network) silently falls back to a fresh UC vend, so the
     # backing can never break credential resolution. Set
-    # ``YGG_DATABRICKS_CREDS_SECRET_SCOPE`` to override the scope name, or to an
-    # empty string to disable persistence entirely.
+    # ``YGG_DATABRICKS_CREDS_SECRET_PREFIX`` to override the ``aws`` scope
+    # prefix, or to an empty string to disable persistence entirely.
 
     #: Don't reuse a persisted credential within this many seconds of its
     #: expiry — leave the caller enough runway to actually use it before a
     #: refresh is forced.
     _PERSIST_EXPIRY_MARGIN: ClassVar[float] = 600.0
-    _DEFAULT_SECRET_SCOPE: ClassVar[str] = "ygg_aws_credentials"
+    _DEFAULT_SECRET_PREFIX: ClassVar[str] = "aws"
+    #: The single secret key each per-resource scope stores its read/write
+    #: credential map under.
+    _SECRET_KEY: ClassVar[str] = "credentials"
 
     @classmethod
-    def _secret_scope(cls) -> "Optional[str]":
-        """The secret scope to back credentials with, or ``None`` (disabled)."""
-        scope = os.environ.get(
-            "YGG_DATABRICKS_CREDS_SECRET_SCOPE", cls._DEFAULT_SECRET_SCOPE,
+    def _secret_prefix(cls) -> "Optional[str]":
+        """The scope-name prefix (``aws`` by default), or ``None`` when
+        persistence is disabled via an empty override."""
+        prefix = os.environ.get(
+            "YGG_DATABRICKS_CREDS_SECRET_PREFIX", cls._DEFAULT_SECRET_PREFIX,
         )
-        return scope.strip() or None
+        return prefix.strip() or None
 
-    def _secret_key(self, mode: Mode) -> str:
-        """Stable, Databricks-legal secret key for this resource + mode.
+    def _secret_scope(self) -> "Optional[str]":
+        """Per-resource secret scope name (``<prefix>.<kind>.<resource>``), or
+        ``None`` when persistence is disabled.
 
-        Secret keys allow ``[A-Za-z0-9_.-]`` only; the raw key (a UUID for
-        volume / table, a URL for a path credential) is sanitised and, when
-        long, suffixed with a stable xxhash so distinct URLs never collide.
+        The resource slug is the readable :attr:`_resource_url` (the volume /
+        table UC name, or storage URL) when known, else the UC id. Databricks
+        scope names allow ``[A-Za-z0-9_.@-]`` and cap at 128 chars, so the slug
+        is sanitised and, when the whole name would overflow, truncated with a
+        stable xxhash suffix so distinct resources never collide.
         """
-        raw = f"{self._RESOURCE_NAME}.{self.key}.{mode.name}"
-        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", raw)
-        if len(safe) > 240:
+        prefix = self._secret_prefix()
+        if prefix is None:
+            return None
+        raw = str(self._resource_url or self.key)
+        slug = re.sub(r"[^A-Za-z0-9_.@-]", "_", raw).strip("._@-") or "x"
+        scope = f"{prefix}.{self._RESOURCE_KIND}.{slug}"
+        if len(scope) > 128:
             import xxhash
-            safe = safe[:200] + "_" + xxhash.xxh64(raw.encode("utf-8")).hexdigest()
-        return safe
+            digest = xxhash.xxh64(raw.encode("utf-8")).hexdigest()
+            head = f"{prefix}.{self._RESOURCE_KIND}."
+            keep = max(1, 128 - len(head) - len(digest) - 1)
+            scope = f"{head}{slug[:keep]}.{digest}"
+        return scope
+
+    @staticmethod
+    def _creds_to_entry(creds: AwsCredentials) -> dict:
+        return {
+            "access_key_id": creds.access_key_id,
+            "access_point": creds.access_point,
+            "secret_access_key": creds.secret_access_key,
+            "session_token": creds.session_token,
+            "expiration": creds.expiration,
+        }
 
     @staticmethod
     def _remaining_seconds(creds: AwsCredentials) -> float:
@@ -279,10 +316,28 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
             return -1.0
         return (expires - dt.datetime.now(dt.timezone.utc)).total_seconds()
 
+    def _read_secret_map(self) -> dict:
+        """The ``{mode: creds}`` map stored under the resource's ``credentials``
+        secret, or ``{}`` (best-effort — any failure yields an empty map)."""
+        scope = self._secret_scope()
+        if scope is None:
+            return {}
+        try:
+            secret = self.client.secrets.secret(self._SECRET_KEY, scope=scope)
+            data = secret.refresh(raise_error=False).object
+        except Exception:
+            LOGGER.debug(
+                "reading persisted credentials for %s=%r failed",
+                self._RESOURCE_NAME, self.key, exc_info=True,
+            )
+            return {}
+        return dict(data) if isinstance(data, Mapping) else {}
+
     def _load_persisted(self, mode: Mode) -> "Optional[AwsCredentials]":
         """Return a still-valid cached credential for *mode*, or ``None``.
 
-        Checks the in-process memo first, then the backing secret. Anything
+        Checks the in-process memo first, then the resource's ``credentials``
+        secret (picking the *mode* entry from its read/write map). Anything
         within :attr:`_PERSIST_EXPIRY_MARGIN` of expiry is treated as a miss so
         the caller vends fresh.
         """
@@ -291,26 +346,15 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         if hit is not None and self._remaining_seconds(hit) > self._PERSIST_EXPIRY_MARGIN:
             return hit
 
-        scope = self._secret_scope()
-        if scope is None:
-            return None
-        try:
-            secret = self.client.secrets.secret(self._secret_key(mode), scope=scope)
-            data = secret.refresh(raise_error=False).object
-        except Exception:
-            LOGGER.debug(
-                "reading persisted credentials for %s=%r (mode=%s) failed",
-                self._RESOURCE_NAME, self.key, mode.name, exc_info=True,
-            )
-            return None
-        if not isinstance(data, Mapping):
+        entry = self._read_secret_map().get(mode.name)
+        if not isinstance(entry, Mapping):
             return None
         creds = AwsCredentials(
-            access_key_id=data.get("access_key_id"),
-            access_point=data.get("access_point"),
-            secret_access_key=data.get("secret_access_key"),
-            session_token=data.get("session_token"),
-            expiration=data.get("expiration"),
+            access_key_id=entry.get("access_key_id"),
+            access_point=entry.get("access_point"),
+            secret_access_key=entry.get("secret_access_key"),
+            session_token=entry.get("session_token"),
+            expiration=entry.get("expiration"),
         )
         if not creds.is_complete() or self._remaining_seconds(creds) <= self._PERSIST_EXPIRY_MARGIN:
             return None
@@ -322,24 +366,26 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         return creds
 
     def _persist(self, mode: Mode, creds: AwsCredentials) -> None:
-        """Best-effort: stash *creds* in the in-process memo and the backing
-        secret. Only persist credentials that carry an expiry (so the loader's
-        freshness check is meaningful)."""
-        self.__dict__.setdefault("_persisted_cache", {})[mode] = creds
+        """Best-effort: stash *creds* in the in-process memo and write the
+        resource's ``credentials`` secret as a ``{mode: creds}`` map.
+
+        The map is built from the in-process memo, so once a process has vended
+        both read and write the single secret carries both. Only credentials
+        that carry an expiry are persisted (so the loader's freshness check is
+        meaningful)."""
+        memo = self.__dict__.setdefault("_persisted_cache", {})
+        memo[mode] = creds
         scope = self._secret_scope()
         if scope is None or not creds.expiration:
             return
+        value = {
+            m.name: self._creds_to_entry(c)
+            for m, c in memo.items()
+            if c.expiration
+        }
         try:
             self.client.secrets.create_secret(
-                key=self._secret_key(mode),
-                value={
-                    "access_key_id": creds.access_key_id,
-                    "access_point": creds.access_point,
-                    "secret_access_key": creds.secret_access_key,
-                    "session_token": creds.session_token,
-                    "expiration": creds.expiration,
-                },
-                scope=scope,
+                key=self._SECRET_KEY, value=value, scope=scope,
             )
         except Exception:
             LOGGER.debug(
@@ -472,12 +518,14 @@ class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
     """
 
     _RESOURCE_NAME = "volume_id"
+    _RESOURCE_KIND = "volume"
 
     def __new__(
         cls,
         volume_id: str,
         *,
         client: Any = None,
+        resource_url: "str | None" = None,
     ) -> "AWSDatabricksVolumeCredentials":
         return super().__new__(cls, str(volume_id))
 
@@ -486,12 +534,15 @@ class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
         volume_id: str,
         *,
         client: Any = None,
+        resource_url: "str | None" = None,
     ) -> None:
         if getattr(self, "_initialized", False):
             if client is not None:
                 self._client = client
+            if resource_url and not getattr(self, "_resource_url", None):
+                self._resource_url = str(resource_url)
             return
-        super().__init__(str(volume_id), client=client)
+        super().__init__(str(volume_id), client=client, resource_url=resource_url)
         self.volume_id: str = str(volume_id)
 
     def __getnewargs__(self):
@@ -507,6 +558,7 @@ class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
         super().__setstate__({"key": str(volume_id)})
         self.volume_id = str(volume_id)
         self._client = None
+        self._resource_url = None
         self._client_cache = {}
 
     def _operation_for(self, mode: Mode) -> "VolumeOperation":
@@ -535,12 +587,14 @@ class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
     """
 
     _RESOURCE_NAME = "table_id"
+    _RESOURCE_KIND = "table"
 
     def __new__(
         cls,
         table_id: str,
         *,
         client: Any = None,
+        resource_url: "str | None" = None,
     ) -> "AWSDatabricksTableCredentials":
         return super().__new__(cls, str(table_id))
 
@@ -549,12 +603,15 @@ class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
         table_id: str,
         *,
         client: Any = None,
+        resource_url: "str | None" = None,
     ) -> None:
         if getattr(self, "_initialized", False):
             if client is not None:
                 self._client = client
+            if resource_url and not getattr(self, "_resource_url", None):
+                self._resource_url = str(resource_url)
             return
-        super().__init__(str(table_id), client=client)
+        super().__init__(str(table_id), client=client, resource_url=resource_url)
         self.table_id: str = str(table_id)
 
     def __getnewargs__(self):
@@ -570,6 +627,7 @@ class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
         super().__setstate__({"key": str(table_id)})
         self.table_id = str(table_id)
         self._client = None
+        self._resource_url = None
         self._client_cache = {}
 
     def _operation_for(self, mode: Mode) -> "TableOperation":
@@ -605,6 +663,7 @@ class AWSDatabricksPathCredentials(_DatabricksCredentialsBase):
     """
 
     _RESOURCE_NAME = "url"
+    _RESOURCE_KIND = "path"
 
     @staticmethod
     def _normalize(url: str) -> str:
@@ -648,6 +707,7 @@ class AWSDatabricksPathCredentials(_DatabricksCredentialsBase):
         super().__setstate__({"key": url})
         self.url = url
         self._client = None
+        self._resource_url = None
         self._client_cache = {}
 
     def _operation_for(self, mode: Mode) -> "PathOperation":

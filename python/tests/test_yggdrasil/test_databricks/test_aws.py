@@ -510,15 +510,17 @@ def _persisted_payload(expiration: str) -> dict:
 
 def _wire_secret_object(client, obj):
     """Make ``client.secrets.secret(...).refresh(raise_error=False).object``
-    return *obj* (a dict to simulate a stored credential, or None)."""
+    return *obj* — the per-resource ``{mode: creds}`` map (or None)."""
     client.secrets.secret.return_value.refresh.return_value.object = obj
 
 
 class TestSecretsBackedPersistence:
-    def test_vend_persists_to_secret(self) -> None:
+    def test_vend_persists_to_per_resource_scope_under_credentials_key(self) -> None:
         client, gen = _volume_client()
         _wire_secret_object(client, None)  # nothing cached yet → must vend
-        p = AWSDatabricksVolumeCredentials("vid-persist-1", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-1", client=client, resource_url="cat.sch.vol",
+        )
 
         out = p.get_credentials(mode="read")
 
@@ -526,14 +528,29 @@ class TestSecretsBackedPersistence:
         gen.assert_called_once()
         client.secrets.create_secret.assert_called_once()
         kw = client.secrets.create_secret.call_args.kwargs
-        assert kw["scope"] == "ygg_aws_credentials"
-        assert kw["key"] == "volume_id.vid-persist-1.READ_ONLY"
-        assert kw["value"]["access_key_id"] == "AKIA-test"
-        assert kw["value"]["session_token"] == "session-test"
+        # Scope is per resource, aws-prefixed, named from the resource URL;
+        # the credential lives under the single ``credentials`` key as a
+        # per-mode map.
+        assert kw["scope"] == "aws.volume.cat.sch.vol"
+        assert kw["key"] == "credentials"
+        assert kw["value"]["READ_ONLY"]["access_key_id"] == "AKIA-test"
+        assert kw["value"]["READ_ONLY"]["session_token"] == "session-test"
+
+    def test_scope_falls_back_to_id_without_resource_url(self) -> None:
+        client, _ = _volume_client()
+        _wire_secret_object(client, None)
+        p = AWSDatabricksVolumeCredentials("vid-noerl", client=client)
+
+        p.get_credentials(mode="read")
+
+        assert (
+            client.secrets.create_secret.call_args.kwargs["scope"]
+            == "aws.volume.vid-noerl"
+        )
 
     def test_reuse_from_secret_skips_vend(self) -> None:
         client, gen = _volume_client()
-        _wire_secret_object(client, _persisted_payload(_future_iso()))
+        _wire_secret_object(client, {"READ_ONLY": _persisted_payload(_future_iso())})
         p = AWSDatabricksVolumeCredentials("vid-persist-2", client=client)
 
         out = p.get_credentials(mode="read")
@@ -543,12 +560,21 @@ class TestSecretsBackedPersistence:
         assert out.access_key_id == "AKIA-persisted"
         assert out.session_token == "session-persisted"
 
+    def test_other_mode_entry_is_a_miss(self) -> None:
+        # The map only holds a write entry → a read still vends.
+        client, gen = _volume_client()
+        _wire_secret_object(client, {"OVERWRITE": _persisted_payload(_future_iso())})
+        p = AWSDatabricksVolumeCredentials("vid-persist-2b", client=client)
+
+        p.get_credentials(mode="read")
+        gen.assert_called_once()
+
     def test_near_expiry_secret_revends(self) -> None:
         client, gen = _volume_client()
         # 1 minute of life left — inside the 10-minute margin → treat as miss.
         import datetime as _dt
         soon = _iso(_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=1))
-        _wire_secret_object(client, _persisted_payload(soon))
+        _wire_secret_object(client, {"READ_ONLY": _persisted_payload(soon)})
         p = AWSDatabricksVolumeCredentials("vid-persist-3", client=client)
 
         out = p.get_credentials(mode="read")
@@ -566,11 +592,12 @@ class TestSecretsBackedPersistence:
 
         gen.assert_called_once()
         # The secret was only read once (the first call's miss); the second
-        # call short-circuited on the in-process memo.
+        # call short-circuited on the in-process memo. Persist builds the map
+        # from the memo, so it adds no extra read.
         client.secrets.secret.assert_called_once()
 
-    def test_disabled_when_scope_empty(self, monkeypatch) -> None:
-        monkeypatch.setenv("YGG_DATABRICKS_CREDS_SECRET_SCOPE", "")
+    def test_disabled_when_prefix_empty(self, monkeypatch) -> None:
+        monkeypatch.setenv("YGG_DATABRICKS_CREDS_SECRET_PREFIX", "")
         client, gen = _volume_client()
         p = AWSDatabricksVolumeCredentials("vid-persist-5", client=client)
 
@@ -580,15 +607,20 @@ class TestSecretsBackedPersistence:
         client.secrets.secret.assert_not_called()     # no read
         client.secrets.create_secret.assert_not_called()  # no write
 
-    def test_scope_override_via_env(self, monkeypatch) -> None:
-        monkeypatch.setenv("YGG_DATABRICKS_CREDS_SECRET_SCOPE", "my_scope")
+    def test_prefix_override_via_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("YGG_DATABRICKS_CREDS_SECRET_PREFIX", "myteam")
         client, gen = _volume_client()
         _wire_secret_object(client, None)
-        p = AWSDatabricksVolumeCredentials("vid-persist-6", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-6", client=client, resource_url="cat.sch.vol",
+        )
 
         p.get_credentials(mode="read")
 
-        assert client.secrets.create_secret.call_args.kwargs["scope"] == "my_scope"
+        assert (
+            client.secrets.create_secret.call_args.kwargs["scope"]
+            == "myteam.volume.cat.sch.vol"
+        )
 
     def test_secret_read_failure_falls_back_to_vend(self) -> None:
         client, gen = _volume_client()
@@ -611,7 +643,7 @@ class TestSecretsBackedPersistence:
         gen.assert_called_once()
         assert out.access_key_id == "AKIA-test"
 
-    def test_read_and_write_modes_use_distinct_secret_keys(self) -> None:
+    def test_read_and_write_modes_share_credentials_key(self) -> None:
         client, _ = _volume_client()
         _wire_secret_object(client, None)
         p = AWSDatabricksVolumeCredentials("vid-persist-9", client=client)
@@ -619,21 +651,23 @@ class TestSecretsBackedPersistence:
         p.get_credentials(mode="read")
         p.get_credentials(mode="overwrite")
 
+        # Both modes write the same ``credentials`` key; the last write carries
+        # both entries (built from the in-process memo).
         keys = {c.kwargs["key"] for c in client.secrets.create_secret.call_args_list}
-        assert keys == {
-            "volume_id.vid-persist-9.READ_ONLY",
-            "volume_id.vid-persist-9.OVERWRITE",
-        }
+        assert keys == {"credentials"}
+        last_value = client.secrets.create_secret.call_args.kwargs["value"]
+        assert set(last_value) == {"READ_ONLY", "OVERWRITE"}
 
-    def test_table_provider_also_persists(self) -> None:
+    def test_table_provider_persists_to_table_scope(self) -> None:
         client, gen = _table_client()
         _wire_secret_object(client, None)
-        p = AWSDatabricksTableCredentials("tid-persist-1", client=client)
+        p = AWSDatabricksTableCredentials(
+            "tid-persist-1", client=client, resource_url="cat.sch.tbl",
+        )
 
         p.get_credentials(mode="read")
 
         client.secrets.create_secret.assert_called_once()
-        assert (
-            client.secrets.create_secret.call_args.kwargs["key"]
-            == "table_id.tid-persist-1.READ_ONLY"
-        )
+        kw = client.secrets.create_secret.call_args.kwargs
+        assert kw["scope"] == "aws.table.cat.sch.tbl"
+        assert kw["key"] == "credentials"

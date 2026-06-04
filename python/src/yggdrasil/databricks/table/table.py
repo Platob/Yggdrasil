@@ -3698,6 +3698,7 @@ class Table(DatabricksPath):
         return AWSDatabricksTableCredentials(
             table_id=self.table_id,
             client=self.client,
+            resource_url=self.full_name(),
         )
 
     def temporary_credentials(self, operation: TableOperation = TableOperation.READ):

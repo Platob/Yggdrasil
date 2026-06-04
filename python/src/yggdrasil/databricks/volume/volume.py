@@ -558,6 +558,7 @@ class Volume(DatabricksPath):
         return AWSDatabricksVolumeCredentials(
             volume_id=self.volume_id,
             client=self.client,
+            resource_url=self.full_name(),
         )
 
     def aws(
