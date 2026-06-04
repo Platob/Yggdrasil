@@ -154,28 +154,46 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         assert env.spec.environment_version is None
         assert not env.spec.dependencies
 
-    def test_ingestion_smoke(self) -> None:
+    def test_bulk_stage_ingest_fast_reuse_and_cleanup(self) -> None:
         # Heavy: builds + ships the ygg wheel and runs a serverless cloudFiles
         # job (minutes). Opt in with YGG_TEST_AUTOLOADER_RUN=1.
         if not os.environ.get("YGG_TEST_AUTOLOADER_RUN"):
             self.skipTest("set YGG_TEST_AUTOLOADER_RUN=1 to run the live ingestion sweep")
-        # Stage a file, then run the deployed job once (AvailableNow) and assert
-        # the rows land in the table. (The file-arrival *trigger* is validated
-        # above; here we drive one ingestion sweep deterministically.)
-        leaf = self.stage / f"batch_{secrets.token_hex(3)}.parquet"
-        leaf.write_table(pa.table({"id": [101, 102], "v": ["x", "y"]}), mode=Mode.OVERWRITE)
 
-        job = self.table.auto_loader(available_now=True)  # source = staging
-        run = job.run(wait=900, raise_error=True)
+        # Stage 100 small Parquet files into the cloud staging area.
+        n = int(os.environ.get("YGG_TEST_AUTOLOADER_N", "100"))
+        for i in range(n):
+            (self.stage / f"batch_{i:04d}_{secrets.token_hex(2)}.parquet").write_table(
+                pa.table({"id": [i], "v": [f"r{i}"]}), mode=Mode.OVERWRITE)
+        assert len(list(self.stage.iterdir())) >= n
+
+        # Get-or-create twice — the warm second call reuses the deployed bundle
+        # (only the project wheel is refreshed) and updates the *same* job, not a
+        # duplicate. clean_source exercises the cloudFiles.cleanSource path with a
+        # valid > 7-day retention (regression: retention 0 is rejected).
+        job = self.table.auto_loader(available_now=True, clean_source=True)
+        t = time.time()
+        job2 = self.table.auto_loader(available_now=True, clean_source=True)
+        warm = time.time() - t
+        assert job2.job_id == job.job_id, "get-or-create should reuse the same job"
+        # Warm get-or-create is cheap (no full ~100 MB bundle re-upload).
+        assert warm < 90, f"warm get-or-create too slow: {warm:.1f}s"
+
+        run = job2.run(wait=1200, raise_error=True)
         assert run is not None
 
-        # Give UC a beat, then read the table back.
-        deadline = time.time() + 120
+        # All 100 rows land in the table.
+        deadline = time.time() + 180
         ids: list = []
         while time.time() < deadline:
             ids = sorted(self.table.read_arrow_table().column("id").to_pylist())
-            if 101 in ids and 102 in ids:
+            if len(set(ids)) >= n:
                 break
             time.sleep(5)
-        assert 101 in ids and 102 in ids, f"ingested ids={ids}"
-        leaf.remove(missing_ok=True)
+        assert len(set(ids)) >= n, f"ingested {len(set(ids))}/{n}"
+
+        # cloudFiles.cleanSource is a rolling janitor (> 7-day retention) so the
+        # just-ingested files are NOT removed within this sweep; explicit staging
+        # removal empties the source deterministically.
+        self.stage.remove(recursive=True, missing_ok=True)
+        assert len(list(self.stage.iterdir())) == 0

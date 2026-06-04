@@ -28,6 +28,8 @@ def auto_load(
     file_format: str = "parquet",
     checkpoint: str = "",
     available_now: bool = True,
+    clean_source: bool = False,
+    clean_source_retention: str = "8 days",
 ) -> dict[str, Any]:
     """Ingest files under *source* into *table* with Databricks Auto Loader.
 
@@ -43,6 +45,16 @@ def auto_load(
             ``Trigger.AvailableNow`` micro-batch sweep of everything currently
             at *source* then stops — the shape a scheduled / file-arrival job
             wants. ``False`` runs a continuous 1-minute micro-batch stream.
+        clean_source: ``True`` makes Auto Loader **delete each source file once
+            it's been ingested and is older than the retention window**
+            (``cloudFiles.cleanSource = DELETE``) so a staging area doesn't grow
+            without bound. Cleanup runs at the start of a later micro-batch — it
+            does **not** delete files within the same one-shot ``AvailableNow``
+            sweep that ingests them — so it's a rolling janitor, not immediate.
+            Default ``False`` leaves processed files in place.
+        clean_source_retention: Retention window for *clean_source*
+            (``cloudFiles.cleanSource.retentionDuration``). Databricks requires
+            an interval **greater than 7 days**; default ``"8 days"``.
 
     Returns a small summary dict (table + resolved checkpoint + rows ingested
     when known) — handy in the job run output / when called locally.
@@ -74,6 +86,14 @@ def auto_load(
         .option("cloudFiles.schemaLocation", f"{checkpoint}/_schema")
         .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
     )
+    if clean_source:
+        # Self-cleaning staging: delete each file once ingested + committed and
+        # older than the retention window (Databricks requires > 7 days).
+        reader = (
+            reader
+            .option("cloudFiles.cleanSource", "DELETE")
+            .option("cloudFiles.cleanSource.retentionDuration", clean_source_retention)
+        )
     frame = reader.load(source)
 
     writer = (

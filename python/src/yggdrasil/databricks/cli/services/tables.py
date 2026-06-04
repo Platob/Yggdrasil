@@ -40,6 +40,10 @@ class TablesCommand:
                         help="Continuous 1-minute micro-batch stream (default: one AvailableNow sweep).")
         al.add_argument("--file-arrival", dest="file_arrival", action="store_true",
                         help="Attach a file-arrival trigger on the source.")
+        al.add_argument("--clean-source", dest="clean_source", action="store_true",
+                        help="Delete each staged file once ingested + past retention (self-cleaning).")
+        al.add_argument("--clean-source-retention", dest="clean_source_retention", default="8 days",
+                        help="Retention window for --clean-source (> 7 days; default '8 days').")
         al.add_argument("--environment", default="yellow",
                         help="Reusable serverless base environment name (default: yellow).")
         al.add_argument("--no-environment", dest="no_environment", action="store_true",
@@ -87,6 +91,8 @@ class TablesCommand:
                 checkpoint=args.checkpoint,
                 available_now=not args.continuous,
                 file_arrival=args.file_arrival,
+                clean_source=args.clean_source,
+                clean_source_retention=args.clean_source_retention,
                 bundle_dependencies=not args.no_bundle,
                 environment=environment,
                 deploy=deploy,

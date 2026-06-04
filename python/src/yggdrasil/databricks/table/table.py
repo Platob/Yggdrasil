@@ -3110,6 +3110,8 @@ class Table(DatabricksPath):
         available_now: bool = True,
         file_arrival: bool = False,
         trigger: "Any" = None,
+        clean_source: bool = False,
+        clean_source_retention: str = "8 days",
         bundle_dependencies: bool = True,
         environment: "str | None" = "yellow",
         deploy: bool = True,
@@ -3142,6 +3144,15 @@ class Table(DatabricksPath):
                 custom *trigger*).
             trigger: An explicit Databricks ``TriggerSettings`` (schedule /
                 file-arrival), passed through as-is.
+            clean_source: ``True`` makes Auto Loader delete each staged file once
+                it's been ingested and is older than *clean_source_retention*
+                (``cloudFiles.cleanSource = DELETE``) so the staging area is
+                self-cleaning. A rolling janitor — it does not delete files
+                within the same one-shot sweep that ingests them. Default
+                ``False``.
+            clean_source_retention: Retention window for *clean_source*;
+                Databricks requires an interval **greater than 7 days** (default
+                ``"8 days"``).
             bundle_dependencies: ``True`` (default) ships the whole transitive
                 dependency closure as wheels so the serverless environment
                 installs with **zero PyPI access** ("0 pip install"); ``False``
@@ -3186,7 +3197,7 @@ class Table(DatabricksPath):
             trigger=trigger,
             parameters=[
                 self.full_name(), str(source), file_format,
-                checkpoint or "", available_now,
+                checkpoint or "", available_now, clean_source, clean_source_retention,
             ],
         )
         # Ship the whole dependency closure as wheels so the serverless env

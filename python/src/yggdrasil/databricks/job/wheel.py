@@ -578,18 +578,37 @@ def ensure_bundle(
     environment to a matching Python (the deploy already matches the local one).
 
     Cached per ``(dist, version)`` in ``<workspace_dir>/<dist>-bundle/``: a
-    bundle whose project wheel is already present is reused unless *rebuild*."""
+    bundle whose project wheel is already present is reused unless *rebuild*.
+
+    *rebuild* uploads **incrementally** — dependency wheels are version-pinned and
+    immutable, so any already in the bundle dir are reused and only the (small)
+    project wheel is refreshed (its code can change at the same version, e.g. an
+    editable install). This keeps a warm redeploy fast: a handful of MB instead of
+    the whole ~100 MB closure."""
     dist = distribution_for(package)
     version = ilmd.version(dist)
     dist_dir = f"{workspace_dir.rstrip('/')}/{_norm(dist)}-bundle"
-    if not rebuild:
-        existing = deployed_wheels(client, dist, version, workspace_dir=dist_dir)
-        if existing:
-            logger.info(
-                "reusing %d-wheel %s %s bundle at %s",
-                len(existing), dist, version, dist_dir,
-            )
-            return existing
+    deployed = deployed_wheels(client, dist, version, workspace_dir=dist_dir)
+    if deployed and not rebuild:
+        logger.info(
+            "reusing %d-wheel %s %s bundle at %s",
+            len(deployed), dist, version, dist_dir,
+        )
+        return deployed
+
+    proj = _norm(dist)
+    if deployed:
+        # Warm rebuild: the dependency closure is already deployed (immutable,
+        # version-pinned), so only the project wheel can have changed (e.g. an
+        # editable install at the same version). Build + upload just that — uv,
+        # no full pip-wheel closure — and reuse every deployed dependency wheel.
+        logger.info("refreshing %s %s project wheel; reusing deployed deps", dist, version)
+        project_wheels = build_wheel(package, extras=extras, no_deps=True)
+        names = {w.name for w in project_wheels}
+        paths = [upload_wheel(client, w, workspace_dir=dist_dir) for w in project_wheels]
+        paths += [p for p in deployed if p.rsplit("/", 1)[-1] not in names]
+        return paths
+
     logger.info("building full %s %s bundle (project + deps) -> %s", dist, version, dist_dir)
     wheels = build_wheel(package, extras=extras, no_deps=False)
     return [upload_wheel(client, w, workspace_dir=dist_dir) for w in wheels]

@@ -36,7 +36,7 @@ class TestTableAutoLoader:
         assert kwargs["trigger"] is None
         # Positional job parameters: target table, source, format, checkpoint, mode.
         assert kwargs["parameters"] == [
-            "cat.sch.tbl", "s3://bkt/landing", "json", "", True,
+            "cat.sch.tbl", "s3://bkt/landing", "json", "", True, False, "8 days",
         ]
         # Get-or-create happens through Flow.deploy(client) → create_or_update.
         Flow.return_value.deploy.assert_called_once_with(tbl.client)
@@ -52,7 +52,7 @@ class TestTableAutoLoader:
         kwargs = Flow.call_args.kwargs
         assert kwargs["name"] == "my_loader"
         assert kwargs["parameters"] == [
-            "cat.sch.tbl", "s3://bkt/landing", "parquet", "s3://bkt/ckpt", False,
+            "cat.sch.tbl", "s3://bkt/landing", "parquet", "s3://bkt/ckpt", False, False, "8 days",
         ]
 
     def test_file_arrival_builds_trigger_on_source(self):
@@ -142,6 +142,28 @@ class TestAutoLoadEntryPoint:
         spark.sql.assert_not_called()  # no DESCRIBE DETAIL when checkpoint given
         writer.option.assert_any_call("checkpointLocation", "s3://ckpt")
         writer.trigger.assert_called_once_with(processingTime="1 minute")
+
+    def test_clean_source_sets_cleanSource_delete(self):
+        spark, reader, _frame, _writer = self._spark()
+        with self._with_pyspark(spark):
+            auto_load("cat.sch.tbl", "s3://src", checkpoint="s3://ckpt", clean_source=True)
+        reader.option.assert_any_call("cloudFiles.cleanSource", "DELETE")
+        # Databricks requires a retention interval > 7 days.
+        reader.option.assert_any_call("cloudFiles.cleanSource.retentionDuration", "8 days")
+
+    def test_clean_source_retention_override(self):
+        spark, reader, _frame, _writer = self._spark()
+        with self._with_pyspark(spark):
+            auto_load("cat.sch.tbl", "s3://src", checkpoint="s3://ckpt",
+                      clean_source=True, clean_source_retention="30 days")
+        reader.option.assert_any_call("cloudFiles.cleanSource.retentionDuration", "30 days")
+
+    def test_clean_source_off_by_default(self):
+        spark, reader, _frame, _writer = self._spark()
+        with self._with_pyspark(spark):
+            auto_load("cat.sch.tbl", "s3://src", checkpoint="s3://ckpt")
+        calls = [c.args[0] for c in reader.option.call_args_list]
+        assert "cloudFiles.cleanSource" not in calls
 
 
 class TestStageStoragePathAndDefaultSource:
