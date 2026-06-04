@@ -52,6 +52,32 @@ class S3NotFound(S3Error):
     """404 / NoSuchKey."""
 
 
+class _Headers(dict):
+    """Case-insensitive HTTP headers.
+
+    Keys are stored lower-cased and lookups lower-case the query key, so
+    ``headers.get("Content-Length")`` and ``headers.get("content-length")``
+    agree. HTTP/2 lower-cases every header name on the wire, and
+    ``dict(urllib3_headers)`` flattens that to lower-case keys — without this,
+    a capitalised lookup (``"Content-Length"``) silently misses and, for stat,
+    triggers a needless second round trip (a ranged GET to recover the size).
+    """
+
+    __slots__ = ()
+
+    def __init__(self, data: Any = None) -> None:
+        super().__init__((str(k).lower(), v) for k, v in dict(data or {}).items())
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        return super().get(str(key).lower(), default)
+
+    def __getitem__(self, key: Any) -> Any:
+        return super().__getitem__(str(key).lower())
+
+    def __contains__(self, key: Any) -> bool:
+        return super().__contains__(str(key).lower())
+
+
 @dataclass(slots=True)
 class S3Response:
     """Minimal wire response the transport hands back."""
@@ -59,6 +85,12 @@ class S3Response:
     status: int
     headers: Mapping[str, str]
     content: bytes
+
+    def __post_init__(self) -> None:
+        # Normalise headers to a case-insensitive view once, at the boundary,
+        # so every downstream lookup is casing-proof.
+        if not isinstance(self.headers, _Headers):
+            self.headers = _Headers(self.headers)
 
 
 @dataclass(slots=True)
