@@ -3110,6 +3110,7 @@ class Table(DatabricksPath):
         available_now: bool = True,
         file_arrival: bool = False,
         trigger: "Any" = None,
+        bundle_dependencies: bool = True,
         deploy: bool = True,
     ) -> "Any":
         """Get-or-create a Databricks **Auto Loader** ingestion job for this table.
@@ -3119,7 +3120,7 @@ class Table(DatabricksPath):
         task runs :func:`yggdrasil.databricks.table.auto_loader.auto_load` on the
         cluster: Spark Structured Streaming + ``cloudFiles`` incrementally
         ingests files dropped under *source* into this table (exactly-once,
-        schema-evolving). The job is named ``ygg_autoloader_<full_name>`` and
+        schema-evolving). The job is named ``[YGG][AUTOLOADER] <full_name>`` and
         upserted by name (:meth:`Jobs.create_or_update`), so repeated calls
         reconfigure the same job rather than piling up duplicates.
 
@@ -3128,7 +3129,7 @@ class Table(DatabricksPath):
                 ``None`` (default) uses this table's cloud staging area
                 (:meth:`stage_storage_path`), so files staged there are ingested
                 with no explicit wiring.
-            name: Job name override (default ``ygg_autoloader_<full_name>``).
+            name: Job name override (default ``[YGG][AUTOLOADER] <full_name>``).
             file_format: ``cloudFiles.format`` (parquet / json / csv / avro / …).
             checkpoint: Streaming checkpoint + schema location; ``None`` lets the
                 on-cluster step derive ``<table-location>/_ygg_autoloader``.
@@ -3140,6 +3141,11 @@ class Table(DatabricksPath):
                 custom *trigger*).
             trigger: An explicit Databricks ``TriggerSettings`` (schedule /
                 file-arrival), passed through as-is.
+            bundle_dependencies: ``True`` (default) ships the whole transitive
+                dependency closure as wheels so the serverless environment
+                installs with **zero PyPI access** ("0 pip install"); ``False``
+                ships only the ygg wheel and resolves deps from the workspace
+                index at install.
             deploy: ``True`` (default) get-or-creates the job now and returns the
                 :class:`~yggdrasil.databricks.job.job.Job`; ``False`` returns the
                 configured (un-deployed) :class:`Flow` for inspection / a manual
@@ -3167,9 +3173,7 @@ class Table(DatabricksPath):
                 ),
             )
 
-        job_name = name or "ygg_autoloader_" + re.sub(
-            r"[^A-Za-z0-9_.-]", "_", self.full_name(),
-        )
+        job_name = name or f"[YGG][AUTOLOADER] {self.full_name()}"
         flow = Flow(
             auto_load,
             name=job_name,
@@ -3179,6 +3183,9 @@ class Table(DatabricksPath):
                 checkpoint or "", available_now,
             ],
         )
+        # Ship the whole dependency closure as wheels so the serverless env
+        # installs with zero PyPI access ("0 pip install").
+        flow.bundle_dependencies = bundle_dependencies
         return flow.deploy(self.client) if deploy else flow
 
     def stage_insert(

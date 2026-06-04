@@ -32,7 +32,7 @@ class TestTableAutoLoader:
         args, kwargs = Flow.call_args
         # The on-cluster cloudFiles entry point is the job's target.
         assert args[0] is auto_load
-        assert kwargs["name"] == "ygg_autoloader_cat.sch.tbl"
+        assert kwargs["name"] == "[YGG][AUTOLOADER] cat.sch.tbl"
         assert kwargs["trigger"] is None
         # Positional job parameters: target table, source, format, checkpoint, mode.
         assert kwargs["parameters"] == [
@@ -71,12 +71,11 @@ class TestTableAutoLoader:
         Flow.return_value.deploy.assert_not_called()
         assert out is Flow.return_value
 
-    def test_job_name_is_sanitised(self):
-        tbl = _table(catalog_name="my cat", schema_name="sch", table_name="t/b")
+    def test_job_name_uses_bracketed_prefix(self):
+        tbl = _table(catalog_name="cat", schema_name="sch", table_name="tbl")
         with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
             tbl.auto_loader("s3://x", deploy=False)
-        # Spaces / slashes collapse to underscores so the job name is legal.
-        assert Flow.call_args.kwargs["name"] == "ygg_autoloader_my_cat.sch.t_b"
+        assert Flow.call_args.kwargs["name"] == "[YGG][AUTOLOADER] cat.sch.tbl"
 
 
 class TestAutoLoadEntryPoint:

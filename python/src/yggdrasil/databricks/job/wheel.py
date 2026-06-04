@@ -47,6 +47,7 @@ __all__ = [
     "deployed_wheels",
     "ensure_ygg_wheel",
     "ensure_ygg_wheels",
+    "ensure_bundle",
     "ygg_runtime_dependencies",
     "ygg_environment",
     "ygg_environments",
@@ -541,6 +542,42 @@ def ensure_ygg_wheels(
         logger.info("no ygg %s wheel at %s — building for %s", version, dist_dir, list(versions))
 
     wheels = build_wheels_for_versions("ygg", versions=versions, extras=("databricks",))
+    return [upload_wheel(client, w, workspace_dir=dist_dir) for w in wheels]
+
+
+def ensure_bundle(
+    client: Any,
+    package: str = "ygg",
+    *,
+    extras: "tuple[str, ...] | list[str]" = ("databricks",),
+    workspace_dir: str = WORKSPACE_PYPI_DIR,
+    rebuild: bool = False,
+) -> list[str]:
+    """Build *package* **with its whole transitive dependency closure** as
+    wheels and upload every one; return their workspace paths.
+
+    Where :func:`ensure_ygg_wheels` ships only the project wheel (deps resolve
+    from the index at install), this bundles everything — so a serverless
+    environment that lists these wheel paths installs **entirely from them, with
+    zero PyPI access** ("0 pip install"). The dependency wheels are built for the
+    deploying host's platform / Python via ``pip wheel``; pin the serverless
+    environment to a matching Python (the deploy already matches the local one).
+
+    Cached per ``(dist, version)`` in ``<workspace_dir>/<dist>-bundle/``: a
+    bundle whose project wheel is already present is reused unless *rebuild*."""
+    dist = distribution_for(package)
+    version = ilmd.version(dist)
+    dist_dir = f"{workspace_dir.rstrip('/')}/{_norm(dist)}-bundle"
+    if not rebuild:
+        existing = deployed_wheels(client, dist, version, workspace_dir=dist_dir)
+        if existing:
+            logger.info(
+                "reusing %d-wheel %s %s bundle at %s",
+                len(existing), dist, version, dist_dir,
+            )
+            return existing
+    logger.info("building full %s %s bundle (project + deps) -> %s", dist, version, dist_dir)
+    wheels = build_wheel(package, extras=extras, no_deps=False)
     return [upload_wheel(client, w, workspace_dir=dist_dir) for w in wheels]
 
 

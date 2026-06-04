@@ -107,7 +107,7 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
     def _purge(cls) -> None:
         # Delete the job, purge staged + table S3 data, drop the table.
         try:
-            job = cls.client.jobs.get(f"ygg_autoloader_{cls.table.full_name()}".replace(".", "_"))
+            job = cls.client.jobs.get(f"[YGG][AUTOLOADER] {cls.table.full_name()}")
             if job is not None:
                 job.delete()
         except Exception:

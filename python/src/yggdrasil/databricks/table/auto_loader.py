@@ -62,7 +62,7 @@ def auto_load(
         checkpoint = f"{location}/_ygg_autoloader"
 
     logger.info(
-        "Auto Loader %s ← %s (format=%s, checkpoint=%s, available_now=%s)",
+        "[YGG][AUTOLOADER] %s ← %s (format=%s, checkpoint=%s, available_now=%s)",
         table, source, file_format, checkpoint, available_now,
     )
 
@@ -95,5 +95,5 @@ def auto_load(
             summary["rows"] = int(progress.get("numInputRows", 0))
     except Exception:  # noqa: BLE001 — progress is best-effort telemetry
         pass
-    logger.info("Auto Loader into %s finished: %s", table, summary)
+    logger.info("[YGG][AUTOLOADER] into %s finished: %s", table, summary)
     return summary

@@ -156,6 +156,13 @@ class _Runnable:
     #: ``py3XX``) on deploy, not just the local-matched ``default``. The build
     #: already produces a wheel per Python; this exposes them as job environments.
     all_environments: bool = False
+    #: Bundle the **whole transitive dependency closure** as wheels and ship
+    #: them all, so the serverless environment installs with **zero PyPI
+    #: access** ("0 pip install") — instead of the project wheel + index
+    #: requirements. Trades a larger one-time upload for an offline, fully
+    #: reproducible env build. Mutually exclusive with :attr:`all_environments`
+    #: (bundles target the deploy host's single Python).
+    bundle_dependencies: bool = False
 
     _wheel_paths: "tuple[str, ...]" = ()
     _ygg_wheels: "list[str] | None" = None
@@ -288,6 +295,24 @@ class _Runnable:
         from yggdrasil.databricks.job import wheel as W
 
         editable_ygg = W.is_editable_install("ygg")
+
+        if self.bundle_dependencies:
+            # 0 pip install: ship the whole dependency closure as wheels — the
+            # env installs entirely from them, no PyPI. Bundle ygg + (when the
+            # target lives elsewhere) the user package, both with their deps.
+            base = W.user_pypi_dir(client) if editable_ygg else W.WORKSPACE_PYPI_DIR
+            paths = W.ensure_bundle(client, "ygg", workspace_dir=base, rebuild=editable_ygg)
+            pkg = self.wheel_package()
+            dist = W.distribution_for(pkg)
+            if W._norm(dist) != "ygg":
+                ud = W.is_editable_install(dist)
+                ubase = W.user_pypi_dir(client) if ud else W.WORKSPACE_PYPI_DIR
+                paths = paths + W.ensure_bundle(
+                    client, pkg, extras=self.wheel_extras, workspace_dir=ubase, rebuild=ud)
+            self._ygg_wheels = paths      # default env composes from effective_dependencies
+            seen: set[str] = set()
+            return [p for p in paths if not (p in seen or seen.add(p))]
+
         ygg_wheels = W.ensure_ygg_wheels(
             client,
             workspace_dir=(W.user_pypi_dir(client) if editable_ygg else W.WORKSPACE_PYPI_DIR),
