@@ -26,6 +26,7 @@ ygg databricks <group> <action> [flags]
 | [`fs`](#filesystem-fs) | Files across Workspace / Volumes / DBFS — ls/cat/write/put/get/mkdir/rm/stat/cp/mv |
 | [`wheel`](#wheels-wheel) | Wheel registry — build/upload/deploy/list in the workspace PyPI-like index |
 | [`deploy`](#deploy) | Build + upload wheels and assemble serverless environments |
+| [`seed`](#seed) | One-shot readiness — check (and provision) wheels, environments, a default warehouse, and config |
 
 ---
 
@@ -566,6 +567,60 @@ ygg databricks deploy env --all-versions > environments.json
 
 ---
 
+## Seed
+
+One command to answer *"is this workspace ready to run ygg, and if not,
+make it ready"*. `seed` walks four prerequisites and, by default,
+provisions anything missing:
+
+| Area | Checks | Provisions (default mode) |
+|---|---|---|
+| **config** | connectivity, host, current user, default catalog/schema, workspace id | — (read-only) |
+| **wheels** | the versioned ygg image wheel in the registry | builds + uploads it ([`deploy ygg`](#deploy)) |
+| **environments** | the serverless env version + runtime deps | assembles the `JobEnvironment` off the fresh wheel |
+| **warehouses** | a SQL warehouse to execute against | ensures a default (creates a serverless one if none) |
+
+```bash
+ygg databricks seed
+```
+
+| Flag | Purpose |
+|---|---|
+| `--check` | **Read-only**: report readiness, create/upload nothing. Exits `1` if anything is missing — use it as a CI gate. |
+| `--rebuild` | Force a fresh wheel build even if the version is already deployed. |
+| `--all-versions` | Seed a wheel + environment for every supported Python (3.10–3.13). |
+| `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`). |
+
+The report is sectioned with status glyphs — `✓` ready, `▲` missing,
+`✗` errored:
+
+```text
+  ygg databricks seed  (check mode)
+  ●  config
+    host      https://ws.example.com
+    user      me@example.com
+    catalog   main
+  ✓  config reachable
+  ●  wheels
+  ▲  ygg 0.8.52 wheel not deployed under /Workspace/Shared/pypi/ygg
+  ●  environments
+  ✓  environment config resolvable
+  ●  warehouses
+  ✓  1 warehouse(s) available
+  ▲  prerequisites missing — run `ygg databricks seed` to provision
+```
+
+Connectivity is the gate: if the workspace can't be reached (bad host /
+token), `seed` reports the auth error and exits non-zero without touching
+anything else. Use it right after configuring a workspace, or in CI:
+
+```bash
+# fail the pipeline unless the workspace is fully provisioned
+ygg databricks --profile prod seed --check
+```
+
+---
+
 ## Extending the CLI
 
 There are two surfaces in the tree:
@@ -573,7 +628,7 @@ There are two surfaces in the tree:
 - **`yggdrasil.databricks.cli`** — the working `ygg databricks` CLI
   documented above. Each group is a small command class
   (`ClustersCommand`, `WarehousesCommand`, `JobsCommand`, `FSCommand`,
-  `WheelCommand`, `DeployCommand`) that registers an argparse sub-parser and dispatches
+  `WheelCommand`, `DeployCommand`, `SeedCommand`) that registers an argparse sub-parser and dispatches
   straight into the service layer. To add a group, write a class with a
   `register(subparsers)` classmethod and add it to
   `cli/services/__init__.py` + the registration block in `cli/__init__.py`.

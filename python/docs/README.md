@@ -11,7 +11,7 @@ The published site lives at **https://platob.github.io/Yggdrasil/** and is built
 - [Casting](guides/casting.md) — scalars, tabular, engine bridges.
 - [IO & HTTP](guides/io-http.md) — buffers, URLs, sessions, batch dispatch.
 - [Databricks](guides/databricks.md) — SQL, compute, files, secrets, IAM, Genie.
-- [Databricks CLI](guides/databricks-cli.md) — `ygg databricks` clusters, warehouses, jobs, fs, wheel, deploy.
+- [Databricks CLI](guides/databricks-cli.md) — `ygg databricks` clusters, warehouses, jobs, fs, wheel, deploy, seed.
 - [Development](guides/development.md) — tests, lint, docs, Rust extension.
 - [Module index](modules.md) and [module pages](modules/README.md).
 - [API Reference](api/index.md) — auto-generated.
