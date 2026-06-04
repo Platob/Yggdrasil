@@ -21,6 +21,7 @@ under ``tests/test_yggdrasil/test_delta/`` — this file adds to that.
 
 from __future__ import annotations
 
+import multiprocessing
 import shutil
 from typing import Any
 
@@ -33,6 +34,48 @@ from yggdrasil.io.delta import (
     DeltaOptions,
 )
 from yggdrasil.io.delta.tests import DeltaTestCase
+
+
+def _append_worker(table_path: str, worker_id: int, n_appends: int) -> "str | None":
+    """Append *n_appends* one-row batches to the Delta table at *table_path*.
+
+    Runs in its **own OS process** (spawned, so it re-imports yggdrasil
+    cold): the :class:`DeltaFolder` it opens has a fresh, independent
+    singleton cache — its own snapshot TTL and its own ``_delta_log``
+    listing, none of it shared with the parent or sibling workers. This is
+    the production shape (N machines / processes writing one table on shared
+    storage), and the adversarial case for optimistic concurrency: every
+    process starts from a cold view and must re-list + rebase on each
+    collision. The atomic ``O_CREAT|O_EXCL`` commit is the only
+    cross-process synchronisation.
+
+    Returns ``None`` on success or a ``repr`` of the first exception.
+    """
+    import pyarrow as pa
+
+    from yggdrasil.enums import Mode
+    from yggdrasil.io.delta import DeltaFolder, DeltaOptions
+
+    try:
+        d = DeltaFolder(path=table_path)
+        opts = DeltaOptions(
+            mode=Mode.APPEND,
+            checkpoint_interval=0,
+            commit_max_retries=500,
+            commit_retry_backoff=0.01,
+            commit_retry_jitter=0.05,
+            commit_retry_max_delay=0.5,
+        )
+        for i in range(n_appends):
+            key = worker_id * 1000 + i
+            d.write_arrow_batches(
+                pa.table({"id": pa.array([key], pa.int64()),
+                          "w": pa.array([worker_id], pa.int64())}).to_batches(),
+                options=opts,
+            )
+        return None
+    except BaseException as exc:  # noqa: BLE001
+        return repr(exc)
 
 
 def _key_field(name: str = "id") -> Field:
@@ -484,6 +527,88 @@ class TestRebaseOnConflict(DeltaTestCase):
         # 1 initial + 2 retries; exhaustion carries no logical conflict.
         self.assertEqual(attempts["n"], 3)
         self.assertIsNone(ctx.exception.conflict)
+
+
+# ---------------------------------------------------------------------------
+# Cross-process concurrency — independent caches, real atomic commit
+# ---------------------------------------------------------------------------
+
+
+class TestCrossProcessConcurrency(DeltaTestCase):
+    """Concurrent appends from several *processes* that share no cache.
+
+    The in-process tests above simulate a race by mocking ``_commit_atomic``
+    or smuggling a commit file; the threaded "live" suite shares one
+    process-lifetime :class:`DeltaFolder` singleton (so one snapshot/log
+    cache). Neither exercises the real deployment shape: N independent
+    processes, each with a cold, private cache, contending on one Delta
+    table on a shared filesystem. Only the ``O_CREAT|O_EXCL`` commit
+    serialises them. This pins that every racing blind append lands —
+    version advances by exactly one per commit, no writer clobbers another.
+    """
+
+    def test_independent_processes_all_appends_land(self) -> None:
+        d = self.delta_io("xproc")
+        # Seed v0 so every worker contends on top of an existing table with a
+        # known schema (instead of N processes racing the initial create).
+        d.write_arrow_table(
+            self.pa.table({"id": self.pa.array([-1], self.pa.int64()),
+                           "w": self.pa.array([-1], self.pa.int64())}),
+        )
+        base_version = d.snapshot(fresh=True).version
+        table_path = d.path.full_path()
+
+        workers, appends = 4, 5
+        # ``spawn`` re-imports yggdrasil in each child, so no worker inherits
+        # the parent's warm singleton/snapshot cache — genuinely cold,
+        # independent views (``fork`` would copy the parent's post-seed cache).
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(workers) as pool:
+            results = pool.starmap(
+                _append_worker,
+                [(table_path, w, appends) for w in range(workers)],
+            )
+        self.assertEqual(results, [None] * workers)  # no worker errored
+
+        # A fresh reader (cold cache) sees the converged table.
+        snap = DeltaFolder(path=table_path).refresh().snapshot(fresh=True)
+        # One commit per append, none lost to a clobbered version.
+        self.assertEqual(snap.version, base_version + workers * appends)
+
+        out = DeltaFolder(path=table_path).read_arrow_table()
+        ids = sorted(out.column("id").to_pylist())
+        expected = sorted([-1] + [w * 1000 + i
+                                  for w in range(workers) for i in range(appends)])
+        self.assertEqual(ids, expected)  # every row present, no lost writes
+
+    def test_max_contention_single_version_target(self) -> None:
+        # Worst case for the atomic commit: every process targets the *same*
+        # next version at once (one append each on a freshly-seeded table),
+        # so all collide on ``base+1`` and must re-list + rebase. Exactly one
+        # wins each version; the rest advance to the next free slot. None is
+        # lost and no two ever share a version.
+        d = self.delta_io("xproc_hot")
+        d.write_arrow_table(
+            self.pa.table({"id": self.pa.array([0], self.pa.int64()),
+                           "w": self.pa.array([0], self.pa.int64())}),
+        )
+        base_version = d.snapshot(fresh=True).version
+        table_path = d.path.full_path()
+
+        workers = 6
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(workers) as pool:
+            results = pool.starmap(
+                _append_worker,
+                [(table_path, w, 1) for w in range(1, workers + 1)],
+            )
+        self.assertEqual(results, [None] * workers)
+
+        snap = DeltaFolder(path=table_path).refresh().snapshot(fresh=True)
+        self.assertEqual(snap.version, base_version + workers)
+        out = DeltaFolder(path=table_path).read_arrow_table()
+        self.assertEqual(sorted(out.column("id").to_pylist()),
+                         sorted([0] + [w * 1000 for w in range(1, workers + 1)]))
 
 
 # ---------------------------------------------------------------------------
