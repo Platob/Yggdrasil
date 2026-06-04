@@ -531,6 +531,38 @@ class SQLEngine(DatabricksService, StatementExecutor):
         return stmt
 
     # ------------------------------------------------------------------
+    # Re-attach
+    # ------------------------------------------------------------------
+
+    def statement_result(
+        self,
+        statement_id: str,
+        *,
+        warehouse_id: str | None = None,
+        warehouse_name: str | None = None,
+    ) -> "WarehouseStatementResult":
+        """Re-attach to an already-executed statement by its ``statement_id``.
+
+        The Databricks Statement Execution API keeps a finished statement's
+        result available for a window after it runs. This binds a warehouse
+        handle (the engine default unless one is named) to ``statement_id``
+        and returns a readable :class:`WarehouseStatementResult` — call
+        ``wait()`` / ``to_arrow_table()`` / ``to_polars()`` / … to
+        materialise it without re-running the query.
+
+        The statement text isn't needed (the statement already ran); a bare
+        prepared statement is attached only to carry result-read config
+        (disposition / format).
+        """
+        warehouse = self.warehouse(
+            warehouse_id=warehouse_id, warehouse_name=warehouse_name,
+        )
+        prepared = WarehousePreparedStatement.prepare("", client=self.client)
+        return WarehouseStatementResult(
+            executor=warehouse, statement=prepared, statement_id=statement_id,
+        )
+
+    # ------------------------------------------------------------------
     # Tables
     # ------------------------------------------------------------------
 

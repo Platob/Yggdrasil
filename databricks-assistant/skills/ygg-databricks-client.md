@@ -2,76 +2,100 @@
 
 ## When to use
 
-The user asks to connect to Databricks, authenticate, use a service
-(SQL, tables, volumes, jobs, secrets, compute, genie), or needs the
-client in a notebook or job.
+The user asks to connect to Databricks, authenticate, reach a service
+(SQL, tables, volumes, jobs, secrets, compute, IAM, vector search), or
+needs the client inside a notebook or job.
 
 ## Connect
 
 ```python
 from yggdrasil.databricks import DatabricksClient
 
-dbc = DatabricksClient()  # picks up DATABRICKS_HOST/TOKEN from env
+dbc = DatabricksClient()   # inside a notebook: host/token from the runtime
 ```
 
-Singleton by config — same `(host, auth)` → same instance. Picklable
-across Spark workers and job tasks.
+- **Singleton by config** — same constructor args → the same instance
+  (process-wide). `DatabricksClient.current()` returns the global one.
+- **Picklable** — capture it in Spark workers / job tasks; it
+  re-authenticates from the runtime on the far side.
 
 ### Auth patterns
 
 | Auth | How |
 | --- | --- |
+| Runtime (notebook/job) | nothing — host + token are injected |
 | PAT (env) | set `DATABRICKS_HOST` + `DATABRICKS_TOKEN` |
 | PAT (explicit) | `DatabricksClient(host="https://…", token="dapi…")` |
-| Service principal | set `DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET` |
+| OAuth M2M (env) | set `DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET` |
+| OAuth M2M (explicit) | `DatabricksClient(client_id="…", client_secret="…")` |
+| Config profile | `DatabricksClient(profile="prod")` (`~/.databrickscfg`) |
 | Account-level | `DatabricksClient(account_id="…")` |
 
-Inside a Databricks notebook, host + token are auto-injected.
+You can also default the working catalog/schema:
+`DatabricksClient(catalog_name="main", schema_name="default")`.
 
 ## Services
 
+Reach everything through `dbc.<service>` — never `import databricks.sdk`.
+
 ```python
-dbc.sql           # SQL execution → StatementResult
-dbc.tables        # Unity Catalog tables
-dbc.schemas       # schemas
-dbc.catalogs      # catalogs
-dbc.columns       # column metadata
-dbc.volumes       # Volume resources
-dbc.warehouses    # SQL warehouses
-dbc.compute       # clusters + instance pools
-dbc.jobs          # Jobs (create, run, wait)
-dbc.secrets       # secret scopes
-dbc.iam           # users, groups
-dbc.genie         # Genie spaces + Q&A
-dbc.ai            # vector search
+dbc.sql            # SQL execution → StatementResult
+dbc.tables         # Unity Catalog tables (dbc.views is an alias)
+dbc.schemas        # schemas
+dbc.catalogs       # catalogs
+dbc.columns        # column metadata
+dbc.volumes        # Volume resources
+dbc.warehouses     # SQL warehouses
+dbc.compute        # clusters + instance pools  (dbc.clusters == dbc.compute.clusters)
+dbc.jobs           # Jobs (create_or_update, get, run)
+dbc.job_runs       # Job runs
+dbc.secrets        # secret scopes + secrets
+dbc.iam            # users, groups
+dbc.ai             # dbc.ai.vector_search
+dbc.external        # external locations + storage credentials
+dbc.entity_tags    # UC entity tags
 ```
 
-## Resource singletons
+Plus helpers: `dbc.dataset(...)`, `dbc.parallelize(...)`, `dbc.spark()`,
+`dbc.path(...)`, `dbc.tmp_path(...)`, `dbc.open(...)`.
 
-`Table`, `Volume`, `Schema`, `Catalog`, `Job`, `Cluster`,
-`Warehouse`, `Secret` are singleton resources with lifecycle methods:
+> There is **no** `dbc.genie`. Genie is not implemented in this library —
+> don't suggest it.
+
+## Resource objects
+
+`Table`, `Volume`, `Schema`, `Catalog`, `Job`, `JobRun`, `Cluster`,
+`Warehouse` are resource objects with lifecycle methods. Get them through
+the service, then call methods on them:
 
 ```python
 tbl = dbc.tables["main.default.orders"]
 tbl.exists()
-tbl.ensure_created(schema=schema)
-tbl.read_info()
+tbl.ensure_created(schema)          # schema is positional
+tbl.read_infos()
 tbl.delete()
 
 vol = dbc.volumes["main.default.staging"]
-vol.ensure_created()
-vol.path   # → VolumePath
+vol.create()                        # idempotent (or vol.get_or_create())
+vol.path("sub/file.parquet")        # → VolumePath
 ```
 
-Route through these methods — don't call `ws.tables.create()`
-directly.
-
-## SparkTabular / Dataset
+## Secrets
 
 ```python
-ds = dbc.dataset("SELECT * FROM main.sales.orders")
-ds = dbc.dataset("main.sales.orders")
-ds = dbc.parallelize(fetch_data, urls, schema=output_schema)
+dbc.secrets.create_scope("vendor")
+dbc.secrets.create_secret("api-key", "<value>", scope="vendor")
+
+dbc.secrets["vendor/api-key"]       # dict-style read → Secret
+dbc.secrets.secret("api-key", scope="vendor")
+list(dbc.secrets.list_scopes())
+```
+
+## Distributed work
+
+```python
+ds = dbc.dataset("SELECT * FROM main.sales.orders")   # → SparkDataset
+results = dbc.parallelize(urls, fetch, schema=out)    # inputs first, fn second
 ```
 
 See the `ygg-spark-tabular` skill for the full Dataset API.
@@ -79,6 +103,8 @@ See the `ygg-spark-tabular` skill for the full Dataset API.
 ## Don'ts
 
 - Don't `import databricks.sdk` directly — go through `dbc.<service>`.
-- Don't construct multiple clients for the same workspace — the
-  singleton cache handles it.
-- Don't pickle `WorkspaceClient`; pickle `DatabricksClient`.
+  (The raw SDK clients are reachable via `dbc.workspace_client()` if you
+  truly need them, but prefer the service layer.)
+- Don't build multiple clients for one workspace — the singleton handles it.
+- Don't use `dbc.dbfs_path(...)` — it's deprecated; use `dbc.path(...)`.
+- Don't reference `dbc.genie` — it doesn't exist.

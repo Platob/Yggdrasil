@@ -3,7 +3,7 @@
 ## When to use
 
 The user asks to install or set up `ygg` / `yggdrasil`, or hits
-`ModuleNotFoundError`.
+`ModuleNotFoundError: yggdrasil`.
 
 ## Install
 
@@ -14,25 +14,34 @@ dbutils.library.restartPython()
 
 - `[databricks]` adds `databricks-sdk`.
 - Do **not** add `[bigdata]` — Spark is already on the cluster.
-- Add `[data]` when you need pandas + numpy + sqlglot.
-- Add `[http]` when you need HTTP session features for API ingestion.
+- Add `[data]` for local pandas + numpy + sqlglot.
+- Add `[http]` for the HTTP-session helpers (API ingestion).
+
+Combine extras when needed: `"ygg[databricks,http]"`.
 
 ### Pin a version
 
 ```python
-%pip install "ygg[databricks]==0.7.94"
+%pip install "ygg[databricks]==0.8.45"
 ```
+
+Pin in production jobs so a notebook and its scheduled run install the
+same build.
 
 ### Quick check
 
 ```python
 from yggdrasil.databricks import DatabricksClient
+
 dbc = DatabricksClient()
-print(dbc)
+print(dbc)              # repr shows the resolved host
+dbc.sql.execute("SELECT current_user() AS me").to_pylist()
 ```
 
 ## Don'ts
 
-- Don't `pip install yggdrasil` — the PyPI name is `ygg`.
+- Don't `pip install yggdrasil` — the PyPI distribution name is `ygg`
+  (the import name is `yggdrasil`).
 - Don't skip `dbutils.library.restartPython()` after `%pip install`.
-- Don't install `databricks-sdk` separately.
+- Don't install `databricks-sdk` separately — the `[databricks]` extra
+  pulls a compatible version.
