@@ -3304,7 +3304,16 @@ class Table(DatabricksPath):
         safe_merge: bool = False,
         staging_volume: "Volume | None" = None
     ) -> "StatementBatch | Tabular | None":
-        """Insert through the warehouse SQL path with staged Parquet.
+        """Insert *data* into this table.
+
+        Fast path: an EXTERNAL Delta table that's directly writable per its
+        existing Unity Catalog metadata takes a native storage-path write —
+        the rows are committed straight to the table's ``_delta_log`` via
+        DeltaFolder, with no Volume staging or warehouse INSERT. This is used
+        only for the plain APPEND / OVERWRITE / TRUNCATE shape (no keyed MERGE,
+        maintenance, ``return_data``, or forced ``engine``); everything else,
+        and any table the metadata can't confirm writable, falls back to the
+        classic warehouse SQL path with staged Parquet.
 
         ``safe_merge`` controls keyed-write strategy:
 
@@ -3339,6 +3348,42 @@ class Table(DatabricksPath):
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
+
+        # Storage-path write — when the (just-ensured) target is directly
+        # writable per its *existing* Unity Catalog metadata (an EXTERNAL Delta
+        # table with a resolvable ``storage_location``, decided by
+        # ``_delta_capable`` off the cached ``infos`` — no warehouse round
+        # trip), commit the rows straight to the table's storage path via
+        # DeltaFolder instead of staging Parquet + running an INSERT.
+        #
+        # Scoped to the plain APPEND / OVERWRITE / TRUNCATE shape whose
+        # DeltaFolder semantics match the SQL path exactly; a keyed MERGE,
+        # maintenance (ZORDER / VACUUM / OPTIMIZE), a schema-evolving update
+        # set, ``return_data``, or an explicitly forced ``engine`` all keep the
+        # classic warehouse path below. ``_native_delta_folder`` vends + probes
+        # the write credential up front and returns ``None`` on any failure, so
+        # a location the metadata *claims* is writable but isn't falls back
+        # here before a single row is consumed.
+        if (
+            engine is None
+            and not match_by
+            and not update_column_names
+            and not zorder_by
+            and not optimize_after_merge
+            and vacuum_hours is None
+            and not safe_merge
+            and not return_data
+            and mode_enum in (Mode.AUTO, Mode.APPEND, Mode.OVERWRITE, Mode.TRUNCATE)
+            and target._delta_capable(write=True)
+        ):
+            folder = target._native_delta_folder(write=True)
+            if folder is not None:
+                logger.debug(
+                    "arrow_insert: native storage-path write for %r (mode=%s)",
+                    target, mode_enum.name,
+                )
+                folder.write_table(data, cast_options, mode=mode_enum)
+                return None
 
         wait = WaitingConfig.from_(wait)
         staging = self.insert_volume_path(target, temporary=bool(wait), staging_volume=staging_volume)

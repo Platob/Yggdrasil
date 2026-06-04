@@ -380,3 +380,92 @@ class TestWriteRouting:
 
         folder.write_arrow_batches.assert_called_once()
         warehouse.assert_not_called()
+
+
+class TestArrowInsertNativeStoragePath:
+    """``arrow_insert`` storage-path fast path: a plain APPEND/OVERWRITE on a
+    table that's writable per its existing metadata commits straight to the
+    storage path via DeltaFolder (no Volume staging, no warehouse INSERT);
+    everything else falls back to the classic staged-Parquet path."""
+
+    def _data(self):
+        return pa.table({"a": [1, 2, 3]})
+
+    def test_writable_takes_native_storage_path(self):
+        self._tbl = _table()
+        folder = MagicMock()
+        with patch.object(Table, "create", side_effect=lambda *a, **k: self._tbl), \
+                patch.object(Table, "collect_schema", return_value=_schema(("a", pa.int64()))), \
+                patch.object(Table, "_delta_capable", return_value=True) as capable, \
+                patch.object(Table, "_native_delta_folder", return_value=folder) as native, \
+                patch.object(Table, "insert_volume_path") as staging:
+            out = self._tbl.arrow_insert(self._data(), mode="append")
+
+        capable.assert_called_once_with(write=True)
+        native.assert_called_once_with(write=True)
+        folder.write_table.assert_called_once()
+        assert folder.write_table.call_args.kwargs["mode"].name == "APPEND"
+        staging.assert_not_called()  # no Volume staging
+        assert out is None
+
+    def test_not_writable_falls_back_to_classic(self):
+        self._tbl = _table()
+        with patch.object(Table, "create", side_effect=lambda *a, **k: self._tbl), \
+                patch.object(Table, "collect_schema", return_value=_schema(("a", pa.int64()))), \
+                patch.object(Table, "_delta_capable", return_value=False), \
+                patch.object(Table, "_native_delta_folder") as native, \
+                patch.object(Table, "insert_volume_path") as staging, \
+                patch("yggdrasil.databricks.table.table.DatabricksTableInsert") as op_cls:
+            staging.return_value = MagicMock()
+            self._tbl.arrow_insert(self._data(), mode="append")
+
+        native.assert_not_called()             # metadata says not writable
+        staging.assert_called_once()           # classic Volume staging ran
+        op_cls.assert_called_once()            # classic INSERT op built
+
+    def test_keyed_merge_stays_classic_even_if_writable(self):
+        self._tbl = _table()
+        with patch.object(Table, "create", side_effect=lambda *a, **k: self._tbl), \
+                patch.object(Table, "collect_schema", return_value=_schema(("a", pa.int64()))), \
+                patch.object(Table, "_delta_capable", return_value=True), \
+                patch.object(Table, "_native_delta_folder") as native, \
+                patch.object(Table, "insert_volume_path") as staging, \
+                patch("yggdrasil.databricks.table.table.DatabricksTableInsert") as op_cls:
+            staging.return_value = MagicMock()
+            self._tbl.arrow_insert(self._data(), mode="upsert", match_by=["a"])
+
+        native.assert_not_called()             # keyed MERGE needs the warehouse
+        staging.assert_called_once()
+        op_cls.assert_called_once()
+
+    def test_explicit_engine_stays_classic(self):
+        self._tbl = _table()
+        with patch.object(Table, "create", side_effect=lambda *a, **k: self._tbl), \
+                patch.object(Table, "collect_schema", return_value=_schema(("a", pa.int64()))), \
+                patch.object(Table, "_delta_capable", return_value=True), \
+                patch.object(Table, "_native_delta_folder") as native, \
+                patch.object(Table, "insert_volume_path") as staging, \
+                patch("yggdrasil.databricks.table.table.DatabricksTableInsert") as op_cls:
+            staging.return_value = MagicMock()
+            self._tbl.arrow_insert(self._data(), mode="append", engine="api")
+
+        native.assert_not_called()             # forced engine → no native guess
+        staging.assert_called_once()
+        op_cls.assert_called_once()
+
+    def test_probe_failure_falls_back_to_classic(self):
+        # Metadata claims writable but the credential probe returns None — the
+        # rows must still land, via the classic warehouse path.
+        self._tbl = _table()
+        with patch.object(Table, "create", side_effect=lambda *a, **k: self._tbl), \
+                patch.object(Table, "collect_schema", return_value=_schema(("a", pa.int64()))), \
+                patch.object(Table, "_delta_capable", return_value=True), \
+                patch.object(Table, "_native_delta_folder", return_value=None) as native, \
+                patch.object(Table, "insert_volume_path") as staging, \
+                patch("yggdrasil.databricks.table.table.DatabricksTableInsert") as op_cls:
+            staging.return_value = MagicMock()
+            self._tbl.arrow_insert(self._data(), mode="append")
+
+        native.assert_called_once_with(write=True)  # probe attempted
+        staging.assert_called_once()                # then classic fallback
+        op_cls.assert_called_once()                 # classic INSERT op built
