@@ -2376,3 +2376,103 @@ class TestExternalStorageFallbackFlagsVolume:
             with pytest.raises(FileNotFoundError):
                 p._read_mv(16, 0)
         vol.mark_external_denied.assert_not_called()   # transient → keep fast path
+
+
+class TestStorageStrategyDelegation:
+    """More VolumePath ops delegate to the direct cloud-storage Path (its own
+    HEAD / DeleteObject / delete_prefix optimizations) when the volume is
+    external-usable, with the same permission-error flagging + Files-API
+    fallback as read/write."""
+
+    _MOD = "yggdrasil.databricks.fs.volume_path"
+
+    def _vp(self):
+        return VolumePath(
+            "/Volumes/cat/sch/vol/sub/file.bin", service=MagicMock(spec=Volumes),
+        )
+
+    def _no_mount(self):
+        return patch(f"{self._MOD}._local_mount_available", return_value=False)
+
+    # -- stat -----------------------------------------------------------------
+    def test_stat_delegates_to_storage_path(self):
+        from yggdrasil.io.io_stats import IOStats
+        p = self._vp()
+        sf = MagicMock()
+        sf._stat_uncached.return_value = IOStats(kind=IOKind.FILE, size=42, mtime=1.0)
+        with self._no_mount(), \
+                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "_fs_request") as fs:
+            out = p._stat_uncached()
+        assert out.kind is IOKind.FILE and out.size == 42
+        fs.assert_not_called()  # never touched the Files API
+
+    def test_stat_missing_falls_through_to_files_api(self):
+        from yggdrasil.io.io_stats import IOStats
+        p = self._vp()
+        sf = MagicMock()
+        sf._stat_uncached.return_value = IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
+        with self._no_mount(), \
+                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "_fs_request", side_effect=Exception("probe")), \
+                patch.object(VolumePath, "_list_directory", return_value=iter(())):
+            out = p._stat_uncached()
+        assert out.kind is IOKind.MISSING  # S3 MISSING → Files-API confirmed missing
+        sf._stat_uncached.assert_called_once()
+
+    def test_stat_permission_error_flags_volume_and_falls_back(self):
+        from yggdrasil.aws.fs.s3_http import S3Error
+        p = self._vp()
+        sf = MagicMock()
+        sf._stat_uncached.side_effect = S3Error(403, "AccessDenied", "x", "k")
+        vol = MagicMock()
+        with self._no_mount(), \
+                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol), \
+                patch.object(VolumePath, "_fs_request", side_effect=Exception("probe")), \
+                patch.object(VolumePath, "_list_directory", return_value=iter(())):
+            out = p._stat_uncached()
+        vol.mark_external_denied.assert_called_once_with(write=False)
+        assert out.kind is IOKind.MISSING
+
+    # -- remove file ----------------------------------------------------------
+    def test_remove_file_delegates_to_storage_path(self):
+        from yggdrasil.dataclasses import WaitingConfig
+        p = self._vp()
+        sf = MagicMock()
+        with self._no_mount(), \
+                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "_delete_path") as files_delete:
+            p._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
+        sf._remove_file.assert_called_once()
+        files_delete.assert_not_called()
+
+    def test_remove_file_permission_error_flags_and_falls_back(self):
+        from yggdrasil.aws.fs.s3_http import S3Error
+        from yggdrasil.dataclasses import WaitingConfig
+        p = self._vp()
+        sf = MagicMock()
+        sf._remove_file.side_effect = S3Error(403, "AccessDenied", "x", "k")
+        vol = MagicMock()
+        with self._no_mount(), \
+                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol), \
+                patch.object(VolumePath, "_delete_path") as files_delete:
+            p._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
+        vol.mark_external_denied.assert_called_once_with(write=True)
+        files_delete.assert_called_once()  # fell back to the Files API
+
+    # -- remove dir (recursive) ----------------------------------------------
+    def test_remove_dir_recursive_delegates_to_delete_prefix(self):
+        from yggdrasil.dataclasses import WaitingConfig
+        p = VolumePath("/Volumes/cat/sch/vol/tmp", service=MagicMock(spec=Volumes))
+        sf = MagicMock()
+        with self._no_mount(), \
+                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "_ls") as ls, \
+                patch.object(VolumePath, "_delete_path") as files_delete:
+            p._remove_dir(recursive=True, missing_ok=True, wait=WaitingConfig.from_(True))
+        sf._remove_dir.assert_called_once()
+        assert sf._remove_dir.call_args.kwargs["recursive"] is True
+        ls.assert_not_called()           # no Files-API fan-out
+        files_delete.assert_not_called()

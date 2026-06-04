@@ -39,6 +39,15 @@ that re-invokes :meth:`temporary_credentials` on every near-expiry
 refresh cycle. One fewer hop per read / write, no Unity Catalog
 quota burn for the bulk transfer.
 
+When the volume is EXTERNAL and the schema grants ``EXTERNAL USE
+SCHEMA`` (:meth:`UCSchema.can_use_external`), the Holder primitives take
+this path automatically and so do :meth:`_stat_uncached` (S3 HEAD),
+:meth:`_remove_file` (``DeleteObject``) and recursive :meth:`_remove_dir`
+(``delete_prefix`` — one list + batched delete vs the Files-API per-leaf
+fan-out) — each falling back to the Files API, and flagging the volume
+not externally read/writable on a permission error, so the direct path
+isn't retried.
+
 Cluster-mount fast path
 -----------------------
 
@@ -605,6 +614,27 @@ class VolumePath(DatabricksPath):
                     size=int(st.st_size),
                     mtime=st.st_mtime,
                 )
+        # Direct-storage fast path (EXTERNAL volume + EXTERNAL USE SCHEMA):
+        # stat straight off the cloud storage — one S3 HEAD (plus a prefix
+        # probe for a directory) instead of the Files-API file/dir probe pair,
+        # and the S3 ``Content-Length`` is authoritative for size. A positive
+        # (FILE / DIRECTORY) result is returned as-is; MISSING falls through to
+        # the Files API, which also recognises the empty / implicit directories
+        # a bare object store can't.
+        sf = self._external_storage_file(write=False)
+        if sf is not None:
+            try:
+                stats = sf._stat_uncached()
+            except Exception as exc:  # vend / HEAD failure → fall back
+                logger.warning(
+                    "external storage stat failed for %r (%s: %s); "
+                    "using the Files API", self, type(exc).__name__, exc,
+                )
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=False)
+            else:
+                if stats.kind is not IOKind.MISSING:
+                    return stats
         # Off-cluster: probe via the Files REST API. Heuristic: a leaf
         # with a ``.`` is almost always a file (``foo.parquet`` /
         # ``part-….json``); a bare leaf is almost always a directory
@@ -1153,7 +1183,6 @@ class VolumePath(DatabricksPath):
         self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
-        del wait
         logger.debug(
             "Deleting volume file %r (missing_ok=%s)", self, missing_ok,
         )
@@ -1168,6 +1197,22 @@ class VolumePath(DatabricksPath):
                 raise
             self.invalidate_singleton()
             return
+        # Direct-storage fast path: ``DeleteObject`` straight off the cloud
+        # storage instead of a Files-API DELETE.
+        sf = self._external_storage_file(write=True)
+        if sf is not None:
+            try:
+                sf._remove_file(missing_ok=missing_ok, wait=wait)
+            except Exception as exc:  # vend / DeleteObject failure → fall back
+                logger.warning(
+                    "external storage delete failed for %r (%s: %s); "
+                    "using the Files API", self, type(exc).__name__, exc,
+                )
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=True)
+            else:
+                self.invalidate_singleton()
+                return
         try:
             self._delete_path("files", self.api_path)
         except Exception:
@@ -1208,6 +1253,28 @@ class VolumePath(DatabricksPath):
                 api_path, recursive,
             )
             return
+        # Direct-storage fast path: drop the tree straight off the cloud
+        # storage — recursive is one ``ListObjectsV2`` + batched
+        # ``DeleteObjects`` (S3Bucket.delete_prefix) instead of the Files-API
+        # per-leaf DELETE fan-out below.
+        sf = self._external_storage_file(write=True)
+        if sf is not None:
+            try:
+                sf._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait)
+            except Exception as exc:  # vend / DeleteObjects failure → fall back
+                logger.warning(
+                    "external storage rmdir failed for %r (%s: %s); "
+                    "using the Files API", self, type(exc).__name__, exc,
+                )
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=True)
+            else:
+                self.invalidate_singleton()
+                logger.info(
+                    "Deleted volume directory %r (recursive=%s) via storage",
+                    self, recursive,
+                )
+                return
         # ``files.delete_directory`` is non-recursive — its docstring is
         # explicit: "To delete a non-empty directory, first delete all
         # of its contents." Hitting it on a non-empty directory returns
