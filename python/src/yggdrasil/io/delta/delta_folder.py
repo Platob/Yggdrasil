@@ -126,6 +126,16 @@ class DeltaOptions(FolderOptions):
     min_reader_version: int = 1
     min_writer_version: int = 2
     delete_via_dv: bool = False
+    #: When True (default) a write lands a new commit at version ``N+1`` in
+    #: the ``_delta_log`` — the normal Delta path. When False, the data
+    #: parquet files are still written into the table directory but **no
+    #: commit is recorded**: the version is not bumped and the ``_delta_log``
+    #: is left untouched. Lets a caller stage data files into a table
+    #: location (for a later or external commit) without advancing the
+    #: table's history or changing what a reader's snapshot sees. A delete /
+    #: truncate — which can only take effect through a commit — is a no-op
+    #: under this flag.
+    make_new_version: bool = True
     commit_max_retries: int = 8
     commit_retry_backoff: float = 0.05
     commit_retry_jitter: float = 0.05
@@ -677,7 +687,14 @@ class DeltaFolder(Folder):
 
         ``ConcurrentDeltaCommitError`` is reserved for true logical
         conflicts and exhausted retries.
+
+        When ``options.make_new_version`` is False the data files written by
+        the caller are kept on disk but no commit is recorded — we return
+        without bumping the version or touching the ``_delta_log``.
         """
+        if not options.make_new_version:
+            return
+
         max_retries = max(0, int(options.commit_max_retries or 0))
         backoff = float(options.commit_retry_backoff or 0.0)
         jitter = float(options.commit_retry_jitter or 0.0)
@@ -1019,6 +1036,12 @@ class DeltaFolder(Folder):
         options = self.check_options(kwargs.pop("options", None), **kwargs)
         snap = self.snapshot(fresh=True)
         if snap.metadata is None:
+            return 0
+        # A row delete / truncate only takes effect through a commit
+        # (RemoveFile + survivor AddFile). With make_new_version disabled we
+        # may not record one, so it's a no-op — return before rewriting any
+        # survivor files.
+        if not options.make_new_version:
             return 0
 
         sidecar_cache: dict[str, bytes] = {}

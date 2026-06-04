@@ -279,6 +279,68 @@ class TestEngineBridges(DeltaTestCase):
 
 
 # ---------------------------------------------------------------------------
+# make_new_version=False — write data files without committing a version
+# ---------------------------------------------------------------------------
+
+
+class TestMakeNewVersion(DeltaTestCase):
+    def _opts(self, **kw):
+        from yggdrasil.io.delta import DeltaOptions
+
+        return DeltaOptions(make_new_version=False, **kw)
+
+    def _log_commits(self, d):
+        return sorted(
+            c.name for c in (d.path / "_delta_log").iterdir()
+            if c.name.endswith(".json")
+        )
+
+    def _data_files(self, d):
+        return sorted(c.name for c in d.path.iterdir() if c.name.endswith(".parquet"))
+
+    def test_append_writes_files_but_no_commit(self) -> None:
+        d = self.delta_io()
+        d.write_arrow_table(self.pa.table({"id": [1, 2, 3]}))
+        version_before = d.snapshot(fresh=True).version
+        log_before = self._log_commits(d)
+        data_before = self._data_files(d)
+
+        d.write_arrow_table(self.pa.table({"id": [4, 5, 6]}), options=self._opts())
+
+        # Version + log are untouched ...
+        self.assertEqual(d.snapshot(fresh=True).version, version_before)
+        self.assertEqual(self._log_commits(d), log_before)
+        # ... but the data parquet files were physically written.
+        self.assertGreater(len(self._data_files(d)), len(data_before))
+        # The uncommitted files aren't visible to a reader.
+        self.assertEqual(sorted(d.read_arrow_table().column("id").to_pylist()),
+                         [1, 2, 3])
+
+    def test_default_true_still_commits(self) -> None:
+        d = self.delta_io()
+        d.write_arrow_table(self.pa.table({"id": [1, 2, 3]}))
+        before = d.snapshot(fresh=True).version
+        d.write_arrow_table(self.pa.table({"id": [4, 5, 6]}))  # default make_new_version=True
+        self.assertEqual(d.snapshot(fresh=True).version, before + 1)
+        self.assertEqual(sorted(d.read_arrow_table().column("id").to_pylist()),
+                         [1, 2, 3, 4, 5, 6])
+
+    def test_delete_is_noop(self) -> None:
+        d = self.delta_io()
+        d.write_arrow_table(self.pa.table({"id": [1, 2, 3, 4, 5]}))
+        before = d.snapshot(fresh=True).version
+        log_before = self._log_commits(d)
+
+        d.delete("id IN (2, 4)", options=self._opts())
+
+        # No commit, no version bump, rows still all present.
+        self.assertEqual(d.snapshot(fresh=True).version, before)
+        self.assertEqual(self._log_commits(d), log_before)
+        self.assertEqual(sorted(d.read_arrow_table().column("id").to_pylist()),
+                         [1, 2, 3, 4, 5])
+
+
+# ---------------------------------------------------------------------------
 # Sanity — the simple-list envelope's decoder is the inverse of the encoder
 # ---------------------------------------------------------------------------
 
