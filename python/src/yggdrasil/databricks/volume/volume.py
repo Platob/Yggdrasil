@@ -548,17 +548,26 @@ class Volume(DatabricksPath):
             )
         )
 
-    def credentials_refresher(self) -> AWSDatabricksVolumeCredentials:
+    def credentials_refresher(
+        self,
+        *,
+        secret_cache: bool = False,
+    ) -> AWSDatabricksVolumeCredentials:
         """Return the process-wide singleton credentials provider for
         this volume.
 
         Keyed by ``volume_id`` — every :class:`Volume` / :class:`VolumePath`
         pointing at the same UC volume collapses to one provider.
+
+        ``secret_cache=True`` opts the provider into persisting its vended
+        AWS credentials in a per-volume Databricks secret scope (off by
+        default); the opt-in is sticky across the shared singleton.
         """
         return AWSDatabricksVolumeCredentials(
             volume_id=self.volume_id,
             client=self.client,
             resource_url=self.full_name(),
+            secret_cache=secret_cache,
         )
 
     def aws(
@@ -566,10 +575,16 @@ class Volume(DatabricksPath):
         *,
         mode: ModeLike = None,
         region: Optional[str] = None,
+        secret_cache: bool = False,
     ) -> "AWSClient":
         """Return an :class:`AWSClient` whose credentials self-refresh
-        from :meth:`temporary_credentials`."""
-        return self.credentials_refresher().aws_client(mode=mode, region=region)
+        from :meth:`temporary_credentials`.
+
+        ``secret_cache=True`` backs the vended credentials with a per-volume
+        Databricks secret scope (off by default)."""
+        return self.credentials_refresher(
+            secret_cache=secret_cache,
+        ).aws_client(mode=mode, region=region)
 
     def arrow_filesystem(
         self,

@@ -29,17 +29,19 @@ The bound :class:`DatabricksClient` is mutable: every constructor
 call updates the live binding so refreshes that follow a client
 rotation pick up the fresh workspace auth.
 
-Vended credentials are also cached in a Databricks **secret scope, one
+Vended credentials can also be cached in a Databricks **secret scope, one
 per resource** — ``aws.<kind>.<resource>`` (e.g.
 ``aws.volume.cat.sch.vol`` / ``aws.table.cat.sch.tbl``), with the
 credentials stored under a single ``credentials`` key (a read/write map).
 A later resolution — in this process, on a Spark executor, or in a fresh
 run — reuses a still-valid cached credential instead of re-vending it from
 Unity Catalog; an in-process memo short-circuits repeat calls without even
-reading the secret. The ``aws`` prefix is overridable via
-``YGG_DATABRICKS_CREDS_SECRET_PREFIX`` (set it empty to disable
-persistence). The whole layer is best-effort: any Secrets-API failure
-falls back to a fresh UC vend, so it never blocks credential resolution.
+reading the secret. This is **off by default**: a caller opts in with
+``secret_cache=True`` (on the provider, or ``Volume.aws`` /
+``Table.aws`` / ``credentials_refresher``). The ``aws`` scope prefix is
+overridable via ``YGG_DATABRICKS_CREDS_SECRET_PREFIX`` (empty also disables
+it). The whole layer is best-effort: any Secrets-API failure falls back to
+a fresh UC vend, so it never blocks credential resolution.
 """
 
 from __future__ import annotations
@@ -143,6 +145,7 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         *,
         client: Any = None,
         resource_url: "str | None" = None,
+        secret_cache: bool = False,
     ) -> None:
         # ``AwsCredentialsProvider.__init__`` is idempotent — re-entry
         # just rebinds the live client so refreshes after a workspace
@@ -152,6 +155,8 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
                 self._client = client
             if resource_url and not getattr(self, "_resource_url", None):
                 self._resource_url = str(resource_url)
+            if secret_cache:                      # opt-in is sticky
+                self._secret_cache = True
             return
         super().__init__(key)
         self._client: Any = client
@@ -159,6 +164,9 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         # storage URL) used to name the per-resource secret scope; falls
         # back to ``key`` (the UC id) when not supplied.
         self._resource_url: "Optional[str]" = str(resource_url) if resource_url else None
+        # Off by default — credentials are only persisted to a Databricks
+        # secret scope when a caller opts in with ``secret_cache=True``.
+        self._secret_cache: bool = bool(secret_cache)
         # Cache key is the *resolved* mode + region.
         self._client_cache: "dict[tuple[Mode, Optional[str]], AWSClient]" = {}
 
@@ -279,6 +287,8 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         is sanitised and, when the whole name would overflow, truncated with a
         stable xxhash suffix so distinct resources never collide.
         """
+        if not self._secret_cache:
+            return None
         prefix = self._secret_prefix()
         if prefix is None:
             return None
@@ -526,6 +536,7 @@ class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
         *,
         client: Any = None,
         resource_url: "str | None" = None,
+        secret_cache: bool = False,
     ) -> "AWSDatabricksVolumeCredentials":
         return super().__new__(cls, str(volume_id))
 
@@ -535,14 +546,20 @@ class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
         *,
         client: Any = None,
         resource_url: "str | None" = None,
+        secret_cache: bool = False,
     ) -> None:
         if getattr(self, "_initialized", False):
             if client is not None:
                 self._client = client
             if resource_url and not getattr(self, "_resource_url", None):
                 self._resource_url = str(resource_url)
+            if secret_cache:
+                self._secret_cache = True
             return
-        super().__init__(str(volume_id), client=client, resource_url=resource_url)
+        super().__init__(
+            str(volume_id), client=client,
+            resource_url=resource_url, secret_cache=secret_cache,
+        )
         self.volume_id: str = str(volume_id)
 
     def __getnewargs__(self):
@@ -559,6 +576,7 @@ class AWSDatabricksVolumeCredentials(_DatabricksCredentialsBase):
         self.volume_id = str(volume_id)
         self._client = None
         self._resource_url = None
+        self._secret_cache = False
         self._client_cache = {}
 
     def _operation_for(self, mode: Mode) -> "VolumeOperation":
@@ -595,6 +613,7 @@ class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
         *,
         client: Any = None,
         resource_url: "str | None" = None,
+        secret_cache: bool = False,
     ) -> "AWSDatabricksTableCredentials":
         return super().__new__(cls, str(table_id))
 
@@ -604,14 +623,20 @@ class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
         *,
         client: Any = None,
         resource_url: "str | None" = None,
+        secret_cache: bool = False,
     ) -> None:
         if getattr(self, "_initialized", False):
             if client is not None:
                 self._client = client
             if resource_url and not getattr(self, "_resource_url", None):
                 self._resource_url = str(resource_url)
+            if secret_cache:
+                self._secret_cache = True
             return
-        super().__init__(str(table_id), client=client, resource_url=resource_url)
+        super().__init__(
+            str(table_id), client=client,
+            resource_url=resource_url, secret_cache=secret_cache,
+        )
         self.table_id: str = str(table_id)
 
     def __getnewargs__(self):
@@ -628,6 +653,7 @@ class AWSDatabricksTableCredentials(_DatabricksCredentialsBase):
         self.table_id = str(table_id)
         self._client = None
         self._resource_url = None
+        self._secret_cache = False
         self._client_cache = {}
 
     def _operation_for(self, mode: Mode) -> "TableOperation":
@@ -677,6 +703,7 @@ class AWSDatabricksPathCredentials(_DatabricksCredentialsBase):
         url: str,
         *,
         client: Any = None,
+        secret_cache: bool = False,
     ) -> "AWSDatabricksPathCredentials":
         return super().__new__(cls, cls._normalize(url))
 
@@ -685,13 +712,16 @@ class AWSDatabricksPathCredentials(_DatabricksCredentialsBase):
         url: str,
         *,
         client: Any = None,
+        secret_cache: bool = False,
     ) -> None:
         if getattr(self, "_initialized", False):
             if client is not None:
                 self._client = client
+            if secret_cache:
+                self._secret_cache = True
             return
         normalized = self._normalize(url)
-        super().__init__(normalized, client=client)
+        super().__init__(normalized, client=client, secret_cache=secret_cache)
         self.url: str = normalized
 
     def __getnewargs__(self):
@@ -708,6 +738,7 @@ class AWSDatabricksPathCredentials(_DatabricksCredentialsBase):
         self.url = url
         self._client = None
         self._resource_url = None
+        self._secret_cache = False
         self._client_cache = {}
 
     def _operation_for(self, mode: Mode) -> "PathOperation":

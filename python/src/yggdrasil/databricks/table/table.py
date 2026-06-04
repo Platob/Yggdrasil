@@ -3666,6 +3666,7 @@ class Table(DatabricksPath):
         operation: "TableOperation | ModeLike | None" = None,
         *,
         region: Optional[str] = None,
+        secret_cache: bool = False,
     ) -> "AWSClient":
         """Return an :class:`AWSClient` whose credentials self-refresh
         from Unity Catalog's ``temporary_table_credentials`` API.
@@ -3680,18 +3681,30 @@ class Table(DatabricksPath):
 
         ``operation`` accepts a :class:`TableOperation`, a
         :class:`Mode` / mode-like string, or ``None`` (defaults to the
-        right operation for this table's type).
+        right operation for this table's type). ``secret_cache=True``
+        backs the vended credentials with a per-table Databricks secret
+        scope (off by default).
         """
         op = _resolve_table_operation(operation, self.infos.table_type)
         mode = Mode.READ_ONLY if op == TableOperation.READ else Mode.OVERWRITE
-        return self.credentials_refresher().aws_client(mode=mode, region=region)
+        return self.credentials_refresher(
+            secret_cache=secret_cache,
+        ).aws_client(mode=mode, region=region)
 
-    def credentials_refresher(self) -> "AWSDatabricksTableCredentials":
+    def credentials_refresher(
+        self,
+        *,
+        secret_cache: bool = False,
+    ) -> "AWSDatabricksTableCredentials":
         """Return the process-wide singleton credentials provider for
         this table.
 
         Keyed by ``table_id``; handles both read and write modes
         internally via :meth:`AWSDatabricksTableCredentials.get_credentials`.
+
+        ``secret_cache=True`` opts the provider into persisting its vended
+        AWS credentials in a per-table Databricks secret scope (off by
+        default); the opt-in is sticky across the shared singleton.
         """
         from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
 
@@ -3699,6 +3712,7 @@ class Table(DatabricksPath):
             table_id=self.table_id,
             client=self.client,
             resource_url=self.full_name(),
+            secret_cache=secret_cache,
         )
 
     def temporary_credentials(self, operation: TableOperation = TableOperation.READ):

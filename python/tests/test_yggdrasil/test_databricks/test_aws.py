@@ -515,11 +515,41 @@ def _wire_secret_object(client, obj):
 
 
 class TestSecretsBackedPersistence:
+    """Persistence is **opt-in** (``secret_cache=True``); off by default."""
+
+    def test_disabled_by_default(self) -> None:
+        # No ``secret_cache`` → no secret read, no write, plain vend.
+        client, gen = _volume_client()
+        _wire_secret_object(client, None)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-default-off", client=client, resource_url="cat.sch.vol",
+        )
+
+        out = p.get_credentials(mode="read")
+
+        assert out.access_key_id == "AKIA-test"
+        gen.assert_called_once()
+        client.secrets.secret.assert_not_called()         # no read
+        client.secrets.create_secret.assert_not_called()  # no write
+
+    def test_reuse_ignored_when_secret_cache_off(self) -> None:
+        # A valid cached credential is ignored unless the caller opts in.
+        client, gen = _volume_client()
+        _wire_secret_object(client, {"READ_ONLY": _persisted_payload(_future_iso())})
+        p = AWSDatabricksVolumeCredentials("vid-default-off-2", client=client)
+
+        out = p.get_credentials(mode="read")
+
+        gen.assert_called_once()                          # vended, not reused
+        assert out.access_key_id == "AKIA-test"
+        client.secrets.secret.assert_not_called()
+
     def test_vend_persists_to_per_resource_scope_under_credentials_key(self) -> None:
         client, gen = _volume_client()
         _wire_secret_object(client, None)  # nothing cached yet → must vend
         p = AWSDatabricksVolumeCredentials(
             "vid-persist-1", client=client, resource_url="cat.sch.vol",
+            secret_cache=True,
         )
 
         out = p.get_credentials(mode="read")
@@ -536,10 +566,27 @@ class TestSecretsBackedPersistence:
         assert kw["value"]["READ_ONLY"]["access_key_id"] == "AKIA-test"
         assert kw["value"]["READ_ONLY"]["session_token"] == "session-test"
 
+    def test_secret_cache_opt_in_is_sticky_across_singleton(self) -> None:
+        # The provider is a singleton; once any construction opts in, the
+        # shared instance keeps persisting.
+        client, _ = _volume_client()
+        _wire_secret_object(client, None)
+        AWSDatabricksVolumeCredentials(
+            "vid-sticky", client=client, secret_cache=True,
+        )
+        # A later plain construction returns the same (now-enabled) singleton.
+        p = AWSDatabricksVolumeCredentials("vid-sticky", client=client)
+
+        p.get_credentials(mode="read")
+
+        client.secrets.create_secret.assert_called_once()
+
     def test_scope_falls_back_to_id_without_resource_url(self) -> None:
         client, _ = _volume_client()
         _wire_secret_object(client, None)
-        p = AWSDatabricksVolumeCredentials("vid-noerl", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-noerl", client=client, secret_cache=True,
+        )
 
         p.get_credentials(mode="read")
 
@@ -551,7 +598,9 @@ class TestSecretsBackedPersistence:
     def test_reuse_from_secret_skips_vend(self) -> None:
         client, gen = _volume_client()
         _wire_secret_object(client, {"READ_ONLY": _persisted_payload(_future_iso())})
-        p = AWSDatabricksVolumeCredentials("vid-persist-2", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-2", client=client, secret_cache=True,
+        )
 
         out = p.get_credentials(mode="read")
 
@@ -564,7 +613,9 @@ class TestSecretsBackedPersistence:
         # The map only holds a write entry → a read still vends.
         client, gen = _volume_client()
         _wire_secret_object(client, {"OVERWRITE": _persisted_payload(_future_iso())})
-        p = AWSDatabricksVolumeCredentials("vid-persist-2b", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-2b", client=client, secret_cache=True,
+        )
 
         p.get_credentials(mode="read")
         gen.assert_called_once()
@@ -575,7 +626,9 @@ class TestSecretsBackedPersistence:
         import datetime as _dt
         soon = _iso(_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=1))
         _wire_secret_object(client, {"READ_ONLY": _persisted_payload(soon)})
-        p = AWSDatabricksVolumeCredentials("vid-persist-3", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-3", client=client, secret_cache=True,
+        )
 
         out = p.get_credentials(mode="read")
 
@@ -585,7 +638,9 @@ class TestSecretsBackedPersistence:
     def test_in_process_memo_skips_second_secret_read_and_vend(self) -> None:
         client, gen = _volume_client()
         _wire_secret_object(client, None)
-        p = AWSDatabricksVolumeCredentials("vid-persist-4", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-4", client=client, secret_cache=True,
+        )
 
         p.get_credentials(mode="read")                # vends + memoises
         p.get_credentials(mode="read")                # served from the memo
@@ -599,7 +654,9 @@ class TestSecretsBackedPersistence:
     def test_disabled_when_prefix_empty(self, monkeypatch) -> None:
         monkeypatch.setenv("YGG_DATABRICKS_CREDS_SECRET_PREFIX", "")
         client, gen = _volume_client()
-        p = AWSDatabricksVolumeCredentials("vid-persist-5", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-5", client=client, secret_cache=True,
+        )
 
         p.get_credentials(mode="read")
 
@@ -613,6 +670,7 @@ class TestSecretsBackedPersistence:
         _wire_secret_object(client, None)
         p = AWSDatabricksVolumeCredentials(
             "vid-persist-6", client=client, resource_url="cat.sch.vol",
+            secret_cache=True,
         )
 
         p.get_credentials(mode="read")
@@ -625,7 +683,9 @@ class TestSecretsBackedPersistence:
     def test_secret_read_failure_falls_back_to_vend(self) -> None:
         client, gen = _volume_client()
         client.secrets.secret.side_effect = RuntimeError("no secrets access")
-        p = AWSDatabricksVolumeCredentials("vid-persist-7", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-7", client=client, secret_cache=True,
+        )
 
         out = p.get_credentials(mode="read")  # must not raise
 
@@ -636,7 +696,9 @@ class TestSecretsBackedPersistence:
         client, gen = _volume_client()
         _wire_secret_object(client, None)
         client.secrets.create_secret.side_effect = RuntimeError("no write access")
-        p = AWSDatabricksVolumeCredentials("vid-persist-8", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-8", client=client, secret_cache=True,
+        )
 
         out = p.get_credentials(mode="read")  # best-effort persist swallows the error
 
@@ -646,7 +708,9 @@ class TestSecretsBackedPersistence:
     def test_read_and_write_modes_share_credentials_key(self) -> None:
         client, _ = _volume_client()
         _wire_secret_object(client, None)
-        p = AWSDatabricksVolumeCredentials("vid-persist-9", client=client)
+        p = AWSDatabricksVolumeCredentials(
+            "vid-persist-9", client=client, secret_cache=True,
+        )
 
         p.get_credentials(mode="read")
         p.get_credentials(mode="overwrite")
@@ -663,6 +727,7 @@ class TestSecretsBackedPersistence:
         _wire_secret_object(client, None)
         p = AWSDatabricksTableCredentials(
             "tid-persist-1", client=client, resource_url="cat.sch.tbl",
+            secret_cache=True,
         )
 
         p.get_credentials(mode="read")
