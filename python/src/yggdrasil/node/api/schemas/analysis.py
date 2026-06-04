@@ -221,3 +221,76 @@ class ForecastResult(StrictModel):
     series: list[ForecastSeries]
     source_rows: int
     sampled: bool = False
+
+
+# -- technical indicators / comparison / AI ---------------------------------
+
+class IndicatorsRequest(StrictModel):
+    path: str
+    column: str
+    order_by: str | None = None
+    limit: int = 2000
+    rsi_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    bb_period: int = 20
+    bb_std: float = 2.0
+    atr_high: str | None = None
+    atr_low: str | None = None
+    filters: list[FilterSpec] = []
+
+
+class IndicatorsResult(StrictModel):
+    node_id: str
+    path: str
+    column: str
+    index: list[Any]
+    value: list[float | None]
+    rsi: list[float | None]
+    macd_line: list[float | None]
+    macd_signal_line: list[float | None]
+    macd_hist: list[float | None]
+    bb_upper: list[float | None]
+    bb_mid: list[float | None]
+    bb_lower: list[float | None]
+    atr: list[float | None] | None = None
+    truncated: bool
+    source_rows: int
+
+
+class CompareSeries(StrictModel):
+    path: str
+    column: str
+    label: str | None = None
+    order_by: str | None = None
+
+
+class CompareRequest(StrictModel):
+    series: list[CompareSeries]
+    limit: int = 2000
+    normalize: bool = True
+
+
+class CompareResult(StrictModel):
+    node_id: str
+    labels: list[str]
+    index: list[Any]
+    values: list[list[float | None]]
+    correlation: list[list[float | None]] | None = None
+
+
+class AiSummaryRequest(StrictModel):
+    path: str
+    column: str | None = None
+    question: str | None = None
+
+
+class AiSummaryResult(StrictModel):
+    node_id: str
+    path: str
+    summary: str
+    key_points: list[str]
+    chart_hint: str | None = None
+    model: str
+    error: str | None = None

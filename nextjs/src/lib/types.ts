@@ -393,3 +393,48 @@ export interface UserCard {
   online: boolean;
   last_seen_at: string;
 }
+
+// ── Analysis: technical indicators / compare / AI ───────────────────────────
+
+export interface IndicatorsResult {
+  node_id: string;
+  path: string;
+  column: string;
+  index: (string | number)[];
+  value: (number | null)[];
+  rsi: (number | null)[];
+  macd_line: (number | null)[];
+  macd_signal_line: (number | null)[];
+  macd_hist: (number | null)[];
+  bb_upper: (number | null)[];
+  bb_mid: (number | null)[];
+  bb_lower: (number | null)[];
+  atr: (number | null)[] | null;
+  truncated: boolean;
+  source_rows: number;
+}
+
+export interface CompareSeriesInput {
+  path: string;
+  column: string;
+  label?: string;
+  order_by?: string;
+}
+
+export interface CompareResult {
+  node_id: string;
+  labels: string[];
+  index: (string | number)[];
+  values: (number | null)[][];
+  correlation: (number | null)[][] | null;
+}
+
+export interface AiSummaryResult {
+  node_id: string;
+  path: string;
+  summary: string;
+  key_points: string[];
+  chart_hint: string | null;
+  model: string;
+  error?: string | null;
+}

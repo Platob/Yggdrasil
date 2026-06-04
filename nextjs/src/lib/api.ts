@@ -4,13 +4,16 @@
 // http://127.0.0.1:8100 (or BOT_API_URL) — see nextjs/next.config.ts.
 
 import type {
+  AiSummaryResult,
   AuditEntry,
   ChannelInfo,
   ClusterStats,
+  CompareResult,
   DAGEntry,
   DAGRunEntry,
   FsEntry,
   HealthResponse,
+  IndicatorsResult,
   Message,
   ExcelInfo,
   MetricsResponse,
@@ -603,6 +606,56 @@ export function finance(
   return jsonFetch(`/api/v2/analysis/finance${node ? `?node=${encodeURIComponent(node)}` : ""}`, {
     method: "POST",
     body: JSON.stringify({ path, column, ...body }),
+  });
+}
+
+// POST /analysis/indicators — RSI, MACD, Bollinger Bands (+ ATR when high/low
+// supplied) over a price series, computed where the data lives.
+export async function getIndicators(
+  path: string,
+  column: string,
+  opts: {
+    order_by?: string;
+    rsi_period?: number;
+    macd_fast?: number;
+    macd_slow?: number;
+    macd_signal?: number;
+    bb_period?: number;
+    bb_std?: number;
+    limit?: number;
+    node?: string;
+  } = {}
+): Promise<IndicatorsResult> {
+  const { node, ...rest } = opts;
+  return jsonFetch<IndicatorsResult>(
+    `/api/v2/analysis/indicators${node ? `?node=${encodeURIComponent(node)}` : ""}`,
+    { method: "POST", body: JSON.stringify({ path, column, ...rest }) }
+  );
+}
+
+// POST /analysis/compare — normalize + overlay multiple series and compute the
+// cross-series correlation matrix.
+export async function compareSeriesApi(
+  series: { path: string; column: string; label?: string; order_by?: string }[],
+  opts: { normalize?: boolean; limit?: number; node?: string } = {}
+): Promise<CompareResult> {
+  const { node, normalize = true, limit = 2000 } = opts;
+  return jsonFetch<CompareResult>(
+    `/api/v2/analysis/compare${node ? `?node=${encodeURIComponent(node)}` : ""}`,
+    { method: "POST", body: JSON.stringify({ series, normalize, limit }) }
+  );
+}
+
+// POST /analysis/ai_summary — Claude-powered natural-language analysis of a
+// series (requires ANTHROPIC_API_KEY on the node).
+export async function aiSummary(
+  path: string,
+  column: string | null,
+  question: string | null = null
+): Promise<AiSummaryResult> {
+  return jsonFetch<AiSummaryResult>("/api/v2/analysis/ai_summary", {
+    method: "POST",
+    body: JSON.stringify({ path, column, question }),
   });
 }
 

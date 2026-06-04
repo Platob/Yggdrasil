@@ -7,12 +7,18 @@ from ..deps import get_analysis_service, get_network_service
 from ..schemas.analysis import (
     AggregateRequest,
     AggregateResult,
+    AiSummaryRequest,
+    AiSummaryResult,
+    CompareRequest,
+    CompareResult,
     DescribeResult,
     ExportRequest,
     FinanceRequest,
     FinanceResult,
     ForecastRequest,
     ForecastResult,
+    IndicatorsRequest,
+    IndicatorsResult,
     OhlcRequest,
     OhlcResult,
     PivotRequest,
@@ -127,6 +133,41 @@ async def ohlc(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/ohlc", json_body=req.model_dump())
     return await service.ohlc(req)
+
+
+@router.post("/indicators", response_model=IndicatorsResult)
+async def indicators(
+    req: IndicatorsRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> IndicatorsResult:
+    """RSI, MACD, Bollinger Bands, and ATR for a price series."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/indicators", json_body=req.model_dump())
+    return await service.indicators(req)
+
+
+@router.post("/compare", response_model=CompareResult)
+async def compare(
+    req: CompareRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> CompareResult:
+    """Normalize and compare multiple series; compute cross-series correlation."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/compare", json_body=req.model_dump())
+    return await service.compare(req)
+
+
+@router.post("/ai_summary", response_model=AiSummaryResult)
+async def ai_summary(
+    req: AiSummaryRequest,
+    service: AnalysisService = Depends(get_analysis_service),
+) -> AiSummaryResult:
+    """Claude-powered natural-language analysis (requires ANTHROPIC_API_KEY)."""
+    return await service.ai_summary(req)
 
 
 @router.post("/export")

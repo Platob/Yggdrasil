@@ -27,7 +27,13 @@ from ...exceptions import ForbiddenError, NotFoundError
 from ..schemas.analysis import (
     AggregateRequest,
     AggregateResult,
+    AiSummaryRequest,
+    AiSummaryResult,
+    CompareRequest,
+    CompareResult,
     DescribeResult,
+    IndicatorsRequest,
+    IndicatorsResult,
     ExportRequest,
     FilterSpec,
     FinanceMetrics,
@@ -95,6 +101,55 @@ class AnalysisService:
 
     async def forecast(self, req: "ForecastRequest") -> "ForecastResult":
         return await run_in_threadpool(partial(self._forecast, req))
+
+    async def indicators(self, req: "IndicatorsRequest") -> "IndicatorsResult":
+        return await run_in_threadpool(partial(self._indicators, req))
+
+    async def compare(self, req: "CompareRequest") -> "CompareResult":
+        return await run_in_threadpool(partial(self._compare, req))
+
+    async def ai_summary(self, req: "AiSummaryRequest") -> "AiSummaryResult":
+        import os
+        import json as _json
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        from ..schemas.analysis import AiSummaryResult
+        if not api_key:
+            return AiSummaryResult(
+                node_id=self.settings.node_id, path=req.path,
+                summary="Set ANTHROPIC_API_KEY to enable AI analysis.",
+                key_points=[], chart_hint=None, model="none",
+            )
+        ctx = await run_in_threadpool(partial(self._gather_ai_context, req))
+        question = req.question or "Provide a concise quantitative analysis of this dataset."
+        prompt = (
+            f"{ctx}\n\nQuestion: {question}\n\n"
+            'Reply as JSON only: {"summary": "...", "key_points": ["..."], "chart_hint": "..."}'
+        )
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = msg.content[0].text.strip()
+            if raw.startswith("```"):
+                raw = "\n".join(raw.split("\n")[1:]).rsplit("```", 1)[0].strip()
+            parsed = _json.loads(raw)
+            return AiSummaryResult(
+                node_id=self.settings.node_id, path=req.path,
+                summary=parsed.get("summary", raw),
+                key_points=parsed.get("key_points", []),
+                chart_hint=parsed.get("chart_hint"),
+                model="claude-haiku-4-5-20251001",
+            )
+        except Exception as exc:
+            return AiSummaryResult(
+                node_id=self.settings.node_id, path=req.path,
+                summary=f"AI analysis failed: {exc}",
+                key_points=[], chart_hint=None, model="none", error=str(exc),
+            )
 
     def _forecast(self, req: "ForecastRequest") -> "ForecastResult":
         """Forecast a value column over time (optionally per group key).
@@ -668,3 +723,176 @@ class AnalysisService:
             volume=_safe_list(out["volume"]) if has_vol else None,
             bars=out.height, source_rows=source_rows,
         )
+
+    # -- technical indicators -----------------------------------------------
+
+    def _indicators(self, req) -> "IndicatorsResult":
+        from ..schemas.analysis import IndicatorsResult
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        cols = set(lf.collect_schema().names())
+        if req.column not in cols:
+            raise BadRequestError(f"column {req.column!r} not found")
+        keep = list(dict.fromkeys(
+            ([req.order_by] if req.order_by and req.order_by in cols else []) +
+            [req.column] +
+            ([req.atr_high] if req.atr_high and req.atr_high in cols else []) +
+            ([req.atr_low] if req.atr_low and req.atr_low in cols else [])
+        ))
+        plan = lf.select(keep)
+        if req.order_by and req.order_by in cols:
+            plan = plan.sort(req.order_by)
+        cap = min(req.limit, self._row_cap_for_bytes(plan))
+        df = plan.head(cap + 1).collect(engine="streaming")
+        truncated = df.height > cap
+        if truncated:
+            df = df.head(cap)
+
+        prices = df[req.column].cast(pl.Float64, strict=False)
+        index = (
+            df[req.order_by].to_list()
+            if req.order_by and req.order_by in cols
+            else list(range(df.height))
+        )
+
+        # RSI via Wilder smoothing (alpha = 1/period)
+        delta = prices.diff()
+        alpha = 1.0 / max(1, req.rsi_period)
+        gain = delta.clip(lower_bound=0.0)
+        loss = (-delta).clip(lower_bound=0.0)
+        avg_gain = gain.ewm_mean(alpha=alpha, ignore_nulls=True)
+        avg_loss = loss.ewm_mean(alpha=alpha, ignore_nulls=True)
+        rsi = 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+
+        # MACD
+        ema_fast = prices.ewm_mean(span=req.macd_fast, ignore_nulls=True)
+        ema_slow = prices.ewm_mean(span=req.macd_slow, ignore_nulls=True)
+        macd_ln = ema_fast - ema_slow
+        macd_sig = macd_ln.ewm_mean(span=req.macd_signal, ignore_nulls=True)
+        macd_hist = macd_ln - macd_sig
+
+        # Bollinger Bands
+        bb_mid = prices.rolling_mean(window_size=max(2, req.bb_period))
+        bb_std_s = prices.rolling_std(window_size=max(2, req.bb_period))
+        bb_upper = bb_mid + req.bb_std * bb_std_s
+        bb_lower = bb_mid - req.bb_std * bb_std_s
+
+        # ATR
+        atr_vals = None
+        has_atr = bool(req.atr_high and req.atr_low and req.atr_high in cols and req.atr_low in cols)
+        if has_atr:
+            h = df[req.atr_high].cast(pl.Float64, strict=False)
+            lo_s = df[req.atr_low].cast(pl.Float64, strict=False)
+            pc = prices.shift(1)
+            tr = pl.max_horizontal([
+                (h - lo_s).abs(),
+                (h - pc).abs(),
+                (lo_s - pc).abs(),
+            ])
+            atr_vals = _safe_list(tr.ewm_mean(alpha=1.0 / 14, ignore_nulls=True))
+
+        source_rows = lf.select(pl.len()).collect(engine="streaming").item()
+        return IndicatorsResult(
+            node_id=self.settings.node_id, path=req.path, column=req.column,
+            index=[_safe(v) for v in index],
+            value=_safe_list(prices), rsi=_safe_list(rsi),
+            macd_line=_safe_list(macd_ln), macd_signal_line=_safe_list(macd_sig),
+            macd_hist=_safe_list(macd_hist),
+            bb_upper=_safe_list(bb_upper), bb_mid=_safe_list(bb_mid), bb_lower=_safe_list(bb_lower),
+            atr=atr_vals, truncated=truncated, source_rows=source_rows,
+        )
+
+    # -- multi-asset comparison ---------------------------------------------
+
+    def _compare(self, req) -> "CompareResult":
+        from ..schemas.analysis import CompareResult
+        all_vals: list[list[float | None]] = []
+        all_index: list = []
+        labels: list[str] = []
+        for s in req.series:
+            lf = self._frame(s.path)
+            schema = lf.collect_schema()
+            cols = set(schema.names())
+            if s.column not in cols:
+                raise BadRequestError(f"column {s.column!r} not in {s.path!r}")
+            keep = list(dict.fromkeys(
+                ([s.order_by] if s.order_by and s.order_by in cols else []) + [s.column]
+            ))
+            plan = lf.select(keep)
+            if s.order_by and s.order_by in cols:
+                plan = plan.sort(s.order_by)
+            cap = min(req.limit, self._row_cap_for_bytes(plan))
+            df = plan.head(cap).collect(engine="streaming")
+            vals: list[float | None] = df[s.column].cast(pl.Float64, strict=False).to_list()
+            idx = (
+                df[s.order_by].to_list()
+                if s.order_by and s.order_by in cols
+                else list(range(len(vals)))
+            )
+            if not all_index:
+                all_index = [_safe(v) for v in idx]
+            if req.normalize:
+                first = next((v for v in vals if v is not None), None)
+                if first and first != 0.0:
+                    vals = [(v / first * 100.0) if v is not None else None for v in vals]
+            all_vals.append([_safe(v) for v in vals])
+            labels.append(s.label or f"{s.path.split('/')[-1]}/{s.column}")
+
+        corr: list[list[float | None]] | None = None
+        n = len(all_vals)
+        if n >= 2:
+            min_len = min(len(d) for d in all_vals)
+            arrs = [np.array([v for v in d[:min_len] if v is not None], dtype=float) for d in all_vals]
+            corr = []
+            for i in range(n):
+                row = []
+                for j in range(n):
+                    try:
+                        sz = min(len(arrs[i]), len(arrs[j]))
+                        r = float(np.corrcoef(arrs[i][:sz], arrs[j][:sz])[0, 1])
+                        row.append(None if not math.isfinite(r) else round(r, 4))
+                    except Exception:
+                        row.append(None)
+                corr.append(row)
+
+        return CompareResult(
+            node_id=self.settings.node_id, labels=labels,
+            index=all_index, values=all_vals, correlation=corr,
+        )
+
+    # -- AI context builder -------------------------------------------------
+
+    def _gather_ai_context(self, req) -> str:
+        lf = self._frame(req.path)
+        schema = lf.collect_schema()
+        source_rows = lf.select(pl.len()).collect(engine="streaming").item()
+        lines = [
+            f"Dataset: {req.path}",
+            f"Rows: {source_rows:,}",
+            f"Schema: {', '.join(f'{n}:{t}' for n, t in schema.items())}",
+        ]
+        if req.column and req.column in schema.names():
+            try:
+                from ..schemas.analysis import FinanceRequest as FR
+                res = self._finance(FR(path=req.path, column=req.column, limit=2000))
+                m = res.metrics
+                lines.append(f"\n{req.column} finance metrics:")
+                if m.total_return is not None:
+                    lines.append(f"  total_return={m.total_return:.4f}")
+                if m.cagr is not None:
+                    lines.append(f"  CAGR={m.cagr:.4f}")
+                if m.sharpe is not None:
+                    lines.append(f"  Sharpe={m.sharpe:.4f}")
+                if m.sortino is not None:
+                    lines.append(f"  Sortino={m.sortino:.4f}")
+                if m.ann_volatility is not None:
+                    lines.append(f"  ann_vol={m.ann_volatility:.4f}")
+                if m.max_drawdown is not None:
+                    lines.append(f"  max_drawdown={m.max_drawdown:.4f}")
+                if m.calmar is not None:
+                    lines.append(f"  Calmar={m.calmar:.4f}")
+                vals = [v for v in res.value if v is not None]
+                if vals:
+                    lines.append(f"  first={vals[0]:.4f} last={vals[-1]:.4f} n={len(vals)}")
+            except Exception:
+                pass
+        return "\n".join(lines)
