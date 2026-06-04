@@ -28,14 +28,26 @@ and the singleton-by-resource_id guarantee.
 The bound :class:`DatabricksClient` is mutable: every constructor
 call updates the live binding so refreshes that follow a client
 rotation pick up the fresh workspace auth.
+
+Vended credentials are also cached in a Databricks **secret scope**
+(``ygg_aws_credentials`` by default; override via
+``YGG_DATABRICKS_CREDS_SECRET_SCOPE``, or set it empty to disable),
+keyed by ``(resource, mode)``. A later resolution — in this process,
+on a Spark executor, or in a fresh run — reuses a still-valid cached
+credential instead of re-vending it from Unity Catalog; an in-process
+memo short-circuits repeat calls without even reading the secret. The
+whole layer is best-effort: any Secrets-API failure falls back to a
+fresh UC vend, so it never blocks credential resolution.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import logging
+import os
 import re
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional
 
 from yggdrasil.aws.config import AwsCredentials
 from yggdrasil.aws.provider import AwsCredentialsProvider
@@ -182,6 +194,9 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
         obvious.
         """
         resolved = Mode.from_(mode, default=self.DEFAULT_MODE)
+        cached = self._load_persisted(resolved)
+        if cached is not None:
+            return cached
         operation = self._operation_for(resolved)
         try:
             resp = self._generate(operation)
@@ -197,13 +212,140 @@ class _DatabricksCredentialsBase(AwsCredentialsProvider):
                 f"``aws_temp_credentials`` — the {self._RESOURCE_NAME} "
                 f"is likely backed by Azure or GCP, not S3."
             )
-        return AwsCredentials(
+        creds = AwsCredentials(
             access_key_id=aws.access_key_id,
             access_point=getattr(aws, "access_point", None),
             secret_access_key=aws.secret_access_key,
             session_token=aws.session_token,
             expiration=_iso_or_str(getattr(resp, "expiration_time", None)),
         )
+        self._persist(resolved, creds)
+        return creds
+
+    # ------------------------------------------------------------------
+    # Secrets-backed persistence of vended credentials
+    # ------------------------------------------------------------------
+    #
+    # Temporary credentials are cached in a Databricks secret scope, keyed by
+    # ``(resource, mode)``, so a later resolution — in this process or another
+    # (a Spark executor, a fresh run) — reuses a still-valid credential instead
+    # of re-vending it from Unity Catalog. An in-process memo short-circuits
+    # repeat calls without even reading the secret.
+    #
+    # All of it is **best-effort**: any Secrets-API failure (scope missing, no
+    # permission, network) silently falls back to a fresh UC vend, so the
+    # backing can never break credential resolution. Set
+    # ``YGG_DATABRICKS_CREDS_SECRET_SCOPE`` to override the scope name, or to an
+    # empty string to disable persistence entirely.
+
+    #: Don't reuse a persisted credential within this many seconds of its
+    #: expiry — leave the caller enough runway to actually use it before a
+    #: refresh is forced.
+    _PERSIST_EXPIRY_MARGIN: ClassVar[float] = 600.0
+    _DEFAULT_SECRET_SCOPE: ClassVar[str] = "ygg_aws_credentials"
+
+    @classmethod
+    def _secret_scope(cls) -> "Optional[str]":
+        """The secret scope to back credentials with, or ``None`` (disabled)."""
+        scope = os.environ.get(
+            "YGG_DATABRICKS_CREDS_SECRET_SCOPE", cls._DEFAULT_SECRET_SCOPE,
+        )
+        return scope.strip() or None
+
+    def _secret_key(self, mode: Mode) -> str:
+        """Stable, Databricks-legal secret key for this resource + mode.
+
+        Secret keys allow ``[A-Za-z0-9_.-]`` only; the raw key (a UUID for
+        volume / table, a URL for a path credential) is sanitised and, when
+        long, suffixed with a stable xxhash so distinct URLs never collide.
+        """
+        raw = f"{self._RESOURCE_NAME}.{self.key}.{mode.name}"
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", raw)
+        if len(safe) > 240:
+            import xxhash
+            safe = safe[:200] + "_" + xxhash.xxh64(raw.encode("utf-8")).hexdigest()
+        return safe
+
+    @staticmethod
+    def _remaining_seconds(creds: AwsCredentials) -> float:
+        """Seconds until *creds* expire; ``-1`` when there's no usable expiry
+        (a credential with no expiration is never trusted as cached state)."""
+        if not creds.expiration:
+            return -1.0
+        try:
+            from yggdrasil.data.cast import any_to_datetime
+            expires = any_to_datetime(creds.expiration, tz=dt.timezone.utc)
+        except Exception:
+            return -1.0
+        return (expires - dt.datetime.now(dt.timezone.utc)).total_seconds()
+
+    def _load_persisted(self, mode: Mode) -> "Optional[AwsCredentials]":
+        """Return a still-valid cached credential for *mode*, or ``None``.
+
+        Checks the in-process memo first, then the backing secret. Anything
+        within :attr:`_PERSIST_EXPIRY_MARGIN` of expiry is treated as a miss so
+        the caller vends fresh.
+        """
+        memo = self.__dict__.setdefault("_persisted_cache", {})
+        hit = memo.get(mode)
+        if hit is not None and self._remaining_seconds(hit) > self._PERSIST_EXPIRY_MARGIN:
+            return hit
+
+        scope = self._secret_scope()
+        if scope is None:
+            return None
+        try:
+            secret = self.client.secrets.secret(self._secret_key(mode), scope=scope)
+            data = secret.refresh(raise_error=False).object
+        except Exception:
+            LOGGER.debug(
+                "reading persisted credentials for %s=%r (mode=%s) failed",
+                self._RESOURCE_NAME, self.key, mode.name, exc_info=True,
+            )
+            return None
+        if not isinstance(data, Mapping):
+            return None
+        creds = AwsCredentials(
+            access_key_id=data.get("access_key_id"),
+            access_point=data.get("access_point"),
+            secret_access_key=data.get("secret_access_key"),
+            session_token=data.get("session_token"),
+            expiration=data.get("expiration"),
+        )
+        if not creds.is_complete() or self._remaining_seconds(creds) <= self._PERSIST_EXPIRY_MARGIN:
+            return None
+        memo[mode] = creds
+        LOGGER.debug(
+            "reusing persisted credentials for %s=%r (mode=%s)",
+            self._RESOURCE_NAME, self.key, mode.name,
+        )
+        return creds
+
+    def _persist(self, mode: Mode, creds: AwsCredentials) -> None:
+        """Best-effort: stash *creds* in the in-process memo and the backing
+        secret. Only persist credentials that carry an expiry (so the loader's
+        freshness check is meaningful)."""
+        self.__dict__.setdefault("_persisted_cache", {})[mode] = creds
+        scope = self._secret_scope()
+        if scope is None or not creds.expiration:
+            return
+        try:
+            self.client.secrets.create_secret(
+                key=self._secret_key(mode),
+                value={
+                    "access_key_id": creds.access_key_id,
+                    "access_point": creds.access_point,
+                    "secret_access_key": creds.secret_access_key,
+                    "session_token": creds.session_token,
+                    "expiration": creds.expiration,
+                },
+                scope=scope,
+            )
+        except Exception:
+            LOGGER.debug(
+                "persisting credentials for %s=%r (mode=%s) failed",
+                self._RESOURCE_NAME, self.key, mode.name, exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # AWSClient binding — one per (mode, region)

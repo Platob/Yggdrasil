@@ -482,3 +482,158 @@ class TestPathCredentials:
         client, _ = _path_client()
         p = AWSDatabricksPathCredentials("s3://b/p/", client=client)
         assert pickle.loads(pickle.dumps(p)) is p
+
+
+# ===========================================================================
+# Secrets-backed persistence — reuse vended creds across calls / processes
+# ===========================================================================
+
+
+def _iso(dt_):
+    return dt_.isoformat()
+
+
+def _future_iso(hours: int = 24) -> str:
+    import datetime as _dt
+    return _iso(_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=hours))
+
+
+def _persisted_payload(expiration: str) -> dict:
+    return {
+        "access_key_id": "AKIA-persisted",
+        "access_point": None,
+        "secret_access_key": "secret-persisted",
+        "session_token": "session-persisted",
+        "expiration": expiration,
+    }
+
+
+def _wire_secret_object(client, obj):
+    """Make ``client.secrets.secret(...).refresh(raise_error=False).object``
+    return *obj* (a dict to simulate a stored credential, or None)."""
+    client.secrets.secret.return_value.refresh.return_value.object = obj
+
+
+class TestSecretsBackedPersistence:
+    def test_vend_persists_to_secret(self) -> None:
+        client, gen = _volume_client()
+        _wire_secret_object(client, None)  # nothing cached yet → must vend
+        p = AWSDatabricksVolumeCredentials("vid-persist-1", client=client)
+
+        out = p.get_credentials(mode="read")
+
+        assert isinstance(out, AwsCredentials)
+        gen.assert_called_once()
+        client.secrets.create_secret.assert_called_once()
+        kw = client.secrets.create_secret.call_args.kwargs
+        assert kw["scope"] == "ygg_aws_credentials"
+        assert kw["key"] == "volume_id.vid-persist-1.READ_ONLY"
+        assert kw["value"]["access_key_id"] == "AKIA-test"
+        assert kw["value"]["session_token"] == "session-test"
+
+    def test_reuse_from_secret_skips_vend(self) -> None:
+        client, gen = _volume_client()
+        _wire_secret_object(client, _persisted_payload(_future_iso()))
+        p = AWSDatabricksVolumeCredentials("vid-persist-2", client=client)
+
+        out = p.get_credentials(mode="read")
+
+        gen.assert_not_called()                       # no UC vend
+        client.secrets.create_secret.assert_not_called()
+        assert out.access_key_id == "AKIA-persisted"
+        assert out.session_token == "session-persisted"
+
+    def test_near_expiry_secret_revends(self) -> None:
+        client, gen = _volume_client()
+        # 1 minute of life left — inside the 10-minute margin → treat as miss.
+        import datetime as _dt
+        soon = _iso(_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=1))
+        _wire_secret_object(client, _persisted_payload(soon))
+        p = AWSDatabricksVolumeCredentials("vid-persist-3", client=client)
+
+        out = p.get_credentials(mode="read")
+
+        gen.assert_called_once()                      # stale → fresh vend
+        assert out.access_key_id == "AKIA-test"
+
+    def test_in_process_memo_skips_second_secret_read_and_vend(self) -> None:
+        client, gen = _volume_client()
+        _wire_secret_object(client, None)
+        p = AWSDatabricksVolumeCredentials("vid-persist-4", client=client)
+
+        p.get_credentials(mode="read")                # vends + memoises
+        p.get_credentials(mode="read")                # served from the memo
+
+        gen.assert_called_once()
+        # The secret was only read once (the first call's miss); the second
+        # call short-circuited on the in-process memo.
+        client.secrets.secret.assert_called_once()
+
+    def test_disabled_when_scope_empty(self, monkeypatch) -> None:
+        monkeypatch.setenv("YGG_DATABRICKS_CREDS_SECRET_SCOPE", "")
+        client, gen = _volume_client()
+        p = AWSDatabricksVolumeCredentials("vid-persist-5", client=client)
+
+        p.get_credentials(mode="read")
+
+        gen.assert_called_once()
+        client.secrets.secret.assert_not_called()     # no read
+        client.secrets.create_secret.assert_not_called()  # no write
+
+    def test_scope_override_via_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("YGG_DATABRICKS_CREDS_SECRET_SCOPE", "my_scope")
+        client, gen = _volume_client()
+        _wire_secret_object(client, None)
+        p = AWSDatabricksVolumeCredentials("vid-persist-6", client=client)
+
+        p.get_credentials(mode="read")
+
+        assert client.secrets.create_secret.call_args.kwargs["scope"] == "my_scope"
+
+    def test_secret_read_failure_falls_back_to_vend(self) -> None:
+        client, gen = _volume_client()
+        client.secrets.secret.side_effect = RuntimeError("no secrets access")
+        p = AWSDatabricksVolumeCredentials("vid-persist-7", client=client)
+
+        out = p.get_credentials(mode="read")  # must not raise
+
+        gen.assert_called_once()
+        assert out.access_key_id == "AKIA-test"
+
+    def test_persist_failure_does_not_break_vend(self) -> None:
+        client, gen = _volume_client()
+        _wire_secret_object(client, None)
+        client.secrets.create_secret.side_effect = RuntimeError("no write access")
+        p = AWSDatabricksVolumeCredentials("vid-persist-8", client=client)
+
+        out = p.get_credentials(mode="read")  # best-effort persist swallows the error
+
+        gen.assert_called_once()
+        assert out.access_key_id == "AKIA-test"
+
+    def test_read_and_write_modes_use_distinct_secret_keys(self) -> None:
+        client, _ = _volume_client()
+        _wire_secret_object(client, None)
+        p = AWSDatabricksVolumeCredentials("vid-persist-9", client=client)
+
+        p.get_credentials(mode="read")
+        p.get_credentials(mode="overwrite")
+
+        keys = {c.kwargs["key"] for c in client.secrets.create_secret.call_args_list}
+        assert keys == {
+            "volume_id.vid-persist-9.READ_ONLY",
+            "volume_id.vid-persist-9.OVERWRITE",
+        }
+
+    def test_table_provider_also_persists(self) -> None:
+        client, gen = _table_client()
+        _wire_secret_object(client, None)
+        p = AWSDatabricksTableCredentials("tid-persist-1", client=client)
+
+        p.get_credentials(mode="read")
+
+        client.secrets.create_secret.assert_called_once()
+        assert (
+            client.secrets.create_secret.call_args.kwargs["key"]
+            == "table_id.tid-persist-1.READ_ONLY"
+        )
