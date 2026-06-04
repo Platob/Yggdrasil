@@ -186,6 +186,62 @@ class TestReadArrowBatchesSingleOpen:
         )
 
 
+class TestNestedArchiveRead:
+    """A ``.zip`` entry inside an archive resolves to :class:`ZipFile`
+    and is recursed into, so a zip-of-zips of tabular files reads as
+    one flattened stream. A nested archive with NO tabular content
+    must not crash a read that has sibling tabular data — it's skipped
+    like any other non-tabular entry."""
+
+    def _parquet_bytes(self, table: pa.Table) -> bytes:
+        from yggdrasil.io.parquet_file import ParquetFile
+
+        buf = Memory()
+        ParquetFile(holder=buf, owns_holder=False).write_arrow_batches(
+            iter(table.to_batches())
+        )
+        return buf.to_bytes()
+
+    def test_nested_zip_of_parquet_flattens(self) -> None:
+        from yggdrasil.io.zip_file import ZipFile as _Zip
+
+        inner = _build_archive(
+            {"data.parquet": self._parquet_bytes(pa.table({"x": [1, 2, 3]}))}
+        )
+        raw = _build_archive({"inner.zip": inner})
+        zf = _Zip(holder=Memory(raw), owns_holder=False)
+        assert zf.read_arrow_table().num_rows == 3
+
+    def test_non_tabular_nested_zip_is_skipped_not_fatal(self) -> None:
+        from yggdrasil.io.zip_file import ZipFile as _Zip
+
+        # Outer archive: a real parquet sibling + a nested zip that
+        # holds only a non-tabular file. The read must yield the
+        # parquet rows, not crash on the nested archive.
+        nested = _build_archive({"readme.txt": b"hello"})
+        raw = _build_archive(
+            {
+                "a.parquet": self._parquet_bytes(pa.table({"x": [1, 2]})),
+                "inner.zip": nested,
+            }
+        )
+        zf = _Zip(holder=Memory(raw), owns_holder=False)
+        out = zf.read_arrow_table()
+        assert out.num_rows == 2
+        assert out["x"].to_pylist() == [1, 2]
+
+    def test_only_non_tabular_nested_zip_still_raises(self) -> None:
+        from yggdrasil.io.zip_file import ZipFile as _Zip
+
+        # No tabular data anywhere — the read surfaces the "nothing to
+        # read" error rather than silently returning an empty table.
+        nested = _build_archive({"readme.txt": b"hello"})
+        raw = _build_archive({"inner.zip": nested})
+        zf = _Zip(holder=Memory(raw), owns_holder=False)
+        with pytest.raises(ValueError, match="none resolve"):
+            zf.read_arrow_table()
+
+
 # ---------------------------------------------------------------------------
 # Append-path streaming
 # ---------------------------------------------------------------------------

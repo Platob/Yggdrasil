@@ -848,11 +848,62 @@ class ZipFile(IO):
 
                 # Decompress + dispatch inline so we never pay N
                 # directory parses for N entries.
+                #
+                # A ``.zip`` entry resolves to :class:`ZipFile` and is
+                # recursed into — a zip-of-zips of tabular files reads
+                # as one flattened stream. But a nested archive that
+                # holds NO tabular content raises (its own "none
+                # resolve" guard); letting that bubble out would crash
+                # an outer read that has perfectly good sibling tabular
+                # entries, contradicting the skip-non-tabular contract.
+                # So a nested zip is lenient: an empty/non-tabular inner
+                # archive contributes nothing and is recorded as
+                # unresolved, exactly like a plain non-tabular entry.
+                produced_any = False
+                non_zip_resolved = False
                 for info, cls in resolved:
                     payload = zf.read(info.filename)
                     leaf = cls(holder=Memory(payload), owns_holder=True)
-                    yield from leaf._read_arrow_batches(
+                    if issubclass(cls, ZipFile):
+                        nested_any = False
+                        try:
+                            for batch in leaf._read_arrow_batches(
+                                leaf.options_class()(),
+                            ):
+                                nested_any = produced_any = True
+                                yield batch
+                        except ValueError:
+                            # The nested "no tabular entries" guard fires
+                            # before any batch is yielded — swallow it and
+                            # mark the entry unresolved. A ValueError that
+                            # surfaces *after* data started flowing is a
+                            # real decode error and must propagate.
+                            if nested_any:
+                                raise
+                            unresolved.append(
+                                f"{info.filename!r}: nested archive holds no "
+                                "tabular entries"
+                            )
+                        continue
+                    non_zip_resolved = True
+                    for batch in leaf._read_arrow_batches(
                         leaf.options_class()(),
+                    ):
+                        produced_any = True
+                        yield batch
+
+                # Every resolved entry was a nested archive and none held
+                # tabular data — surface the same "nothing to read" error
+                # the top-level guard raises instead of returning an empty
+                # stream that hides the problem.
+                if not non_zip_resolved and not produced_any:
+                    exts = _registered_tabular_extensions()
+                    raise ValueError(
+                        f"{type(self).__name__}: archive has "
+                        f"{len(file_entries)} entries but none resolve to a "
+                        "registered Tabular leaf. Reasons: "
+                        f"{unresolved!r}. Registered tabular extensions: "
+                        f"{exts!r}."
                     )
 
     # ==================================================================
