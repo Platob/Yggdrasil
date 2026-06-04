@@ -826,38 +826,38 @@ class VolumePath(DatabricksPath):
         access is permitted for the backing volume — else ``None`` (caller uses
         the Files API).
 
-        Gated up front on the Unity Catalog prerequisite, checked before any
-        I/O: the volume is EXTERNAL **and** the current user holds
-        ``EXTERNAL USE SCHEMA`` on its schema
-        (:meth:`UCSchema.can_use_external`, cached on the shared schema
-        singleton — one grants lookup decides for the whole process). When
-        granted, an EXTERNAL volume's backing cloud location is reachable
-        directly, so a read / write can skip the Files-API hop and the UC
-        quota burn. The probe is side-effect-free and never raises into the
-        I/O flow; only ``s3://`` locations are served directly today.
-
-        A UC-managed storage layout (``__unitystorage`` / ``__unitycatalog`` in
-        the path) is governed by Unity Catalog — direct ``PutObject`` is denied
-        there — so direct **writes** are disabled for such locations and routed
-        through the Files API; reads may still go direct.
+        Eligibility is decided **once per mode** and cached on the
+        :class:`Volume` singleton (:meth:`Volume.external_access`), so the
+        check doesn't re-run on every I/O. It requires: the volume is EXTERNAL,
+        the current user holds ``EXTERNAL USE SCHEMA`` on its schema
+        (:meth:`UCSchema.can_use_external`), the location is ``s3://``, and —
+        for a write — it isn't a UC-managed ``__unitystorage`` /
+        ``__unitycatalog`` layout (where direct ``PutObject`` is denied). When
+        eligible, the backing cloud location is reachable directly, skipping
+        the Files-API hop and the UC quota burn; only the per-file Path
+        (``root / rel``) is resolved on the cached-eligible path. Never raises
+        into the I/O flow.
         """
         if self._split_volume() is None:
             return None  # path too shallow to address a volume
         try:
             vol = self.volume
-            if (vol.volume_type or "").upper() != "EXTERNAL":
-                return None
-            if not vol.schema.can_use_external():
-                return None
-            # A prior permission error on this volume/mode disables the fast
-            # path: the credential vends but the storage op itself is denied.
-            if not vol.can_access_external(write=write):
-                return None
+            cached = vol.external_access(write=write)
+            if cached is False:
+                return None  # known not directly reachable for this mode
             raw = vol.storage_location()
-            if not (URL.from_str(raw).scheme or "").startswith("s3"):
-                return None
-            if write and ("__unitystorage" in raw or "__unitycatalog" in raw):
-                return None  # UC-managed storage — direct writes denied
+            if cached is None:
+                # First time for this mode — run the eligibility check + cache
+                # the verdict so later ops skip straight to path resolution.
+                eligible = (
+                    (vol.volume_type or "").upper() == "EXTERNAL"
+                    and vol.schema.can_use_external()
+                    and (URL.from_str(raw).scheme or "").startswith("s3")
+                    and not (write and ("__unitystorage" in raw or "__unitycatalog" in raw))
+                )
+                vol.mark_external_ok(write=write) if eligible else vol.mark_external_denied(write=write)
+                if not eligible:
+                    return None
             root = vol.aws(mode=Mode.AUTO if write else Mode.READ_ONLY).s3.path(raw)
         except Exception as exc:  # type / location / credential resolution
             logger.debug("external storage path unavailable for %r: %s", self, exc)

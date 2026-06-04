@@ -193,27 +193,37 @@ class Volume(DatabricksPath):
         self._storage_path: Any = None
         self._catalog: Any = None
         self._schema: Any = None
-        # Per-mode direct-storage access flags. ``True`` until a real
-        # permission error proves otherwise: UC can vend READ_WRITE creds whose
-        # underlying S3 policy still denies a read or a write, and the schema
-        # grant (``EXTERNAL USE SCHEMA``) doesn't capture that. Once a 403 is
-        # seen, the matching mode stops taking the direct-storage fast path for
-        # this volume (process-wide, via the singleton) and routes through the
-        # Files API instead. See :meth:`VolumePath._external_storage_file`.
-        self._external_readable: bool = True
-        self._external_writable: bool = True
+        # Per-mode direct-storage access state, **cached** so the eligibility
+        # check (external type + ``EXTERNAL USE SCHEMA`` grant + s3 location +
+        # ``__unitycatalog`` write gate) runs once per mode, not on every I/O.
+        # ``None`` = not yet determined, ``True`` = usable, ``False`` = not
+        # usable (managed / no grant / non-s3, or a permission error proved the
+        # vended creds can't actually read/write the storage). Process-wide via
+        # the singleton. See :meth:`VolumePath._external_storage_file`.
+        self._external_readable: Optional[bool] = None
+        self._external_writable: Optional[bool] = None
         self._initialized = True
 
-    # ── direct-storage access flags ────────────────────────────────────────────
+    # ── direct-storage access cache ─────────────────────────────────────────────
 
-    def can_access_external(self, *, write: bool) -> bool:
-        """True iff this volume's backing storage is still believed reachable
-        directly for the given mode (no prior permission denial)."""
+    def external_access(self, *, write: bool) -> Optional[bool]:
+        """Cached per-mode direct-storage accessibility: ``True`` (usable),
+        ``False`` (not usable / denied), or ``None`` (not yet determined — the
+        caller should resolve it and record the result)."""
         return self._external_writable if write else self._external_readable
 
+    def mark_external_ok(self, *, write: bool) -> None:
+        """Cache that this volume's storage is directly reachable for the mode
+        — subsequent ops skip the eligibility check."""
+        if write:
+            self._external_writable = True
+        else:
+            self._external_readable = True
+
     def mark_external_denied(self, *, write: bool) -> None:
-        """Flag this volume's direct storage as not externally writable (or
-        readable) after a permission error, so the fast path isn't retried."""
+        """Cache that this volume's storage is **not** directly reachable for
+        the mode (ineligible, or a permission error), so the fast path isn't
+        retried."""
         if write:
             self._external_writable = False
         else:
