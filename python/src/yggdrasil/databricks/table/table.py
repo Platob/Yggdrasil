@@ -3093,6 +3093,75 @@ class Table(DatabricksPath):
             **kwargs,
         )
 
+    def auto_loader(
+        self,
+        source: str,
+        *,
+        name: "str | None" = None,
+        file_format: str = "parquet",
+        checkpoint: "str | None" = None,
+        available_now: bool = True,
+        file_arrival: bool = False,
+        trigger: "Any" = None,
+        deploy: bool = True,
+    ) -> "Any":
+        """Get-or-create a Databricks **Auto Loader** ingestion job for this table.
+
+        Builds a serverless job — leveraging the ygg wheel + environment via the
+        :class:`~yggdrasil.databricks.job.skeleton.Flow` machinery — whose single
+        task runs :func:`yggdrasil.databricks.table.auto_loader.auto_load` on the
+        cluster: Spark Structured Streaming + ``cloudFiles`` incrementally
+        ingests files dropped under *source* into this table (exactly-once,
+        schema-evolving). The job is named ``ygg_autoloader_<full_name>`` and
+        upserted by name (:meth:`Jobs.create_or_update`), so repeated calls
+        reconfigure the same job rather than piling up duplicates.
+
+        Args:
+            source: Cloud path Auto Loader watches (``s3://…`` / ``/Volumes/…``).
+            name: Job name override (default ``ygg_autoloader_<full_name>``).
+            file_format: ``cloudFiles.format`` (parquet / json / csv / avro / …).
+            checkpoint: Streaming checkpoint + schema location; ``None`` lets the
+                on-cluster step derive ``<table-location>/_ygg_autoloader``.
+            available_now: ``True`` → a one-shot ``Trigger.AvailableNow`` sweep
+                (the shape a scheduled / file-arrival run wants); ``False`` →
+                continuous micro-batch.
+            file_arrival: ``True`` → attach a file-arrival trigger on *source*
+                so the job fires when new files land (mutually exclusive with a
+                custom *trigger*).
+            trigger: An explicit Databricks ``TriggerSettings`` (schedule /
+                file-arrival), passed through as-is.
+            deploy: ``True`` (default) get-or-creates the job now and returns the
+                :class:`~yggdrasil.databricks.job.job.Job`; ``False`` returns the
+                configured (un-deployed) :class:`Flow` for inspection / a manual
+                ``.deploy(client)``.
+
+        Returns the deployed :class:`Job` (``deploy=True``) or the :class:`Flow`.
+        """
+        from yggdrasil.databricks.job.skeleton import Flow
+        from yggdrasil.databricks.table.auto_loader import auto_load
+
+        if file_arrival and trigger is None:
+            from databricks.sdk.service.jobs import (
+                FileArrivalTriggerConfiguration, TriggerSettings,
+            )
+            trigger = TriggerSettings(
+                file_arrival=FileArrivalTriggerConfiguration(url=str(source)),
+            )
+
+        job_name = name or "ygg_autoloader_" + re.sub(
+            r"[^A-Za-z0-9_.-]", "_", self.full_name(),
+        )
+        flow = Flow(
+            auto_load,
+            name=job_name,
+            trigger=trigger,
+            parameters=[
+                self.full_name(), str(source), file_format,
+                checkpoint or "", available_now,
+            ],
+        )
+        return flow.deploy(self.client) if deploy else flow
+
     def stage_insert(
         self,
         data: Any,
