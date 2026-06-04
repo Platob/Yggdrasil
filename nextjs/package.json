@@ -1,6 +1,6 @@
 {
   "name": "yggdrasil-ui",
-  "version": "0.8.52",
+  "version": "0.8.53",
   "private": true,
   "scripts": {
     "dev": "next dev",

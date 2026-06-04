@@ -632,7 +632,7 @@ def ensure_named_environment(
 
         environment_version: '5'
         dependencies:
-          - /Workspace/Shared/pypi/ygg/ygg-0.8.52-py3-none-any.whl
+          - /Workspace/Shared/pypi/ygg/ygg-0.8.53-py3-none-any.whl
           - pyarrow==...
 
     Written (overwritten) on every call — upsert semantics, so redeploying keeps
