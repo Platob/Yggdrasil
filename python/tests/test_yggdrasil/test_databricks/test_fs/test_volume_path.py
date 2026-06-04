@@ -2217,16 +2217,27 @@ class TestExternalStorageGating:
             "/Volumes/cat/sch/vol/sub/file.bin", service=MagicMock(spec=Volumes),
         )
 
-    def _volume(self, *, external=True, can_use=True, location="s3://bkt/root"):
+    def _volume(self, *, external=True, can_use=True, can_access=True,
+                location="s3://bkt/root"):
         vol = MagicMock()
         vol.volume_type = "EXTERNAL" if external else "MANAGED"
         vol.schema.can_use_external.return_value = can_use
+        vol.can_access_external.return_value = can_access
         vol.storage_location.return_value = location
         sentinel = object()
         root = MagicMock()
         root.__truediv__.return_value = sentinel
         vol.aws.return_value.s3.path.return_value = root
         return vol, root, sentinel
+
+    def test_none_when_volume_access_previously_denied(self) -> None:
+        # A prior 403 flagged the volume's write access → fast path off.
+        p = self._vp()
+        vol, *_ = self._volume(can_access=False)
+        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
+            assert p._external_storage_file(write=True) is None
+        vol.can_access_external.assert_called_once_with(write=True)
+        vol.aws.assert_not_called()
 
     def test_resolves_when_external_and_permitted(self) -> None:
         p = self._vp()
@@ -2278,3 +2289,90 @@ class TestExternalStorageGating:
         with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
             p._external_storage_file(write=False)
         assert vol.aws.call_args.kwargs["mode"] == Mode.READ_ONLY
+
+
+class TestVolumeExternalAccessFlags:
+    """``Volume`` per-mode direct-storage access flags."""
+
+    def _volume(self):
+        from yggdrasil.databricks.volume.volume import Volume
+        return Volume(service=MagicMock(spec=Volumes),
+                      catalog_name="c", schema_name="s", volume_name="v")
+
+    def test_default_both_modes_accessible(self) -> None:
+        v = self._volume()
+        assert v.can_access_external(write=False) is True
+        assert v.can_access_external(write=True) is True
+
+    def test_mark_denied_is_per_mode(self) -> None:
+        v = self._volume()
+        v.mark_external_denied(write=True)
+        assert v.can_access_external(write=True) is False
+        assert v.can_access_external(write=False) is True   # read unaffected
+        v.mark_external_denied(write=False)
+        assert v.can_access_external(write=False) is False
+
+
+class TestLooksLikePermissionDenied:
+    def test_stdlib_permission_error(self) -> None:
+        from yggdrasil.databricks.fs.volume_path import _looks_like_permission_denied
+        assert _looks_like_permission_denied(PermissionError("nope")) is True
+
+    def test_databricks_permission_denied_by_name(self) -> None:
+        from yggdrasil.databricks.fs.volume_path import _looks_like_permission_denied
+
+        class PermissionDenied(Exception):
+            pass
+
+        assert _looks_like_permission_denied(PermissionDenied("denied")) is True
+
+    def test_s3_403(self) -> None:
+        from yggdrasil.aws.fs.s3_http import S3Error
+        from yggdrasil.databricks.fs.volume_path import _looks_like_permission_denied
+        assert _looks_like_permission_denied(S3Error(403, "AccessDenied", "x", "k")) is True
+
+    def test_unrelated_error_is_not_permission(self) -> None:
+        from yggdrasil.databricks.fs.volume_path import _looks_like_permission_denied
+        assert _looks_like_permission_denied(ValueError("bad region")) is False
+        assert _looks_like_permission_denied(TimeoutError("slow")) is False
+
+
+class TestExternalStorageFallbackFlagsVolume:
+    """A permission error on the direct read/write flags the volume (per mode)
+    and falls back to the Files API."""
+
+    def _vp(self):
+        return VolumePath(
+            "/Volumes/cat/sch/vol/sub/file.bin", service=MagicMock(spec=Volumes),
+        )
+
+    def test_read_403_flags_volume_not_readable_then_files_api(self) -> None:
+        import pytest
+        from yggdrasil.aws.fs.s3_http import S3Error
+
+        p = self._vp()
+        sf = MagicMock()
+        sf._read_mv.side_effect = S3Error(403, "AccessDenied", "denied", "key")
+        vol = MagicMock()
+        with patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol), \
+                patch.object(VolumePath, "_fs_request",
+                             side_effect=FileNotFoundError("→ files api")):
+            with pytest.raises(FileNotFoundError):
+                p._read_mv(16, 0)
+        vol.mark_external_denied.assert_called_once_with(write=False)
+
+    def test_transient_read_error_does_not_flag_volume(self) -> None:
+        import pytest
+
+        p = self._vp()
+        sf = MagicMock()
+        sf._read_mv.side_effect = ConnectionError("blip")
+        vol = MagicMock()
+        with patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol), \
+                patch.object(VolumePath, "_fs_request",
+                             side_effect=FileNotFoundError("→ files api")):
+            with pytest.raises(FileNotFoundError):
+                p._read_mv(16, 0)
+        vol.mark_external_denied.assert_not_called()   # transient → keep fast path

@@ -819,6 +819,10 @@ class VolumePath(DatabricksPath):
                 return None
             if not vol.schema.can_use_external():
                 return None
+            # A prior permission error on this volume/mode disables the fast
+            # path: the credential vends but the storage op itself is denied.
+            if not vol.can_access_external(write=write):
+                return None
             raw = vol.storage_location()
             if not (URL.from_str(raw).scheme or "").startswith("s3"):
                 return None
@@ -1328,7 +1332,11 @@ class VolumePath(DatabricksPath):
                     "external storage read failed for %r (%s: %s); "
                     "using the Files API", self, type(exc).__name__, exc,
                 )
-                self.volume.schema.mark_external_unusable()
+                # A permission denial means the creds can't read this volume's
+                # storage directly — flag the volume so the read fast path isn't
+                # retried. Other (transient) failures just fall back this once.
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=False)
             else:
                 if n < 0 and pos == 0 and not self._stat_cached:
                     self._persist_stat_cache(
@@ -1550,7 +1558,8 @@ class VolumePath(DatabricksPath):
                     "external storage write failed for %r (%s: %s); "
                     "using the Files API", self, type(exc).__name__, exc,
                 )
-                self.volume.schema.mark_external_unusable()
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=True)
             else:
                 self._persist_stat_cache(
                     IOStats(size=len(payload), kind=IOKind.FILE,
@@ -1641,7 +1650,8 @@ class VolumePath(DatabricksPath):
                     "external storage write failed for %r (%s: %s); "
                     "using the Files API", self, type(exc).__name__, exc,
                 )
-                self.volume.schema.mark_external_unusable()
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=True)
             else:
                 self._persist_stat_cache(
                     IOStats(size=size, kind=IOKind.FILE,
@@ -1726,6 +1736,27 @@ def _looks_like_not_found(exc: BaseException) -> bool:
     if isinstance(exc, FileNotFoundError):
         return True
     return "does not exist" in str(exc).lower()
+
+
+def _looks_like_permission_denied(exc: BaseException) -> bool:
+    """True for an access-denied failure, regardless of which layer raised it.
+
+    Covers the stdlib :class:`PermissionError`, the Databricks SDK
+    ``PermissionDenied``, and an :class:`~yggdrasil.aws.fs.s3_http.S3Error`
+    403/401 (``AccessDenied`` / ``Forbidden``) from a direct ``GetObject`` /
+    ``PutObject`` — so a vended credential whose S3 policy still denies the op
+    is recognised and the volume's fast path disabled."""
+    if isinstance(exc, PermissionError):
+        return True
+    if type(exc).__name__ in ("PermissionDenied", "AccessDenied", "Forbidden"):
+        return True
+    if getattr(exc, "status", None) in (401, 403):
+        return True
+    code = getattr(exc, "code", "") or ""
+    if isinstance(code, str) and code.lower() in ("accessdenied", "forbidden", "401", "403"):
+        return True
+    text = str(exc).lower()
+    return "access denied" in text or "forbidden" in text or "not authorized" in text
 
 
 def _looks_like_already_exists(exc: BaseException) -> bool:

@@ -193,7 +193,31 @@ class Volume(DatabricksPath):
         self._storage_path: Any = None
         self._catalog: Any = None
         self._schema: Any = None
+        # Per-mode direct-storage access flags. ``True`` until a real
+        # permission error proves otherwise: UC can vend READ_WRITE creds whose
+        # underlying S3 policy still denies a read or a write, and the schema
+        # grant (``EXTERNAL USE SCHEMA``) doesn't capture that. Once a 403 is
+        # seen, the matching mode stops taking the direct-storage fast path for
+        # this volume (process-wide, via the singleton) and routes through the
+        # Files API instead. See :meth:`VolumePath._external_storage_file`.
+        self._external_readable: bool = True
+        self._external_writable: bool = True
         self._initialized = True
+
+    # ── direct-storage access flags ────────────────────────────────────────────
+
+    def can_access_external(self, *, write: bool) -> bool:
+        """True iff this volume's backing storage is still believed reachable
+        directly for the given mode (no prior permission denial)."""
+        return self._external_writable if write else self._external_readable
+
+    def mark_external_denied(self, *, write: bool) -> None:
+        """Flag this volume's direct storage as not externally writable (or
+        readable) after a permission error, so the fast path isn't retried."""
+        if write:
+            self._external_writable = False
+        else:
+            self._external_readable = False
 
     # ── identity ──────────────────────────────────────────────────────────────
 
