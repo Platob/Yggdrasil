@@ -187,8 +187,8 @@ class TestStagingVolumeExternal:
         staging.assert_not_called()                 # no re-derivation
         assert goc.call_args.kwargs["storage_location"] == "s3://pinned/loc"
 
-    def test_external_table_without_staging_root_stays_managed(self) -> None:
-        # No resolvable schema staging path → fall back to the managed default.
+    def test_external_table_without_any_storage_root_stays_managed(self) -> None:
+        # No schema staging path AND no table storage location → managed default.
         from types import SimpleNamespace
 
         from yggdrasil.databricks.schema.schema import UCSchema
@@ -196,7 +196,8 @@ class TestStagingVolumeExternal:
         tbl = _table("cat", "sch", "tbl")
         with patch.object(
             Table, "read_infos",
-            return_value=SimpleNamespace(table_type=TableType.EXTERNAL),
+            return_value=SimpleNamespace(table_type=TableType.EXTERNAL,
+                                         storage_location=None),
         ), patch.object(
             Table, "infos", new_callable=PropertyMock,
         ) as infos, patch.object(
@@ -205,9 +206,43 @@ class TestStagingVolumeExternal:
             Volume, "get_or_create",
         ) as goc:
             infos.return_value.properties = {}
+            infos.return_value.table_type = TableType.EXTERNAL
             tbl.ensure_staging_volume()
 
         goc.assert_not_called()
+
+    def test_external_table_falls_back_to_its_own_location(self) -> None:
+        # No schema staging path, but the external table has its own storage
+        # location → stage in a ``_ygg_staging`` sibling of the table data.
+        import hashlib
+        from types import SimpleNamespace
+
+        from yggdrasil.databricks.schema.schema import UCSchema
+
+        tbl = _table("cat", "sch", "tbl")
+        with patch.object(
+            Table, "read_infos",
+            return_value=SimpleNamespace(
+                table_type=TableType.EXTERNAL,
+                storage_location="s3://bkt/ext/cat/sch/tbl",
+            ),
+        ), patch.object(
+            Table, "infos", new_callable=PropertyMock,
+        ) as infos, patch.object(
+            UCSchema, "staging_location", return_value=None,
+        ), patch.object(
+            Table, "properties", new_callable=PropertyMock,
+        ) as props, patch.object(
+            Volume, "get_or_create",
+        ) as goc:
+            infos.return_value.properties = {}
+            infos.return_value.table_type = TableType.EXTERNAL
+            props.return_value = {}
+            tbl.ensure_staging_volume()
+
+        key = hashlib.blake2b(b"cat.sch.tbl", digest_size=16).hexdigest()
+        assert goc.call_args.kwargs["storage_location"] == \
+            f"s3://bkt/ext/cat/sch/_ygg_staging/{key}"
 
     def test_managed_table_skips_external_create(self) -> None:
         """A managed table leaves the staging volume to the default (managed)

@@ -3316,18 +3316,29 @@ class Table(DatabricksPath):
 
         Returns the ``ygg.staging_root`` property when the table already
         carries it — read straight from cached :attr:`infos`, no re-derivation.
-        Otherwise derives ``<schema-staging-root>/<table-hash>`` (the schema's
-        governed external root via :meth:`UCSchema.staging_location`, plus a
-        deterministic per-table hash so the location is stable and collision
-        free) and best-effort stamps it onto the table's TBLPROPERTIES — a
-        missing ALTER grant just means the next caller re-derives it. Returns
-        ``None`` when the schema exposes no staging root (e.g. a managed
+        Otherwise derives ``<staging-base>/<table-hash>`` — a deterministic
+        per-table hash so the location is stable and collision free — and
+        best-effort stamps it onto the table's TBLPROPERTIES (a missing ALTER
+        grant just means the next caller re-derives it). The staging base is the
+        schema's governed external root (:meth:`UCSchema.staging_location`) when
+        the schema exposes one; otherwise, for an **external** table, it falls
+        back to a sibling of the table's own storage location
+        (``<table-parent>/_ygg_staging``) — governed by the same external
+        location — so staging works even when the schema has no configured
+        external root. Returns ``None`` when neither resolves (e.g. a managed
         table), so the caller falls back to the default managed staging path.
         """
         existing = (self.infos.properties or {}).get(self.STAGING_ROOT_PROPERTY)
         if existing:
             return existing
         base = self.schema.staging_location()
+        if not base:
+            # Fall back to the external table's own governed location: stage in
+            # a ``_ygg_staging`` sibling of the table data (outside its
+            # ``_delta_log`` / data files), within the same external location.
+            location = self.storage_location()
+            if location and self.infos.table_type == TableType.EXTERNAL:
+                base = location.rstrip("/").rsplit("/", 1)[0] + "/_ygg_staging"
         if not base:
             return None
         key = hashlib.blake2b(
