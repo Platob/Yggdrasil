@@ -24,6 +24,7 @@ ygg databricks <group> <action> [flags]
 | [`warehouses`](#warehouses) | SQL warehouses — list/get/create/delete/start/stop |
 | [`job`](#jobs) | Jobs & runs — list/get/run/runs/logs/cancel/repair/delete |
 | [`fs`](#filesystem-fs) | Files across Workspace / Volumes / DBFS — ls/cat/write/put/get/mkdir/rm/stat/cp/mv |
+| [`wheel`](#wheels-wheel) | Wheel registry — build/upload/deploy/list in the workspace PyPI-like index |
 | [`deploy`](#deploy) | Build + upload wheels and assemble serverless environments |
 
 ---
@@ -411,6 +412,82 @@ ygg databricks fs mv /Workspace/Shared/old.csv /Volumes/main/default/archive/old
 
 ---
 
+## Wheels (`wheel`)
+
+The wheel registry lifecycle on its own — building, uploading, and
+browsing the workspace's PyPI-like wheel index
+(`/Workspace/Shared/pypi/<dist>/...` by default). Where [`deploy`](#deploy)
+ships the whole ygg image in one shot (wheel **plus** the serverless
+`JobEnvironment`), `wheel` lets you drive each step.
+
+```bash
+ygg databricks wheel <action> [flags]
+```
+
+Like `deploy`, the wheel is built from the **live package on disk**: the
+machinery synthesizes a buildable project from the *installed* package's
+own files + metadata, so the artifact runs exactly the code you have now —
+dev checkout or pip-installed.
+
+### `wheel build`
+
+Build wheel(s) locally from a package — **no workspace upload, no
+credentials needed** (it runs `uv`/`pip` locally). Prints the produced
+`.whl` paths to stdout.
+
+| Flag | Purpose |
+|---|---|
+| `--out-dir` | Directory to write the `.whl`(s) into (default: a temp dir) |
+| `--extra` | Optional-dependency extra to fold in (repeatable) |
+| `-r`, `--requirement` | Extra requirement to bundle alongside (repeatable) |
+| `--no-deps` | Pure-python project wheel only; deps resolve at install time |
+| `--all-versions` | A wheel for every supported Python (3.10–3.13) |
+
+```bash
+ygg databricks wheel build yggdrasil --out-dir ./dist
+ygg databricks wheel build mypkg --no-deps --out-dir ./dist
+ygg databricks wheel build yggdrasil --extra databricks --all-versions
+```
+
+### `wheel upload`
+
+Upload one or more **prebuilt** `.whl` files into the registry. Prints
+each resulting workspace path.
+
+```bash
+ygg databricks wheel upload ./dist/mypkg-1.0-py3-none-any.whl
+ygg databricks wheel upload ./dist/*.whl --workspace-dir /Workspace/Shared/pypi
+```
+
+This pairs with `wheel build` for an air-gapped flow: build locally on a
+machine with the package, then upload the artifacts from one that has
+workspace access.
+
+### `wheel deploy`
+
+Build the live package **and** upload its wheel(s) in one step — the wheel
+half of `deploy` without the environment JSON. Prints the workspace
+path(s). Same build flags as `wheel build`.
+
+```bash
+ygg databricks wheel deploy yggdrasil --extra databricks
+ygg databricks wheel deploy mypkg -r "pandas>=2" --no-deps
+```
+
+### `wheel list`
+
+Browse the registry. With no package it lists the distribution folders;
+with a package (import or distribution name) it lists that distribution's
+deployed `.whl` files.
+
+```bash
+ygg databricks wheel list              # ygg/  mypkg/  ...
+ygg databricks wheel list ygg          # /Workspace/Shared/pypi/ygg/ygg-0.8.45-py3-none-any.whl
+ygg databricks wheel list --workspace-dir /Workspace/Users/me@co.com/pypi
+```
+
+---
+
 ## Deploy
 
 Ship your Python code to Databricks serverless. The machinery in
@@ -496,7 +573,7 @@ There are two surfaces in the tree:
 - **`yggdrasil.databricks.cli`** — the working `ygg databricks` CLI
   documented above. Each group is a small command class
   (`ClustersCommand`, `WarehousesCommand`, `JobsCommand`, `FSCommand`,
-  `DeployCommand`) that registers an argparse sub-parser and dispatches
+  `WheelCommand`, `DeployCommand`) that registers an argparse sub-parser and dispatches
   straight into the service layer. To add a group, write a class with a
   `register(subparsers)` classmethod and add it to
   `cli/services/__init__.py` + the registration block in `cli/__init__.py`.
