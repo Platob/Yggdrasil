@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import unittest
+import uuid
 from typing import Any, ClassVar
 
 import pyarrow as pa
@@ -92,7 +93,15 @@ class TestCssPricesPocSmoke(DatabricksIntegrationCase):
             cls.root = cls.source.schema_storage_location().split(
                 "/__unitystorage",
             )[0].rstrip("/")
-            cls.location = f"{cls.root}/poc/css_prices_poc"
+            # Unique per run: the Delta byte cache (yggdrasil.io.delta._cache)
+            # is keyed by S3 path on the documented invariant that a
+            # version-addressed ``_delta_log/<n>.json`` is immutable. Reusing a
+            # fixed location across runs (drop + recreate writes *new* content to
+            # the same ``00…00.json`` path) violates that, so the persistent
+            # disk cache would serve a prior run's stale commit bytes — and the
+            # DeltaFolder read would see 0 rows. A fresh location per run keeps
+            # the invariant intact and the test hermetic.
+            cls.location = f"{cls.root}/poc/css_prices_poc-{uuid.uuid4().hex[:12]}"
 
             cls.sample = _canonical_utc(
                 cls.client.sql.execute(
