@@ -622,7 +622,7 @@ class DatabricksPath(RemotePath, DatabricksResource):
             from .catalog.catalog import UCCatalog
             from .schema.schema import UCSchema
 
-            if target in (DBFSPath, VolumePath, WorkspacePath, UCSchema, UCCatalog):
+            if target in (DBFSPath, VolumePath, WorkspacePath):
                 if normalized is not None:
                     data = None
                     url = normalized
@@ -635,11 +635,15 @@ class DatabricksPath(RemotePath, DatabricksResource):
                     _PENDING_URL_STASH[id(instance)] = normalized
                 return instance
 
-        # Resource-shaped or off-family target — construct eagerly via
-        # ``from_url`` so the returned object is fully initialized.
-        # Python's auto-``__init__`` only fires when the result is an
-        # instance of the originating ``cls`` (DatabricksPath); resource
-        # targets like ``Table`` aren't, so they need eager init here.
+        # Resource-shaped target — construct eagerly via ``from_url`` so the
+        # URL is parsed into Unity Catalog coordinates and the returned object
+        # is fully initialized. ``Table`` isn't a :class:`DatabricksPath`, so
+        # Python's post-``__new__`` ``__init__`` pass is skipped for it. The
+        # resource *paths* (:class:`Volume` / :class:`UCSchema` /
+        # :class:`UCCatalog`) **are** ``DatabricksPath`` subclasses, so Python
+        # *does* re-run their ``__init__`` here with this dispatcher's original
+        # positional arg — their constructors absorb it as an ignored leading
+        # ``data`` and no-op on the already-built (``_initialized``) singleton.
         if normalized is None:
             raise TypeError(
                 f"{cls.__name__} cannot dispatch to {target.__name__} "
