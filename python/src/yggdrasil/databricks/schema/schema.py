@@ -594,22 +594,6 @@ class UCSchema(DatabricksPath):
     def storage_root(self) -> Optional[str]:
         return self.infos.storage_root
 
-    def staging_location(self) -> Optional[str]:
-        """Derive the schema's staging root, ``<root>/uc/tables``.
-
-        ``<root>`` is the governed external storage location before the managed
-        ``/__unitystorage`` segment. Returns ``None`` when the schema has no
-        resolvable storage location (e.g. a managed schema). This is a pure
-        derivation — the resolved per-table staging root is recorded on the
-        **table** (the ``ygg.staging_root`` TBLPROPERTY,
-        :meth:`Table.staging_root`), not in schema metadata.
-        """
-        info = self.read_infos(default=None)
-        location = getattr(info, "storage_location", None) if info else None
-        if not location:
-            return None
-        return location.split("/__unitystorage")[0].rstrip("/") + "/uc/tables"
-
     # ── navigation ────────────────────────────────────────────────────────────
 
     @property

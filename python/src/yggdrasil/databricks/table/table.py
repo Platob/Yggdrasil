@@ -20,7 +20,6 @@ on write keep the cache fresh without fan-out invalidation.
 from __future__ import annotations
 
 import datetime as _dt
-import hashlib
 import logging
 import re
 import time
@@ -3105,9 +3104,9 @@ class Table(DatabricksPath):
 
         Args:
             source: Cloud path Auto Loader watches (``s3://…`` / ``/Volumes/…``).
-                ``None`` (default) uses this table's cloud staging area
-                (:meth:`stage_storage_path`), so files staged there are ingested
-                with no explicit wiring.
+                ``None`` (default) uses the staging volume's cloud storage path
+                (``ensure_staging_volume().storage_path() / STAGE_SUBPATH``), so
+                files staged there are ingested with no explicit wiring.
             name: Job name override (default ``[YGG][AUTOLOADER] <full_name>``).
             file_format: ``cloudFiles.format`` (parquet / json / csv / avro / …).
             checkpoint: Streaming checkpoint + schema location; ``None`` lets the
@@ -3165,9 +3164,12 @@ class Table(DatabricksPath):
             environment = ygg_base_environment_name()
 
         if source is None:
-            # Default to the table's own cloud staging area, so files staged
-            # via the storage path are ingested with no explicit wiring.
-            source = self.stage_storage_path().full_path()
+            # Default to the staging volume's own cloud storage path, so files
+            # staged there are ingested with no explicit wiring.
+            source = (
+                self.ensure_staging_volume().storage_path(mode=Mode.AUTO)
+                / self.STAGE_SUBPATH
+            ).full_path()
 
         if file_arrival and trigger is None:
             from databricks.sdk.service.jobs import (
@@ -3208,17 +3210,17 @@ class Table(DatabricksPath):
         """Stage *data* as Parquet under this table's **Auto Loader staging
         area** and return the path it landed at — no warehouse statement runs.
 
-        Writes a fresh, uniquely-named Parquet file directly under
-        :meth:`stage_storage_path` — the cloud-storage path a deployed
-        :meth:`auto_loader` job watches — so staged rows are ingested with no
-        extra wiring: ``stage_insert`` → Auto Loader → table. Falls back to the
-        Files-API volume staging (:meth:`staging_folder`) when a direct cloud
-        path isn't available (e.g. a managed table without external staging),
-        preserving a stage-for-later-load there.
+        Writes a fresh, uniquely-named Parquet file directly under the staging
+        volume's cloud storage path (``STAGE_SUBPATH`` prefix) — the same path a
+        deployed :meth:`auto_loader` job watches — so staged rows are ingested
+        with no extra wiring: ``stage_insert`` → Auto Loader → table. Falls back
+        to the Files-API volume staging (:meth:`staging_folder`) when a direct
+        cloud path isn't available (e.g. a managed staging volume), preserving a
+        stage-for-later-load there.
         """
         leaf = f"insert-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.parquet"
         try:
-            root = self.stage_storage_path()
+            root = self.ensure_staging_volume().storage_path(mode=Mode.AUTO) / self.STAGE_SUBPATH
         except Exception:  # noqa: BLE001 — degrade to Files-API volume staging
             logger.debug(
                 "stage_insert: direct cloud staging unavailable for %s; "
@@ -3341,86 +3343,52 @@ class Table(DatabricksPath):
             schema_name=self.schema_name,
         ).volume(value)
 
-    #: TBLPROPERTY under which a table records its resolved external staging
-    #: root URL, so later inserts read it straight from the table metadata
-    #: instead of re-deriving it from the schema storage location.
-    STAGING_ROOT_PROPERTY: ClassVar[str] = "ygg.staging_root"
+    #: Sub-prefix under the staging volume's storage root where Auto Loader
+    #: staged files live (kept apart from the ``.sql/tmp`` insert scratch so a
+    #: deployed auto_loader job never sweeps up arrow_insert's temp Parquet).
+    STAGE_SUBPATH: ClassVar[str] = ".ygg/stage"
 
-    def staging_root(self) -> "str | None":
-        """This table's external staging root URL, recorded in TBLPROPERTIES.
+    @property
+    def staging_location(self) -> "str | None":
+        """The staging :class:`Volume`'s backing storage location, or ``None``.
 
-        Returns the ``ygg.staging_root`` property when the table already
-        carries it — read straight from cached :attr:`infos`, no re-derivation.
-        Otherwise derives ``<staging-base>/<table-hash>`` — a deterministic
-        per-table hash so the location is stable and collision free — and
-        best-effort stamps it onto the table's TBLPROPERTIES (a missing ALTER
-        grant just means the next caller re-derives it). The staging base is the
-        schema's governed external root (:meth:`UCSchema.staging_location`) when
-        the schema exposes one; otherwise, for an **external** table, it falls
-        back to a sibling of the table's own storage location
-        (``<table-parent>/_ygg_staging``) — governed by the same external
-        location — so staging works even when the schema has no configured
-        external root. Returns ``None`` when neither resolves (e.g. a managed
-        table), so the caller falls back to the default managed staging path.
+        A pure, non-failing read of the staging volume's :class:`VolumeInfo`
+        (``read_info(default=None)``): yields the backing ``storage_location``
+        URL when the volume exists, ``None`` when it doesn't exist yet.
         """
-        existing = (self.infos.properties or {}).get(self.STAGING_ROOT_PROPERTY)
-        if existing:
-            return existing
-        base = self.schema.staging_location()
-        if not base:
-            # Fall back to the external table's own governed location: stage in
-            # a ``_ygg_staging`` sibling of the table data (outside its
-            # ``_delta_log`` / data files), within the same external location.
-            location = self.storage_location()
-            if location and self.infos.table_type == TableType.EXTERNAL:
-                base = location.rstrip("/").rsplit("/", 1)[0] + "/_ygg_staging"
-        if not base:
-            return None
-        key = hashlib.blake2b(
-            f"{self.catalog_name}.{self.schema_name}.{self.table_name}".encode("utf-8"),
-            digest_size=16,
-        ).hexdigest()
-        root = f"{base.rstrip('/')}/{key}"
-        try:
-            self.properties[self.STAGING_ROOT_PROPERTY] = root
-        except Exception:
-            logger.debug(
-                "Recording %s on %r failed; will re-derive next time",
-                self.STAGING_ROOT_PROPERTY, self, exc_info=True,
-            )
-        return root
+        info = self.staging_volume.read_info(default=None)
+        return getattr(info, "storage_location", None) if info is not None else None
+
+    @staging_location.setter
+    def staging_location(self, value: str) -> None:
+        """Pin the staging volume to *value* as an **external** volume.
+
+        Creates the staging volume external at *value* when it doesn't exist
+        yet; when it already exists, leaves it untouched if the location is
+        unchanged, otherwise drops and recreates it there (an external volume's
+        ``storage_location`` is immutable in Unity Catalog, so a relocation is
+        a delete + create).
+        """
+        volume = self.staging_volume
+        info = volume.read_info(default=None)
+        if info is None:
+            volume.create(storage_location=value, volume_type="EXTERNAL")
+            return
+        if getattr(info, "storage_location", None) == value:
+            return
+        volume.delete()
+        volume.create(storage_location=value, volume_type="EXTERNAL")
 
     def ensure_staging_volume(self) -> "Volume":
         """Get-or-create this table's staging :class:`Volume` and return it.
 
-        For an **external** table the staging volume is created *external* too,
-        at the table's :meth:`staging_root` — ``<schema_root>/uc/tables/<hash>``,
-        recorded in the table's TBLPROPERTIES so it's read straight from the
-        table metadata rather than re-derived every time. That keeps staged
-        Parquet on the same governed external location as the table (and
-        resolves the same way before the table exists, unlike the UC
-        ``table_id``). A managed table (or one whose schema exposes no staging
-        root) keeps the default (managed) create path, materialised lazily on
-        first write.
-
-        Kept off the :attr:`staging_volume` property on purpose — resolving
-        ``infos`` / creating a volume on a bare handle read is too surprising;
-        creation belongs at the staging-folder boundary where a write is
-        actually imminent.
+        Managed by default, created (and its parents ensured) lazily on first
+        call — idempotent, so repeated calls collapse to a cached read. To
+        stage on a governed external location instead, set
+        :attr:`staging_location` first; that creates / relocates the volume as
+        external and this call then just confirms it exists.
         """
-        volume = self.staging_volume
-        # A table that doesn't exist yet (staging Parquet before the
-        # create/insert) has no ``infos`` — treat it as the managed default
-        # path rather than letting the remote lookup raise.
-        info = self.read_infos(default=None)
-        if info is not None and info.table_type == TableType.EXTERNAL:
-            root = self.staging_root()
-            if root:
-                volume.get_or_create(
-                    volume_type="EXTERNAL",
-                    storage_location=root,
-                )
-        return volume
+        return self.staging_volume.get_or_create()
 
     def staging_folder(
         self,
@@ -3428,26 +3396,10 @@ class Table(DatabricksPath):
     ) -> VolumePath:
         """Return the staging folder for this table.
 
-        Ensures the staging volume exists first (external for an external
-        table — see :meth:`ensure_staging_volume`).
+        Ensures the staging volume exists first (see
+        :meth:`ensure_staging_volume`).
         """
         return self.ensure_staging_volume().path(".sql/tmp", temporary=temporary)
-
-    def stage_storage_path(self, *, sub: str = ".ygg/stage") -> "Path":
-        """The staging area as a direct **cloud storage** :class:`Path`.
-
-        :meth:`staging_folder` hands back a ``/Volumes/...`` :class:`VolumePath`
-        (Files-API addressable); this resolves the *same* external staging
-        volume to its backing object-store location (an ``s3://...``
-        :class:`~yggdrasil.aws.fs.path.S3Path` carrying the volume's vended
-        credentials), so staged files land straight in cloud storage and the
-        path is a plain cloud URL — exactly what Auto Loader (``cloudFiles``)
-        watches. Used as the default :meth:`auto_loader` *source*.
-
-        ``sub`` is the prefix under the volume root the staged files live at.
-        """
-        root = self.ensure_staging_volume().storage_path(mode=Mode.AUTO)
-        return (root / sub) if sub else root
 
     def insert_volume_path(
         self,

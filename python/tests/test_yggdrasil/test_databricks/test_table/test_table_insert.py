@@ -71,15 +71,16 @@ class TestInsertForwarding:
         assert t.insert_into.call_args.kwargs["wait"] is False
 
     def test_stage_insert_writes_into_autoloader_staging(self):
-        # Lands a uniquely-named parquet under the Auto Loader staging path
-        # (stage_storage_path) so a deployed auto_loader job ingests it.
+        # Lands a uniquely-named parquet under the staging volume's cloud
+        # storage path (STAGE_SUBPATH) so a deployed auto_loader job ingests it.
         t = MagicMock()
         leaf = MagicMock()
         root = MagicMock()
         root.__truediv__.return_value = leaf
-        t.stage_storage_path.return_value = root
+        # ensure_staging_volume().storage_path() / STAGE_SUBPATH → stage root.
+        storage = t.ensure_staging_volume.return_value.storage_path.return_value
+        storage.__truediv__.return_value = root
         out = Table.stage_insert(t, {"a": [1]})
-        t.stage_storage_path.assert_called_once_with()
         t.insert_volume_path.assert_not_called()
         name = root.__truediv__.call_args.args[0]
         assert name.startswith("insert-") and name.endswith(".parquet")
@@ -92,15 +93,18 @@ class TestInsertForwarding:
         leaf = MagicMock()
         root = MagicMock()
         root.__truediv__.return_value = leaf
-        t.stage_storage_path.return_value = root
+        storage = t.ensure_staging_volume.return_value.storage_path.return_value
+        storage.__truediv__.return_value = root
         opts = CastOptions()
         Table.stage_insert(t, {"a": [1]}, cast_options=opts)
         assert leaf.write_table.call_args.args[1] is opts
 
     def test_stage_insert_falls_back_to_volume_staging(self):
-        # No direct cloud staging (e.g. managed table) → Files-API volume staging.
+        # No direct cloud staging (e.g. managed volume) → Files-API volume staging.
         t = MagicMock()
-        t.stage_storage_path.side_effect = RuntimeError("no external staging")
+        t.ensure_staging_volume.return_value.storage_path.side_effect = RuntimeError(
+            "no external staging"
+        )
         leaf = MagicMock()
         folder = MagicMock()
         folder.__truediv__.return_value = leaf

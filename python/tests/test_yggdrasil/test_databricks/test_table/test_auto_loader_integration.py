@@ -85,10 +85,15 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
             raise unittest.SkipTest(f"cannot provision external table: {exc}") from exc
 
         # The staging area must be a real cloud-storage Path (direct S3) for
-        # cloudFiles to watch it — skip if the credential vend / grant doesn't
-        # actually permit direct access.
+        # cloudFiles to watch it — pin the staging volume external at an s3://
+        # base, then resolve its storage path. Skip if the credential vend /
+        # grant doesn't actually permit direct access.
         try:
-            cls.stage = cls.table.stage_storage_path()
+            cls.table.staging_location = f"{cls._base}/staging"
+            cls.stage = (
+                cls.table.ensure_staging_volume().storage_path(mode=Mode.AUTO)
+                / cls.table.STAGE_SUBPATH
+            )
             cls.source = cls.stage.full_path()
             assert cls.source.startswith("s3://")
         except Exception as exc:  # noqa: BLE001
@@ -126,7 +131,7 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
             pass
 
     # ------------------------------------------------------------------
-    def test_stage_storage_path_writes_to_s3(self) -> None:
+    def test_staging_volume_storage_writes_to_s3(self) -> None:
         leaf = self.stage / f"probe_{secrets.token_hex(3)}.parquet"
         leaf.write_table(pa.table({"id": [1], "v": ["a"]}), mode=Mode.OVERWRITE)
         # Round-trips off the bucket, and the path is a plain s3:// URL.
