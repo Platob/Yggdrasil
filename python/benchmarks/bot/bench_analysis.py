@@ -91,8 +91,63 @@ def main() -> None:
         print(f"  eager full read (30) + pivot:   {eager_pivot_ms:8.1f} ms")
         print(f"  ==> {eager_pivot_ms / pivot_ms:5.1f}x\n")
 
-    # -- forecasting (xgboost→gbr→ridge over engineered features) -----------
+    # -- technical indicators -------------------------------------------------
     import math
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        m = 10_000
+        ts = list(range(m))
+        price = [100.0 + 0.02 * i + 8.0 * math.sin(2 * math.pi * i / 50) for i in range(m)]
+        pq.write_table(pa.table({"ts": ts, "price": price}), str(home / "price.parquet"))
+        settings = Settings(node_id="bench", node_home=home, front_home=home)
+        svc = AnalysisService(settings, fs=FsService(settings))
+        print(f"  price.parquet: {m:,} rows — technical indicators\n")
+        for inds in (["rsi"], ["macd"], ["bb"], ["rsi", "macd", "bb", "atr", "stoch"]):
+            req = IndicatorsRequest(path="price.parquet", column="price",
+                                   indicators=inds, window=14, limit=m)
+            t0 = time.perf_counter()
+            for _ in range(3):
+                r = asyncio.run(svc.indicators(req))
+            ms = (time.perf_counter() - t0) / 3 * 1000
+            series_names = [s.name for s in r.indicators]
+            print(f"  indicators {str(inds):40s}: {ms:7.1f} ms  → {series_names}")
+        print()
+
+    # -- portfolio analytics --------------------------------------------------
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        m = 5_000
+        assets = 4
+        import random
+        random.seed(42)
+        for j in range(assets):
+            # GBM: cumulative log-returns from a single pass (correct path)
+            p, path = 100.0, [100.0]
+            for _ in range(m - 1):
+                p *= math.exp(random.gauss(0.0002, 0.01))
+                path.append(p)
+            pq.write_table(pa.table({"price": path}), str(home / f"asset{j}.parquet"))
+        settings = Settings(node_id="bench", node_home=home, front_home=home)
+        svc = AnalysisService(settings, fs=FsService(settings))
+        print(f"  {assets} GBM paths, {m:,} bars — portfolio analytics\n")
+        for n_assets in (2, 4):
+            req = PortfolioRequest(
+                paths=[f"asset{j}.parquet" for j in range(n_assets)],
+                columns=["price"] * n_assets,
+                labels=[f"A{j}" for j in range(n_assets)],
+                limit=m,
+            )
+            t0 = time.perf_counter()
+            for _ in range(3):
+                r = asyncio.run(svc.portfolio(req))
+            ms = (time.perf_counter() - t0) / 3 * 1000
+            assets_info = [(a.label, f"sr={a.sharpe:.2f}" if a.sharpe else "sr=n/a")
+                           for a in r.assets]
+            print(f"  portfolio {n_assets} assets: {ms:7.1f} ms  "
+                  f"VaR95={r.var_95:.4f}  {assets_info}")
+        print()
+
+    # -- forecasting (xgboost→gbr→ridge over engineered features) -----------
     with tempfile.TemporaryDirectory() as d:
         home = Path(d)
         m = 50_000
