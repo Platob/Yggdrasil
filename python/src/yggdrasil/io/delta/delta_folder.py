@@ -35,7 +35,7 @@ from yggdrasil.io.delta.deletion_vector import (
 )
 from yggdrasil.io.delta.log import DeltaLog, LogSegment
 from yggdrasil.io.delta.protocol import (
-    AddFile, CommitInfo, DeltaAction, DeletionVectorDescriptor,
+    AddFile, CommitInfo, DeltaAction,
     DomainMetadata, Metadata, Protocol, RemoveFile, Txn,
 )
 from yggdrasil.io.delta.schema_codec import (

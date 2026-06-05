@@ -6,12 +6,14 @@ persistent local-disk store under ``~/.cache`` that holds the bulk (notably the
 large checkpoint parquet) and survives process restarts, so repeated CLI runs /
 job restarts don't re-GET the same files from S3.
 
-Only immutable, version-addressed files go through here (commit JSONs, checkpoint
-parquet/manifests, sidecars) — never the mutable ``_last_checkpoint`` pointer or
-the directory listing (those stay listing-fresh). Local-filesystem sources are
-read straight through (already on disk). All cache ops are best-effort: a miss or
-an I/O error on the cache never breaks a read. The one staleness window is a
-table dropped and *recreated at the same path* within the disk TTL.
+The caller decides per read whether to cache (``cache=``): only **remote**,
+immutable, version-addressed files are cached (commit JSONs, checkpoint
+parquet/manifests, sidecars). A **local** table reads straight through — it's
+already on local disk, so a second copy would be pointless — and so does the
+mutable ``_last_checkpoint`` pointer (the listing keeps it fresh). All cache ops
+are best-effort: a miss or an I/O error on the cache never breaks a read. The one
+staleness window is a table dropped and *recreated at the same path* within the
+disk TTL.
 
 Knobs (env): ``YGG_DELTA_RAM_CACHE_BYTES`` (default 4 MB),
 ``YGG_DELTA_CACHE_DIR`` (default ``$XDG_CACHE_HOME/yggdrasil/delta-log`` or
@@ -158,19 +160,35 @@ def _maybe_prune() -> None:
         pass
 
 
-def cached_read(path: "Path") -> bytes:
-    """Two-tier read of an immutable log file; raises ``FileNotFoundError`` if
-    the source is absent (so callers' existing handling still applies)."""
-    if getattr(path, "is_local_path", False):
-        with path.open("rb") as bio:           # already on local disk
+def _fetch_many(misses: "List[tuple]") -> "List[tuple]":
+    """Concurrently open+read each ``(index, path, key)``; missing ⇒ ``None``."""
+    def _fetch(item):
+        i, path, key = item
+        try:
+            with path.open("rb") as bio:
+                return i, key, bio.read()
+        except FileNotFoundError:
+            return i, key, None
+
+    if len(misses) == 1:
+        return [_fetch(misses[0])]
+    with cf.ThreadPoolExecutor(max_workers=min(len(misses), _MAX_FETCH_WORKERS)) as ex:
+        return list(ex.map(_fetch, misses))
+
+
+def read_one(path: "Path", *, cache: bool) -> bytes:
+    """Read one log file; ``cache=False`` (a local table, or the mutable pointer)
+    reads straight through. Raises ``FileNotFoundError`` if the source is absent."""
+    if not cache:
+        with path.open("rb") as bio:
             return bio.read()
     key = _key(path)
     hit = _ram.get(key)
+    if hit is None:
+        hit = _disk_get(key)
+        if hit is not None:
+            _ram.put(key, hit)
     if hit is not None:
-        return hit
-    hit = _disk_get(key)
-    if hit is not None:
-        _ram.put(key, hit)
         return hit
     with path.open("rb") as bio:
         raw = bio.read()
@@ -179,46 +197,33 @@ def cached_read(path: "Path") -> bytes:
     return raw
 
 
-def cached_read_many(paths: "Iterable[Path]") -> "List[Optional[bytes]]":
-    """Bytes for each path in order: RAM/disk hits resolved first, the remaining
-    source misses fetched **concurrently**. Missing files map to ``None``."""
+def read_many(paths: "Iterable[Path]", *, cache: bool) -> "List[Optional[bytes]]":
+    """Bytes for each path, in order, missing files mapping to ``None``. With
+    ``cache`` (a remote table), RAM/disk hits are resolved first and only the
+    misses fetched concurrently; without it (a local table) everything is read
+    concurrently and nothing is cached."""
     paths = list(paths)
     if not paths:
         return []
     out: "List[Optional[bytes]]" = [None] * len(paths)
-    # (index, path, key-or-None). key None ⇒ local source: read, don't cache.
-    misses: "List[tuple]" = []
-    for i, p in enumerate(paths):
-        if getattr(p, "is_local_path", False):
-            misses.append((i, p, None))
-            continue
-        key = _key(p)
-        hit = _ram.get(key)
-        if hit is None:
-            hit = _disk_get(key)
-        if hit is not None:
-            _ram.put(key, hit)
-            out[i] = hit
-        else:
-            misses.append((i, p, key))
+    if cache:
+        misses: "List[tuple]" = []
+        for i, p in enumerate(paths):
+            key = _key(p)
+            hit = _ram.get(key)
+            if hit is None:
+                hit = _disk_get(key)
+            if hit is not None:
+                _ram.put(key, hit)
+                out[i] = hit
+            else:
+                misses.append((i, p, key))
+    else:
+        misses = [(i, p, None) for i, p in enumerate(paths)]
     if not misses:
         return out
-
-    def _fetch(item):
-        i, p, key = item
-        try:
-            with p.open("rb") as bio:
-                return i, key, bio.read()
-        except FileNotFoundError:
-            return i, key, None
-
-    if len(misses) == 1:
-        results = [_fetch(misses[0])]
-    else:
-        with cf.ThreadPoolExecutor(max_workers=min(len(misses), _MAX_FETCH_WORKERS)) as ex:
-            results = list(ex.map(_fetch, misses))
-    for i, key, raw in results:
-        if raw is not None and key is not None:
+    for i, key, raw in _fetch_many(misses):
+        if cache and raw is not None:
             _disk_put(key, raw)
             _ram.put(key, raw)
         out[i] = raw

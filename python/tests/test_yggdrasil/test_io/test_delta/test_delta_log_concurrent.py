@@ -1,8 +1,10 @@
 """Delta log byte cache + concurrent reads (yggdrasil.io.delta._cache).
 
-Immutable log files go through a two-tier cache: a small RAM LRU (bytes-bounded)
-backed by a local-disk store under ~/.cache. Misses are fetched concurrently.
-These tests isolate the disk tier to a temp dir and reset the RAM tier per test.
+Remote immutable log files go through a two-tier cache (small RAM LRU backed by
+a local-disk store under ~/.cache); local tables and the mutable
+``_last_checkpoint`` pointer read straight through (``cache=False``). Misses are
+fetched concurrently. These tests isolate the disk tier to a temp dir and reset
+the RAM tier per test.
 """
 from __future__ import annotations
 
@@ -13,7 +15,6 @@ from contextlib import contextmanager
 import pytest
 
 from yggdrasil.io.delta import _cache
-from yggdrasil.io.delta import log as dlog
 from yggdrasil.io.delta.log import DeltaLog, LogSegment
 
 
@@ -27,14 +28,13 @@ def _isolate_cache(tmp_path, monkeypatch):
 
 
 class FakePath:
-    """Path stand-in: ``full_path()`` + counting context-manager ``open()``."""
+    """Path stand-in: ``full_path()`` + a counting context-manager ``open()``."""
 
-    def __init__(self, name, data=b"", *, missing=False, barrier=None, local=False):
+    def __init__(self, name, data=b"", *, missing=False, barrier=None):
         self._name = name
         self._data = data
         self._missing = missing
         self._barrier = barrier
-        self.is_local_path = local
         self.opens = 0
 
     def full_path(self):
@@ -66,7 +66,7 @@ def test_byte_lru_evicts_oldest_over_budget():
 
 def test_byte_lru_skips_items_over_item_cap():
     lru = _cache._ByteLRU(max_bytes=1000, item_max=100)
-    lru.put("big", b"x" * 101)    # too big for RAM tier
+    lru.put("big", b"x" * 101)    # too big for the RAM tier
     assert lru.get("big") is None
 
 
@@ -81,54 +81,53 @@ def test_byte_lru_get_marks_recently_used():
     assert lru.get("b") is None
 
 
-# -- two-tier read ---------------------------------------------------------
+# -- two-tier read (cache=True) --------------------------------------------
 
-def test_cached_read_hits_ram_second_time():
+def test_read_one_hits_ram_second_time():
     p = FakePath("/k", b"DATA")
-    assert _cache.cached_read(p) == b"DATA"
-    assert _cache.cached_read(p) == b"DATA"
-    assert p.opens == 1           # second read served from RAM, source untouched
+    assert _cache.read_one(p, cache=True) == b"DATA"
+    assert _cache.read_one(p, cache=True) == b"DATA"
+    assert p.opens == 1           # second read served from RAM
 
 
-def test_cached_read_survives_ram_clear_via_disk(monkeypatch):
+def test_read_one_survives_ram_clear_via_disk(monkeypatch):
     p = FakePath("/k", b"DATA")
-    assert _cache.cached_read(p) == b"DATA"   # populates RAM + disk
+    assert _cache.read_one(p, cache=True) == b"DATA"   # populates RAM + disk
     # Simulate a fresh process: wipe RAM, keep disk.
     monkeypatch.setattr(_cache, "_ram", _cache._ByteLRU(_cache._RAM_MAX_BYTES,
                                                         _cache._RAM_ITEM_MAX_BYTES))
-    assert _cache.cached_read(p) == b"DATA"
-    assert p.opens == 1           # served from disk, still no second source read
+    assert _cache.read_one(p, cache=True) == b"DATA"
+    assert p.opens == 1           # served from disk, no second source read
 
 
-def test_local_path_is_not_cached():
-    p = FakePath("/local", b"L", local=True)
-    assert _cache.cached_read(p) == b"L"
-    assert _cache.cached_read(p) == b"L"
-    assert p.opens == 2           # local source read each time; nothing on disk
+def test_cache_false_reads_through_without_caching():
+    p = FakePath("/local", b"L")
+    assert _cache.read_one(p, cache=False) == b"L"
+    assert _cache.read_one(p, cache=False) == b"L"
+    assert p.opens == 2           # read each time; nothing cached
     assert not (_cache._DISK_DIR.exists() and any(_cache._DISK_DIR.iterdir()))
 
 
 def test_disk_disabled_when_ttl_zero(monkeypatch):
     monkeypatch.setattr(_cache, "_DISK_TTL", 0.0)
-    p = FakePath("/k", b"D")
-    _cache.cached_read(p)
+    _cache.read_one(FakePath("/k", b"D"), cache=True)
     assert not _cache._DISK_DIR.exists()      # nothing written to disk
 
 
-# -- cached_read_many (concurrent) -----------------------------------------
+# -- read_many (concurrent) ------------------------------------------------
 
 def test_read_many_preserves_order():
     paths = [FakePath(f"/k{i}", f"d{i}".encode()) for i in range(5)]
-    assert _cache.cached_read_many(paths) == [b"d0", b"d1", b"d2", b"d3", b"d4"]
+    assert _cache.read_many(paths, cache=True) == [b"d0", b"d1", b"d2", b"d3", b"d4"]
 
 
 def test_read_many_empty():
-    assert _cache.cached_read_many([]) == []
+    assert _cache.read_many([], cache=True) == []
 
 
 def test_read_many_missing_maps_to_none():
     paths = [FakePath("/a", b"A"), FakePath("/b", missing=True), FakePath("/c", b"C")]
-    assert _cache.cached_read_many(paths) == [b"A", None, b"C"]
+    assert _cache.read_many(paths, cache=True) == [b"A", None, b"C"]
 
 
 def test_read_many_fetches_misses_concurrently():
@@ -136,15 +135,14 @@ def test_read_many_fetches_misses_concurrently():
     barrier = threading.Barrier(n)
     paths = [FakePath(f"/p{i}", f"v{i}".encode(), barrier=barrier) for i in range(n)]
     # Would raise BrokenBarrierError on timeout if the misses were serialised.
-    assert _cache.cached_read_many(paths) == [b"v0", b"v1", b"v2", b"v3"]
+    assert _cache.read_many(paths, cache=True) == [b"v0", b"v1", b"v2", b"v3"]
 
 
-def test_read_many_serves_hits_without_reopen():
+def test_read_many_cache_false_does_not_cache():
     paths = [FakePath(f"/h{i}", f"d{i}".encode()) for i in range(3)]
-    _cache.cached_read_many(paths)            # warm
-    again = _cache.cached_read_many(paths)
-    assert again == [b"d0", b"d1", b"d2"]
-    assert all(p.opens == 1 for p in paths)   # all RAM hits
+    _cache.read_many(paths, cache=False)
+    _cache.read_many(paths, cache=False)
+    assert all(p.opens == 2 for p in paths)   # no caching → re-read each time
 
 
 # -- replay still correct through the cache --------------------------------
@@ -154,7 +152,8 @@ def test_replay_raw_yields_commits_in_order():
     c1 = FakePath("/1.json", b'{"remove": {"path": "a"}}')
     seg = LogSegment(version=1, checkpoint_version=-1,
                      checkpoint_files=(), commit_files=(c0, c1))
-    log = DeltaLog.__new__(DeltaLog)  # replay_raw only reads the segment
+    log = DeltaLog.__new__(DeltaLog)   # replay_raw only needs the segment + _remote
+    log._remote = False                # read straight through (no caching)
     out = list(log.replay_raw(seg))
     assert out == [
         {"add": {"path": "a"}},

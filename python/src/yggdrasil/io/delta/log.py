@@ -18,8 +18,7 @@ from yggdrasil.pickle import json as ygg_json
 
 from yggdrasil.io.delta import _cache
 from yggdrasil.io.delta._names import (
-    LAST_CHECKPOINT_NAME, LOG_DIR_NAME, SIDECARS_DIR_NAME,
-    format_commit_name, version_from_log_name,
+    LAST_CHECKPOINT_NAME, LOG_DIR_NAME, SIDECARS_DIR_NAME, version_from_log_name,
 )
 from yggdrasil.io.delta.protocol import DeltaAction, parse_action
 
@@ -44,11 +43,14 @@ class LogSegment:
 
 
 class DeltaLog:
-    __slots__ = ("table_root", "log_path", "_last_checkpoint", "_listing")
+    __slots__ = ("table_root", "log_path", "_remote", "_last_checkpoint", "_listing")
 
     def __init__(self, table_root: "Path") -> None:
         self.table_root = table_root
         self.log_path = table_root / LOG_DIR_NAME
+        # Decide once: only a remote table benefits from the byte cache. A local
+        # one is already on disk, so caching it would just be a redundant copy.
+        self._remote = not bool(getattr(self.log_path, "is_local_path", False))
         self._last_checkpoint: "Optional[Mapping[str, object]]" = None
         self._listing: "Optional[Tuple[str, ...]]" = None
 
@@ -75,7 +77,9 @@ class DeltaLog:
         if self._last_checkpoint is not None:
             return self._last_checkpoint or None
         try:
-            payload = ygg_json.loads(_read_path(self.log_path / LAST_CHECKPOINT_NAME))
+            # The pointer is mutable — never cached; the listing keeps it fresh.
+            payload = ygg_json.loads(
+                _cache.read_one(self.log_path / LAST_CHECKPOINT_NAME, cache=False))
         except Exception:
             self._last_checkpoint = {}; return None
         self._last_checkpoint = payload or {}
@@ -166,7 +170,7 @@ class DeltaLog:
             elif name.endswith(".json"): v2_manifests.append(name)
 
         if v2_manifests:
-            try: raw = _cache.cached_read(self.log_path / v2_manifests[0]).decode("utf-8")
+            try: raw = _cache.read_one(self.log_path / v2_manifests[0], cache=self._remote).decode("utf-8")
             except Exception: return ()
             sidecars = []
             for line in raw.splitlines():
@@ -203,7 +207,7 @@ class DeltaLog:
             # sidecar parquet are fetched concurrently, then parsed in order.
             remote = [p for p in segment.checkpoint_files
                       if not getattr(p, "is_local_path", False)]
-            remote_blobs = iter(_cache.cached_read_many(remote))
+            remote_blobs = iter(_cache.read_many(remote, cache=self._remote))
             for path in segment.checkpoint_files:
                 if getattr(path, "is_local_path", False):
                     try: table = pq.read_table(path.full_path())
@@ -223,7 +227,7 @@ class DeltaLog:
         # Commit JSONs are small and independent — prefetch them concurrently
         # (one S3 GET each otherwise serialises the whole replay), then parse in
         # ascending version order so later commits still override earlier ones.
-        for blob in _cache.cached_read_many(segment.commit_files):
+        for blob in _cache.read_many(segment.commit_files, cache=self._remote):
             if blob is None: continue                 # missing → skip
             for line in blob.decode("utf-8").splitlines():
                 line = line.strip()
@@ -232,7 +236,3 @@ class DeltaLog:
                 except Exception: continue
 
 
-def _read_path(path: "Path") -> bytes:
-    """Plain (uncached) read — for the mutable ``_last_checkpoint`` pointer."""
-    with path.open("rb") as bio:
-        return bio.read()
