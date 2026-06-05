@@ -56,6 +56,7 @@ from databricks.sdk.service.sql import (
 from yggdrasil.concurrent.threading import Job, JobPoolExecutor
 from yggdrasil.data import Schema
 from yggdrasil.enums import MimeType, MimeTypes, Mode
+from yggdrasil.enums.byteunit import ByteUnit
 from yggdrasil.enums.media_type import MediaTypes
 from yggdrasil.enums.state import State
 from yggdrasil.data.options import CastOptions
@@ -85,7 +86,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_BYTE_SIZE = 32 * 1024 * 1024
+_DEFAULT_BYTE_SIZE = 32 * ByteUnit.MIB
 # Module-level — single source of truth for retryable error codes.
 _RETRYABLE_ERROR_CODES: frozenset[str] = frozenset({
     "DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES",
@@ -1144,10 +1145,11 @@ class WarehouseStatementResult(StatementResult):
 
         if not yielded_any:
             yield from _empty_arrow_batches(options.target.to_arrow_schema())
-        else:
+        elif logger.isEnabledFor(logging.INFO):
+            # Only pay the human-size formatting when INFO is actually on.
             logger.info(
-                "Statement %r streamed %d chunks / %d rows / %d bytes",
-                self, total_chunks, total_rows, total_bytes,
+                "Statement %r streamed %d chunks / %d rows / %s",
+                self, total_chunks, total_rows, ByteUnit.pretty(total_bytes),
             )
 
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: CastOptions) -> None:

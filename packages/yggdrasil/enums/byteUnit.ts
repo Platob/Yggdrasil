@@ -79,4 +79,18 @@ export class ByteUnit {
     }
     return `${n} B`;
   }
+
+  /**
+   * Human-readable rendering of a quantity ``v`` expressed in ``unit``.
+   *
+   * ``v`` is a scalar count of ``unit`` (bytes by default); it's scaled to a
+   * byte count and handed to {@link format}. The companion to ``format`` for
+   * the "I have N MiB, show it nicely" case:
+   *
+   *     ByteUnit.pretty(1536)             // "1.5 KiB"
+   *     ByteUnit.pretty(8, ByteUnit.MIB)  // "8.0 MiB"
+   */
+  static pretty(v: number, unit: ByteUnit = ByteUnit.B, opts: { iec?: boolean; precision?: number } = {}): string {
+    return ByteUnit.format(Math.round(v * unit.bytes), opts);
+  }
 }

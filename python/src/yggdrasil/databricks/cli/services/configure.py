@@ -14,9 +14,10 @@ Three things in one command:
 3. **Remember the session** — the verified client becomes the process
    *current* client (:meth:`DatabricksClient.set_current`) and a small
    metadata snapshot of the latest session (profile, host, user,
-   workspace/account ids, timestamp) is dumped to
-   ``~/.config/databricks-sdk-py/ygg-session.json`` so later tooling can
-   default to "the workspace I last configured".
+   workspace/account ids, timestamp) is dumped into the session folder
+   ``~/.config/databricks-sdk-py/sessions/`` as ``<hostname>.json`` (the
+   per-machine default) so later tooling can default to "the workspace I
+   last configured on this host".
 
 Sub-actions::
 
@@ -89,10 +90,23 @@ class ConfigureCommand:
         return Path(path).expanduser()
 
     @staticmethod
-    def _session_file() -> Path:
-        """Where the latest-session snapshot is dumped — alongside the SDK's
+    def _session_dir() -> Path:
+        """The session folder — per-host snapshots live here, beside the SDK's
         own ``~/.config/databricks-sdk-py`` cache folder."""
-        return Path.home() / ".config" / "databricks-sdk-py" / "ygg-session.json"
+        return Path.home() / ".config" / "databricks-sdk-py" / "sessions"
+
+    @staticmethod
+    def _session_file() -> Path:
+        """The default session file for this machine: ``sessions/<hostname>.json``.
+
+        Keying the latest-session snapshot by the local hostname keeps each
+        workstation's "last workspace I configured" separate when the home
+        directory is shared (NFS / synced profiles)."""
+        import socket
+        host = socket.gethostname() or "default"
+        # Sanitise to a filename-safe token (FQDNs, odd hostnames).
+        host = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in host)
+        return ConfigureCommand._session_dir() / f"{host}.json"
 
     # ------------------------------------------------------------------ #
     # configure
@@ -230,9 +244,12 @@ class ConfigureCommand:
         No secrets are written: token / client_secret are deliberately left
         out; only the non-sensitive identity + routing metadata is dumped.
         """
+        import socket
+
         meta: dict[str, Any] = {
             "profile": profile,
             "host": host,
+            "hostname": socket.gethostname() or None,
             "config_file": str(config_file),
             "auth_type": "oauth" if oauth else "pat",
             "user": user,

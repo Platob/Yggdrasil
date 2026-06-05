@@ -135,10 +135,11 @@ After writing, the freshly-saved profile is loaded into a
 `DatabricksClient`, the current user is resolved to confirm the
 credentials work, that client becomes the process **current** client, and
 a non-sensitive snapshot of the session — profile, host, user,
-workspace/account ids, timestamp — is dumped to
-`~/.config/databricks-sdk-py/ygg-session.json`. **No secrets** (token /
-client secret) are written into the session file. A failed verification
-still keeps the profile on disk (it just warns).
+workspace/account ids, timestamp — is dumped into the session folder
+`~/.config/databricks-sdk-py/sessions/` as `<hostname>.json` (the
+per-machine default). **No secrets** (token / client secret) are written
+into the session file. A failed verification still keeps the profile on
+disk (it just warns).
 
 ### `configure list`
 

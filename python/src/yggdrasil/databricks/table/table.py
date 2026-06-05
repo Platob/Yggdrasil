@@ -60,6 +60,7 @@ from yggdrasil.databricks.sql.sql_utils import (
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
+from yggdrasil.enums.byteunit import ByteUnit
 from yggdrasil.enums.engine_type import EngineType
 from yggdrasil.execution.expr import (
     Predicate,
@@ -102,13 +103,14 @@ _VIEW_TABLE_TYPES: frozenset[TableType] = frozenset({
 # Below this on-disk size, the ``engine=None`` guess reads/writes a Delta table
 # natively (DeltaFolder); at or above it the SQL warehouse parallelises the
 # scan/commit better. Matches Delta's default target file size.
-_NATIVE_DELTA_MAX_BYTES: int = 128 * 1024 * 1024
+_NATIVE_DELTA_MAX_BYTES: int = 128 * ByteUnit.MIB
 
-# EXTERNAL Delta tables prefer the direct storage-path write across a much
-# larger range: UC vends READ_WRITE credentials for external tables, so the
-# native DeltaFolder commit avoids a warehouse round-trip. Only very large
-# external tables fall back to the warehouse.
-_NATIVE_DELTA_MAX_BYTES_EXTERNAL: int = 4 * 1024 * 1024 * 1024
+# EXTERNAL Delta tables can read direct off external storage (UC vends
+# READ_WRITE credentials for them, so the native DeltaFolder path avoids a
+# warehouse round-trip) — but only auto-engage it for *small* tables: the
+# direct external-storage scan reaches out of the workspace, so above this
+# cap the warehouse (which keeps the scan inside Databricks) is preferred.
+_NATIVE_DELTA_MAX_BYTES_EXTERNAL: int = 8 * ByteUnit.MIB
 
 
 def _coerce_tag_str(value: Any) -> str:

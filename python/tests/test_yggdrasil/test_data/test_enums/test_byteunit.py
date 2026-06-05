@@ -220,6 +220,26 @@ class TestFormat:
         assert ByteUnit.format(-1024) == "-1.0 KiB"
 
 
+class TestPretty:
+
+    def test_defaults_to_bytes(self) -> None:
+        assert ByteUnit.pretty(1536) == "1.5 KiB"
+        assert ByteUnit.pretty(0) == "0 B"
+        assert ByteUnit.pretty(1024 ** 2) == "1.0 MiB"
+
+    def test_scales_by_unit(self) -> None:
+        assert ByteUnit.pretty(8, ByteUnit.MIB) == "8.0 MiB"
+        assert ByteUnit.pretty(1, ByteUnit.GIB) == "1.0 GiB"
+
+    def test_accepts_unit_token(self) -> None:
+        assert ByteUnit.pretty(1.5, "gb") == "1.5 GiB"
+        assert ByteUnit.pretty(2, "kib") == "2.0 KiB"
+
+    def test_short_form_and_precision(self) -> None:
+        assert ByteUnit.pretty(8, ByteUnit.MIB, iec=False) == "8.0 MB"
+        assert ByteUnit.pretty(1.5, ByteUnit.KIB, precision=2) == "1.50 KiB"
+
+
 class TestEnumExportedFromPackage:
     """``ByteUnit`` is reachable from ``yggdrasil.enums``."""
 
