@@ -281,6 +281,22 @@ class AWSClient(Singleton):
         kwargs.pop("refresher", None)
         kwargs.pop("singleton_ttl", None)
         resolved = cls._resolve_init_kwargs(**kwargs)
+        # A refresher-backed client renews its own credentials, so the seed
+        # access key / secret / token it was first built from are *ephemeral*:
+        # UC (or any refresher) vends fresh temporary creds on every call. If
+        # they leak into the identity the singleton fragments — a new client +
+        # boto session, and a credential refresh, on every vend — which is
+        # exactly the "many refreshed credentials" churn. ``refresher_key`` is
+        # the stable identity in that case; drop the rotating seed creds from
+        # the key so one client persists and the refresher handles its own
+        # (per-mode) renewal internally.
+        if resolved.get("refresher_key"):
+            resolved = {
+                **resolved,
+                "access_key_id": None,
+                "secret_access_key": None,
+                "session_token": None,
+            }
         return (cls, tuple(resolved[name] for name in cls._IDENTITY_FIELDS))
 
     def __init__(
@@ -822,9 +838,12 @@ class AWSClient(Singleton):
         assert refresher is not None  # gated by has_refresher() above
 
         def refresh():
-            LOGGER.debug("Refreshing credentials via refresher %r", refresher)
             metadata = _refresher_to_metadata(refresher)
-            LOGGER.info(
+            # Renewal cadence is botocore's (driven by credential expiry) and
+            # happens silently for the life of the client — keep it at DEBUG so
+            # a long-lived process with many refresher-backed clients doesn't
+            # spam INFO on every internal renewal.
+            LOGGER.debug(
                 "Refreshed credentials via refresher %r (expiry=%s)",
                 refresher, metadata.get("expiry_time"),
             )
