@@ -33,7 +33,7 @@ from typing import Any, ClassVar, Iterator
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Scheme
 from yggdrasil.enums.media_type import MediaType
-from yggdrasil.io.io_stats import IOStats, IOKind
+from yggdrasil.io.io_stats import IOStats, IOKind, format_bytes
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
 
@@ -692,8 +692,9 @@ class WorkspacePath(DatabricksPath):
                     media_type=self.media_type,
                 )
             )
-            logger.info("Uploaded workspace file %r (size=%d)", self, size)
-        else:
+            if logger.isEnabledFor(logging.INFO):
+                logger.info("Uploaded workspace file %r (size=%s)", self, format_bytes(size))
+        elif logger.isEnabledFor(logging.INFO):
             logger.info("Uploaded workspace file %r (size=stream)", self)
         return size
 

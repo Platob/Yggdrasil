@@ -83,7 +83,7 @@ from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Mode, ModeLike, Scheme
 from yggdrasil.enums.media_type import MediaType
 from yggdrasil.http_.exceptions import HTTPError
-from yggdrasil.io.io_stats import IOStats, IOKind
+from yggdrasil.io.io_stats import IOStats, IOKind, format_bytes
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
 
@@ -1668,7 +1668,8 @@ class VolumePath(DatabricksPath):
                 self._raise_for_files_status(resp, api_path)
 
             self._upload_call_ensuring_volume(_do_upload)
-            logger.info("Uploaded volume file %r (size=%d)", self, size)
+            if logger.isEnabledFor(logging.INFO):
+                logger.info("Uploaded volume file %r (size=%s)", self, format_bytes(size))
         self._persist_stat_cache(
             IOStats(
                 size=size,
@@ -1692,7 +1693,8 @@ class VolumePath(DatabricksPath):
         """
         size = int(source.size)
         api_path = self.api_path
-        logger.debug("Streaming volume file %r (%d bytes)", self, size)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Streaming volume file %r (%s)", self, format_bytes(size))
         # Cluster fast path — copy straight to the kernel mount, bounded.
         if _local_mount_available():
             parent = os.path.dirname(api_path)
@@ -1740,7 +1742,8 @@ class VolumePath(DatabricksPath):
                 self._raise_for_files_status(resp, api_path)
 
             self._upload_call_ensuring_volume(_do_upload)
-            logger.info("Streamed volume file %r (size=%d)", self, size)
+            if logger.isEnabledFor(logging.INFO):
+                logger.info("Streamed volume file %r (size=%s)", self, format_bytes(size))
         self._persist_stat_cache(
             IOStats(
                 size=size,

@@ -31,10 +31,42 @@ if TYPE_CHECKING:
     from yggdrasil.data.data_field import Field
 
 
-__all__ = ["IOStats", "IOKind", "TimeLike"]
+__all__ = ["IOStats", "IOKind", "TimeLike", "format_bytes"]
 
 
 TimeLike = Union[dt.datetime, dt.date, dt.timedelta, str, float, int]
+
+
+_BINARY_UNITS = ("KiB", "MiB", "GiB", "TiB", "PiB")
+_SI_UNITS = ("kB", "MB", "GB", "TB", "PB")
+
+
+def format_bytes(n: "int | float | None", *, binary: bool = True) -> str:
+    """Human-readable byte count for logs / messages — ``1536`` → ``'1.5 KiB'``.
+
+    Binary (IEC, 1024-step ``KiB``/``MiB``/…) by default, matching how the
+    codebase sizes its buffers and limits; pass ``binary=False`` for SI
+    (1000-step ``kB``/``MB``/…). ``None`` renders as ``'unknown'`` and sub-step
+    counts stay exact bytes (``'512 B'``); larger values get one decimal.
+
+    Cheap (a handful of divisions), but callers that log on a hot path should
+    still gate the call behind ``logger.isEnabledFor(...)`` so it's skipped
+    when the level is disabled.
+    """
+    if n is None:
+        return "unknown"
+    step = 1024.0 if binary else 1000.0
+    units = _BINARY_UNITS if binary else _SI_UNITS
+    value = float(n)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    if value < step:
+        return f"{sign}{int(value)} B"
+    for unit in units:
+        value /= step
+        if value < step:
+            return f"{sign}{value:.1f} {unit}"
+    return f"{sign}{value:.1f} {units[-1]}"
 
 
 @dataclass(slots=True, repr=False, eq=False)
