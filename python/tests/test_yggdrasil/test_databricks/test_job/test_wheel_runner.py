@@ -192,7 +192,7 @@ class TestWheel:
             DP.from_.return_value = path
             dest = wheel.ensure_named_environment(
                 client, "ygg-1.2.3",
-                dependencies=["/ws/pypi/ygg-bundle/ygg-1.2.3-py3-none-any.whl"],
+                dependencies=["/ws/pypi/ygg/ygg-1.2.3-py3-none-any.whl"],
                 filename="ygg-1.2.3.yml",
             )
         assert dest == "/Workspace/Shared/environments/ygg-1.2.3.yml"
@@ -321,58 +321,93 @@ class TestWheel:
         bw.assert_called_once_with("ygg", versions=wheel.SUPPORTED_PYTHONS, extras=("databricks",))
         assert out == ["/ws/job/ygg/ygg-9.9-py3-none-any.whl"]
 
-    def test_ensure_bundle_reuses_full_when_present_and_not_rebuild(self):
+    def test_wheel_dist_normalizes_distribution_folder(self):
+        assert wheel._wheel_dist("ygg-9.9-py3-none-any.whl") == "ygg"
+        assert wheel._wheel_dist("databricks_sdk-0.114.0-py3-none-any.whl") == "databricks-sdk"
+        assert wheel._wheel_dist("polars_runtime_32-1.41-cp310-abi3-linux.whl") == "polars-runtime-32"
+
+    def test_registry_upload_routes_to_distribution_folder(self, tmp_path):
+        # A wheel lands under <root>/<dist>/<wheel>, not a flat bundle dir.
         client = MagicMock()
-        deployed = ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
-                    "/ws/ygg-bundle/pyarrow-1-cp311.whl"]
-        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=deployed), \
-             patch("yggdrasil.databricks.job.wheel.build_wheel") as bw:
-            out = wheel.ensure_bundle(client, "ygg", workspace_dir="/ws")
-        bw.assert_not_called()                 # full cache hit → no build/upload
-        assert out == deployed
+        wf = tmp_path / "databricks_sdk-0.114.0-py3-none-any.whl"
+        wf.write_bytes(b"WB")
+        path = MagicMock()
+        path.exists.return_value = False
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP:
+            DP.from_.return_value = path
+            dest = wheel.registry_upload(client, wf, workspace_dir="/ws/pypi")
+        assert dest == "/ws/pypi/databricks-sdk/databricks_sdk-0.114.0-py3-none-any.whl"
+        path.write_bytes.assert_called_once_with(b"WB")
 
-    def test_ensure_bundle_rebuild_uploads_only_project_reuses_deps(self):
-        # Warm rebuild (e.g. editable ygg): deps already deployed are reused and
-        # only the project wheel is rebuilt (no_deps) + re-uploaded → fast.
+    def test_registry_upload_skips_present_immutable_wheel(self, tmp_path):
         client = MagicMock()
-        deployed = ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
-                    "/ws/ygg-bundle/pyarrow-1-cp311.whl",
-                    "/ws/ygg-bundle/polars-2-cp311.whl"]
-        uploaded: list[str] = []
+        wf = tmp_path / "pyarrow-1-cp311.whl"
+        wf.write_bytes(b"WB")
+        path = MagicMock()
+        path.exists.return_value = True            # already deployed (immutable)
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP:
+            DP.from_.return_value = path
+            dest = wheel.registry_upload(client, wf, workspace_dir="/ws/pypi")
+        assert dest == "/ws/pypi/pyarrow/pyarrow-1-cp311.whl"
+        path.write_bytes.assert_not_called()       # no re-upload of an immutable wheel
 
-        def _upload(c, w, *, workspace_dir):
-            uploaded.append(w.name)
-            return f"{workspace_dir}/{w.name}"
+    def test_ensure_bundle_reuses_from_manifest_when_present(self):
+        # Manifest present + project wheel still there → reuse, no build.
+        client = MagicMock()
+        manifest = MagicMock()
+        manifest.exists.return_value = True
+        manifest.read_text.return_value = (
+            "/ws/ygg/ygg-9.9-py3-none-any.whl\n/ws/pyarrow/pyarrow-1-cp311.whl\n"
+        )
+        proj = MagicMock()
+        proj.exists.return_value = True            # the project wheel still deployed
 
-        def _build(pkg, *, extras=(), requirements=(), no_deps=False):
-            assert no_deps is True   # warm rebuild builds only the project wheel
-            return [Path("/tmp/ygg-9.9-py3-none-any.whl")]
+        def _from(path, *, client):
+            return manifest if path.endswith(".bundle") else proj
 
         with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=deployed), \
-             patch("yggdrasil.databricks.job.wheel.build_wheel", side_effect=_build), \
-             patch("yggdrasil.databricks.job.wheel.upload_wheel", side_effect=_upload):
-            out = wheel.ensure_bundle(client, "ygg", workspace_dir="/ws", rebuild=True)
-        # Only the project wheel was built + uploaded; the two deps reused by path.
-        assert uploaded == ["ygg-9.9-py3-none-any.whl"]
+             patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=_from), \
+             patch("yggdrasil.databricks.job.wheel.build_bundle") as bb:
+            out = wheel.ensure_bundle(client, "ygg", python="3.11", workspace_dir="/ws")
+        bb.assert_not_called()                     # manifest cache hit → no build
         assert out == [
-            "/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",   # freshly built + uploaded
-            "/ws/ygg-bundle/pyarrow-1-cp311.whl",         # reused
-            "/ws/ygg-bundle/polars-2-cp311.whl",          # reused
+            "/ws/ygg/ygg-9.9-py3-none-any.whl",
+            "/ws/pyarrow/pyarrow-1-cp311.whl",
         ]
 
-    def test_ensure_bundle_cold_uploads_everything(self):
+    def test_ensure_bundle_cold_uploads_by_distribution_and_writes_manifest(self):
+        # No manifest → build the closure, upload each wheel into its dist folder
+        # (ygg first), and persist a manifest of the resulting paths.
         client = MagicMock()
-        built = [Path("/tmp/ygg-9.9-py3-none-any.whl"), Path("/tmp/pyarrow-1-cp311.whl")]
+        manifest = MagicMock()
+        manifest.exists.return_value = False
+        built = [Path("/tmp/pyarrow-1-cp311.whl"), Path("/tmp/ygg-9.9-py3-none-any.whl")]
         with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=[]), \
-             patch("yggdrasil.databricks.job.wheel.build_wheel", return_value=built), \
-             patch("yggdrasil.databricks.job.wheel.upload_wheel",
-                   side_effect=lambda c, w, *, workspace_dir: f"{workspace_dir}/{w.name}"):
-            out = wheel.ensure_bundle(client, "ygg", workspace_dir="/ws")
-        assert out == ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
-                       "/ws/ygg-bundle/pyarrow-1-cp311.whl"]
+             patch("yggdrasil.databricks.path.DatabricksPath.from_", return_value=manifest), \
+             patch("yggdrasil.databricks.job.wheel.build_bundle", return_value=built), \
+             patch("yggdrasil.databricks.job.wheel.registry_upload",
+                   side_effect=lambda c, w, *, workspace_dir, overwrite=False:
+                       f"{workspace_dir}/{wheel._wheel_dist(w.name)}/{w.name}"):
+            out = wheel.ensure_bundle(client, "ygg", python="3.11", workspace_dir="/ws")
+        # ygg (project) wheel first, then deps — each under its distribution folder.
+        assert out == [
+            "/ws/ygg/ygg-9.9-py3-none-any.whl",
+            "/ws/pyarrow/pyarrow-1-cp311.whl",
+        ]
+        manifest.write_text.assert_called_once()
+        assert "ygg-9.9-py3-none-any.whl" in manifest.write_text.call_args.args[0]
+
+    def test_ensure_bundles_builds_one_per_version(self):
+        client = MagicMock()
+        with patch("yggdrasil.databricks.job.wheel.ensure_bundle",
+                   side_effect=lambda c, p, *, python, extras, workspace_dir, rebuild:
+                       [f"/ws/ygg/ygg-9.9-{python}.whl"]) as eb:
+            out = wheel.ensure_bundles(client, "ygg", versions=["3.10", "3.13"], workspace_dir="/ws")
+        assert out == {
+            "3.10": ["/ws/ygg/ygg-9.9-3.10.whl"],
+            "3.13": ["/ws/ygg/ygg-9.9-3.13.whl"],
+        }
+        assert eb.call_count == 2
 
     def test_deployed_wheels_dist_only_and_full(self):
         client = MagicMock()

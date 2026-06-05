@@ -32,15 +32,17 @@ class TableOptions(CastOptions):
       * :attr:`~EngineType.DATABRICKS_SQL_WAREHOUSE` — the SQL warehouse.
       * :attr:`~EngineType.SPARK` — a Spark session.
       * ``None`` (default) — **guess best** per call: an active Spark session →
-        ``SPARK``; otherwise a small Delta table (< 128 MiB on disk) →
-        ``YGGDRASIL``; a larger one → ``DATABRICKS_SQL_WAREHOUSE``.
+        ``SPARK``; otherwise ``DATABRICKS_SQL_WAREHOUSE``. The native
+        DeltaFolder path is **never** auto-selected — it bypasses the warehouse
+        (and its governance / staging), so it is taken only when requested
+        explicitly with ``engine=YGGDRASIL``.
 
     In every case, if the native path can't get UC credentials for the
     table's storage, the read/write transparently falls back to the warehouse.
     """
 
     #: Read/write compute selector (:class:`EngineType`). ``None`` → guess best
-    #: from active Spark + table size.
+    #: (active Spark → ``SPARK``, else the warehouse); native is opt-in only.
     engine: "EngineType | None" = None
 
     def __post_init__(self) -> None:

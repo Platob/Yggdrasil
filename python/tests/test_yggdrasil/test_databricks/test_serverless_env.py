@@ -123,7 +123,53 @@ class TestBuildYaml:
         assert spec["environment_version"] == "2"
 
 
+class TestBuildRequirements:
+    WHEELS = [
+        "ygg-0.8.49-py3-none-any.whl",
+        "databricks_sdk-0.114.0-py3-none-any.whl",
+        "polars-1.41.2-py3-none-any.whl",
+    ]
+
+    def test_flat_wheel_list_no_environment_version(self) -> None:
+        body = build_serverless_env.build_requirements("0.8.49", "3.12", self.WHEELS)
+        lines = [ln for ln in body.splitlines() if ln and not ln.startswith("#")]
+        # The cluster requirements are the same wheels, by path, ygg first — and
+        # carry no ``environment_version`` line (a classic cluster has no such key).
+        assert lines == self.WHEELS
+        assert "environment_version" not in body
+
+
 class TestMain:
+    def test_main_writes_serverless_and_cluster(self, tmp_path) -> None:
+        wheel_dir = tmp_path / "wheels"
+        wheel_dir.mkdir()
+        (wheel_dir / "databricks_sdk-0.114.0-py3-none-any.whl").write_bytes(b"")
+        out_dir = tmp_path / "out"
+        rc = build_serverless_env.main(
+            ["--version", "9.9.9", "--python", "3.12",
+             "--wheel-dir", str(wheel_dir), "--out-dir", str(out_dir)]
+        )
+        assert rc == 0
+        # Both a serverless spec and a classic-cluster requirements file are written.
+        serverless = yaml.safe_load((out_dir / "ygg-9.9.9-py3.12-serverless.yml").read_text())
+        assert serverless["environment_version"] == "5"
+        cluster = (out_dir / "ygg-9.9.9-py3.12-cluster.requirements.txt").read_text()
+        wheels = [ln for ln in cluster.splitlines() if ln and not ln.startswith("#")]
+        assert wheels == ["ygg-9.9.9-py3-none-any.whl", "databricks_sdk-0.114.0-py3-none-any.whl"]
+
+    def test_all_versions_writes_a_pair_per_python(self, tmp_path) -> None:
+        rc = build_serverless_env.main(
+            ["--version", "9.9.9", "--all-versions", "--out-dir", str(tmp_path)]
+        )
+        assert rc == 0
+        for py in ("3.10", "3.11", "3.12", "3.13"):
+            assert (tmp_path / f"ygg-9.9.9-py{py}-serverless.yml").exists()
+            assert (tmp_path / f"ygg-9.9.9-py{py}-cluster.requirements.txt").exists()
+        # py3.10 → environment_version "1"; py3.12 → latest "5".
+        assert yaml.safe_load(
+            (tmp_path / "ygg-9.9.9-py3.10-serverless.yml").read_text()
+        )["environment_version"] == "1"
+
     def test_main_writes_versioned_spec(self, tmp_path) -> None:
         wheel_dir = tmp_path / "wheels"
         wheel_dir.mkdir()

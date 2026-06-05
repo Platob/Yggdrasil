@@ -60,7 +60,6 @@ from yggdrasil.databricks.sql.sql_utils import (
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
-from yggdrasil.enums.byteunit import ByteUnit
 from yggdrasil.enums.engine_type import EngineType
 from yggdrasil.execution.expr import (
     Predicate,
@@ -99,18 +98,6 @@ _VIEW_TABLE_TYPES: frozenset[TableType] = frozenset({
     TableType.MATERIALIZED_VIEW,
     TableType.METRIC_VIEW,
 })
-
-# Below this on-disk size, the ``engine=None`` guess reads/writes a Delta table
-# natively (DeltaFolder); at or above it the SQL warehouse parallelises the
-# scan/commit better. Matches Delta's default target file size.
-_NATIVE_DELTA_MAX_BYTES: int = 128 * ByteUnit.MIB
-
-# EXTERNAL Delta tables can read direct off external storage (UC vends
-# READ_WRITE credentials for them, so the native DeltaFolder path avoids a
-# warehouse round-trip) — but only auto-engage it for *small* tables: the
-# direct external-storage scan reaches out of the workspace, so above this
-# cap the warehouse (which keeps the scan inside Databricks) is preferred.
-_NATIVE_DELTA_MAX_BYTES_EXTERNAL: int = 8 * ByteUnit.MIB
 
 
 def _coerce_tag_str(value: Any) -> str:
@@ -1009,25 +996,15 @@ class Table(DatabricksPath):
 
         ``options.engine`` selects explicitly (an :class:`EngineType` or alias);
         ``YGGDRASIL`` on a table that can't take the native path degrades to the
-        warehouse rather than erroring. ``None`` **guesses best** — but the
-        native DeltaFolder path is only ever *auto*-selected for a **read**:
+        warehouse rather than erroring. ``None`` **guesses best**:
 
         - an active Spark session → ``SPARK``;
-        - else, **read only**, a Delta table small enough on disk →
-          ``YGGDRASIL`` (the direct DeltaFolder read);
         - else → ``DATABRICKS_SQL_WAREHOUSE``.
 
-        A **write** never auto-routes to the native storage-path commit just
-        because the table is an external Delta table — that bypasses the
-        warehouse (and its governance / staging) silently. By default a write
-        goes through the staging-volume + SQL warehouse path; the direct
-        DeltaFolder commit must be requested explicitly with
-        ``engine=YGGDRASIL`` (``"native"`` / ``"ygg"``).
-
-        The native read-path size cap depends on the table type: an
-        **EXTERNAL** Delta table (UC vends READ_WRITE credentials for it) reads
-        direct across a much larger range (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``);
-        a managed table keeps the smaller ``_NATIVE_DELTA_MAX_BYTES`` cap.
+        The native DeltaFolder path is **never** auto-selected — for a read or a
+        write. Reading/writing straight off the table's storage ``_delta_log``
+        bypasses the warehouse (and its governance / staging), so it must be
+        requested explicitly with ``engine=YGGDRASIL`` (``"native"`` / ``"ygg"``).
         """
         engine = EngineType.from_(getattr(options, "engine", None))
         if engine is not None:
@@ -1037,26 +1014,6 @@ class Table(DatabricksPath):
 
         if self._has_active_spark(options):
             return EngineType.SPARK
-        # Auto native (YGGDRASIL) is read-only; a write opts in explicitly.
-        if not write and self._delta_capable(write=False):
-            cap = (
-                _NATIVE_DELTA_MAX_BYTES_EXTERNAL
-                if self.infos.table_type == TableType.EXTERNAL
-                else _NATIVE_DELTA_MAX_BYTES
-            )
-            size = self._delta_total_bytes()
-            native = size is not None and size < cap
-            if logger.isEnabledFor(logging.DEBUG):
-                # Render the byte counts as binary IEC sizes (1 KiB = 1024 B).
-                logger.debug(
-                    "Engine guess for %r: size=%s cap=%s → %s",
-                    self,
-                    ByteUnit.pretty(size) if size is not None else "unknown",
-                    ByteUnit.pretty(cap),
-                    "native" if native else "warehouse",
-                )
-            if native:
-                return EngineType.YGGDRASIL
         return EngineType.DATABRICKS_SQL_WAREHOUSE
 
     @staticmethod
@@ -1069,17 +1026,6 @@ class Table(DatabricksPath):
             return SparkSession.getActiveSession() is not None
         except Exception:
             return False
-
-    def _delta_total_bytes(self) -> "int | None":
-        """The Delta table's on-disk byte size (sum of active ``AddFile``
-        sizes from the ``_delta_log``), or ``None`` if it can't be resolved.
-
-        Sizes with *read* credentials — this only informs the routing guess,
-        so it must not need write access."""
-        try:
-            return self.delta(write=False).snapshot().total_bytes
-        except Exception:
-            return None
 
     def _native_delta_folder(self, *, write: bool) -> "DeltaFolder | None":
         """Build the :meth:`delta` DeltaFolder for a read or a write and verify

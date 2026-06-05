@@ -341,7 +341,6 @@ class TestWriteRouting:
         with patch.object(Table, "_delta_capable", return_value=True), \
                 patch.object(Table, "infos", new_callable=PropertyMock) as infos, \
                 patch.object(Table, "_has_active_spark", return_value=False), \
-                patch.object(Table, "_delta_total_bytes", return_value=1024), \
                 patch.object(Table, "collect_schema", return_value=_schema(("a", pa.int64()))), \
                 patch.object(Table, "_native_delta_folder") as native, \
                 patch.object(Table, "arrow_insert") as warehouse:
