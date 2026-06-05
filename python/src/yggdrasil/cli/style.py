@@ -6,6 +6,7 @@ Auto-disables color when stdout is not a TTY.
 from __future__ import annotations
 
 import itertools
+import logging
 import os
 import sys
 import threading
@@ -290,3 +291,92 @@ def step(text: str) -> None: out(event("▸", text, _CORAL) + "\n")
 def ok(text: str) -> None:   out(event("✓", text, _GREEN) + "\n")
 def warn(text: str) -> None: out(event("▲", text, _AMBER) + "\n")
 def fail(text: str) -> None: out(event("✗", text, _RED) + "\n")
+
+
+# -- logging integration ----------------------------------------------------
+#
+# A drop-in :class:`logging.Formatter` + installer so the stdlib ``logging``
+# output wears the same coral theme as the rest of the CLI, instead of the
+# default ``WARNING:root:...`` lines. Glyph + color track the level the same
+# way the structured one-liners above do (``●`` info, ``▲`` warning, ``✗``
+# error), so a log stream and a hand-printed ``style.info(...)`` line read as
+# one surface.
+
+#: Level → (glyph, color-code). Anything unmapped falls back to the info look.
+_LEVEL_STYLE: "dict[int, tuple[str, str]]" = {
+    logging.DEBUG:    ("•", _MUTED),
+    logging.INFO:     ("●", _CORAL),
+    logging.WARNING:  ("▲", _AMBER),
+    logging.ERROR:    ("✗", _RED),
+    logging.CRITICAL: ("✗", _RED),
+}
+
+
+class LogFormatter(logging.Formatter):
+    """Format log records in the ygg CLI look::
+
+        12:34:56  ●  yggdrasil.node.server  starting on :8100
+
+    A dim clock, a level-colored glyph, the muted logger name, then the
+    message — mirroring :func:`event`. Honors the module's color gate
+    (:func:`force_color` / ``NO_COLOR`` / TTY autodetect), so a non-ANSI sink
+    (file, pipe) degrades to plain text. Tracebacks / stack info append in the
+    standard form. Set ``show_name=False`` to drop the logger name for terse
+    single-app output.
+    """
+
+    def __init__(self, *, show_name: bool = True, datefmt: str = "%H:%M:%S") -> None:
+        super().__init__(datefmt=datefmt)
+        self.show_name = show_name
+
+    def format(self, record: logging.LogRecord) -> str:
+        glyph, code = _LEVEL_STYLE.get(record.levelno, ("●", _CORAL))
+        clock = dim(self.formatTime(record, self.datefmt))
+        name = f"  {muted(record.name)}" if self.show_name else ""
+        line = f"  {clock}  {_esc(code, glyph)}{name}  {record.getMessage()}"
+        if record.exc_info:
+            line += "\n" + self.formatException(record.exc_info)
+        if record.stack_info:
+            line += "\n" + self.formatStack(record.stack_info)
+        return line
+
+
+def install_logging(
+    level: "int | str" = logging.INFO,
+    *,
+    logger: "logging.Logger | None" = None,
+    show_name: bool = True,
+    force: bool = False,
+) -> logging.Handler:
+    """Install the CLI-styled :class:`LogFormatter` on a stream handler.
+
+    Attaches a single ``StreamHandler`` (stderr, so it never tangles with the
+    spinner / structured lines on stdout) carrying :class:`LogFormatter` to
+    *logger* (the root logger by default) and sets the level on both. The
+    preferred replacement for ``logging.basicConfig(...)`` in ygg CLIs.
+
+    Idempotent: a handler this function previously installed is reused (its
+    level + formatter refreshed) rather than stacked, so repeated calls across
+    entrypoints don't double every line. ``force=True`` first removes any other
+    handlers on *logger* (e.g. a stray ``basicConfig`` default) so the styled
+    stream is the only sink. Returns the handler.
+    """
+    target = logger if logger is not None else logging.getLogger()
+    target.setLevel(level)
+
+    existing = next(
+        (h for h in target.handlers if getattr(h, "_ygg_styled", False)), None
+    )
+    if force:
+        for h in list(target.handlers):
+            if h is not existing:
+                target.removeHandler(h)
+
+    handler = existing
+    if handler is None:
+        handler = logging.StreamHandler(sys.stderr)
+        handler._ygg_styled = True  # type: ignore[attr-defined]
+        target.addHandler(handler)
+    handler.setLevel(level)
+    handler.setFormatter(LogFormatter(show_name=show_name))
+    return handler

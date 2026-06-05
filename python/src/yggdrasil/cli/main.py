@@ -1282,7 +1282,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.debug:
         import logging
-        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s: %(message)s")
+        from yggdrasil.cli.style import install_logging
+        install_logging(logging.DEBUG, force=True)
 
     if args.command is None:
         from yggdrasil.cli.style import print_logo
