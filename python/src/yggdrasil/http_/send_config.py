@@ -111,9 +111,27 @@ class SendConfig:
             if isinstance(holder, HttpResponseCache):
                 # Specialized local cache: O(1) per-key file presence check.
                 return holder.probe_hashes(requests)
+            # Constrain the presence probe to *this* cache's received window so a
+            # row outside it is never counted as a hit. Otherwise — when the
+            # caller asks for fresh data only (``received_from`` past the cached
+            # row's ``received_at``) — the batch would read the full remote
+            # response row only for ``filter_response`` to drop it and re-fetch
+            # from the network: a wasted remote read of stale cache data. The
+            # window pushes into the same predicate the backend already filters
+            # on (SQL ``WHERE`` for a Table, Arrow predicate for a Folder), so
+            # "only new data" skips the remote read entirely.
+            probe_predicate = predicate
+            window = []
+            if cache.received_from is not None:
+                window.append(col("received_at") >= cache.received_from)
+            if cache.received_to is not None:
+                window.append(col("received_at") < cache.received_to)
+            if window:
+                from yggdrasil.execution.expr import all_of
+                probe_predicate = all_of(predicate, *window)
             try:
                 table = holder.read_arrow_table(
-                    predicate=predicate, columns=[MATCH_COLUMN],
+                    predicate=probe_predicate, columns=[MATCH_COLUMN],
                 )
                 if table is None or table.num_rows == 0:
                     LOGGER.debug("Cache probe: 0 hits in %r", holder)
