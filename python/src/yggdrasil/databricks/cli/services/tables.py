@@ -9,8 +9,9 @@ Currently exposes Auto Loader ingestion::
 ``autoload`` get-or-creates the serverless ``cloudFiles`` ingestion job built by
 :meth:`yggdrasil.databricks.table.table.Table.auto_loader` (named
 ``[YGG][AUTOLOADER] <table>``), shipping the ygg image as a reusable named base
-environment (``--environment``, default ``yellow``) with the whole dependency
-closure bundled for a zero-pip-install cluster env.
+environment (``--environment``; default: the version-pinned ygg image
+``ygg-<version>-py3XX`` the seed writes) with the whole dependency closure
+bundled for a zero-pip-install cluster env.
 """
 from __future__ import annotations
 
@@ -45,8 +46,9 @@ class TablesCommand:
                         help="Delete each staged file once ingested + past retention (self-cleaning).")
         al.add_argument("--clean-source-retention", dest="clean_source_retention", default="8 days",
                         help="Retention window for --clean-source (> 7 days; default '8 days').")
-        al.add_argument("--environment", default="yellow",
-                        help="Reusable serverless base environment name (default: yellow).")
+        al.add_argument("--environment", default=None,
+                        help="Reusable serverless base environment name "
+                             "(default: the version-pinned ygg image, ygg-<version>-py3XX).")
         al.add_argument("--no-environment", dest="no_environment", action="store_true",
                         help="Inline the dependency list on the job instead of a named base env.")
         al.add_argument("--no-bundle", dest="no_bundle", action="store_true",
@@ -69,7 +71,13 @@ class TablesCommand:
         client = build_client(args)
         table = client.tables.table(args.table)
 
-        environment = None if args.no_environment else args.environment
+        if args.no_environment:
+            environment = None                       # inline the deps on the job
+        elif args.environment is not None:
+            environment = args.environment           # explicit shared env name
+        else:
+            from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+            environment = ygg_base_environment_name()  # canonical version-pinned ygg image
         deploy = not args.no_deploy
 
         style.step(

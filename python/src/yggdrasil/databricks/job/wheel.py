@@ -54,6 +54,7 @@ __all__ = [
     "ensure_bundles",
     "ensure_named_environment",
     "ensure_cluster_requirements",
+    "ygg_base_environment_name",
     "deployed_environments",
     "ygg_runtime_dependencies",
     "ygg_environment",
@@ -124,6 +125,25 @@ def environment_key_for(python: str) -> str:
     """The serverless ``environment_key`` for a Python version (``3.11`` →
     ``"py311"``)."""
     return "py" + _py_minor(python).replace(".", "")
+
+
+def ygg_base_environment_name(python: "str | None" = None) -> str:
+    """Canonical name of the reusable serverless **base environment** for the
+    running ygg image — ``ygg-<version>-py3XX``.
+
+    This is exactly the stem ``ygg databricks seed`` writes under
+    :data:`WORKSPACE_ENV_DIR` (``ygg-<version>-py3XX.yml``), so a job that points
+    its ``base_environment_name`` here reuses the seeded, wheel-built image when
+    the seed has run — and self-provisions the identical file (same wheel
+    closure, same path) when it hasn't. The version-pinned name is the single
+    source of truth for "the correct ygg environment", replacing the old static
+    ``yellow`` env."""
+    try:
+        import importlib.metadata as _md
+        version = _md.version("ygg")
+    except Exception:  # noqa: BLE001 — fall back to the in-tree version
+        from yggdrasil.version import __version__ as version
+    return f"ygg-{version}-{environment_key_for(python)}"
 
 
 def wheel_for_python(wheels: "list", python: "str | None" = None) -> str:

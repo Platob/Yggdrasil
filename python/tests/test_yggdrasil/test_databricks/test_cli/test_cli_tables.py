@@ -37,10 +37,13 @@ class TestAutoloadDispatch(unittest.TestCase):
             rc = main(["tables", "autoload", "cat.sch.events"])
         self.assertEqual(rc, 0)
         client.tables.table.assert_called_once_with("cat.sch.events")
+        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
         kwargs = table.auto_loader.call_args.kwargs
         self.assertIs(kwargs["file_arrival"], True)            # default file-arrival trigger
         self.assertEqual(kwargs["available_now"], True)        # default sweep
-        self.assertEqual(kwargs["environment"], "yellow")      # default named env
+        # Default named env is the version-pinned ygg image (not "yellow").
+        self.assertEqual(kwargs["environment"], ygg_base_environment_name())
+        self.assertTrue(kwargs["environment"].startswith("ygg-"))
         self.assertEqual(kwargs["bundle_dependencies"], True)  # default 0-pip-install
         self.assertIs(kwargs["deploy"], True)
 

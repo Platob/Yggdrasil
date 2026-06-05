@@ -3089,7 +3089,7 @@ class Table(DatabricksPath):
         clean_source: bool = False,
         clean_source_retention: str = "8 days",
         bundle_dependencies: bool = True,
-        environment: "str | None" = "yellow",
+        environment: "str | None" = ...,
         deploy: bool = True,
     ) -> "Any":
         """Get-or-create a Databricks **Auto Loader** ingestion job for this table.
@@ -3139,10 +3139,15 @@ class Table(DatabricksPath):
                 ships only the ygg wheel and resolves deps from the workspace
                 index at install.
             environment: Name of a reusable serverless **base environment** to
-                create-or-update and reference (default ``"yellow"``) — the ygg
-                image is written once to ``<name>.env.yaml`` in the workspace and
-                the job points at it by path, so jobs share one cached env.
-                ``None`` inlines the dependency list on the job instead.
+                create-or-update and reference. Default (unset) resolves to the
+                canonical, version-pinned ygg image
+                (:func:`~yggdrasil.databricks.job.wheel.ygg_base_environment_name`,
+                ``ygg-<version>-py3XX``) — the same ``<name>.yml`` file
+                ``ygg databricks seed`` writes under ``/Workspace/Shared/
+                environments``, so the job reuses the seeded wheel-built image
+                (or self-provisions the identical one). Pass an explicit name to
+                point at a different shared env; ``None`` inlines the dependency
+                list on the job instead.
             deploy: ``True`` (default) get-or-creates the job now and returns the
                 :class:`~yggdrasil.databricks.job.job.Job`; ``False`` returns the
                 configured (un-deployed) :class:`Flow` for inspection / a manual
@@ -3152,6 +3157,12 @@ class Table(DatabricksPath):
         """
         from yggdrasil.databricks.job.skeleton import Flow
         from yggdrasil.databricks.table.auto_loader import auto_load
+
+        if environment is ...:
+            # Default to the canonical, version-pinned ygg base environment —
+            # the wheel-built image the seed writes — rather than a static name.
+            from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+            environment = ygg_base_environment_name()
 
         if source is None:
             # Default to the table's own cloud staging area, so files staged
@@ -3183,8 +3194,8 @@ class Table(DatabricksPath):
         # Ship the whole dependency closure as wheels so the serverless env
         # installs with zero PyPI access ("0 pip install").
         flow.bundle_dependencies = bundle_dependencies
-        # Reference a reusable, named serverless base environment (default
-        # "yellow") — written once, shared across ygg jobs — when set.
+        # Reference the reusable, version-pinned ygg base environment (resolved
+        # above) — written once, shared across ygg jobs; ``None`` inlines deps.
         flow.base_environment_name = environment
         return flow.deploy(self.client) if deploy else flow
 

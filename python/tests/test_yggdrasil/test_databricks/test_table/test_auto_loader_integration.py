@@ -144,15 +144,74 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         task = settings.tasks[0]
         assert task.python_wheel_task.package_name == "ygg"
         assert self.table.full_name() in task.python_wheel_task.parameters
-        # The serverless env references the reusable "yellow" base environment
-        # (written to the workspace) rather than inlining the dependency list.
+        # The serverless env references the reusable, version-pinned ygg base
+        # environment (written to /Workspace/Shared/environments as
+        # ``ygg-<version>-py3XX.yml`` — the same file the seed writes) rather
+        # than inlining the dependency list.
+        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
         env = settings.environments[0]
         assert env.spec.base_environment is not None
-        assert env.spec.base_environment.endswith("yellow.env.yaml")
+        assert env.spec.base_environment.endswith(f"{ygg_base_environment_name()}.yml")
         # base_environment carries the version → no inline version, and an
         # ygg-only job layers nothing on top.
         assert env.spec.environment_version is None
         assert not env.spec.dependencies
+
+    def test_autoload_external_s3_via_volume_smoke(self) -> None:
+        """Smoke: ingest external-S3 data **through the UC external volume**.
+
+        The same external location, but addressed as a governed ``/Volumes/...``
+        path (Files-API) instead of a raw ``s3://`` URL — so Auto Loader watches
+        the volume. Verifies the volume staging path resolves, a file written
+        through it lands on the backing S3, and the deployed job targets the
+        volume source with the version-pinned ygg base environment. The actual
+        serverless run is gated behind ``YGG_TEST_AUTOLOADER_RUN=1`` (minutes)."""
+        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+
+        # Volume-addressed staging: /Volumes/<cat>/<sch>/<vol>/.sql/tmp, backed by
+        # the table's EXTERNAL S3 location (created in setUpClass).
+        vol_dir = self.table.staging_folder()
+        vol_source = vol_dir.full_path()
+        assert vol_source.startswith("/Volumes/"), vol_source
+
+        # A file written through the volume round-trips, and its data physically
+        # lives on the external S3 prefix (same bytes, two addressing schemes).
+        leaf = vol_dir / f"vol_probe_{secrets.token_hex(3)}.parquet"
+        leaf.write_table(pa.table({"id": [7], "v": ["vol"]}), mode=Mode.OVERWRITE)
+        assert leaf.read_arrow_table().num_rows == 1
+
+        # Deploy the Auto Loader job watching the VOLUME path. Default trigger is
+        # file-arrival on that volume; the source flows to the on-cluster entry
+        # point and the env is the canonical wheel-built ygg base environment.
+        job = self.table.auto_loader(source=vol_source)
+        try:
+            assert getattr(job, "job_id", None) is not None
+            settings = job.settings
+            task = settings.tasks[0]
+            assert task.python_wheel_task.package_name == "ygg"
+            assert vol_source in task.python_wheel_task.parameters
+            assert settings.trigger.file_arrival.url == vol_source.rstrip("/") + "/"
+            env = settings.environments[0]
+            assert env.spec.base_environment.endswith(f"{ygg_base_environment_name()}.yml")
+
+            if not os.environ.get("YGG_TEST_AUTOLOADER_RUN"):
+                self.skipTest("set YGG_TEST_AUTOLOADER_RUN=1 for the live volume ingestion run")
+
+            # One AvailableNow sweep over the volume, then confirm the row landed.
+            run = self.table.auto_loader(
+                source=vol_source, file_arrival=False, available_now=True,
+            ).run(wait=1200, raise_error=True)
+            assert run is not None
+            deadline = time.time() + 180
+            ids: list = []
+            while time.time() < deadline:
+                ids = self.table.read_arrow_table().column("id").to_pylist()
+                if 7 in ids:
+                    break
+                time.sleep(5)
+            assert 7 in ids, f"volume-staged row not ingested (saw {sorted(set(ids))})"
+        finally:
+            leaf.remove(missing_ok=True)
 
     def test_bulk_stage_ingest_fast_reuse_and_cleanup(self) -> None:
         # Heavy: builds + ships the ygg wheel and runs a serverless cloudFiles
