@@ -90,49 +90,52 @@ class TestInstallLogging:
         assert len(styled) == 1
 
 
-class TestImportTimeLogStyleKeepsLevelControllable:
-    """``import yggdrasil`` must style ygg's own logs without hijacking the root
-    logger — otherwise a later ``logging.basicConfig(level=INFO)`` silently
-    no-ops and ygg's INFO logs can never be turned on. Each case runs in a fresh
-    subprocess so the import-time hook executes against a pristine logging state.
+class TestImportLeavesLoggingUnconfigured:
+    """``import yggdrasil`` must not configure logging at all — no handler on the
+    root logger, no swapped-out ``lastResort`` — so the normal stdlib idioms
+    (``logging.basicConfig``, ``setLevel``) fully decide whether ygg's INFO logs
+    show. Each case runs in a fresh subprocess so import executes against a
+    pristine logging state.
     """
 
-    import subprocess
-    import sys
-
-    def _run(self, body: str, env_extra: dict | None = None) -> "subprocess.CompletedProcess":
+    def _run(self, body: str):
         import os
         import subprocess
         import sys
 
-        env = dict(os.environ)
-        env.pop("YGG_NO_LOG_STYLE", None)
-        if env_extra:
-            env.update(env_extra)
         return subprocess.run(
             [sys.executable, "-c", body],
-            capture_output=True, text=True, env=env,
+            capture_output=True, text=True, env=dict(os.environ),
         )
 
-    def test_import_does_not_add_root_handler(self):
+    def test_import_adds_no_root_handler(self):
         out = self._run(
             "import logging, yggdrasil;"
             "print('ROOT_HANDLERS', len(logging.getLogger().handlers))"
         )
         assert "ROOT_HANDLERS 0" in out.stdout, (out.stdout, out.stderr)
 
-    def test_basicconfig_info_after_import_surfaces_ygg_info(self):
+    def test_import_leaves_last_resort_default(self):
+        # The styled-default-on-import was removed: lastResort stays the stdlib's
+        # own handler, never a ygg-styled one.
+        out = self._run(
+            "import logging, yggdrasil;"
+            "print('STYLED', getattr(logging.lastResort, '_ygg_styled', False))"
+        )
+        assert "STYLED False" in out.stdout, (out.stdout, out.stderr)
+
+    def test_basicconfig_info_surfaces_ygg_info_once(self):
         out = self._run(
             "import logging, yggdrasil;"
             "logging.basicConfig(level=logging.INFO);"
             "logging.getLogger('yggdrasil.demo').info('YGG_INFO_MARKER')"
         )
-        # The INFO line must appear (styled handler writes to stderr) ...
+        # basicConfig works normally (ygg didn't pre-configure root) ...
         assert "YGG_INFO_MARKER" in out.stderr, (out.stdout, out.stderr)
-        # ... exactly once (no double-logging through both ygg + root handlers).
+        # ... and the line shows exactly once.
         assert out.stderr.count("YGG_INFO_MARKER") == 1, out.stderr
 
-    def test_default_is_quiet_at_info_but_styled_at_warning(self):
+    def test_default_quiet_at_info(self):
         out = self._run(
             "import logging, yggdrasil;"
             "logging.getLogger('yggdrasil.demo').info('HIDDEN_INFO');"
@@ -140,12 +143,3 @@ class TestImportTimeLogStyleKeepsLevelControllable:
         )
         assert "HIDDEN_INFO" not in out.stderr, out.stderr
         assert "SHOWN_WARNING" in out.stderr, out.stderr
-
-    def test_opt_out_leaves_root_unstyled(self):
-        out = self._run(
-            "import logging, yggdrasil;"
-            "yl = logging.getLogger('yggdrasil');"
-            "print('HANDLERS', len(yl.handlers), 'PROP', yl.propagate)",
-            env_extra={"YGG_NO_LOG_STYLE": "1"},
-        )
-        assert "HANDLERS 0 PROP True" in out.stdout, (out.stdout, out.stderr)
