@@ -1068,10 +1068,24 @@ class MimeTypes:
         )
     )
 
+    PARQUET_FOLDER = MimeType.define(
+        MimeType(
+            "PARQUET_FOLDER",
+            "inode/directory+parquet",
+        )
+    )
+
     DELTA_FOLDER = MimeType.define(
         MimeType(
             "DELTA_FOLDER",
             "inode/directory+delta",
+        )
+    )
+
+    RESPONSE_CACHE_FOLDER = MimeType.define(
+        MimeType(
+            "RESPONSE_CACHE_FOLDER",
+            "inode/directory+http-response-cache",
         )
     )
 

@@ -138,3 +138,31 @@ def test_multipart_aborts_on_failure(client):
         c.put_streamed("x", boom())
     assert fake.uploads == {}  # upload aborted, no orphan parts
     assert "x" not in fake.objects
+
+
+def test_response_headers_are_case_insensitive():
+    # HTTP/2 lower-cases header names; a capitalised lookup must still resolve
+    # (else stat misses Content-Length and pays a needless ranged GET — the
+    # "not normal" direct-stat bottleneck this fixes).
+    from yggdrasil.aws.fs.s3_http import S3Response
+    r = S3Response(200, {"content-length": "262144", "ETag": '"abc"'}, b"")
+    assert r.headers.get("Content-Length") == "262144"
+    assert r.headers.get("content-length") == "262144"
+    assert r.headers["CONTENT-LENGTH"] == "262144"
+    assert r.headers.get("etag") == '"abc"' and r.headers.get("ETag") == '"abc"'
+    assert "Content-Length" in r.headers and "content-length" in r.headers
+
+
+def test_stat_resolves_size_from_lowercase_head_without_ranged_get():
+    # A wired S3Path whose object exists: stat finds the size on the HEAD alone
+    # — no fallback ranged GET — even when the header arrives lower-cased.
+    from tests.test_yggdrasil.test_aws._fake_s3 import (
+        FakeS3, reset_s3_singletons, wire_s3_path,
+    )
+    reset_s3_singletons()
+    fake = FakeS3()
+    p = wire_s3_path(fake, "s3://bkt/dir/obj.bin")
+    fake.objects["dir/obj.bin"] = b"0123456789"
+    assert p.size == 10                       # resolved from HEAD
+    assert fake.calls.get("get", 0) == 0      # no ranged-GET fallback
+    reset_s3_singletons()

@@ -107,6 +107,10 @@ class SendConfig:
             holder = cache.tabular or cache.cache_tabular(session=session)
             if holder is None:
                 return set()
+            from yggdrasil.http_.response_cache import HttpResponseCache
+            if isinstance(holder, HttpResponseCache):
+                # Specialized local cache: O(1) per-key file presence check.
+                return holder.probe_hashes(requests)
             try:
                 table = holder.read_arrow_table(
                     predicate=predicate, columns=[MATCH_COLUMN],
@@ -170,6 +174,14 @@ class SendConfig:
         holder = cache.tabular or cache.cache_tabular(session=session)
         if holder is None or not requests:
             return None
+        from yggdrasil.http_.response_cache import HttpResponseCache
+        if isinstance(holder, HttpResponseCache):
+            # Specialized local cache: read the per-key files directly, wrap the
+            # hits as an in-memory tabular (the generic predicate read doesn't
+            # apply to a content-addressed blob store).
+            from yggdrasil.http_.response_batch import responses_to_tabular
+            hits, _misses = holder.read_responses(requests, config=cache)
+            return responses_to_tabular(hits) if hits else None
         batch_predicate = cache.make_batch_lookup_predicate(requests)
         opts = CastOptions(predicate=batch_predicate, target=RESPONSE_SCHEMA)
         return holder.read_table(options=opts)

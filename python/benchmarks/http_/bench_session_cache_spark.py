@@ -43,7 +43,6 @@ from typing import Callable, List
 from yggdrasil.path.memory import Memory
 from yggdrasil.io.request import PreparedRequest
 from yggdrasil.io.response import Response
-from yggdrasil.io.session import Session
 
 
 # ---------------------------------------------------------------------------
@@ -154,29 +153,32 @@ def scenarios(repeat: int) -> list[dict]:
     sixteen_resp = _build_responses(16)
     big_resp = _build_responses(128)
 
-    # ``_responses_to_spark`` is a private classmethod on Session.
-    # Reach for it via the public ``Session`` symbol — the test suite
-    # already does this, and the private call signature is stable.
-    lift = Session._responses_to_spark
+    # The driver-side lift list[Response] → SparkDataFrame is now
+    # ``responses_to_tabular(responses).read_spark_frame()`` (the ArrowTabular
+    # wraps the responses; read_spark_frame self-resolves the SparkSession).
+    from yggdrasil.http_.response_batch import responses_to_tabular
+
+    def lift(resps):
+        return responses_to_tabular(resps).read_spark_frame()
 
     out.append(_time_one(
-        "Session._responses_to_spark([]) empty (cached empty)",
-        lambda: lift([], spark),
+        "responses_to_tabular([]).read_spark_frame() empty",
+        lambda: lift([]),
         repeat=repeat, inner=2_000,
     ))
     out.append(_time_one(
-        "Session._responses_to_spark(1)",
-        lambda: lift(one_resp, spark),
+        "responses_to_tabular(1).read_spark_frame()",
+        lambda: lift(one_resp),
         repeat=repeat, inner=200,
     ))
     out.append(_time_one(
-        "Session._responses_to_spark(16)",
-        lambda: lift(sixteen_resp, spark),
+        "responses_to_tabular(16).read_spark_frame()",
+        lambda: lift(sixteen_resp),
         repeat=repeat, inner=100,
     ))
     out.append(_time_one(
-        "Session._responses_to_spark(128)",
-        lambda: lift(big_resp, spark),
+        "responses_to_tabular(128).read_spark_frame()",
+        lambda: lift(big_resp),
         repeat=repeat, inner=20,
     ))
 

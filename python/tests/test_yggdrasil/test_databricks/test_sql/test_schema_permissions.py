@@ -7,6 +7,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from databricks.sdk.service.catalog import (
+    EffectivePrivilege,
+    EffectivePrivilegeAssignment,
     PermissionsChange,
     Privilege,
     PrivilegeAssignment,
@@ -201,9 +203,15 @@ class TestCanUseExternal:
         )
 
     def _effective(self, workspace, privileges):
+        # ``grants.get_effective`` returns ``EffectivePrivilege`` wrappers (the
+        # enum on ``.privilege``), NOT bare ``Privilege`` enums — mirror that so
+        # the check is exercised against the real wire shape.
         workspace.grants.get_effective.return_value = SimpleNamespace(
             privilege_assignments=[
-                PrivilegeAssignment(principal="alice@example.com", privileges=privileges),
+                EffectivePrivilegeAssignment(
+                    principal="alice@example.com",
+                    privileges=[EffectivePrivilege(privilege=p) for p in privileges],
+                ),
             ],
         )
 

@@ -19,7 +19,9 @@ import pytest
 from databricks.sdk.service.catalog import TableType
 
 from yggdrasil.data.schema import Schema
+from yggdrasil.databricks.table.options import TableOptions
 from yggdrasil.databricks.table.table import Table
+from yggdrasil.enums import EngineType
 
 
 def _schema(*pairs):
@@ -68,23 +70,45 @@ class TestInsertForwarding:
         t.insert_into.assert_called_once()
         assert t.insert_into.call_args.kwargs["wait"] is False
 
-    def test_stage_insert_writes_parquet_and_returns_path(self):
+    def test_stage_insert_writes_into_autoloader_staging(self):
+        # Lands a uniquely-named parquet under the Auto Loader staging path
+        # (stage_storage_path) so a deployed auto_loader job ingests it.
         t = MagicMock()
-        path = MagicMock()
-        t.insert_volume_path.return_value = path
+        leaf = MagicMock()
+        root = MagicMock()
+        root.__truediv__.return_value = leaf
+        t.stage_storage_path.return_value = root
         out = Table.stage_insert(t, {"a": [1]})
-        t.insert_volume_path.assert_called_once_with(t, temporary=False)
-        path.write_table.assert_called_once()
-        assert out is path
+        t.stage_storage_path.assert_called_once_with()
+        t.insert_volume_path.assert_not_called()
+        name = root.__truediv__.call_args.args[0]
+        assert name.startswith("insert-") and name.endswith(".parquet")
+        leaf.write_table.assert_called_once()
+        assert out is leaf
 
     def test_stage_insert_passes_cast_options(self):
         from yggdrasil.data.options import CastOptions
         t = MagicMock()
-        path = MagicMock()
-        t.insert_volume_path.return_value = path
+        leaf = MagicMock()
+        root = MagicMock()
+        root.__truediv__.return_value = leaf
+        t.stage_storage_path.return_value = root
         opts = CastOptions()
         Table.stage_insert(t, {"a": [1]}, cast_options=opts)
-        assert path.write_table.call_args.args[1] is opts
+        assert leaf.write_table.call_args.args[1] is opts
+
+    def test_stage_insert_falls_back_to_volume_staging(self):
+        # No direct cloud staging (e.g. managed table) → Files-API volume staging.
+        t = MagicMock()
+        t.stage_storage_path.side_effect = RuntimeError("no external staging")
+        leaf = MagicMock()
+        folder = MagicMock()
+        folder.__truediv__.return_value = leaf
+        t.staging_folder.return_value = folder
+        out = Table.stage_insert(t, {"a": [1]})
+        t.staging_folder.assert_called_once_with(temporary=False)
+        leaf.write_table.assert_called_once()
+        assert out is leaf
 
 
 # --------------------------------------------------------------------------- #
@@ -297,38 +321,70 @@ class TestMakeSqlInsertAtomic:
 # Write routing — native DeltaFolder vs warehouse (the size gate)
 # --------------------------------------------------------------------------- #
 class TestWriteRouting:
-    """``_write_arrow_batches`` → ``_resolve_engine`` routing: an EXTERNAL
-    Delta table under the (relaxed) external cap commits straight to the
-    storage path via DeltaFolder; a managed table (or a too-large external one)
-    goes to the warehouse ``arrow_insert`` instead."""
+    """``_write_arrow_batches`` → ``_resolve_engine`` routing for **writes**.
+
+    A write never auto-routes to the native DeltaFolder commit off the table
+    being external — by default it goes to the warehouse ``arrow_insert``
+    (staging volume + SQL). The direct storage-path commit happens only when
+    the caller asks for it explicitly with ``engine=YGGDRASIL``."""
 
     def _batches(self):
         return [pa.RecordBatch.from_pylist([{"a": 1}], schema=pa.schema([("a", pa.int64())]))]
 
-    def _options(self):
-        # No ``engine`` set → ``_resolve_engine`` takes the guess path.
-        from yggdrasil.data.options import CastOptions
-        return CastOptions()
+    def _options(self, engine=None):
+        return TableOptions(engine=engine)
 
-    def test_external_under_cap_routes_to_native_delta(self):
+    def test_external_no_engine_routes_to_warehouse(self):
+        # External Delta, small, no Spark — but with no explicit engine a write
+        # still goes to the warehouse: native is no longer auto-selected.
         tbl = _table()
-        folder = MagicMock()
         with patch.object(Table, "_delta_capable", return_value=True), \
                 patch.object(Table, "infos", new_callable=PropertyMock) as infos, \
                 patch.object(Table, "_has_active_spark", return_value=False), \
                 patch.object(Table, "_delta_total_bytes", return_value=1024), \
-                patch.object(Table, "_native_delta_folder", return_value=folder) as native, \
+                patch.object(Table, "collect_schema", return_value=_schema(("a", pa.int64()))), \
+                patch.object(Table, "_native_delta_folder") as native, \
                 patch.object(Table, "arrow_insert") as warehouse:
             infos.return_value.table_type = TableType.EXTERNAL
             tbl._write_arrow_batches(self._batches(), self._options())
+
+        native.assert_not_called()
+        warehouse.assert_called_once()
+
+    def test_explicit_yggdrasil_routes_to_native_delta(self):
+        # Opting in explicitly is the only way a write takes the storage path.
+        tbl = _table()
+        folder = MagicMock()
+        with patch.object(Table, "_delta_capable", return_value=True), \
+                patch.object(Table, "_has_active_spark", return_value=False), \
+                patch.object(Table, "_native_delta_folder", return_value=folder) as native, \
+                patch.object(Table, "arrow_insert") as warehouse:
+            tbl._write_arrow_batches(
+                self._batches(), self._options(engine=EngineType.YGGDRASIL),
+            )
 
         native.assert_called_once_with(write=True)
         folder.write_arrow_batches.assert_called_once()
         warehouse.assert_not_called()
 
-    def test_managed_routes_to_warehouse(self):
+    def test_explicit_yggdrasil_not_capable_routes_to_warehouse(self):
+        # Explicit YGGDRASIL on a non-native-capable table degrades to the
+        # warehouse rather than erroring.
         tbl = _table()
-        # Managed tables aren't write-capable natively → fall to the warehouse.
+        with patch.object(Table, "_delta_capable", return_value=False), \
+                patch.object(Table, "_has_active_spark", return_value=False), \
+                patch.object(Table, "collect_schema", return_value=_schema(("a", pa.int64()))), \
+                patch.object(Table, "_native_delta_folder") as native, \
+                patch.object(Table, "arrow_insert") as warehouse:
+            tbl._write_arrow_batches(
+                self._batches(), self._options(engine=EngineType.YGGDRASIL),
+            )
+
+        native.assert_not_called()
+        warehouse.assert_called_once()
+
+    def test_managed_no_engine_routes_to_warehouse(self):
+        tbl = _table()
         with patch.object(Table, "_delta_capable", return_value=False), \
                 patch.object(Table, "infos", new_callable=PropertyMock) as infos, \
                 patch.object(Table, "_has_active_spark", return_value=False), \
@@ -340,43 +396,3 @@ class TestWriteRouting:
 
         native.assert_not_called()
         warehouse.assert_called_once()
-
-    def test_external_above_cap_routes_to_warehouse(self):
-        from yggdrasil.databricks.table.table import _NATIVE_DELTA_MAX_BYTES_EXTERNAL
-        tbl = _table()
-        with patch.object(Table, "_delta_capable", return_value=True), \
-                patch.object(Table, "infos", new_callable=PropertyMock) as infos, \
-                patch.object(Table, "_has_active_spark", return_value=False), \
-                patch.object(Table, "collect_schema", return_value=_schema(("a", pa.int64()))), \
-                patch.object(
-                    Table, "_delta_total_bytes",
-                    return_value=_NATIVE_DELTA_MAX_BYTES_EXTERNAL + 1,
-                ), \
-                patch.object(Table, "_native_delta_folder") as native, \
-                patch.object(Table, "arrow_insert") as warehouse:
-            infos.return_value.table_type = TableType.EXTERNAL
-            tbl._write_arrow_batches(self._batches(), self._options())
-
-        native.assert_not_called()
-        warehouse.assert_called_once()
-
-    def test_external_above_small_cap_still_native(self):
-        # A size between the managed cap and the external cap stays native for
-        # an EXTERNAL table — the relaxed gate is what's exercised here.
-        from yggdrasil.databricks.table.table import _NATIVE_DELTA_MAX_BYTES
-        tbl = _table()
-        folder = MagicMock()
-        with patch.object(Table, "_delta_capable", return_value=True), \
-                patch.object(Table, "infos", new_callable=PropertyMock) as infos, \
-                patch.object(Table, "_has_active_spark", return_value=False), \
-                patch.object(
-                    Table, "_delta_total_bytes",
-                    return_value=_NATIVE_DELTA_MAX_BYTES * 4,
-                ), \
-                patch.object(Table, "_native_delta_folder", return_value=folder), \
-                patch.object(Table, "arrow_insert") as warehouse:
-            infos.return_value.table_type = TableType.EXTERNAL
-            tbl._write_arrow_batches(self._batches(), self._options())
-
-        folder.write_arrow_batches.assert_called_once()
-        warehouse.assert_not_called()

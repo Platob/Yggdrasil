@@ -156,11 +156,28 @@ class _Runnable:
     #: ``py3XX``) on deploy, not just the local-matched ``default``. The build
     #: already produces a wheel per Python; this exposes them as job environments.
     all_environments: bool = False
+    #: Bundle the **whole transitive dependency closure** as wheels and ship
+    #: them all, so the serverless environment installs with **zero PyPI
+    #: access** ("0 pip install") — instead of the project wheel + index
+    #: requirements. Trades a larger one-time upload for an offline, fully
+    #: reproducible env build. Mutually exclusive with :attr:`all_environments`
+    #: (bundles target the deploy host's single Python).
+    bundle_dependencies: bool = False
+    #: Reference a reusable, named serverless **base environment** (an
+    #: ``<name>.env.yaml`` in the workspace) instead of inlining the dependency
+    #: list — the ygg image is written there once (create-or-update) and the job
+    #: points at it by file path, so jobs share one cached env. ``None`` keeps the
+    #: classic inline environment. Any user package layers on top as extra
+    #: dependencies. Ignored when :attr:`all_environments` is set (the per-Python
+    #: matrix stays inline). Falls back to inline if the env can't be written.
+    base_environment_name: "str | None" = None
 
     _wheel_paths: "tuple[str, ...]" = ()
     _ygg_wheels: "list[str] | None" = None
     _user_wheels: "list[str]" = ()
     _user_deps: "list[str]" = ()
+    _base_environment_path: "str | None" = None
+    _user_layer: "list[str] | None" = None
     _runner_params: "list[str] | None" = None
     _client: Any = None
 
@@ -284,34 +301,72 @@ class _Runnable:
         cluster. Editable installs build to a per-user folder and rebuild each
         deploy; published ones reuse the shared registry. The per-Python wheel
         sets are stashed for :meth:`environments` to compose the full matrix when
-        :attr:`all_environments` is set."""
+        :attr:`all_environments` is set.
+
+        Splits the result into the **ygg image** deps (the shared base) and the
+        **user-package layer** so :attr:`base_environment_name`, when set, can
+        write the (stable) image into a reusable named env and layer the user
+        package on top. Returns the flat union (the inline fallback)."""
         from yggdrasil.databricks.job import wheel as W
 
         editable_ygg = W.is_editable_install("ygg")
-        ygg_wheels = W.ensure_ygg_wheels(
-            client,
-            workspace_dir=(W.user_pypi_dir(client) if editable_ygg else W.WORKSPACE_PYPI_DIR),
-            rebuild=editable_ygg,
-        )
-        runtime = W.ygg_runtime_dependencies()
-
-        user_wheels: list[str] = []
-        user_deps: list[str] = []
         pkg = self.wheel_package()
         dist = W.distribution_for(pkg)
-        if W._norm(dist) != "ygg":
-            editable = W.is_editable_install(dist)
-            base = W.user_pypi_dir(client) if editable else W.WORKSPACE_PYPI_DIR
-            user_wheels = W.ensure_wheels(client, pkg, workspace_dir=f"{base}/{_slug(dist)}")
-            user_deps = W._project_dependencies(dist, set(self.wheel_extras))
+        user_pkg = W._norm(dist) != "ygg"
 
-        self._ygg_wheels, self._user_wheels, self._user_deps = ygg_wheels, user_wheels, user_deps
-        # Flat deps for the default (local-matched) environment.
-        deps = [W.wheel_for_python(ygg_wheels)] + runtime
-        if user_wheels:
-            deps += [W.wheel_for_python(user_wheels)] + user_deps
+        if self.bundle_dependencies:
+            # 0 pip install: ship the whole dependency closure as wheels — the
+            # env installs entirely from them, no PyPI. Bundle ygg + (when the
+            # target lives elsewhere) the user package, both with their deps.
+            base = W.user_pypi_dir(client) if editable_ygg else W.WORKSPACE_PYPI_DIR
+            ygg_base = W.ensure_bundle(client, "ygg", workspace_dir=base, rebuild=editable_ygg)
+            user_layer: list[str] = []
+            if user_pkg:
+                ud = W.is_editable_install(dist)
+                ubase = W.user_pypi_dir(client) if ud else W.WORKSPACE_PYPI_DIR
+                user_layer = W.ensure_bundle(
+                    client, pkg, extras=self.wheel_extras, workspace_dir=ubase, rebuild=ud)
+            self._ygg_wheels, self._user_wheels, self._user_deps = ygg_base, user_layer, []
+        else:
+            ygg_wheels = W.ensure_ygg_wheels(
+                client,
+                workspace_dir=(W.user_pypi_dir(client) if editable_ygg else W.WORKSPACE_PYPI_DIR),
+                rebuild=editable_ygg,
+            )
+            # The shared image is the local-matched ygg wheel + its runtime
+            # (index) deps; the user package (if any) is the layer on top.
+            ygg_base = [W.wheel_for_python(ygg_wheels)] + W.ygg_runtime_dependencies()
+            user_wheels: list[str] = []
+            user_deps: list[str] = []
+            if user_pkg:
+                editable = W.is_editable_install(dist)
+                base = W.user_pypi_dir(client) if editable else W.WORKSPACE_PYPI_DIR
+                user_wheels = W.ensure_wheels(client, pkg, workspace_dir=f"{base}/{_slug(dist)}")
+                user_deps = W._project_dependencies(dist, set(self.wheel_extras))
+            user_layer = ([W.wheel_for_python(user_wheels)] + user_deps) if user_wheels else []
+            self._ygg_wheels, self._user_wheels, self._user_deps = ygg_wheels, user_wheels, user_deps
+
+        # Reusable named base environment: write the (stable) ygg image once and
+        # have the job reference it by path; the user package layers on inline.
+        # Falls back to the classic inline env if it can't be written.
+        self._base_environment_path, self._user_layer = None, None
+        if self.base_environment_name and not self.all_environments:
+            try:
+                self._base_environment_path = W.ensure_named_environment(
+                    client, self.base_environment_name,
+                    dependencies=ygg_base,
+                    environment_version=self.environment_version,
+                )
+                self._user_layer = list(user_layer)
+            except Exception:  # noqa: BLE001 — degrade to inline deps on any failure
+                logger.warning(
+                    "could not write base environment %r — inlining dependencies",
+                    self.base_environment_name, exc_info=True,
+                )
+                self._base_environment_path = None
+
         seen: set[str] = set()
-        return [d for d in deps if not (d in seen or seen.add(d))]
+        return [d for d in (ygg_base + user_layer) if not (d in seen or seen.add(d))]
 
     def _python_dependencies(self, python: str) -> list[str]:
         """The dependency list for a specific *python* — the wheels matching it
@@ -349,7 +404,12 @@ class _Runnable:
         :meth:`effective_dependencies`). When :attr:`all_environments` is set and
         the per-Python wheels have been built (post-:meth:`deploy`), also appends
         one env per :data:`~yggdrasil.databricks.job.wheel.SUPPORTED_PYTHONS`
-        (keyed ``py3XX``) so a task can run under any Python by environment key."""
+        (keyed ``py3XX``) so a task can run under any Python by environment key.
+
+        When :meth:`_serverless_dependencies` wrote a reusable named base
+        environment (:attr:`base_environment_name`), the default env references
+        it by file path (``base_environment``) and only layers the user package
+        on top — one shared, cached env instead of an inlined dependency list."""
         if not self.serverless:
             return None
         from databricks.sdk.service.compute import Environment
@@ -366,6 +426,20 @@ class _Runnable:
                     dependencies=deps,
                 ),
             )
+
+        if getattr(self, "_base_environment_path", None):
+            # Reference the shared "yellow"-style base env; layer the user
+            # package (empty for ygg-only jobs) on top. base_environment carries
+            # the environment_version, so it isn't set alongside it.
+            return [
+                JobEnvironment(
+                    environment_key=self.environment_key,
+                    spec=Environment(
+                        base_environment=self._base_environment_path,
+                        dependencies=(self._user_layer or None),
+                    ),
+                )
+            ]
 
         envs = [env(self.environment_key, self.effective_dependencies(), None)]
         if self.all_environments and getattr(self, "_ygg_wheels", None):

@@ -193,7 +193,41 @@ class Volume(DatabricksPath):
         self._storage_path: Any = None
         self._catalog: Any = None
         self._schema: Any = None
+        # Per-mode direct-storage access state, **cached** so the eligibility
+        # check (external type + ``EXTERNAL USE SCHEMA`` grant + s3 location +
+        # ``__unitycatalog`` write gate) runs once per mode, not on every I/O.
+        # ``None`` = not yet determined, ``True`` = usable, ``False`` = not
+        # usable (managed / no grant / non-s3, or a permission error proved the
+        # vended creds can't actually read/write the storage). Process-wide via
+        # the singleton. See :meth:`VolumePath._external_storage_file`.
+        self._external_readable: Optional[bool] = None
+        self._external_writable: Optional[bool] = None
         self._initialized = True
+
+    # ── direct-storage access cache ─────────────────────────────────────────────
+
+    def external_access(self, *, write: bool) -> Optional[bool]:
+        """Cached per-mode direct-storage accessibility: ``True`` (usable),
+        ``False`` (not usable / denied), or ``None`` (not yet determined — the
+        caller should resolve it and record the result)."""
+        return self._external_writable if write else self._external_readable
+
+    def mark_external_ok(self, *, write: bool) -> None:
+        """Cache that this volume's storage is directly reachable for the mode
+        — subsequent ops skip the eligibility check."""
+        if write:
+            self._external_writable = True
+        else:
+            self._external_readable = True
+
+    def mark_external_denied(self, *, write: bool) -> None:
+        """Cache that this volume's storage is **not** directly reachable for
+        the mode (ineligible, or a permission error), so the fast path isn't
+        retried."""
+        if write:
+            self._external_writable = False
+        else:
+            self._external_readable = False
 
     # ── identity ──────────────────────────────────────────────────────────────
 
@@ -548,16 +582,26 @@ class Volume(DatabricksPath):
             )
         )
 
-    def credentials_refresher(self) -> AWSDatabricksVolumeCredentials:
+    def credentials_refresher(
+        self,
+        *,
+        secret_cache: bool = False,
+    ) -> AWSDatabricksVolumeCredentials:
         """Return the process-wide singleton credentials provider for
         this volume.
 
         Keyed by ``volume_id`` — every :class:`Volume` / :class:`VolumePath`
         pointing at the same UC volume collapses to one provider.
+
+        ``secret_cache=True`` opts the provider into persisting its vended
+        AWS credentials in a per-volume Databricks secret scope (off by
+        default); the opt-in is sticky across the shared singleton.
         """
         return AWSDatabricksVolumeCredentials(
             volume_id=self.volume_id,
             client=self.client,
+            resource_url=self.full_name(),
+            secret_cache=secret_cache,
         )
 
     def aws(
@@ -565,10 +609,16 @@ class Volume(DatabricksPath):
         *,
         mode: ModeLike = None,
         region: Optional[str] = None,
+        secret_cache: bool = False,
     ) -> "AWSClient":
         """Return an :class:`AWSClient` whose credentials self-refresh
-        from :meth:`temporary_credentials`."""
-        return self.credentials_refresher().aws_client(mode=mode, region=region)
+        from :meth:`temporary_credentials`.
+
+        ``secret_cache=True`` backs the vended credentials with a per-volume
+        Databricks secret scope (off by default)."""
+        return self.credentials_refresher(
+            secret_cache=secret_cache,
+        ).aws_client(mode=mode, region=region)
 
     def arrow_filesystem(
         self,

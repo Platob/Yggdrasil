@@ -1,16 +1,24 @@
-"""Delta transaction-log parser with content caching."""
+"""Delta transaction-log parser.
+
+Immutable log files (commit JSONs, checkpoints, sidecars) are read through the
+two-tier byte cache in :mod:`yggdrasil.io.delta._cache` (small RAM LRU + disk
+under ``~/.cache``); the mutable ``_last_checkpoint`` pointer and the directory
+listing are read fresh. Above all this, the parsed
+:class:`~yggdrasil.io.delta.snapshot.Snapshot` is cached on the (location-keyed
+singleton) ``DeltaFolder`` and advances incrementally off a fresh listing, so the
+log files are (re)read only when the listing actually changes."""
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import dataclasses
-from typing import TYPE_CHECKING, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Tuple
 
-from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.pickle import json as ygg_json
 
+from yggdrasil.io.delta import _cache
 from yggdrasil.io.delta._names import (
-    LAST_CHECKPOINT_NAME, LOG_DIR_NAME, SIDECARS_DIR_NAME,
-    format_commit_name, version_from_log_name,
+    LAST_CHECKPOINT_NAME, LOG_DIR_NAME, SIDECARS_DIR_NAME, version_from_log_name,
 )
 from yggdrasil.io.delta.protocol import DeltaAction, parse_action
 
@@ -20,8 +28,6 @@ if TYPE_CHECKING:
 __all__ = ["DeltaLog", "LogSegment"]
 
 _VERSION_FMT = "{:020d}"
-_CONTENT_CACHE_MAX_BYTES = 1 * 1024 * 1024
-_content_cache: ExpiringDict[str, bytes] = ExpiringDict(default_ttl=60.0, max_size=1024)
 
 
 @dataclasses.dataclass(slots=True)
@@ -37,11 +43,14 @@ class LogSegment:
 
 
 class DeltaLog:
-    __slots__ = ("table_root", "log_path", "_last_checkpoint", "_listing")
+    __slots__ = ("table_root", "log_path", "_remote", "_last_checkpoint", "_listing")
 
     def __init__(self, table_root: "Path") -> None:
         self.table_root = table_root
         self.log_path = table_root / LOG_DIR_NAME
+        # Decide once: only a remote table benefits from the byte cache. A local
+        # one is already on disk, so caching it would just be a redundant copy.
+        self._remote = not bool(getattr(self.log_path, "is_local_path", False))
         self._last_checkpoint: "Optional[Mapping[str, object]]" = None
         self._listing: "Optional[Tuple[str, ...]]" = None
 
@@ -68,7 +77,9 @@ class DeltaLog:
         if self._last_checkpoint is not None:
             return self._last_checkpoint or None
         try:
-            payload = ygg_json.loads(_read_cached(self.log_path / LAST_CHECKPOINT_NAME))
+            # The pointer is mutable — never cached; the listing keeps it fresh.
+            payload = ygg_json.loads(
+                _cache.read_one(self.log_path / LAST_CHECKPOINT_NAME, cache=False))
         except Exception:
             self._last_checkpoint = {}; return None
         self._last_checkpoint = payload or {}
@@ -100,8 +111,17 @@ class DeltaLog:
 
 
     def segment(self, version: "Optional[int]" = None) -> LogSegment:
-        listing = self._list_log_dir()
-        last_ck = self.read_last_checkpoint()
+        # The directory listing and the ``_last_checkpoint`` pointer are two
+        # independent object-store round-trips — overlap them (each memoizes a
+        # distinct attribute, so the two threads don't race).
+        if self._listing is None and self._last_checkpoint is None:
+            with cf.ThreadPoolExecutor(max_workers=2) as ex:
+                ck_future = ex.submit(self.read_last_checkpoint)
+                listing = self._list_log_dir()
+                last_ck = ck_future.result()
+        else:
+            listing = self._list_log_dir()
+            last_ck = self.read_last_checkpoint()
         ck_hint = int(last_ck["version"]) if last_ck and "version" in last_ck else -1
 
         all_commits = sorted(
@@ -150,7 +170,7 @@ class DeltaLog:
             elif name.endswith(".json"): v2_manifests.append(name)
 
         if v2_manifests:
-            try: raw = _read_cached(self.log_path / v2_manifests[0]).decode("utf-8")
+            try: raw = _cache.read_one(self.log_path / v2_manifests[0], cache=self._remote).decode("utf-8")
             except Exception: return ()
             sidecars = []
             for line in raw.splitlines():
@@ -180,17 +200,22 @@ class DeltaLog:
 
     def replay_raw(self, segment: LogSegment) -> "Iterator[Mapping[str, object]]":
         if segment.checkpoint_files:
+            import io as _io
             import pyarrow.parquet as pq
+
+            # Local files read straight from disk (mmap); remote checkpoint /
+            # sidecar parquet are fetched concurrently, then parsed in order.
+            remote = [p for p in segment.checkpoint_files
+                      if not getattr(p, "is_local_path", False)]
+            remote_blobs = iter(_cache.read_many(remote, cache=self._remote))
             for path in segment.checkpoint_files:
-                try:
-                    local = path.full_path() if getattr(path, "is_local_path", False) else None
-                    if local:
-                        table = pq.read_table(local)
-                    else:
-                        import io as _io
-                        with path.open("rb") as bio:
-                            table = pq.read_table(_io.BytesIO(bio.read()))
-                except FileNotFoundError: continue
+                if getattr(path, "is_local_path", False):
+                    try: table = pq.read_table(path.full_path())
+                    except FileNotFoundError: continue
+                else:
+                    raw = next(remote_blobs)
+                    if raw is None: continue          # missing → skip
+                    table = pq.read_table(_io.BytesIO(raw))
                 cols = table.column_names
                 if not cols or table.num_rows == 0: continue
                 mat = [table.column(c).to_pylist() for c in cols]
@@ -199,23 +224,15 @@ class DeltaLog:
                         if mat[ci][ri] is not None:
                             yield {col: mat[ci][ri]}; break
 
-        for commit in segment.commit_files:
-            try: blob = _read_cached(commit).decode("utf-8")
-            except FileNotFoundError: continue
-            for line in blob.splitlines():
+        # Commit JSONs are small and independent — prefetch them concurrently
+        # (one S3 GET each otherwise serialises the whole replay), then parse in
+        # ascending version order so later commits still override earlier ones.
+        for blob in _cache.read_many(segment.commit_files, cache=self._remote):
+            if blob is None: continue                 # missing → skip
+            for line in blob.decode("utf-8").splitlines():
                 line = line.strip()
                 if not line: continue
                 try: yield ygg_json.loads(line)
                 except Exception: continue
 
 
-def _read_cached(path: "Path") -> bytes:
-    fn = getattr(path, "full_path", None)
-    key = fn() if callable(fn) else str(path)
-    cached = _content_cache.get(key)
-    if cached is not None: return cached
-    with path.open("rb") as bio:
-        raw = bio.read()
-    if len(raw) <= _CONTENT_CACHE_MAX_BYTES:
-        _content_cache[key] = raw
-    return raw

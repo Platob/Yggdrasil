@@ -979,8 +979,13 @@ class Table(DatabricksPath):
     def _delta_capable(self, *, write: bool) -> bool:
         """True when a native :meth:`delta` DeltaFolder read (or write) is
         possible: a Delta table with resolvable storage — and, for a write, an
-        *external* one (UC vends READ_WRITE creds only for external; a managed
-        commit would 403)."""
+        *external* one on a non-UC-managed location.
+
+        UC vends READ_WRITE creds only for external tables (a managed commit
+        would 403), and a ``__unitycatalog`` storage layout is Unity-Catalog
+        governed even when the table is "external" — direct ``PutObject`` there
+        is denied, so the storage path is **not writable**: a write must route
+        through the warehouse instead of a direct DeltaFolder commit."""
         try:
             infos = self.infos
         except Exception:
@@ -993,6 +998,8 @@ class Table(DatabricksPath):
             return False
         if write and infos.table_type != TableType.EXTERNAL:
             return False
+        if write and "__unitycatalog" in infos.storage_location:
+            return False
         return True
 
     def _resolve_engine(self, options: CastOptions, *, write: bool) -> "EngineType":
@@ -1000,16 +1007,25 @@ class Table(DatabricksPath):
 
         ``options.engine`` selects explicitly (an :class:`EngineType` or alias);
         ``YGGDRASIL`` on a table that can't take the native path degrades to the
-        warehouse rather than erroring. ``None`` **guesses best**: an active
-        Spark session → ``SPARK``; else a Delta table small enough on disk →
-        ``YGGDRASIL`` (the direct DeltaFolder read/write); else →
-        ``DATABRICKS_SQL_WAREHOUSE`` (it parallelises big scans/writes better).
+        warehouse rather than erroring. ``None`` **guesses best** — but the
+        native DeltaFolder path is only ever *auto*-selected for a **read**:
 
-        The native-path size cap depends on the table type: an **EXTERNAL**
-        Delta table (UC vends READ_WRITE credentials for it) prefers the direct
-        storage-path write across a much larger range
-        (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``); a managed table keeps the
-        smaller ``_NATIVE_DELTA_MAX_BYTES`` cap.
+        - an active Spark session → ``SPARK``;
+        - else, **read only**, a Delta table small enough on disk →
+          ``YGGDRASIL`` (the direct DeltaFolder read);
+        - else → ``DATABRICKS_SQL_WAREHOUSE``.
+
+        A **write** never auto-routes to the native storage-path commit just
+        because the table is an external Delta table — that bypasses the
+        warehouse (and its governance / staging) silently. By default a write
+        goes through the staging-volume + SQL warehouse path; the direct
+        DeltaFolder commit must be requested explicitly with
+        ``engine=YGGDRASIL`` (``"native"`` / ``"ygg"``).
+
+        The native read-path size cap depends on the table type: an
+        **EXTERNAL** Delta table (UC vends READ_WRITE credentials for it) reads
+        direct across a much larger range (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``);
+        a managed table keeps the smaller ``_NATIVE_DELTA_MAX_BYTES`` cap.
         """
         engine = EngineType.from_(getattr(options, "engine", None))
         if engine is not None:
@@ -1019,7 +1035,8 @@ class Table(DatabricksPath):
 
         if self._has_active_spark(options):
             return EngineType.SPARK
-        if self._delta_capable(write=write):
+        # Auto native (YGGDRASIL) is read-only; a write opts in explicitly.
+        if not write and self._delta_capable(write=False):
             cap = (
                 _NATIVE_DELTA_MAX_BYTES_EXTERNAL
                 if self.infos.table_type == TableType.EXTERNAL
@@ -1132,8 +1149,11 @@ class Table(DatabricksPath):
         engine = self._resolve_engine(options, write=True)
 
         # YGGDRASIL → commit straight to the ``_delta_log`` via our DeltaFolder.
-        # The credential probe runs *before* ``batches`` is consumed, so a vend
-        # failure falls back to the SQL insert below with the stream intact.
+        # Only ever reached when the caller asked for it explicitly
+        # (``engine=YGGDRASIL``) — a write never auto-routes here off the
+        # table being external (see ``_resolve_engine``). The credential probe
+        # runs *before* ``batches`` is consumed, so a vend failure falls back
+        # to the SQL insert below with the stream intact.
         if engine == EngineType.YGGDRASIL:
             folder = self._native_delta_folder(write=True)
             if folder is not None:
@@ -3080,20 +3100,141 @@ class Table(DatabricksPath):
             **kwargs,
         )
 
+    def auto_loader(
+        self,
+        source: "str | None" = None,
+        *,
+        name: "str | None" = None,
+        file_format: str = "parquet",
+        checkpoint: "str | None" = None,
+        available_now: bool = True,
+        file_arrival: bool = False,
+        trigger: "Any" = None,
+        clean_source: bool = False,
+        clean_source_retention: str = "8 days",
+        bundle_dependencies: bool = True,
+        environment: "str | None" = "yellow",
+        deploy: bool = True,
+    ) -> "Any":
+        """Get-or-create a Databricks **Auto Loader** ingestion job for this table.
+
+        Builds a serverless job — leveraging the ygg wheel + environment via the
+        :class:`~yggdrasil.databricks.job.skeleton.Flow` machinery — whose single
+        task runs :func:`yggdrasil.databricks.table.auto_loader.auto_load` on the
+        cluster: Spark Structured Streaming + ``cloudFiles`` incrementally
+        ingests files dropped under *source* into this table (exactly-once,
+        schema-evolving). The job is named ``[YGG][AUTOLOADER] <full_name>`` and
+        upserted by name (:meth:`Jobs.create_or_update`), so repeated calls
+        reconfigure the same job rather than piling up duplicates.
+
+        Args:
+            source: Cloud path Auto Loader watches (``s3://…`` / ``/Volumes/…``).
+                ``None`` (default) uses this table's cloud staging area
+                (:meth:`stage_storage_path`), so files staged there are ingested
+                with no explicit wiring.
+            name: Job name override (default ``[YGG][AUTOLOADER] <full_name>``).
+            file_format: ``cloudFiles.format`` (parquet / json / csv / avro / …).
+            checkpoint: Streaming checkpoint + schema location; ``None`` lets the
+                on-cluster step derive ``<table-location>/_ygg_autoloader``.
+            available_now: ``True`` → a one-shot ``Trigger.AvailableNow`` sweep
+                (the shape a scheduled / file-arrival run wants); ``False`` →
+                continuous micro-batch.
+            file_arrival: ``True`` → attach a file-arrival trigger on *source*
+                so the job fires when new files land (mutually exclusive with a
+                custom *trigger*).
+            trigger: An explicit Databricks ``TriggerSettings`` (schedule /
+                file-arrival), passed through as-is.
+            clean_source: ``True`` makes Auto Loader delete each staged file once
+                it's been ingested and is older than *clean_source_retention*
+                (``cloudFiles.cleanSource = DELETE``) so the staging area is
+                self-cleaning. A rolling janitor — it does not delete files
+                within the same one-shot sweep that ingests them. Default
+                ``False``.
+            clean_source_retention: Retention window for *clean_source*;
+                Databricks requires an interval **greater than 7 days** (default
+                ``"8 days"``).
+            bundle_dependencies: ``True`` (default) ships the whole transitive
+                dependency closure as wheels so the serverless environment
+                installs with **zero PyPI access** ("0 pip install"); ``False``
+                ships only the ygg wheel and resolves deps from the workspace
+                index at install.
+            environment: Name of a reusable serverless **base environment** to
+                create-or-update and reference (default ``"yellow"``) — the ygg
+                image is written once to ``<name>.env.yaml`` in the workspace and
+                the job points at it by path, so jobs share one cached env.
+                ``None`` inlines the dependency list on the job instead.
+            deploy: ``True`` (default) get-or-creates the job now and returns the
+                :class:`~yggdrasil.databricks.job.job.Job`; ``False`` returns the
+                configured (un-deployed) :class:`Flow` for inspection / a manual
+                ``.deploy(client)``.
+
+        Returns the deployed :class:`Job` (``deploy=True``) or the :class:`Flow`.
+        """
+        from yggdrasil.databricks.job.skeleton import Flow
+        from yggdrasil.databricks.table.auto_loader import auto_load
+
+        if source is None:
+            # Default to the table's own cloud staging area, so files staged
+            # via the storage path are ingested with no explicit wiring.
+            source = self.stage_storage_path().full_path()
+
+        if file_arrival and trigger is None:
+            from databricks.sdk.service.jobs import (
+                FileArrivalTriggerConfiguration, TriggerSettings,
+            )
+            # The file-arrival trigger URL must be a directory — Databricks
+            # rejects it unless it ends with '/'.
+            trigger = TriggerSettings(
+                file_arrival=FileArrivalTriggerConfiguration(
+                    url=str(source).rstrip("/") + "/",
+                ),
+            )
+
+        job_name = name or f"[YGG][AUTOLOADER] {self.full_name()}"
+        flow = Flow(
+            auto_load,
+            name=job_name,
+            trigger=trigger,
+            parameters=[
+                self.full_name(), str(source), file_format,
+                checkpoint or "", available_now, clean_source, clean_source_retention,
+            ],
+        )
+        # Ship the whole dependency closure as wheels so the serverless env
+        # installs with zero PyPI access ("0 pip install").
+        flow.bundle_dependencies = bundle_dependencies
+        # Reference a reusable, named serverless base environment (default
+        # "yellow") — written once, shared across ygg jobs — when set.
+        flow.base_environment_name = environment
+        return flow.deploy(self.client) if deploy else flow
+
     def stage_insert(
         self,
         data: Any,
         *,
         cast_options: Optional[CastOptions] = None,
-    ) -> VolumePath:
-        """Stage *data* as Parquet under this table's staging area; return the
-        :class:`VolumePath` it landed at — no warehouse statement runs.
+    ) -> "Path":
+        """Stage *data* as Parquet under this table's **Auto Loader staging
+        area** and return the path it landed at — no warehouse statement runs.
 
-        Mints a fresh staging path via :meth:`insert_volume_path` and writes
-        *data* there with the caller's ``cast_options``. Use this to pre-stage
-        rows for a later load without driving the insert SQL.
+        Writes a fresh, uniquely-named Parquet file directly under
+        :meth:`stage_storage_path` — the cloud-storage path a deployed
+        :meth:`auto_loader` job watches — so staged rows are ingested with no
+        extra wiring: ``stage_insert`` → Auto Loader → table. Falls back to the
+        Files-API volume staging (:meth:`staging_folder`) when a direct cloud
+        path isn't available (e.g. a managed table without external staging),
+        preserving a stage-for-later-load there.
         """
-        path = self.insert_volume_path(self, temporary=False)
+        leaf = f"insert-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.parquet"
+        try:
+            root = self.stage_storage_path()
+        except Exception:  # noqa: BLE001 — degrade to Files-API volume staging
+            logger.debug(
+                "stage_insert: direct cloud staging unavailable for %s; "
+                "using volume staging", self, exc_info=True,
+            )
+            root = self.staging_folder(temporary=False)
+        path = root / leaf
         path.write_table(data, cast_options, mode=Mode.OVERWRITE)
         return path
 
@@ -3209,17 +3350,67 @@ class Table(DatabricksPath):
             schema_name=self.schema_name,
         ).volume(value)
 
+    #: TBLPROPERTY under which a table records its resolved external staging
+    #: root URL, so later inserts read it straight from the table metadata
+    #: instead of re-deriving it from the schema storage location.
+    STAGING_ROOT_PROPERTY: ClassVar[str] = "ygg.staging_root"
+
+    def staging_root(self) -> "str | None":
+        """This table's external staging root URL, recorded in TBLPROPERTIES.
+
+        Returns the ``ygg.staging_root`` property when the table already
+        carries it — read straight from cached :attr:`infos`, no re-derivation.
+        Otherwise derives ``<staging-base>/<table-hash>`` — a deterministic
+        per-table hash so the location is stable and collision free — and
+        best-effort stamps it onto the table's TBLPROPERTIES (a missing ALTER
+        grant just means the next caller re-derives it). The staging base is the
+        schema's governed external root (:meth:`UCSchema.staging_location`) when
+        the schema exposes one; otherwise, for an **external** table, it falls
+        back to a sibling of the table's own storage location
+        (``<table-parent>/_ygg_staging``) — governed by the same external
+        location — so staging works even when the schema has no configured
+        external root. Returns ``None`` when neither resolves (e.g. a managed
+        table), so the caller falls back to the default managed staging path.
+        """
+        existing = (self.infos.properties or {}).get(self.STAGING_ROOT_PROPERTY)
+        if existing:
+            return existing
+        base = self.schema.staging_location()
+        if not base:
+            # Fall back to the external table's own governed location: stage in
+            # a ``_ygg_staging`` sibling of the table data (outside its
+            # ``_delta_log`` / data files), within the same external location.
+            location = self.storage_location()
+            if location and self.infos.table_type == TableType.EXTERNAL:
+                base = location.rstrip("/").rsplit("/", 1)[0] + "/_ygg_staging"
+        if not base:
+            return None
+        key = hashlib.blake2b(
+            f"{self.catalog_name}.{self.schema_name}.{self.table_name}".encode("utf-8"),
+            digest_size=16,
+        ).hexdigest()
+        root = f"{base.rstrip('/')}/{key}"
+        try:
+            self.properties[self.STAGING_ROOT_PROPERTY] = root
+        except Exception:
+            logger.debug(
+                "Recording %s on %r failed; will re-derive next time",
+                self.STAGING_ROOT_PROPERTY, self, exc_info=True,
+            )
+        return root
+
     def ensure_staging_volume(self) -> "Volume":
         """Get-or-create this table's staging :class:`Volume` and return it.
 
-        For an **external** table the staging volume is created *external*
-        too, rooted on the schema's storage location — the segment before
-        ``__unitystorage`` — and keyed by a deterministic hash of the table's
-        fully-qualified name: ``<schema_root>/uc/tables/<hash>``. That keeps
-        staged Parquet on the same governed external location as the table
-        (and resolves the same way before the table exists, unlike the UC
-        ``table_id``). A managed table keeps the default (managed) create
-        path, materialised lazily on first write.
+        For an **external** table the staging volume is created *external* too,
+        at the table's :meth:`staging_root` — ``<schema_root>/uc/tables/<hash>``,
+        recorded in the table's TBLPROPERTIES so it's read straight from the
+        table metadata rather than re-derived every time. That keeps staged
+        Parquet on the same governed external location as the table (and
+        resolves the same way before the table exists, unlike the UC
+        ``table_id``). A managed table (or one whose schema exposes no staging
+        root) keeps the default (managed) create path, materialised lazily on
+        first write.
 
         Kept off the :attr:`staging_volume` property on purpose — resolving
         ``infos`` / creating a volume on a bare handle read is too surprising;
@@ -3232,15 +3423,12 @@ class Table(DatabricksPath):
         # path rather than letting the remote lookup raise.
         info = self.read_infos(default=None)
         if info is not None and info.table_type == TableType.EXTERNAL:
-            root = self.schema_storage_location().split("/__unitystorage")[0].rstrip("/")
-            key = hashlib.blake2b(
-                f"{self.catalog_name}.{self.schema_name}.{self.table_name}".encode("utf-8"),
-                digest_size=16,
-            ).hexdigest()
-            volume.get_or_create(
-                volume_type="EXTERNAL",
-                storage_location=f"{root}/uc/tables/{key}",
-            )
+            root = self.staging_root()
+            if root:
+                volume.get_or_create(
+                    volume_type="EXTERNAL",
+                    storage_location=root,
+                )
         return volume
 
     def staging_folder(
@@ -3253,6 +3441,22 @@ class Table(DatabricksPath):
         table — see :meth:`ensure_staging_volume`).
         """
         return self.ensure_staging_volume().path(".sql/tmp", temporary=temporary)
+
+    def stage_storage_path(self, *, sub: str = ".ygg/stage") -> "Path":
+        """The staging area as a direct **cloud storage** :class:`Path`.
+
+        :meth:`staging_folder` hands back a ``/Volumes/...`` :class:`VolumePath`
+        (Files-API addressable); this resolves the *same* external staging
+        volume to its backing object-store location (an ``s3://...``
+        :class:`~yggdrasil.aws.fs.path.S3Path` carrying the volume's vended
+        credentials), so staged files land straight in cloud storage and the
+        path is a plain cloud URL — exactly what Auto Loader (``cloudFiles``)
+        watches. Used as the default :meth:`auto_loader` *source*.
+
+        ``sub`` is the prefix under the volume root the staged files live at.
+        """
+        root = self.ensure_staging_volume().storage_path(mode=Mode.AUTO)
+        return (root / sub) if sub else root
 
     def insert_volume_path(
         self,
@@ -3653,6 +3857,7 @@ class Table(DatabricksPath):
         operation: "TableOperation | ModeLike | None" = None,
         *,
         region: Optional[str] = None,
+        secret_cache: bool = False,
     ) -> "AWSClient":
         """Return an :class:`AWSClient` whose credentials self-refresh
         from Unity Catalog's ``temporary_table_credentials`` API.
@@ -3667,24 +3872,38 @@ class Table(DatabricksPath):
 
         ``operation`` accepts a :class:`TableOperation`, a
         :class:`Mode` / mode-like string, or ``None`` (defaults to the
-        right operation for this table's type).
+        right operation for this table's type). ``secret_cache=True``
+        backs the vended credentials with a per-table Databricks secret
+        scope (off by default).
         """
         op = _resolve_table_operation(operation, self.infos.table_type)
         mode = Mode.READ_ONLY if op == TableOperation.READ else Mode.OVERWRITE
-        return self.credentials_refresher().aws_client(mode=mode, region=region)
+        return self.credentials_refresher(
+            secret_cache=secret_cache,
+        ).aws_client(mode=mode, region=region)
 
-    def credentials_refresher(self) -> "AWSDatabricksTableCredentials":
+    def credentials_refresher(
+        self,
+        *,
+        secret_cache: bool = False,
+    ) -> "AWSDatabricksTableCredentials":
         """Return the process-wide singleton credentials provider for
         this table.
 
         Keyed by ``table_id``; handles both read and write modes
         internally via :meth:`AWSDatabricksTableCredentials.get_credentials`.
+
+        ``secret_cache=True`` opts the provider into persisting its vended
+        AWS credentials in a per-table Databricks secret scope (off by
+        default); the opt-in is sticky across the shared singleton.
         """
         from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
 
         return AWSDatabricksTableCredentials(
             table_id=self.table_id,
             client=self.client,
+            resource_url=self.full_name(),
+            secret_cache=secret_cache,
         )
 
     def temporary_credentials(self, operation: TableOperation = TableOperation.READ):

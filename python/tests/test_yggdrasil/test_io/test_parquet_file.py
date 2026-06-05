@@ -930,7 +930,7 @@ class TestThriftFooterLimits:
     def test_read_passes_thrift_limits_to_parquet_open(self) -> None:
         from unittest.mock import patch
         import pyarrow as pa
-        from yggdrasil.io import parquet_file as pf_mod
+        from yggdrasil.parquet import parquet_file as pf_mod
 
         table = pa.table({"a": [1, 2, 3]})
         mem = Memory()

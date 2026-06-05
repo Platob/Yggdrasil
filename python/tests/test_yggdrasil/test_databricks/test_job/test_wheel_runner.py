@@ -162,6 +162,27 @@ class TestWheel:
         bw.assert_called_once_with("yggdrasil", extras=["databricks"], requirements=(), no_deps=False)
         assert dests == ["/ws/job/ygg-1.0-py3-none-any.whl", "/ws/job/pyarrow-1-py3-none-any.whl"]
 
+    def test_ensure_named_environment_writes_env_yaml_and_returns_path(self):
+        client = MagicMock()
+        path = MagicMock()
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.job.wheel.serverless_environment_version", return_value="5"):
+            DP.from_.return_value = path
+            dest = wheel.ensure_named_environment(
+                client, "yellow",
+                dependencies=["/ws/pypi/ygg-1.0-py3-none-any.whl", "pyarrow==1"],
+            )
+        assert dest == "/Workspace/Shared/ygg/environments/yellow.env.yaml"
+        DP.from_.assert_called_once_with(dest, client=client)
+        path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
+        body = path.write_text.call_args.args[0]
+        assert body == (
+            "environment_version: '5'\n"
+            "dependencies:\n"
+            "  - /ws/pypi/ygg-1.0-py3-none-any.whl\n"
+            "  - pyarrow==1\n"
+        )
+
     def test_import_packages_for_inverts_distribution_for(self):
         # ``ygg`` (pip/dist name) → its top-level import package ``yggdrasil``.
         assert wheel.import_packages_for("ygg") == ["yggdrasil"]
@@ -234,6 +255,59 @@ class TestWheel:
         dw.assert_not_called()                 # rebuild bypasses the reuse probe
         bw.assert_called_once_with("ygg", versions=wheel.SUPPORTED_PYTHONS, extras=("databricks",))
         assert out == ["/ws/job/ygg/ygg-9.9-py3-none-any.whl"]
+
+    def test_ensure_bundle_reuses_full_when_present_and_not_rebuild(self):
+        client = MagicMock()
+        deployed = ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
+                    "/ws/ygg-bundle/pyarrow-1-cp311.whl"]
+        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=deployed), \
+             patch("yggdrasil.databricks.job.wheel.build_wheel") as bw:
+            out = wheel.ensure_bundle(client, "ygg", workspace_dir="/ws")
+        bw.assert_not_called()                 # full cache hit → no build/upload
+        assert out == deployed
+
+    def test_ensure_bundle_rebuild_uploads_only_project_reuses_deps(self):
+        # Warm rebuild (e.g. editable ygg): deps already deployed are reused and
+        # only the project wheel is rebuilt (no_deps) + re-uploaded → fast.
+        client = MagicMock()
+        deployed = ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
+                    "/ws/ygg-bundle/pyarrow-1-cp311.whl",
+                    "/ws/ygg-bundle/polars-2-cp311.whl"]
+        uploaded: list[str] = []
+
+        def _upload(c, w, *, workspace_dir):
+            uploaded.append(w.name)
+            return f"{workspace_dir}/{w.name}"
+
+        def _build(pkg, *, extras=(), requirements=(), no_deps=False):
+            assert no_deps is True   # warm rebuild builds only the project wheel
+            return [Path("/tmp/ygg-9.9-py3-none-any.whl")]
+
+        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=deployed), \
+             patch("yggdrasil.databricks.job.wheel.build_wheel", side_effect=_build), \
+             patch("yggdrasil.databricks.job.wheel.upload_wheel", side_effect=_upload):
+            out = wheel.ensure_bundle(client, "ygg", workspace_dir="/ws", rebuild=True)
+        # Only the project wheel was built + uploaded; the two deps reused by path.
+        assert uploaded == ["ygg-9.9-py3-none-any.whl"]
+        assert out == [
+            "/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",   # freshly built + uploaded
+            "/ws/ygg-bundle/pyarrow-1-cp311.whl",         # reused
+            "/ws/ygg-bundle/polars-2-cp311.whl",          # reused
+        ]
+
+    def test_ensure_bundle_cold_uploads_everything(self):
+        client = MagicMock()
+        built = [Path("/tmp/ygg-9.9-py3-none-any.whl"), Path("/tmp/pyarrow-1-cp311.whl")]
+        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=[]), \
+             patch("yggdrasil.databricks.job.wheel.build_wheel", return_value=built), \
+             patch("yggdrasil.databricks.job.wheel.upload_wheel",
+                   side_effect=lambda c, w, *, workspace_dir: f"{workspace_dir}/{w.name}"):
+            out = wheel.ensure_bundle(client, "ygg", workspace_dir="/ws")
+        assert out == ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
+                       "/ws/ygg-bundle/pyarrow-1-cp311.whl"]
 
     def test_deployed_wheels_dist_only_and_full(self):
         client = MagicMock()

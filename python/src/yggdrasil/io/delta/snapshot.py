@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Mapping, Optio
 
 from yggdrasil.io.delta.log import DeltaLog, LogSegment
 from yggdrasil.io.delta.protocol import (
-    AddFile, DeltaAction, DomainMetadata, Metadata, Protocol, RemoveFile, Txn,
+    AddFile, DomainMetadata, Metadata, Protocol, RemoveFile, Txn,
 )
 
 if TYPE_CHECKING:

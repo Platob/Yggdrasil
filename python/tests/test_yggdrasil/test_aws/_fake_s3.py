@@ -74,6 +74,17 @@ class FakeS3:
             return S3Response(206 if rng else 200, {"Content-Length": str(len(data))}, data)
         if method == "PUT":
             self._bump("put")
+            # ``If-None-Match: *`` is S3's atomic create-if-absent — a PUT that
+            # only succeeds when the key is absent. A losing writer gets 412
+            # PreconditionFailed. This is what makes a Delta commit JSON race
+            # genuinely atomic on object storage, so model it: without it the
+            # conditional-commit path can't be tested.
+            if (headers.get("If-None-Match") or headers.get("if-none-match")) == "*" \
+                    and key in self.objects:
+                self._bump("put_precondition_failed")
+                return self._xml(412, "<Error><Code>PreconditionFailed</Code>"
+                                      "<Message>At least one of the pre-conditions "
+                                      "you specified did not hold</Message></Error>")
             self.objects[key] = body or b""
             return S3Response(200, {"ETag": '"put"'}, b"")
         if method == "DELETE":

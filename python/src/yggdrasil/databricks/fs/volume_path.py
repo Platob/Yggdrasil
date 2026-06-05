@@ -39,6 +39,15 @@ that re-invokes :meth:`temporary_credentials` on every near-expiry
 refresh cycle. One fewer hop per read / write, no Unity Catalog
 quota burn for the bulk transfer.
 
+When the volume is EXTERNAL and the schema grants ``EXTERNAL USE
+SCHEMA`` (:meth:`UCSchema.can_use_external`), the Holder primitives take
+this path automatically and so do :meth:`_stat_uncached` (S3 HEAD),
+:meth:`_remove_file` (``DeleteObject``) and recursive :meth:`_remove_dir`
+(``delete_prefix`` — one list + batched delete vs the Files-API per-leaf
+fan-out) — each falling back to the Files API, and flagging the volume
+not externally read/writable on a permission error, so the direct path
+isn't retried.
+
 Cluster-mount fast path
 -----------------------
 
@@ -605,6 +614,27 @@ class VolumePath(DatabricksPath):
                     size=int(st.st_size),
                     mtime=st.st_mtime,
                 )
+        # Direct-storage fast path (EXTERNAL volume + EXTERNAL USE SCHEMA):
+        # stat straight off the cloud storage — one S3 HEAD (plus a prefix
+        # probe for a directory) instead of the Files-API file/dir probe pair,
+        # and the S3 ``Content-Length`` is authoritative for size. A positive
+        # (FILE / DIRECTORY) result is returned as-is; MISSING falls through to
+        # the Files API, which also recognises the empty / implicit directories
+        # a bare object store can't.
+        sf = self._external_storage_file(write=False)
+        if sf is not None:
+            try:
+                stats = sf._stat_uncached()
+            except Exception as exc:  # vend / HEAD failure → fall back
+                logger.warning(
+                    "external storage stat failed for %r (%s: %s); "
+                    "using the Files API", self, type(exc).__name__, exc,
+                )
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=False)
+            else:
+                if stats.kind is not IOKind.MISSING:
+                    return stats
         # Off-cluster: probe via the Files REST API. Heuristic: a leaf
         # with a ``.`` is almost always a file (``foo.parquet`` /
         # ``part-….json``); a bare leaf is almost always a directory
@@ -796,34 +826,38 @@ class VolumePath(DatabricksPath):
         access is permitted for the backing volume — else ``None`` (caller uses
         the Files API).
 
-        Gated up front on the Unity Catalog prerequisite, checked before any
-        I/O: the volume is EXTERNAL **and** the current user holds
-        ``EXTERNAL USE SCHEMA`` on its schema
-        (:meth:`UCSchema.can_use_external`, cached on the shared schema
-        singleton — one grants lookup decides for the whole process). When
-        granted, an EXTERNAL volume's backing cloud location is reachable
-        directly, so a read / write can skip the Files-API hop and the UC
-        quota burn. The probe is side-effect-free and never raises into the
-        I/O flow; only ``s3://`` locations are served directly today.
-
-        A UC-managed storage layout (``__unitystorage`` / ``__unitycatalog`` in
-        the path) is governed by Unity Catalog — direct ``PutObject`` is denied
-        there — so direct **writes** are disabled for such locations and routed
-        through the Files API; reads may still go direct.
+        Eligibility is decided **once per mode** and cached on the
+        :class:`Volume` singleton (:meth:`Volume.external_access`), so the
+        check doesn't re-run on every I/O. It requires: the volume is EXTERNAL,
+        the current user holds ``EXTERNAL USE SCHEMA`` on its schema
+        (:meth:`UCSchema.can_use_external`), the location is ``s3://``, and —
+        for a write — it isn't a UC-managed ``__unitystorage`` /
+        ``__unitycatalog`` layout (where direct ``PutObject`` is denied). When
+        eligible, the backing cloud location is reachable directly, skipping
+        the Files-API hop and the UC quota burn; only the per-file Path
+        (``root / rel``) is resolved on the cached-eligible path. Never raises
+        into the I/O flow.
         """
         if self._split_volume() is None:
             return None  # path too shallow to address a volume
         try:
             vol = self.volume
-            if (vol.volume_type or "").upper() != "EXTERNAL":
-                return None
-            if not vol.schema.can_use_external():
-                return None
+            cached = vol.external_access(write=write)
+            if cached is False:
+                return None  # known not directly reachable for this mode
             raw = vol.storage_location()
-            if not (URL.from_str(raw).scheme or "").startswith("s3"):
-                return None
-            if write and ("__unitystorage" in raw or "__unitycatalog" in raw):
-                return None  # UC-managed storage — direct writes denied
+            if cached is None:
+                # First time for this mode — run the eligibility check + cache
+                # the verdict so later ops skip straight to path resolution.
+                eligible = (
+                    (vol.volume_type or "").upper() == "EXTERNAL"
+                    and vol.schema.can_use_external()
+                    and (URL.from_str(raw).scheme or "").startswith("s3")
+                    and not (write and ("__unitystorage" in raw or "__unitycatalog" in raw))
+                )
+                vol.mark_external_ok(write=write) if eligible else vol.mark_external_denied(write=write)
+                if not eligible:
+                    return None
             root = vol.aws(mode=Mode.AUTO if write else Mode.READ_ONLY).s3.path(raw)
         except Exception as exc:  # type / location / credential resolution
             logger.debug("external storage path unavailable for %r: %s", self, exc)
@@ -1149,7 +1183,6 @@ class VolumePath(DatabricksPath):
         self._persist_stat_cache(IOStats(kind=IOKind.DIRECTORY))
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
-        del wait
         logger.debug(
             "Deleting volume file %r (missing_ok=%s)", self, missing_ok,
         )
@@ -1164,6 +1197,22 @@ class VolumePath(DatabricksPath):
                 raise
             self.invalidate_singleton()
             return
+        # Direct-storage fast path: ``DeleteObject`` straight off the cloud
+        # storage instead of a Files-API DELETE.
+        sf = self._external_storage_file(write=True)
+        if sf is not None:
+            try:
+                sf._remove_file(missing_ok=missing_ok, wait=wait)
+            except Exception as exc:  # vend / DeleteObject failure → fall back
+                logger.warning(
+                    "external storage delete failed for %r (%s: %s); "
+                    "using the Files API", self, type(exc).__name__, exc,
+                )
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=True)
+            else:
+                self.invalidate_singleton()
+                return
         try:
             self._delete_path("files", self.api_path)
         except Exception:
@@ -1204,6 +1253,28 @@ class VolumePath(DatabricksPath):
                 api_path, recursive,
             )
             return
+        # Direct-storage fast path: drop the tree straight off the cloud
+        # storage — recursive is one ``ListObjectsV2`` + batched
+        # ``DeleteObjects`` (S3Bucket.delete_prefix) instead of the Files-API
+        # per-leaf DELETE fan-out below.
+        sf = self._external_storage_file(write=True)
+        if sf is not None:
+            try:
+                sf._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait)
+            except Exception as exc:  # vend / DeleteObjects failure → fall back
+                logger.warning(
+                    "external storage rmdir failed for %r (%s: %s); "
+                    "using the Files API", self, type(exc).__name__, exc,
+                )
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=True)
+            else:
+                self.invalidate_singleton()
+                logger.info(
+                    "Deleted volume directory %r (recursive=%s) via storage",
+                    self, recursive,
+                )
+                return
         # ``files.delete_directory`` is non-recursive — its docstring is
         # explicit: "To delete a non-empty directory, first delete all
         # of its contents." Hitting it on a non-empty directory returns
@@ -1328,7 +1399,11 @@ class VolumePath(DatabricksPath):
                     "external storage read failed for %r (%s: %s); "
                     "using the Files API", self, type(exc).__name__, exc,
                 )
-                self.volume.schema.mark_external_unusable()
+                # A permission denial means the creds can't read this volume's
+                # storage directly — flag the volume so the read fast path isn't
+                # retried. Other (transient) failures just fall back this once.
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=False)
             else:
                 if n < 0 and pos == 0 and not self._stat_cached:
                     self._persist_stat_cache(
@@ -1550,7 +1625,8 @@ class VolumePath(DatabricksPath):
                     "external storage write failed for %r (%s: %s); "
                     "using the Files API", self, type(exc).__name__, exc,
                 )
-                self.volume.schema.mark_external_unusable()
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=True)
             else:
                 self._persist_stat_cache(
                     IOStats(size=len(payload), kind=IOKind.FILE,
@@ -1641,7 +1717,8 @@ class VolumePath(DatabricksPath):
                     "external storage write failed for %r (%s: %s); "
                     "using the Files API", self, type(exc).__name__, exc,
                 )
-                self.volume.schema.mark_external_unusable()
+                if _looks_like_permission_denied(exc):
+                    self.volume.mark_external_denied(write=True)
             else:
                 self._persist_stat_cache(
                     IOStats(size=size, kind=IOKind.FILE,
@@ -1726,6 +1803,27 @@ def _looks_like_not_found(exc: BaseException) -> bool:
     if isinstance(exc, FileNotFoundError):
         return True
     return "does not exist" in str(exc).lower()
+
+
+def _looks_like_permission_denied(exc: BaseException) -> bool:
+    """True for an access-denied failure, regardless of which layer raised it.
+
+    Covers the stdlib :class:`PermissionError`, the Databricks SDK
+    ``PermissionDenied``, and an :class:`~yggdrasil.aws.fs.s3_http.S3Error`
+    403/401 (``AccessDenied`` / ``Forbidden``) from a direct ``GetObject`` /
+    ``PutObject`` — so a vended credential whose S3 policy still denies the op
+    is recognised and the volume's fast path disabled."""
+    if isinstance(exc, PermissionError):
+        return True
+    if type(exc).__name__ in ("PermissionDenied", "AccessDenied", "Forbidden"):
+        return True
+    if getattr(exc, "status", None) in (401, 403):
+        return True
+    code = getattr(exc, "code", "") or ""
+    if isinstance(code, str) and code.lower() in ("accessdenied", "forbidden", "401", "403"):
+        return True
+    text = str(exc).lower()
+    return "access denied" in text or "forbidden" in text or "not authorized" in text
 
 
 def _looks_like_already_exists(exc: BaseException) -> bool:

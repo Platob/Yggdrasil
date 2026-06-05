@@ -127,7 +127,9 @@ DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
 
-_TRUNCATE_INTERVAL = dt.timedelta(hours=1)
+#: ``received_from`` / ``received_to`` are snapped to this block so requests in
+#: the same window share a cache key (and the same on-disk grouping). 15 minutes.
+_TRUNCATE_INTERVAL = dt.timedelta(minutes=15)
 
 
 def _truncate_from(value: Any) -> Optional[dt.datetime]:
@@ -449,12 +451,12 @@ class CacheConfig:
         """
         if self.tabular is not None:
             return self.tabular
-        from yggdrasil.path.folder import Folder
+        from yggdrasil.http_.response_cache import HttpResponseCache
 
-        if self.cleanup_ttl is not None:
-            _start_cleanup_daemon(_DEFAULT_CACHE_ROOT, self.cleanup_ttl)
-
-        tabular = Folder(path=self.local_cache_folder(session=session))
+        # The local backend is the specialized content-addressed response cache
+        # (one O(1) file per request), not the generic predicate-scanned Folder.
+        # It self-expires day-old responses on construction — no external daemon.
+        tabular = HttpResponseCache(path=self.local_cache_folder(session=session))
         # Stash the built folder back on the config so subsequent
         # cache scans reuse the same instance — the schema cache and
         # predicate ``free_columns`` memo only stay warm across calls
@@ -482,11 +484,16 @@ class CacheConfig:
         and filtered by ``received_from`` / ``received_to``.
         """
         from yggdrasil.io.response import Response
+        from yggdrasil.http_.response_cache import HttpResponseCache
+
+        request_list = list(requests) if not isinstance(requests, list) else requests
+        holder = self.tabular or self.cache_tabular(session=session)
+        if isinstance(holder, HttpResponseCache):
+            return holder.read_responses(request_list, config=self)
 
         tab = self.read_responses_tabular(
-            requests, spark_session=spark_session, session=session,
+            request_list, spark_session=spark_session, session=session,
         )
-        request_list = list(requests) if not isinstance(requests, list) else requests
         if tab is None:
             return [], list(request_list)
 
@@ -579,6 +586,12 @@ class CacheConfig:
 
         holder = self.tabular or self.cache_tabular(session=session)
         if holder is None:
+            return
+
+        from yggdrasil.http_.response_cache import HttpResponseCache
+        if isinstance(holder, HttpResponseCache):
+            # Specialized local cache: write one content-addressed file per row.
+            holder.write_arrow(data)
             return
 
         from yggdrasil.execution.expr import col as _col
