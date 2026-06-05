@@ -102,21 +102,24 @@ class TestSeedProvision(unittest.TestCase):
                    return_value=["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]) as ensure, \
              patch("yggdrasil.databricks.job.wheel.ensure_bundle", return_value=bundle) as build_bundle, \
              patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
-                   return_value="/Workspace/Shared/environments/yellow.env.yaml") as ene, \
+                   return_value="/Workspace/Shared/environments/ygg-1.0.yml") as ene, \
              patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
-                   return_value="/Workspace/Shared/environments/yellow.requirements.txt") as ecr, \
+                   return_value="/Workspace/Shared/environments/ygg-1.0.requirements.txt") as ecr, \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed"])
         self.assertEqual(rc, 0)
         ensure.assert_called_once()
         build_bundle.assert_called_once()
-        # The reusable "yellow" base environment is persisted for both serverless
-        # (env.yaml) and classic clusters (requirements.txt) from the built wheel
-        # bundle — only built wheels in pypi, zero PyPI access at runtime.
+        # The version-pinned base environment is persisted for both serverless
+        # (ygg-<version>.yml) and classic clusters (requirements.txt) from the
+        # built wheel bundle — only built wheels in pypi, zero PyPI at runtime.
         ene.assert_called_once()
         ecr.assert_called_once()
-        self.assertEqual(ene.call_args.args[1], "yellow")
+        self.assertTrue(ene.call_args.args[1].startswith("ygg-"))
+        self.assertTrue(ene.call_args.kwargs["filename"].startswith("ygg-"))
+        self.assertTrue(ene.call_args.kwargs["filename"].endswith(".yml"))
         self.assertEqual(ene.call_args.kwargs["dependencies"], bundle)
+        self.assertTrue(ecr.call_args.args[1].startswith("ygg-"))
         self.assertEqual(ecr.call_args.kwargs["dependencies"], bundle)
         client.warehouses.find_default.assert_called_once()
 
@@ -138,9 +141,39 @@ class TestSeedProvision(unittest.TestCase):
         self.assertEqual(rc, 0)
         ensure.assert_called_once()              # per-Python wheel matrix
         build_bundle.assert_called_once()
-        # Still persists a single canonical "yellow" env from the built bundle.
+        # Still persists a single canonical version-pinned env from the bundle.
         ene.assert_called_once()
         ecr.assert_called_once()
+
+    def test_seed_overwrite_rebuilds_all_wheels_and_ends(self):
+        """--overwrite forces a from-scratch rebuild (all Pythons + bundle),
+        rewrites the env, and ends before the warehouse step."""
+        client = _client_with(default_wh=MagicMock())
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]) as ensure_all, \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure_one, \
+             patch("yggdrasil.databricks.job.wheel.ensure_bundle",
+                   return_value=["/w/pypi/ygg-bundle/ygg-1.0-py3-none-any.whl"]) as build_bundle, \
+             patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
+                   return_value="/w/env/ygg-1.0.yml") as ene, \
+             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
+                   return_value="/w/env/ygg-1.0.requirements.txt") as ecr, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--overwrite"])
+        self.assertEqual(rc, 0)
+        # All wheels rebuilt: the per-Python matrix (not the single-wheel builder)
+        # and the bundle, both forced fresh.
+        ensure_all.assert_called_once()
+        self.assertTrue(ensure_all.call_args.kwargs["rebuild"])
+        ensure_one.assert_not_called()
+        build_bundle.assert_called_once()
+        self.assertTrue(build_bundle.call_args.kwargs["rebuild"])
+        ene.assert_called_once()
+        ecr.assert_called_once()
+        # Ends before the warehouse step.
+        client.warehouses.find_default.assert_not_called()
 
     def test_unreachable_workspace_returns_one_early(self):
         client = MagicMock()

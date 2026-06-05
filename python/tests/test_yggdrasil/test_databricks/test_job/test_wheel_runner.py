@@ -183,6 +183,21 @@ class TestWheel:
             "  - pyarrow==1\n"
         )
 
+    def test_ensure_named_environment_filename_override(self):
+        # The seed pins a version-named ``ygg-<version>.yml`` via *filename*.
+        client = MagicMock()
+        path = MagicMock()
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.job.wheel.serverless_environment_version", return_value="5"):
+            DP.from_.return_value = path
+            dest = wheel.ensure_named_environment(
+                client, "ygg-1.2.3",
+                dependencies=["/ws/pypi/ygg-bundle/ygg-1.2.3-py3-none-any.whl"],
+                filename="ygg-1.2.3.yml",
+            )
+        assert dest == "/Workspace/Shared/environments/ygg-1.2.3.yml"
+        DP.from_.assert_called_once_with(dest, client=client)
+
     def test_ensure_cluster_requirements_writes_flat_requirements_txt(self):
         client = MagicMock()
         path = MagicMock()
@@ -211,6 +226,7 @@ class TestWheel:
             return c
 
         folder.iterdir.return_value = [
+            _child("ygg-1.0.yml"),         # version-pinned serverless env
             _child("yellow.env.yaml"),
             _child("yellow.requirements.txt"),
             _child("README.md"),          # ignored
@@ -218,7 +234,11 @@ class TestWheel:
         with patch("yggdrasil.databricks.path.DatabricksPath") as DP:
             DP.from_.return_value = folder
             paths = wheel.deployed_environments(client)
-        assert paths == ["/ws/env/yellow.env.yaml", "/ws/env/yellow.requirements.txt"]
+        assert paths == [
+            "/ws/env/ygg-1.0.yml",
+            "/ws/env/yellow.env.yaml",
+            "/ws/env/yellow.requirements.txt",
+        ]
 
     def test_deployed_environments_empty_when_dir_absent(self):
         client = MagicMock()
