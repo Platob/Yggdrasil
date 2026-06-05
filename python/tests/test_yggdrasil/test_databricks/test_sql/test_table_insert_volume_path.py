@@ -10,9 +10,7 @@ single instance to verify the full insert plumbs the staging
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, PropertyMock, patch
-
-from databricks.sdk.service.catalog import TableType
+from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.fs import VolumePath
 from yggdrasil.databricks.table.table import Table
@@ -108,11 +106,11 @@ class TestInsertVolumePath:
 
 
 # ---------------------------------------------------------------------------
-# staging_volume — external, rooted at the schema storage location
+# staging_volume — the cheap, lazily-created staging handle
 # ---------------------------------------------------------------------------
 
 
-class TestStagingVolumeExternal:
+class TestStagingVolume:
 
     def test_property_is_a_cheap_handle(self) -> None:
         """Reading ``staging_volume`` never resolves infos or creates a
@@ -125,139 +123,80 @@ class TestStagingVolumeExternal:
         assert isinstance(vol, Volume)
         goc.assert_not_called()
 
-    def test_external_table_derives_root_and_stamps_table_property(self) -> None:
-        """First staging on an external table derives ``<schema-staging>/<hash>``,
-        records it on the table's ``ygg.staging_root`` TBLPROPERTY, and creates
-        the external volume there — never the client default storage location."""
-        import hashlib
+    def test_ensure_get_or_creates_the_staging_volume(self) -> None:
+        """``ensure_staging_volume`` is a plain idempotent get-or-create on the
+        staging volume (managed by default) and returns the volume handle."""
+        tbl = _table("cat", "sch", "tbl")
+        sentinel = object()
+        with patch.object(Volume, "get_or_create", return_value=sentinel) as goc:
+            assert tbl.ensure_staging_volume() is sentinel
+        goc.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# staging_location — the staging volume's external storage location
+# ---------------------------------------------------------------------------
+
+
+class TestStagingLocation:
+
+    def test_getter_reads_volume_storage_location(self) -> None:
         from types import SimpleNamespace
 
-        from yggdrasil.databricks.schema.schema import UCSchema
-
         tbl = _table("cat", "sch", "tbl")
-        # Table has no recorded staging root yet → derive + stamp.
         with patch.object(
-            Table, "read_infos",
-            return_value=SimpleNamespace(table_type=TableType.EXTERNAL),
-        ), patch.object(
-            Table, "infos", new_callable=PropertyMock,
-        ) as infos, patch.object(
-            UCSchema, "staging_location", return_value="s3://bkt/meta/uc/tables",
-        ), patch.object(
-            Table, "properties", new_callable=PropertyMock,
-        ) as props, patch.object(
-            Volume, "get_or_create",
-        ) as goc:
-            infos.return_value.properties = {}        # nothing recorded yet
-            stored: dict = {}
-            props.return_value = stored
-            vol = tbl.ensure_staging_volume()
+            Volume, "read_info",
+            return_value=SimpleNamespace(storage_location="s3://bkt/loc"),
+        ):
+            assert tbl.staging_location == "s3://bkt/loc"
 
-        key = hashlib.blake2b(b"cat.sch.tbl", digest_size=16).hexdigest()
-        expected = f"s3://bkt/meta/uc/tables/{key}"
-        # Stamped on the table's TBLPROPERTIES ...
-        assert stored["ygg.staging_root"] == expected
-        # ... and the external volume was created there.
-        assert isinstance(vol, Volume)
-        goc.assert_called_once()
-        kw = goc.call_args.kwargs
+    def test_getter_none_when_volume_absent(self) -> None:
+        # Non-failing read: a missing staging volume reads as ``None``.
+        tbl = _table("cat", "sch", "tbl")
+        with patch.object(Volume, "read_info", return_value=None):
+            assert tbl.staging_location is None
+
+    def test_setter_creates_external_when_absent(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        with patch.object(Volume, "read_info", return_value=None), \
+                patch.object(Volume, "create") as create, \
+                patch.object(Volume, "delete") as delete:
+            tbl.staging_location = "s3://bkt/loc"
+        delete.assert_not_called()
+        create.assert_called_once()
+        kw = create.call_args.kwargs
+        assert kw["storage_location"] == "s3://bkt/loc"
         assert kw["volume_type"] == "EXTERNAL"
-        assert kw["storage_location"] == expected
 
-    def test_external_table_reuses_recorded_staging_root(self) -> None:
-        # A recorded ``ygg.staging_root`` is used directly — no derivation.
+    def test_setter_skips_when_unchanged(self) -> None:
         from types import SimpleNamespace
 
-        from yggdrasil.databricks.schema.schema import UCSchema
-
         tbl = _table("cat", "sch", "tbl")
         with patch.object(
-            Table, "read_infos",
-            return_value=SimpleNamespace(table_type=TableType.EXTERNAL),
-        ), patch.object(
-            Table, "infos", new_callable=PropertyMock,
-        ) as infos, patch.object(
-            UCSchema, "staging_location",
-        ) as staging, patch.object(
-            Volume, "get_or_create",
-        ) as goc:
-            infos.return_value.properties = {"ygg.staging_root": "s3://pinned/loc"}
-            tbl.ensure_staging_volume()
+            Volume, "read_info",
+            return_value=SimpleNamespace(storage_location="s3://bkt/loc"),
+        ), patch.object(Volume, "create") as create, \
+                patch.object(Volume, "delete") as delete:
+            tbl.staging_location = "s3://bkt/loc"
+        create.assert_not_called()
+        delete.assert_not_called()
 
-        staging.assert_not_called()                 # no re-derivation
-        assert goc.call_args.kwargs["storage_location"] == "s3://pinned/loc"
-
-    def test_external_table_without_any_storage_root_stays_managed(self) -> None:
-        # No schema staging path AND no table storage location → managed default.
+    def test_setter_relocates_via_delete_and_recreate(self) -> None:
+        # An external volume's storage_location is immutable → delete + recreate.
         from types import SimpleNamespace
 
-        from yggdrasil.databricks.schema.schema import UCSchema
-
         tbl = _table("cat", "sch", "tbl")
         with patch.object(
-            Table, "read_infos",
-            return_value=SimpleNamespace(table_type=TableType.EXTERNAL,
-                                         storage_location=None),
-        ), patch.object(
-            Table, "infos", new_callable=PropertyMock,
-        ) as infos, patch.object(
-            UCSchema, "staging_location", return_value=None,
-        ), patch.object(
-            Volume, "get_or_create",
-        ) as goc:
-            infos.return_value.properties = {}
-            infos.return_value.table_type = TableType.EXTERNAL
-            tbl.ensure_staging_volume()
-
-        goc.assert_not_called()
-
-    def test_external_table_falls_back_to_its_own_location(self) -> None:
-        # No schema staging path, but the external table has its own storage
-        # location → stage in a ``_ygg_staging`` sibling of the table data.
-        import hashlib
-        from types import SimpleNamespace
-
-        from yggdrasil.databricks.schema.schema import UCSchema
-
-        tbl = _table("cat", "sch", "tbl")
-        with patch.object(
-            Table, "read_infos",
-            return_value=SimpleNamespace(
-                table_type=TableType.EXTERNAL,
-                storage_location="s3://bkt/ext/cat/sch/tbl",
-            ),
-        ), patch.object(
-            Table, "infos", new_callable=PropertyMock,
-        ) as infos, patch.object(
-            UCSchema, "staging_location", return_value=None,
-        ), patch.object(
-            Table, "properties", new_callable=PropertyMock,
-        ) as props, patch.object(
-            Volume, "get_or_create",
-        ) as goc:
-            infos.return_value.properties = {}
-            infos.return_value.table_type = TableType.EXTERNAL
-            props.return_value = {}
-            tbl.ensure_staging_volume()
-
-        key = hashlib.blake2b(b"cat.sch.tbl", digest_size=16).hexdigest()
-        assert goc.call_args.kwargs["storage_location"] == \
-            f"s3://bkt/ext/cat/sch/_ygg_staging/{key}"
-
-    def test_managed_table_skips_external_create(self) -> None:
-        """A managed table leaves the staging volume to the default (managed)
-        create path — no external get_or_create at the staging boundary."""
-        tbl = _table("cat", "sch", "tbl")
-        with patch.object(
-            Table, "infos", new_callable=PropertyMock,
-        ) as infos, patch.object(
-            Volume, "get_or_create",
-        ) as goc:
-            infos.return_value.table_type = TableType.MANAGED
-            vol = tbl.ensure_staging_volume()
-
-        assert isinstance(vol, Volume)
-        goc.assert_not_called()
+            Volume, "read_info",
+            return_value=SimpleNamespace(storage_location="s3://bkt/old"),
+        ), patch.object(Volume, "create") as create, \
+                patch.object(Volume, "delete") as delete:
+            tbl.staging_location = "s3://bkt/new"
+        delete.assert_called_once()
+        create.assert_called_once()
+        kw = create.call_args.kwargs
+        assert kw["storage_location"] == "s3://bkt/new"
+        assert kw["volume_type"] == "EXTERNAL"
 
 
 # ---------------------------------------------------------------------------

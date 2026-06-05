@@ -185,30 +185,25 @@ class TestAutoLoadEntryPoint:
         assert "cloudFiles.cleanSource" not in calls
 
 
-class TestStageStoragePathAndDefaultSource:
-    def test_stage_storage_path_resolves_volume_storage(self):
+class TestStageStorageAndDefaultSource:
+    def test_auto_loader_defaults_source_to_staging_volume_storage(self):
+        # The default source is the staging volume's cloud storage path joined
+        # with STAGE_SUBPATH — resolved straight off the staging volume.
         from yggdrasil.enums import Mode
         tbl = _table()
         vol = MagicMock()
-        root = MagicMock()
-        sentinel = object()
-        root.__truediv__.return_value = sentinel
-        vol.storage_path.return_value = root
-        with patch.object(Table, "ensure_staging_volume", return_value=vol):
-            out = tbl.stage_storage_path()
-        assert out is sentinel
-        assert vol.storage_path.call_args.kwargs["mode"] is Mode.AUTO
-        root.__truediv__.assert_called_once_with(".ygg/stage")
-
-    def test_auto_loader_defaults_source_to_stage_storage_path(self):
-        tbl = _table()
+        storage_root = MagicMock()
         stage = MagicMock()
-        stage.full_path.return_value = "s3://bkt/3mv/ygg/stage"
-        with patch.object(Table, "stage_storage_path", return_value=stage), \
+        stage.full_path.return_value = "s3://bkt/3mv/.ygg/stage"
+        storage_root.__truediv__.return_value = stage
+        vol.storage_path.return_value = storage_root
+        with patch.object(Table, "ensure_staging_volume", return_value=vol), \
                 patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
             tbl.auto_loader(file_arrival=True)  # no source
 
+        assert vol.storage_path.call_args.kwargs["mode"] is Mode.AUTO
+        storage_root.__truediv__.assert_called_once_with(Table.STAGE_SUBPATH)
         params = Flow.call_args.kwargs["parameters"]
-        assert params[1] == "s3://bkt/3mv/ygg/stage"            # source = staging storage path
+        assert params[1] == "s3://bkt/3mv/.ygg/stage"            # source = staging storage path
         trig = Flow.call_args.kwargs["trigger"]
-        assert trig.file_arrival.url == "s3://bkt/3mv/ygg/stage/"  # file trigger on it
+        assert trig.file_arrival.url == "s3://bkt/3mv/.ygg/stage/"  # file trigger on it
