@@ -188,22 +188,44 @@ class TestAutoLoadEntryPoint:
 class TestStageStorageAndDefaultSource:
     def test_auto_loader_defaults_source_to_staging_volume_storage(self):
         # The default source is the staging volume's cloud storage path joined
-        # with STAGE_SUBPATH — resolved straight off the staging volume.
+        # with STAGE_SUBPATH, and (on this same zero-config path) the checkpoint
+        # defaults to its CHECKPOINT_SUBPATH sibling — both resolved straight off
+        # the staging volume's (writable, external) storage, never the MANAGED
+        # table's governed location.
         from yggdrasil.enums import Mode
         tbl = _table()
         vol = MagicMock()
         storage_root = MagicMock()
-        stage = MagicMock()
-        stage.full_path.return_value = "s3://bkt/3mv/.ygg/stage"
-        storage_root.__truediv__.return_value = stage
+        leaves = {
+            Table.STAGE_SUBPATH: "s3://bkt/3mv/.ygg/stage",
+            Table.CHECKPOINT_SUBPATH: "s3://bkt/3mv/.ygg/_autoloader",
+        }
+        def _join(sub):
+            m = MagicMock()
+            m.full_path.return_value = leaves[sub]
+            return m
+        storage_root.__truediv__.side_effect = _join
         vol.storage_path.return_value = storage_root
         with patch.object(Table, "ensure_staging_volume", return_value=vol), \
                 patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
-            tbl.auto_loader(file_arrival=True)  # no source
+            tbl.auto_loader(file_arrival=True)  # no source, no checkpoint
 
         assert vol.storage_path.call_args.kwargs["mode"] is Mode.AUTO
-        storage_root.__truediv__.assert_called_once_with(Table.STAGE_SUBPATH)
+        storage_root.__truediv__.assert_any_call(Table.STAGE_SUBPATH)
+        storage_root.__truediv__.assert_any_call(Table.CHECKPOINT_SUBPATH)
         params = Flow.call_args.kwargs["parameters"]
-        assert params[1] == "s3://bkt/3mv/.ygg/stage"            # source = staging storage path
+        assert params[1] == "s3://bkt/3mv/.ygg/stage"             # source = staging storage path
+        assert params[3] == "s3://bkt/3mv/.ygg/_autoloader"       # checkpoint = sibling, writable
         trig = Flow.call_args.kwargs["trigger"]
         assert trig.file_arrival.url == "s3://bkt/3mv/.ygg/stage/"  # file trigger on it
+
+    def test_explicit_source_leaves_checkpoint_to_on_cluster_default(self):
+        # With an explicit source and no checkpoint, the staging volume is not
+        # touched and the checkpoint param stays empty so the on-cluster step
+        # derives <table-location>/_ygg_autoloader (unchanged behavior).
+        tbl = _table()
+        with patch.object(Table, "ensure_staging_volume") as ensure, \
+                patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://bkt/landing", file_arrival=False)
+        ensure.assert_not_called()
+        assert Flow.call_args.kwargs["parameters"][3] == ""
