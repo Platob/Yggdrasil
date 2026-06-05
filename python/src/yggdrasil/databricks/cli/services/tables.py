@@ -3,7 +3,7 @@
 Currently exposes Auto Loader ingestion::
 
     ygg databricks tables autoload catalog.schema.table
-    ygg databricks tables autoload my_cat.my_sch.events --file-arrival
+    ygg databricks tables autoload my_cat.my_sch.events --no-file-arrival
     ygg databricks tables autoload c.s.t --source s3://bucket/drop/ --format json --run --wait 900
 
 ``autoload`` get-or-creates the serverless ``cloudFiles`` ingestion job built by
@@ -38,8 +38,9 @@ class TablesCommand:
                         help="Checkpoint + schema location (default: derived next to the table).")
         al.add_argument("--continuous", action="store_true",
                         help="Continuous 1-minute micro-batch stream (default: one AvailableNow sweep).")
-        al.add_argument("--file-arrival", dest="file_arrival", action="store_true",
-                        help="Attach a file-arrival trigger on the source.")
+        al.add_argument("--no-file-arrival", dest="file_arrival", action="store_false",
+                        help="Deploy without the default file-arrival trigger on the source.")
+        al.set_defaults(file_arrival=True)
         al.add_argument("--clean-source", dest="clean_source", action="store_true",
                         help="Delete each staged file once ingested + past retention (self-cleaning).")
         al.add_argument("--clean-source-retention", dest="clean_source_retention", default="8 days",
@@ -77,8 +78,7 @@ class TablesCommand:
         )
         bits = [f"format={args.file_format}",
                 "continuous" if args.continuous else "available-now"]
-        if args.file_arrival:
-            bits.append("file-arrival")
+        bits.append("file-arrival" if args.file_arrival else "no-trigger")
         bits.append(f"env={environment or 'inline'}")
         bits.append("bundle" if not args.no_bundle else "no-bundle")
         style.info(style.dim(" · ".join(bits)))

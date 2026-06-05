@@ -3084,7 +3084,7 @@ class Table(DatabricksPath):
         file_format: str = "parquet",
         checkpoint: "str | None" = None,
         available_now: bool = True,
-        file_arrival: bool = False,
+        file_arrival: bool = True,
         trigger: "Any" = None,
         clean_source: bool = False,
         clean_source_retention: str = "8 days",
@@ -3115,11 +3115,15 @@ class Table(DatabricksPath):
             available_now: ``True`` → a one-shot ``Trigger.AvailableNow`` sweep
                 (the shape a scheduled / file-arrival run wants); ``False`` →
                 continuous micro-batch.
-            file_arrival: ``True`` → attach a file-arrival trigger on *source*
-                so the job fires when new files land (mutually exclusive with a
-                custom *trigger*).
+            file_arrival: ``True`` (default) → attach a file-arrival trigger on
+                *source* so the job fires automatically when new files land —
+                the natural shape for an ingestion job watching a drop path.
+                ``False`` deploys the job with no trigger (run it on a schedule,
+                manually, or via ``.run()``). Ignored when an explicit *trigger*
+                is given.
             trigger: An explicit Databricks ``TriggerSettings`` (schedule /
-                file-arrival), passed through as-is.
+                file-arrival), passed through as-is. Takes precedence over
+                *file_arrival*.
             clean_source: ``True`` makes Auto Loader delete each staged file once
                 it's been ingested and is older than *clean_source_retention*
                 (``cloudFiles.cleanSource = DELETE``) so the staging area is
