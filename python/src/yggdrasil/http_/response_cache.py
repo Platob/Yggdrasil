@@ -6,12 +6,17 @@ parquet pipeline for what is really a key→blob store. :class:`HttpResponseCach
 is the lean replacement for the **local** backend: it's a :class:`Folder` (so it
 drops in wherever the cache expects a Folder/Tabular holder — ``cache_tabular``,
 ``local_cache_folder``, the cleanup daemon under ``~/.cache/http/response``), but
-each response is stored as one small Arrow-IPC file named by the producing
-request's ``public_hash`` (sharded one byte deep). A lookup is then a single
-O(1) file open, a write a single atomic file replace (upsert) — no dataset scan,
-partitioning, predicate, or schema cast.
+each response is stored as one tiny file named by the producing request's
+``public_hash`` (sharded one byte deep): a 1-byte version, a JSON meta header
+(status, received-at, headers, tags) and the raw body — **no Arrow** on the hot
+path. A lookup is then a single O(1) file read + Response rebuild (the looked-up
+request, same identity, is reattached), a write a single atomic file replace
+(upsert). No dataset scan, partitioning, predicate, schema, or Arrow round-trip.
 
-The remote (Databricks Table) backend is untouched and keeps the tabular path.
+A cache hit measures **several times faster than even a localhost HTTP call**,
+with lighter memory than the generic tabular cache — see
+``benchmarks/http_/bench_response_cache.py``. The remote (Databricks Table)
+backend is untouched and keeps the tabular path.
 """
 from __future__ import annotations
 
@@ -35,29 +40,44 @@ _MATCH_KEY = "public_hash"
 _MATCH_COLUMN = "request_public_hash"
 _MAX_WORKERS = 32
 
-#: The HTTP response Arrow schema is static and already lives in the package
-#: (:data:`yggdrasil.http_.schemas.RESPONSE_SCHEMA`). Cache files therefore store
-#: only the record-batch **body** (``RecordBatch.serialize``) and reattach this
-#: schema on read (``read_record_batch``) — instead of embedding + re-parsing the
-#: full (~13 KB, deeply nested) schema in every per-response file.
-_ARROW_SCHEMA: "Any" = None
+# On-disk record: ``\x01`` + uint32 meta-len + meta(JSON) + raw body. The meta
+# is the minimum to rebuild a Response — status, received-at (µs), headers, tags
+# — deliberately NOT Arrow: a per-response Arrow batch carries ~4 KB of framing
+# even for a 16 B body and costs a full from_arrow_tabular rebuild on read. The
+# producing request isn't stored either: a hit is keyed by the request's
+# public_hash, so the *looked-up* request (same identity) is reattached on read.
+_VERSION = 1
 
 
-def _schema() -> "Any":
-    global _ARROW_SCHEMA
-    if _ARROW_SCHEMA is None:
-        from yggdrasil.http_.schemas import RESPONSE_SCHEMA
-        _ARROW_SCHEMA = RESPONSE_SCHEMA.to_arrow_schema()
-    return _ARROW_SCHEMA
+def _encode(status: int, received: "Any", headers: "Any", tags: "Any", body: bytes) -> bytes:
+    import json
+    micros = int(received.timestamp() * 1_000_000) if received is not None else 0
+    meta = json.dumps(
+        {"s": int(status or 0), "r": micros,
+         "h": dict(headers or ()), "t": dict(tags or ())},
+        separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return bytes((_VERSION,)) + len(meta).to_bytes(4, "little") + meta + (body or b"")
 
 
-def _batch_to_bytes(batch: "Any") -> bytes:
-    return batch.serialize().to_pybytes()
+def _decode(data: bytes, request: "Any") -> "Optional[Response]":
+    import json
+    from datetime import datetime, timezone
+    from yggdrasil.io.response import Response
 
-
-def _bytes_to_batch(data: bytes) -> "Any":
-    import pyarrow as pa
-    return pa.ipc.read_record_batch(pa.py_buffer(data), _schema())
+    if not data or data[0] != _VERSION:
+        return None
+    mlen = int.from_bytes(data[1:5], "little")
+    meta = json.loads(data[5:5 + mlen])
+    body = data[5 + mlen:]
+    return Response(
+        request=request,
+        status_code=meta["s"],
+        headers=meta["h"],
+        tags=meta.get("t") or {},
+        buffer=body,
+        received_at=datetime.fromtimestamp(meta["r"] / 1_000_000, tz=timezone.utc),
+    )
 
 
 def _read_bytes(path: pathlib.Path) -> "Optional[bytes]":
@@ -68,8 +88,8 @@ def _read_bytes(path: pathlib.Path) -> "Optional[bytes]":
 
 
 def _write_atomic(path: pathlib.Path, data: bytes) -> None:
+    # Caller (``_write_many``) has already created the shard dir.
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         tmp.write_bytes(data)
         os.replace(tmp, path)     # atomic publish (safe across procs)
@@ -78,7 +98,7 @@ def _write_atomic(path: pathlib.Path, data: bytes) -> None:
 
 
 class HttpResponseCache(Folder):
-    """Content-addressed local HTTP-response cache (one Arrow-IPC file per key)."""
+    """Content-addressed local HTTP-response cache (one lightweight file per key)."""
 
     mime_type: ClassVar[MimeTypes] = MimeTypes.RESPONSE_CACHE_FOLDER
     __slots__ = ("_root",)
@@ -121,8 +141,6 @@ class HttpResponseCache(Folder):
     ) -> "tuple[list, list]":
         """``(hits, misses)`` — each request's per-key file decoded to a
         :class:`Response` and accepted by ``config.filter_response``."""
-        from yggdrasil.io.response import Response
-
         reqs = list(requests)
         if not reqs:
             return [], []
@@ -131,9 +149,7 @@ class HttpResponseCache(Folder):
             data = _read_bytes(self._file(req.match_value(_MATCH_KEY)))
             if data is None:
                 return req, None
-            for resp in Response.from_arrow_tabular(_bytes_to_batch(data)):
-                return req, resp
-            return req, None
+            return req, _decode(data, req)
 
         if len(reqs) == 1:
             loaded = [_load(reqs[0])]
@@ -167,20 +183,40 @@ class HttpResponseCache(Folder):
                 return
             data = to_arrow()
         batches = data.to_batches() if isinstance(data, pa.Table) else [data]
-        schema = _schema()
         for batch in batches:
             if batch.num_rows == 0:
                 continue
-            if batch.schema != schema:
-                # Align to the canonical schema so the schema-less body reads
-                # back correctly; skip rows we can't coerce (best-effort cache).
-                try:
-                    batch = pa.RecordBatch.from_arrays(
-                        [batch.column(n) for n in schema.names], schema=schema)
-                except Exception:
-                    continue
+            cols = set(batch.schema.names)
+            if not ({_MATCH_COLUMN, "status_code", "headers", "body"} <= cols):
+                continue
+            # Pull the few columns we keep once (vectorised), then write one
+            # lightweight file per row.
             keys = batch.column(_MATCH_COLUMN).to_pylist()
-            for i, key in enumerate(keys):
-                if key is None:
-                    continue
-                _write_atomic(self._file(int(key)), _batch_to_bytes(batch.slice(i, 1)))
+            statuses = batch.column("status_code").to_pylist()
+            headers = batch.column("headers").to_pylist()
+            bodies = batch.column("body").to_pylist()
+            receiveds = (batch.column("received_at").to_pylist()
+                         if "received_at" in cols else [None] * len(keys))
+            tags = (batch.column("tags").to_pylist()
+                    if "tags" in cols else [None] * len(keys))
+            records = [
+                (self._file(int(key)),
+                 _encode(statuses[i], receiveds[i], headers[i], tags[i], bodies[i]))
+                for i, key in enumerate(keys) if key is not None
+            ]
+            self._write_many(records)
+
+    @staticmethod
+    def _write_many(records: "list") -> None:
+        if not records:
+            return
+        for d in {f.parent for f, _ in records}:      # create the shard dirs once
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+        if len(records) == 1:
+            _write_atomic(*records[0])
+            return
+        with cf.ThreadPoolExecutor(max_workers=min(len(records), _MAX_WORKERS)) as ex:
+            list(ex.map(lambda item: _write_atomic(*item), records))
