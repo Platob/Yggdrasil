@@ -21,7 +21,7 @@ Usage::
     DATABRICKS_HOST=... DATABRICKS_TOKEN=... \\
     uv run --extra dev --extra aws python \\
       benchmarks/databricks/bench_databricks_volume_external_storage.py \\
-      --base s3://odp-aws-dls3-eu-central-1-a-apps/3mv/ygg \\
+      --base s3://your-bucket/3mv/ygg \\
       --catalog trading_tgp_dev --schema ygg_bench \\
       --size-kib 256 --files 8 --repeat 3
 """
@@ -59,9 +59,8 @@ def _set_mode(volume, *, direct: bool) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--base", default=os.environ.get(
-        "YGG_TEST_EXTERNAL_LOCATION",
-        "s3://odp-aws-dls3-eu-central-1-a-apps/3mv/ygg"))  # -a-apps = dev
+    ap.add_argument("--base", default=os.environ.get("YGG_TEST_EXTERNAL_LOCATION"),
+                    help="writable s3:// base prefix (or set YGG_TEST_EXTERNAL_LOCATION)")
     ap.add_argument("--catalog", default=os.environ.get(
         "DATABRICKS_INTEGRATION_CATALOG", "trading_tgp_dev"))
     ap.add_argument("--schema", default="ygg_bench")
@@ -69,6 +68,8 @@ def main() -> None:
     ap.add_argument("--files", type=int, default=8)
     ap.add_argument("--repeat", type=int, default=3)
     args = ap.parse_args()
+    if not args.base:
+        ap.error("--base or YGG_TEST_EXTERNAL_LOCATION required")
 
     payload = os.urandom(args.size_kib * 1024)
     tag = secrets.token_hex(4)

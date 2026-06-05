@@ -23,8 +23,7 @@ Requires:
     DATABRICKS_HOST, DATABRICKS_TOKEN (or auth profile)
     External-location CREATE grant. Set ``YGG_TEST_EXTERNAL_LOCATION`` to a
     writable base prefix; otherwise these skip cleanly (an environment
-    grant, not a code defect). On the acceptance workspace the base is
-    ``s3://odp-aws-dls3-eu-central-1-a-apps/trading-tgp/ygg_delta_concurrency``.
+    grant, not a code defect).
 
 Run:
     python -m pytest tests/test_yggdrasil/test_delta/test_delta_concurrency_live.py \\
@@ -44,15 +43,8 @@ from tests.test_yggdrasil.test_delta.test_delta_databricks import (
     _DeltaSQLBase, _has_databricks,
 )
 
-_ACCEPTANCE_BASE = (
-    "s3://odp-aws-dls3-eu-central-1-a-apps/trading-tgp/ygg_delta_concurrency"
-)
-
-
 def _external_base() -> "str | None":
-    return os.environ.get("YGG_TEST_EXTERNAL_LOCATION") or (
-        _ACCEPTANCE_BASE if _has_databricks() else None
-    )
+    return os.environ.get("YGG_TEST_EXTERNAL_LOCATION") or None
 
 
 @pytest.mark.integration

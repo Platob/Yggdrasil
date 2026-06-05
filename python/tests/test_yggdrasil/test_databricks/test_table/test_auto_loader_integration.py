@@ -39,11 +39,9 @@ from yggdrasil.enums import Mode
 from .. import DatabricksIntegrationCase
 
 
-def _external_base() -> str:
-    return os.environ.get(
-        "YGG_TEST_EXTERNAL_LOCATION",
-        "s3://odp-aws-dls3-eu-central-1-a-apps/3mv/ygg",
-    ).rstrip("/")
+def _external_base() -> "str | None":
+    base = os.environ.get("YGG_TEST_EXTERNAL_LOCATION")
+    return base.rstrip("/") if base else None
 
 
 @pytest.mark.integration
@@ -70,8 +68,11 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         except Exception as exc:  # noqa: BLE001
             raise unittest.SkipTest(f"cannot grant EXTERNAL USE SCHEMA: {exc}") from exc
 
+        base = _external_base()
+        if not base:
+            raise unittest.SkipTest("set YGG_TEST_EXTERNAL_LOCATION (writable s3:// base prefix)")
         runid = secrets.token_hex(4)
-        cls._base = f"{_external_base()}/it/{runid}"
+        cls._base = f"{base}/it/{runid}"
         cls.table = cls.client.tables.table(
             catalog_name=cls.INTEGRATION_CATALOG,
             schema_name=cls.INTEGRATION_SCHEMA,
