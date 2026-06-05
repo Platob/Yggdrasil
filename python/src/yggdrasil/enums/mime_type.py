@@ -1082,6 +1082,13 @@ class MimeTypes:
         )
     )
 
+    RESPONSE_CACHE_FOLDER = MimeType.define(
+        MimeType(
+            "RESPONSE_CACHE_FOLDER",
+            "inode/directory+http-response-cache",
+        )
+    )
+
     STATEMENT_RESULT = MimeType.define(
         MimeType(
             "STATEMENT_RESULT",
