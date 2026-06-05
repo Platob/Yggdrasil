@@ -127,7 +127,9 @@ DEFAULT_MAX_BATCH_TTL: float = 300.0
 
 
 
-_TRUNCATE_INTERVAL = dt.timedelta(hours=1)
+#: ``received_from`` / ``received_to`` are snapped to this block so requests in
+#: the same window share a cache key (and the same on-disk grouping). 15 minutes.
+_TRUNCATE_INTERVAL = dt.timedelta(minutes=15)
 
 
 def _truncate_from(value: Any) -> Optional[dt.datetime]:
@@ -451,11 +453,9 @@ class CacheConfig:
             return self.tabular
         from yggdrasil.http_.response_cache import HttpResponseCache
 
-        if self.cleanup_ttl is not None:
-            _start_cleanup_daemon(_DEFAULT_CACHE_ROOT, self.cleanup_ttl)
-
         # The local backend is the specialized content-addressed response cache
         # (one O(1) file per request), not the generic predicate-scanned Folder.
+        # It self-expires day-old responses on construction — no external daemon.
         tabular = HttpResponseCache(path=self.local_cache_folder(session=session))
         # Stash the built folder back on the config so subsequent
         # cache scans reuse the same instance — the schema cache and

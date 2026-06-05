@@ -149,6 +149,50 @@ def test_send_pipeline_split_and_read_hits(tmp_path, monkeypatch):
     assert b"SP" in bodies
 
 
+def test_prune_old_deletes_stale_keeps_fresh(tmp_path):
+    import os
+    import time
+    from yggdrasil.http_.response_cache import _prune_old
+
+    root = tmp_path / "c"
+    (root / "ab").mkdir(parents=True)
+    stale = root / "ab" / "1.arrow"
+    stale.write_bytes(b"x")
+    fresh = root / "ab" / "2.arrow"
+    fresh.write_bytes(b"y")
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(stale, (two_days_ago, two_days_ago))
+
+    removed = _prune_old(root, 86400)            # 1-day TTL
+    assert removed == 1
+    assert not stale.exists()
+    assert fresh.exists()
+
+
+def test_cache_self_cleans_on_construction(tmp_path, monkeypatch):
+    # Constructing the cache schedules a one-shot prune of day-old responses.
+    import os
+    import time
+    import yggdrasil.http_.response_cache as rc
+
+    root = tmp_path / "self"
+    (root / "ab").mkdir(parents=True)
+    stale = root / "ab" / "old.arrow"
+    stale.write_bytes(b"x")
+    old = time.time() - 2 * 86400
+    os.utime(stale, (old, old))
+
+    monkeypatch.setattr(rc, "_cleaned_roots", set())   # reset the per-process guard
+    cache = rc.HttpResponseCache(path=str(root))
+    # cleanup runs in a daemon thread — give it a moment, deterministically
+    for _ in range(200):
+        if not stale.exists():
+            break
+        time.sleep(0.01)
+    assert not stale.exists()
+    assert isinstance(cache, rc.HttpResponseCache)
+
+
 def test_send_pipeline_miss_for_uncached(tmp_path, monkeypatch):
     import yggdrasil.http_.cache_config as cc
     monkeypatch.setattr(cc, "_DEFAULT_CACHE_ROOT", tmp_path)

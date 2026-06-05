@@ -170,6 +170,22 @@ class TestCacheConfigRepr:
 # ---------------------------------------------------------------------------
 
 
+class TestReceivedWindowTruncation:
+    """received_from / received_to snap to 15-minute blocks (not 1 hour)."""
+
+    def test_received_from_floors_to_15min(self):
+        c = CacheConfig(received_from=dt.datetime(2024, 1, 1, 10, 7, 30, tzinfo=dt.timezone.utc))
+        assert c.received_from == dt.datetime(2024, 1, 1, 10, 0, tzinfo=dt.timezone.utc)
+
+    def test_received_to_ceils_to_15min(self):
+        c = CacheConfig(received_to=dt.datetime(2024, 1, 1, 10, 7, 30, tzinfo=dt.timezone.utc))
+        assert c.received_to == dt.datetime(2024, 1, 1, 10, 15, tzinfo=dt.timezone.utc)
+
+    def test_already_aligned_unchanged(self):
+        c = CacheConfig(received_from=dt.datetime(2024, 1, 1, 10, 30, tzinfo=dt.timezone.utc))
+        assert c.received_from == dt.datetime(2024, 1, 1, 10, 30, tzinfo=dt.timezone.utc)
+
+
 class TestConstants:
 
     def test_match_key_value(self):

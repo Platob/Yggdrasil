@@ -23,6 +23,8 @@ from __future__ import annotations
 import concurrent.futures as cf
 import os
 import pathlib
+import threading
+import time
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Optional
 
 from yggdrasil.enums.mime_type import MimeTypes
@@ -47,6 +49,51 @@ _MAX_WORKERS = 32
 # producing request isn't stored either: a hit is keyed by the request's
 # public_hash, so the *looked-up* request (same identity) is reattached on read.
 _VERSION = 1
+
+#: Cached responses auto-expire after this (default 1 day; ``0`` disables).
+_CLEAN_TTL = float(os.environ.get("YGG_HTTP_CACHE_TTL") or 86400.0)
+_cleaned_roots: "set[str]" = set()
+_clean_lock = threading.Lock()
+
+
+def _prune_old(root: pathlib.Path, ttl: float) -> int:
+    """Delete files older than *ttl* seconds under *root* and prune the empty
+    shard dirs left behind. Best-effort; returns the count removed."""
+    if ttl <= 0 or not root.exists():
+        return 0
+    cutoff = time.time() - ttl
+    removed = 0
+    for dirpath, _dirs, files in os.walk(str(root), topdown=False):
+        for name in files:
+            fp = os.path.join(dirpath, name)
+            try:
+                if os.stat(fp).st_mtime < cutoff:
+                    os.unlink(fp)
+                    removed += 1
+            except OSError:
+                pass
+        if dirpath != str(root):
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+    return removed
+
+
+def _schedule_clean(root: pathlib.Path) -> None:
+    """Once per root per process, prune day-old responses in a daemon thread —
+    the local cache self-expires so it never grows without bound."""
+    if _CLEAN_TTL <= 0:
+        return
+    key = str(root)
+    with _clean_lock:
+        if key in _cleaned_roots:
+            return
+        _cleaned_roots.add(key)
+    threading.Thread(
+        target=_prune_old, args=(root, _CLEAN_TTL),
+        name="ygg-http-cache-clean", daemon=True,
+    ).start()
 
 
 def _encode(status: int, received: "Any", headers: "Any", tags: "Any", body: bytes) -> bytes:
@@ -107,6 +154,10 @@ class HttpResponseCache(Folder):
                  tabular_parent: Any = None, **kwargs: Any) -> None:
         super().__init__(data, path=path, tabular_parent=tabular_parent, **kwargs)
         self._root: "Optional[pathlib.Path]" = None
+        try:                                   # auto-expire day-old responses
+            _schedule_clean(self.root)
+        except Exception:                      # never let cleanup break construction
+            pass
 
     @property
     def root(self) -> pathlib.Path:
