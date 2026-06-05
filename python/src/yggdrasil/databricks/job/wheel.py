@@ -17,6 +17,7 @@ import importlib
 import importlib.metadata as ilmd
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -41,13 +42,16 @@ __all__ = [
     "synthesize_project",
     "build_wheel",
     "build_wheels_for_versions",
+    "build_bundle",
     "upload_wheel",
+    "registry_upload",
     "ensure_wheel",
     "ensure_wheels",
     "deployed_wheels",
     "ensure_ygg_wheel",
     "ensure_ygg_wheels",
     "ensure_bundle",
+    "ensure_bundles",
     "ensure_named_environment",
     "ensure_cluster_requirements",
     "deployed_environments",
@@ -173,6 +177,14 @@ def user_pypi_dir(client: Any) -> str:
 
 def _norm(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _wheel_dist(filename: str) -> str:
+    """The PEP 503-normalized distribution folder for a wheel *filename* — its
+    first ``-``-delimited component, normalized (``databricks_sdk-0.114.0-...``
+    → ``databricks-sdk``). Names the per-distribution folder a wheel lands in
+    under the workspace pypi registry."""
+    return _norm(Path(filename).name.split("-", 1)[0])
 
 
 def _norm_version(version: str) -> str:
@@ -411,6 +423,53 @@ def build_wheels_for_versions(
     return wheels
 
 
+def build_bundle(
+    package: str,
+    *,
+    python: "str | None" = None,
+    extras: "tuple[str, ...] | list[str]" = ("databricks",),
+    dest_dir: "str | Path | None" = None,
+) -> list[Path]:
+    """Build *package*'s project wheel **plus its whole dependency closure** as
+    wheels for a single Python version — the input to a *zero-PyPI* serverless /
+    cluster environment.
+
+    The compiled dependency wheels must carry the target's ``cp3XX`` tag, so the
+    closure is resolved inside a throwaway **uv venv pinned to** *python*
+    (``uv venv --python X.Y`` downloads the interpreter); ``pip wheel`` run with
+    that interpreter produces wheels for its tag on the host platform — on the
+    Linux CI host that yields the ``manylinux`` wheels the serverless runtime
+    installs. The pure-python project wheel comes out ``py3-none-any`` (shared
+    across versions). Falls back to the current interpreter when uv isn't on
+    PATH (the bundle then matches the deploying host's Python)."""
+    project = synthesize_project(package, extras=extras)
+    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-bundle-"))
+    py = _py_minor(python)
+
+    venv = Path(tempfile.mkdtemp(prefix="ygg-venv-"))
+    try:
+        subprocess.run(["uv", "venv", "--python", py, str(venv)], check=True)
+    except FileNotFoundError:
+        logger.info("uv not found — building the bundle with the host interpreter")
+        return build_wheel(package, extras=extras, no_deps=False, dest_dir=out)
+
+    bindir = venv / ("Scripts" if os.name == "nt" else "bin")
+    vpy = bindir / ("python.exe" if os.name == "nt" else "python")
+    # uv venvs ship without pip; bootstrap it so ``pip wheel`` can resolve the
+    # closure (uv has no ``pip wheel`` equivalent that bundles dependencies).
+    subprocess.run([str(vpy), "-m", "ensurepip", "--upgrade"], check=True)
+    logger.info("building %s bundle for Python %s into %s", package, py, out)
+    subprocess.run(
+        [str(vpy), "-m", "pip", "wheel", str(project), "--wheel-dir", str(out)],
+        check=True,
+    )
+
+    wheels = sorted(out.glob("*.whl"))
+    if not wheels:
+        raise FileNotFoundError(f"no wheels produced in {out}")
+    return wheels
+
+
 def upload_wheel(client: Any, wheel: "str | Path", *, workspace_dir: str = WORKSPACE_WHL_DIR) -> str:
     """Upload *wheel* to *workspace_dir*; return its workspace path."""
     from yggdrasil.databricks.path import DatabricksPath
@@ -418,6 +477,36 @@ def upload_wheel(client: Any, wheel: "str | Path", *, workspace_dir: str = WORKS
     wheel = Path(wheel)
     dest = f"{workspace_dir.rstrip('/')}/{wheel.name}"
     path = DatabricksPath.from_(dest, client=client)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(wheel.read_bytes())
+    logger.info("uploaded wheel to %s", dest)
+    return dest
+
+
+def registry_upload(
+    client: Any,
+    wheel: "str | Path",
+    *,
+    workspace_dir: str = WORKSPACE_PYPI_DIR,
+    overwrite: bool = False,
+) -> str:
+    """Upload *wheel* into its **own distribution folder** under the PyPI-like
+    registry root — ``<workspace_dir>/<dist>/<wheel>`` — so the registry stays a
+    browsable PEP 503 "simple index" (one folder per distribution, versions
+    side-by-side), rather than a flat per-image bundle directory.
+
+    Dependency wheels are version-pinned and immutable, so an already-present
+    target is left untouched and its path returned (the upload is skipped) —
+    unless *overwrite*, which the caller sets for a project's **own** wheel whose
+    code can change under a fixed version (an editable install)."""
+    from yggdrasil.databricks.path import DatabricksPath
+
+    wheel = Path(wheel)
+    dest = f"{workspace_dir.rstrip('/')}/{_wheel_dist(wheel.name)}/{wheel.name}"
+    path = DatabricksPath.from_(dest, client=client)
+    if not overwrite and path.exists():
+        logger.info("reusing deployed wheel %s", dest)
+        return dest
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(wheel.read_bytes())
     logger.info("uploaded wheel to %s", dest)
@@ -567,55 +656,92 @@ def ensure_bundle(
     client: Any,
     package: str = "ygg",
     *,
+    python: "str | None" = None,
     extras: "tuple[str, ...] | list[str]" = ("databricks",),
     workspace_dir: str = WORKSPACE_PYPI_DIR,
     rebuild: bool = False,
 ) -> list[str]:
-    """Build *package* **with its whole transitive dependency closure** as
-    wheels and upload every one; return their workspace paths.
+    """Build *package* **with its whole transitive dependency closure** for one
+    Python version (default: the local interpreter) and deploy every wheel into
+    the workspace pypi registry; return their workspace paths, project wheel
+    first.
 
     Where :func:`ensure_ygg_wheels` ships only the project wheel (deps resolve
-    from the index at install), this bundles everything — so a serverless
-    environment that lists these wheel paths installs **entirely from them, with
-    zero PyPI access** ("0 pip install"). The dependency wheels are built for the
-    deploying host's platform / Python via ``pip wheel``; pin the serverless
-    environment to a matching Python (the deploy already matches the local one).
+    from the index at install), this bundles everything — so a serverless /
+    cluster environment that lists these wheel paths installs **entirely from
+    them, with zero PyPI access** ("0 pip install"). The compiled dependency
+    wheels carry *python*'s ``cp3XX`` tag (:func:`build_bundle`).
 
-    Cached per ``(dist, version)`` in ``<workspace_dir>/<dist>-bundle/``: a
-    bundle whose project wheel is already present is reused unless *rebuild*.
+    Each wheel lands in its **own distribution folder**
+    (``<workspace_dir>/<dist>/<wheel>`` via :func:`registry_upload`) — the
+    PEP 503 simple-index layout the registry already uses for the ygg wheel, so
+    dependency wheels are shared across images and versions sit side-by-side (no
+    per-image ``<dist>-bundle/`` directory).
 
-    *rebuild* uploads **incrementally** — dependency wheels are version-pinned and
-    immutable, so any already in the bundle dir are reused and only the (small)
-    project wheel is refreshed (its code can change at the same version, e.g. an
-    editable install). This keeps a warm redeploy fast: a handful of MB instead of
-    the whole ~100 MB closure."""
+    Cached per ``(dist, version, python)`` by a small ``.bundle`` manifest beside
+    the project wheel (the dep wheels are scattered across distribution folders,
+    so the manifest records the exact set): a bundle whose manifest is present
+    and whose project wheel still exists is reused unless *rebuild*. Uploads are
+    incremental — immutable dependency wheels already in the registry are reused;
+    only the (small) project wheel is re-uploaded."""
+    from yggdrasil.databricks.path import DatabricksPath
+
     dist = distribution_for(package)
     version = ilmd.version(dist)
-    dist_dir = f"{workspace_dir.rstrip('/')}/{_norm(dist)}-bundle"
-    deployed = deployed_wheels(client, dist, version, workspace_dir=dist_dir)
-    if deployed and not rebuild:
-        logger.info(
-            "reusing %d-wheel %s %s bundle at %s",
-            len(deployed), dist, version, dist_dir,
-        )
-        return deployed
-
     proj = _norm(dist)
-    if deployed:
-        # Warm rebuild: the dependency closure is already deployed (immutable,
-        # version-pinned), so only the project wheel can have changed (e.g. an
-        # editable install at the same version). Build + upload just that — uv,
-        # no full pip-wheel closure — and reuse every deployed dependency wheel.
-        logger.info("refreshing %s %s project wheel; reusing deployed deps", dist, version)
-        project_wheels = build_wheel(package, extras=extras, no_deps=True)
-        names = {w.name for w in project_wheels}
-        paths = [upload_wheel(client, w, workspace_dir=dist_dir) for w in project_wheels]
-        paths += [p for p in deployed if p.rsplit("/", 1)[-1] not in names]
-        return paths
+    py = _py_minor(python)
+    root = workspace_dir.rstrip("/")
+    manifest = f"{root}/{proj}/{proj}-{version}-{environment_key_for(py)}.bundle"
+    mpath = DatabricksPath.from_(manifest, client=client)
 
-    logger.info("building full %s %s bundle (project + deps) -> %s", dist, version, dist_dir)
-    wheels = build_wheel(package, extras=extras, no_deps=False)
-    return [upload_wheel(client, w, workspace_dir=dist_dir) for w in wheels]
+    if not rebuild and mpath.exists():
+        paths = [ln.strip() for ln in mpath.read_text().splitlines() if ln.strip()]
+        if paths and DatabricksPath.from_(paths[0], client=client).exists():
+            logger.info(
+                "reusing %d-wheel %s %s bundle for Python %s", len(paths), dist, version, py,
+            )
+            return paths
+
+    logger.info("building %s %s bundle (project + deps) for Python %s -> %s", dist, version, py, root)
+    wheels = build_bundle(package, python=py, extras=extras)
+    # Project wheel(s) first (so the env lists ygg first), then the deps sorted.
+    project_wheels = sorted(w for w in wheels if _wheel_dist(w.name) == proj)
+    dep_wheels = sorted(w for w in wheels if _wheel_dist(w.name) != proj)
+    paths = [
+        registry_upload(client, w, workspace_dir=root, overwrite=True)
+        for w in project_wheels
+    ]
+    paths += [registry_upload(client, w, workspace_dir=root) for w in dep_wheels]
+
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    mpath.write_text("\n".join(paths) + "\n")
+    return paths
+
+
+def ensure_bundles(
+    client: Any,
+    package: str = "ygg",
+    *,
+    versions: "tuple[str, ...] | list[str]" = SUPPORTED_PYTHONS,
+    extras: "tuple[str, ...] | list[str]" = ("databricks",),
+    workspace_dir: str = WORKSPACE_PYPI_DIR,
+    rebuild: bool = False,
+) -> "dict[str, list[str]]":
+    """:func:`ensure_bundle` **for every Python version** — build + deploy a
+    zero-PyPI wheel closure per Python and return ``{python: wheel paths}``.
+
+    The pure-python project wheel is shared across versions (deployed once); only
+    the compiled dependency wheels differ per Python (distinct ``cp3XX`` tags),
+    each landing in its distribution folder. Feed each version's list to a
+    matching serverless ``base_environment`` / cluster requirements file (one per
+    Python — see the ``seed`` command)."""
+    return {
+        version: ensure_bundle(
+            client, package, python=version, extras=extras,
+            workspace_dir=workspace_dir, rebuild=rebuild,
+        )
+        for version in versions
+    }
 
 
 def ensure_named_environment(
@@ -639,8 +765,8 @@ def ensure_named_environment(
 
         environment_version: '5'
         dependencies:
-          - /Workspace/Shared/pypi/ygg-bundle/ygg-0.8.54-py3-none-any.whl
-          - /Workspace/Shared/pypi/ygg-bundle/pyarrow-...-cp312-...-.whl
+          - /Workspace/Shared/pypi/ygg/ygg-0.8.54-py3-none-any.whl
+          - /Workspace/Shared/pypi/pyarrow/pyarrow-...-cp312-...-.whl
 
     The file is ``<name>.env.yaml`` unless *filename* overrides it — the seed
     writes a version-pinned ``ygg-<version>.yml`` so jobs can point at an exact

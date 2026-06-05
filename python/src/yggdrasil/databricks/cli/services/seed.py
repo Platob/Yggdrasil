@@ -11,11 +11,13 @@ It walks four areas:
 
 - **config**      — connectivity, host, current user, default catalog/schema.
 - **wheels**      — the versioned ygg image wheel in the workspace registry.
-- **environments**— the version-pinned base environment ygg jobs run under,
-  persisted under ``/Workspace/Shared/environments`` as ``ygg-<version>.yml``
-  (serverless ``base_environment``) and ``ygg-<version>.requirements.txt``
-  (classic-cluster ``Library(requirements=...)``). Both list only **built wheels
-  in the workspace pypi registry**, so the runtime installs with zero PyPI access.
+- **environments**— the version-pinned base environments ygg jobs run under,
+  persisted under ``/Workspace/Shared/environments`` — **one pair per Python**:
+  ``ygg-<version>-py3XX.yml`` (serverless ``base_environment``) and
+  ``ygg-<version>-py3XX.requirements.txt`` (classic-cluster
+  ``Library(requirements=...)``). Both list only **built wheels in the workspace
+  pypi registry**, so the runtime installs with zero PyPI access. ``--all-versions``
+  (and ``--overwrite``) writes the pair for every supported Python (3.10–3.13).
 - **warehouses**  — a default SQL warehouse to execute statements against.
 
 In the default (seed) mode it builds/uploads the wheel, assembles and writes
@@ -134,25 +136,38 @@ class SeedCommand:
                     style.warn(f"no base environment files under {whl.WORKSPACE_ENV_DIR}")
                     ok = False
             else:
-                # Persist the version-pinned base environment under
-                # /Workspace/Shared/environments so jobs can reference it by path
+                # Persist the version-pinned base environments under
+                # /Workspace/Shared/environments so jobs can reference them by path
                 # (serverless ``base_environment``) and classic clusters can install
-                # from it (``Library(requirements=...)``). Its dependencies are the
-                # ygg image's whole transitive closure built as wheels into the
-                # workspace pypi registry (ensure_bundle) — only built wheels, so the
-                # runtime installs with zero PyPI access.
-                bundle = whl.ensure_bundle(
-                    client, "ygg", workspace_dir=workspace_dir, rebuild=rebuild,
+                # from them (``Library(requirements=...)``). One pair of files per
+                # Python — a serverless ``ygg-<version>-py3XX.yml`` and a cluster
+                # ``ygg-<version>-py3XX.requirements.txt`` — each listing that
+                # Python's whole transitive closure built as wheels into the
+                # workspace pypi registry (ensure_bundle), so the runtime installs
+                # with zero PyPI access. With --all-versions/--overwrite this covers
+                # every supported Python (3.10–3.13); otherwise just the local one.
+                pythons = list(whl.SUPPORTED_PYTHONS) if all_versions else [None]
+                for py in pythons:
+                    bundle = whl.ensure_bundle(
+                        client, "ygg", python=py, workspace_dir=workspace_dir, rebuild=rebuild,
+                    )
+                    key = whl.environment_key_for(py)
+                    env_name = f"ygg-{version}-{key}"
+                    env_yaml = whl.ensure_named_environment(
+                        client, env_name, dependencies=bundle,
+                        environment_version=whl.serverless_environment_version(py),
+                        filename=f"{env_name}.yml",
+                    )
+                    reqs = whl.ensure_cluster_requirements(client, env_name, dependencies=bundle)
+                    style.out(
+                        f"    {style.dim(key)}  {len(bundle)} wheels  "
+                        f"{style.dim('serverless')} {env_yaml}\n"
+                    )
+                    style.out(f"          {style.dim('cluster')}    {reqs}\n")
+                style.ok(
+                    f"base environments written for {len(pythons)} Python version(s) "
+                    f"(serverless + cluster)"
                 )
-                style.out(f"    {style.dim('wheels')}     {len(bundle)} {style.dim('(built, in pypi)')}\n")
-                env_name = f"ygg-{version}"
-                env_yaml = whl.ensure_named_environment(
-                    client, env_name, dependencies=bundle, filename=f"{env_name}.yml",
-                )
-                reqs = whl.ensure_cluster_requirements(client, env_name, dependencies=bundle)
-                style.out(f"    {style.dim('serverless')} {env_yaml}\n")
-                style.out(f"    {style.dim('cluster')}    {reqs}\n")
-                style.ok(f"base environment {env_name!r} written (serverless + cluster)")
         except Exception as exc:
             style.fail(f"environment step failed: {exc}")
             ok = False
