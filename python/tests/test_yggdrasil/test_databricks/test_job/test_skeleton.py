@@ -277,14 +277,14 @@ def test_named_base_environment_referenced_when_present():
         ...
 
     # Simulate a deploy that wrote a reusable base env + a user-package layer.
-    f._base_environment_path = "/Workspace/Shared/ygg/environments/yellow.env.yaml"
+    f._base_environment_path = "/Workspace/Shared/environments/yellow.env.yaml"
     f._user_layer = ["/ws/userpkg-2.0-py3-none-any.whl", "requests==2"]
     f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl",)  # inline fallback, unused here
 
     envs = f.environments()
     assert len(envs) == 1
     spec = envs[0].spec
-    assert spec.base_environment == "/Workspace/Shared/ygg/environments/yellow.env.yaml"
+    assert spec.base_environment == "/Workspace/Shared/environments/yellow.env.yaml"
     # base env carries the version → not set alongside it; only the layer rides on top.
     assert spec.environment_version is None
     assert spec.dependencies == ["/ws/userpkg-2.0-py3-none-any.whl", "requests==2"]
@@ -295,7 +295,7 @@ def test_named_base_environment_empty_layer_is_none():
     def f(x):
         ...
 
-    f._base_environment_path = "/Workspace/Shared/ygg/environments/yellow.env.yaml"
+    f._base_environment_path = "/Workspace/Shared/environments/yellow.env.yaml"
     f._user_layer = []  # ygg-only job — nothing layered on top
     envs = f.environments()
     assert envs[0].spec.dependencies is None

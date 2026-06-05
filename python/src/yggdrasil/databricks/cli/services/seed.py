@@ -11,9 +11,10 @@ It walks four areas:
 - **config**      — connectivity, host, current user, default catalog/schema.
 - **wheels**      — the versioned ygg image wheel in the workspace registry.
 - **environments**— the reusable ``yellow`` base environment ygg jobs run
-  under, persisted to the workspace as ``yellow.env.yaml`` (serverless
-  ``base_environment``) and ``yellow.requirements.txt`` (classic-cluster
-  ``Library(requirements=...)``).
+  under, persisted under ``/Workspace/Shared/environments`` as ``yellow.env.yaml``
+  (serverless ``base_environment``) and ``yellow.requirements.txt``
+  (classic-cluster ``Library(requirements=...)``). Both list only **built wheels
+  in the workspace pypi registry**, so the runtime installs with zero PyPI access.
 - **warehouses**  — a default SQL warehouse to execute statements against.
 
 In the default (seed) mode it builds/uploads the wheel, assembles and writes
@@ -109,13 +110,7 @@ class SeedCommand:
         style.info("environments")
         try:
             if check:
-                # The serverless version is chosen off the local Python and the
-                # deps come from installed metadata (no build); then we verify the
-                # reusable environment files were actually written (read-only).
-                env_version = whl.serverless_environment_version()
-                deps = whl.ygg_runtime_dependencies()
-                style.out(f"    {style.dim('env version')}  {env_version} {style.dim('(matches local Python)')}\n")
-                style.out(f"    {style.dim('runtime deps')} {len(deps)}\n")
+                # Read-only: verify the reusable environment files were written.
                 persisted = whl.deployed_environments(client)
                 if persisted:
                     for path in persisted[:6]:
@@ -125,30 +120,19 @@ class SeedCommand:
                     style.warn(f"no base environment files under {whl.WORKSPACE_ENV_DIR}")
                     ok = False
             else:
-                # rebuild=False: reuse the wheel just built above.
-                if args.all_versions:
-                    envs = whl.ygg_environments(client, workspace_dir=workspace_dir, rebuild=False)
-                else:
-                    envs = [whl.ygg_environment(client, workspace_dir=workspace_dir, rebuild=False)]
-                for env in envs:
-                    style.out(f"    {style.dim('env')}  {env.environment_key}  "
-                              f"{style.dim('v' + str(env.spec.environment_version))}  "
-                              f"{style.dim(str(len(env.spec.dependencies)) + ' deps')}\n")
-                style.ok(f"{len(envs)} JobEnvironment(s) ready")
-
-                # Persist the canonical reusable "yellow" base environment so jobs
-                # can reference it by path (serverless ``base_environment``) and
-                # classic clusters can install from it (``Library(requirements=...)``).
-                # Derived from the local-matched "default" image (envs[0]).
-                base = envs[0]
-                env_yaml = whl.ensure_named_environment(
-                    client, "yellow",
-                    dependencies=base.spec.dependencies,
-                    environment_version=base.spec.environment_version,
+                # Persist the canonical reusable "yellow" base environment under
+                # /Workspace/Shared/environments so jobs can reference it by path
+                # (serverless ``base_environment``) and classic clusters can install
+                # from it (``Library(requirements=...)``). Its dependencies are the
+                # ygg image's whole transitive closure built as wheels into the
+                # workspace pypi registry (ensure_bundle) — only built wheels, so the
+                # runtime installs with zero PyPI access.
+                bundle = whl.ensure_bundle(
+                    client, "ygg", workspace_dir=workspace_dir, rebuild=args.rebuild,
                 )
-                reqs = whl.ensure_cluster_requirements(
-                    client, "yellow", dependencies=base.spec.dependencies,
-                )
+                style.out(f"    {style.dim('wheels')}     {len(bundle)} {style.dim('(built, in pypi)')}\n")
+                env_yaml = whl.ensure_named_environment(client, "yellow", dependencies=bundle)
+                reqs = whl.ensure_cluster_requirements(client, "yellow", dependencies=bundle)
                 style.out(f"    {style.dim('serverless')} {env_yaml}\n")
                 style.out(f"    {style.dim('cluster')}    {reqs}\n")
                 style.ok("base environment 'yellow' written (serverless + cluster)")

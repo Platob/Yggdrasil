@@ -172,7 +172,7 @@ class TestWheel:
                 client, "yellow",
                 dependencies=["/ws/pypi/ygg-1.0-py3-none-any.whl", "pyarrow==1"],
             )
-        assert dest == "/Workspace/Shared/ygg/environments/yellow.env.yaml"
+        assert dest == "/Workspace/Shared/environments/yellow.env.yaml"
         DP.from_.assert_called_once_with(dest, client=client)
         path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
         body = path.write_text.call_args.args[0]
@@ -192,7 +192,7 @@ class TestWheel:
                 client, "yellow",
                 dependencies=["/ws/pypi/ygg-1.0-py3-none-any.whl", "pyarrow==1"],
             )
-        assert dest == "/Workspace/Shared/ygg/environments/yellow.requirements.txt"
+        assert dest == "/Workspace/Shared/environments/yellow.requirements.txt"
         DP.from_.assert_called_once_with(dest, client=client)
         path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
         body = path.write_text.call_args.args[0]
