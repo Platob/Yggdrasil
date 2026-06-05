@@ -98,6 +98,45 @@ class TestConfigureWrite(unittest.TestCase):
         self.assertNotIn("token", parser["sp"])
         self.assertEqual(json.loads(session.read_text())["auth_type"], "oauth")
 
+    def test_sso_dumps_token_in_session_and_writes_no_secret(self):
+        with _sandbox() as (cfg, session, client):
+            client.files_authorization.return_value = "Bearer sso-tok-xyz"
+            rc = main(["configure", "--config-file", cfg, "--profile", "browser",
+                       "--host", "https://ws", "--sso"])
+        self.assertEqual(rc, 0)
+        # Profile carries the auth type, no static secret.
+        parser = configparser.ConfigParser()
+        parser.read(cfg)
+        self.assertEqual(parser["browser"]["auth_type"], "external-browser")
+        self.assertNotIn("token", parser["browser"])
+        self.assertNotIn("client_secret", parser["browser"])
+        # SSO bearer captured into the session (it lives nowhere else).
+        meta = json.loads(session.read_text())
+        self.assertEqual(meta["auth_type"], "external-browser")
+        self.assertEqual(meta["access_token"], "sso-tok-xyz")
+        self.assertEqual(meta["token_type"], "Bearer")
+        client.files_authorization.assert_called_once()
+
+    def test_explicit_auth_type_implies_sso(self):
+        with _sandbox() as (cfg, session, client):
+            client.files_authorization.return_value = "Bearer az-tok"
+            rc = main(["configure", "--config-file", cfg, "--profile", "az",
+                       "--host", "https://ws", "--auth-type", "azure-cli"])
+        self.assertEqual(rc, 0)
+        parser = configparser.ConfigParser()
+        parser.read(cfg)
+        self.assertEqual(parser["az"]["auth_type"], "azure-cli")
+        self.assertEqual(json.loads(session.read_text())["access_token"], "az-tok")
+
+    def test_pat_session_has_no_access_token(self):
+        with _sandbox() as (cfg, session, client):
+            rc = main(["configure", "--config-file", cfg,
+                       "--host", "https://ws", "--token", "t"])
+        self.assertEqual(rc, 0)
+        meta = json.loads(session.read_text())
+        self.assertNotIn("access_token", meta)
+        client.files_authorization.assert_not_called()
+
     def test_no_session_skips_remember(self):
         with _sandbox() as (cfg, session, client):
             rc = main(["configure", "--config-file", cfg, "--no-session",

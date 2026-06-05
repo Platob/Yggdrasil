@@ -118,6 +118,10 @@ ygg databricks configure --profile prod --host https://prod... --token dapi...
 # OAuth service principal instead of a PAT
 ygg databricks configure --profile sp --host https://ws \
   --client-id <id> --client-secret <secret>
+
+# SSO — interactive browser login; no secret on disk, the session token
+# is captured into the remembered session
+ygg databricks configure --profile browser --host https://ws --sso
 ```
 
 | Flag | Purpose |
@@ -126,6 +130,8 @@ ygg databricks configure --profile sp --host https://ws \
 | `--host` | Workspace URL (prompted if omitted; `https://` is prepended when missing) |
 | `--token` | Personal access token (prompted hidden if omitted) |
 | `--client-id` / `--client-secret` | OAuth service-principal credentials — written instead of a token |
+| `--sso` | Authenticate via SSO (interactive browser). No static secret is written; the resolved session token is dumped into the session |
+| `--auth-type` | Explicit auth type (`external-browser`, `azure-cli`, `databricks-cli`, …); implies `--sso` when no token/secret is given |
 | `--account-id` | Account id for account-level profiles |
 | `--config-file` | Config file path (default `$DATABRICKS_CONFIG_FILE` or `~/.databrickscfg`) |
 | `--no-verify` | Skip the credential check (don't call the workspace) |
@@ -140,6 +146,12 @@ workspace/account ids, timestamp — is dumped into the session folder
 per-machine default). **No secrets** (token / client secret) are written
 into the session file. A failed verification still keeps the profile on
 disk (it just warns).
+
+For an **SSO** login (`--sso` / `--auth-type`) the credential isn't on disk
+— it's an ephemeral bearer minted by the interactive flow — so the
+resolved session token *is* captured into the snapshot (`access_token`),
+letting later tooling replay the session without re-prompting the browser.
+The session file is then locked to owner-only (`600`).
 
 ### `configure list`
 

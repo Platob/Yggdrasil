@@ -10,19 +10,23 @@ Three things in one command:
    preserved; only the named section is rewritten.
 2. **Verify** the credentials by building a :class:`DatabricksClient`
    against the freshly written profile and resolving the current user
-   (skippable with ``--no-verify``).
+   (skippable with ``--no-verify``). With ``--sso`` this runs the
+   interactive browser / CLI flow.
 3. **Remember the session** — the verified client becomes the process
    *current* client (:meth:`DatabricksClient.set_current`) and a small
    metadata snapshot of the latest session (profile, host, user,
    workspace/account ids, timestamp) is dumped into the session folder
    ``~/.config/databricks-sdk-py/sessions/`` as ``<hostname>.json`` (the
    per-machine default) so later tooling can default to "the workspace I
-   last configured on this host".
+   last configured on this host". For an **SSO** login the credential is
+   not on disk, so the resolved session bearer token is captured into the
+   snapshot too (and the file is locked to owner-only).
 
 Sub-actions::
 
     ygg databricks configure                 # write + verify + remember
     ygg databricks configure --profile prod --host https://… --token dapi…
+    ygg databricks configure --sso --host https://…   # SSO: dump the token
     ygg databricks configure list            # list profiles in ~/.databrickscfg
     ygg databricks configure session         # show the remembered session
 """
@@ -61,6 +65,12 @@ class ConfigureCommand:
                             help="OAuth client id (service principal) — written instead of a token.")
         parser.add_argument("--client-secret", dest="configure_client_secret", default=None,
                             help="OAuth client secret.")
+        parser.add_argument("--sso", dest="sso", action="store_true",
+                            help="Authenticate via SSO (interactive browser) — no static credential "
+                                 "is written; the resolved session token is dumped into the session.")
+        parser.add_argument("--auth-type", dest="configure_auth_type", default=None,
+                            help="Explicit auth type (external-browser, azure-cli, databricks-cli, …); "
+                                 "implies SSO when no token/secret is given.")
         parser.add_argument("--account-id", dest="configure_account_id", default=None,
                             help="Databricks account id (for account-level profiles).")
         parser.add_argument("--config-file", dest="configure_config_file", default=None,
@@ -122,6 +132,7 @@ class ConfigureCommand:
         token = getattr(args, "configure_token", None) or getattr(args, "token", None)
         client_id = getattr(args, "configure_client_id", None)
         client_secret = getattr(args, "configure_client_secret", None)
+        auth_type = getattr(args, "configure_auth_type", None)
         account_id = getattr(args, "configure_account_id", None)
 
         interactive = sys.stdin.isatty()
@@ -138,27 +149,39 @@ class ConfigureCommand:
             host = "https://" + host
         host = host.rstrip("/")
 
-        # -- gather credential ------------------------------------------
-        # OAuth (client id/secret) takes precedence when supplied; otherwise
-        # a PAT, prompted hidden when interactive.
+        # -- pick the credential mode -----------------------------------
+        # OAuth M2M (client id/secret) wins when supplied; SSO (a browser /
+        # CLI flow, no static secret) when ``--sso`` / ``--auth-type`` is set;
+        # otherwise a PAT, prompted hidden when interactive.
         oauth = bool(client_id or client_secret)
-        if not oauth and not token and interactive:
-            import getpass
-            token = getpass.getpass("  Token (hidden): ").strip()
-        if oauth:
+        sso = bool(getattr(args, "sso", False) or auth_type) and not oauth and not token
+        if sso:
+            auth_type = auth_type or "external-browser"
+            kind = "sso"
+        elif oauth:
             if not (client_id and client_secret):
                 style.fail("OAuth needs both --client-id and --client-secret")
                 return 1
-        elif not token:
-            style.fail("a token is required (--token or DATABRICKS_TOKEN)")
-            return 1
+            kind = "oauth"
+        else:
+            if not token and interactive:
+                import getpass
+                token = getpass.getpass("  Token (hidden): ").strip()
+            if not token:
+                style.fail("a credential is required: --token, --client-id/--client-secret, or --sso")
+                return 1
+            kind = "pat"
 
         # -- write the profile ------------------------------------------
         config_file = cls._config_file(args)
         fields: dict[str, str] = {"host": host}
-        if oauth:
+        if kind == "oauth":
             fields["client_id"] = client_id
             fields["client_secret"] = client_secret
+        elif kind == "sso":
+            # SSO carries no static secret — only the host + auth type so the
+            # SDK runs the right interactive flow on use.
+            fields["auth_type"] = auth_type
         else:
             fields["token"] = token
         if account_id:
@@ -175,10 +198,16 @@ class ConfigureCommand:
         # exactly what's on disk (not the in-process env / flags).
         client = DatabricksClient(profile=profile, config_file=str(config_file))
 
+        # SSO must authenticate to mint a token to remember — force the flow
+        # even if the user passed --no-verify.
+        verify = (not args.no_verify) or (kind == "sso" and not args.no_session)
         user: Optional[str] = None
-        if not args.no_verify:
+        if verify:
             try:
-                with style.Spinner("verifying credentials...", color="33"):
+                with style.Spinner(
+                    "signing in via SSO..." if kind == "sso" else "verifying credentials...",
+                    color="33",
+                ):
                     user = client.workspace_client().current_user.me().user_name
                 style.ok(f"authenticated as {style.bold(user)}")
             except Exception as exc:  # noqa: BLE001 — profile is saved regardless
@@ -187,8 +216,10 @@ class ConfigureCommand:
         if not args.no_session:
             DatabricksClient.set_current(client)
             path = cls._dump_session(client, profile=profile, host=host,
-                                     config_file=config_file, user=user, oauth=oauth)
-            style.ok(f"remembered as current session → {path}")
+                                     config_file=config_file, user=user, kind=kind,
+                                     auth_type=auth_type)
+            extra = style.dim(" (incl. SSO token)") if kind == "sso" else ""
+            style.ok(f"remembered as current session → {path}{extra}")
 
         style.out("\n")
         style.out(f"  Use it: {style.dim('ygg databricks --profile ' + profile + ' <command>')}\n")
@@ -235,14 +266,20 @@ class ConfigureCommand:
         host: str,
         config_file: Path,
         user: Optional[str],
-        oauth: bool,
+        kind: str,
+        auth_type: Optional[str] = None,
     ) -> Path:
         """Persist a snapshot of the just-configured session.
 
         A tiny JSON record of "the workspace the user last set up" — enough
         for later tooling to default to it without re-reading credentials.
-        No secrets are written: token / client_secret are deliberately left
-        out; only the non-sensitive identity + routing metadata is dumped.
+
+        For **PAT / OAuth** profiles no secret is written (the credential
+        already lives in ``~/.databrickscfg``); only non-sensitive identity +
+        routing metadata is dumped. For **SSO** the credential is *not* on
+        disk — it's an ephemeral, interactively-minted bearer — so the
+        resolved session token is captured here, and the session file is
+        locked down to owner-only.
         """
         import socket
 
@@ -251,7 +288,7 @@ class ConfigureCommand:
             "host": host,
             "hostname": socket.gethostname() or None,
             "config_file": str(config_file),
-            "auth_type": "oauth" if oauth else "pat",
+            "auth_type": auth_type or kind,
             "user": user,
             "product": getattr(client, "product", None),
             "product_version": getattr(client, "product_version", None),
@@ -265,9 +302,29 @@ class ConfigureCommand:
             except Exception:  # noqa: BLE001
                 meta[key] = None
 
+        has_secret = False
+        if kind == "sso":
+            # Resolve the bearer the SSO flow just minted and stash it so the
+            # session can be replayed without re-prompting the browser.
+            try:
+                header = client.files_authorization()  # "Bearer <token>"
+                scheme, _, value = header.partition(" ")
+                meta["token_type"] = scheme or "Bearer"
+                meta["access_token"] = value or header
+                has_secret = True
+            except Exception as exc:  # noqa: BLE001 — token capture is best-effort
+                meta["access_token"] = None
+                meta["token_error"] = str(exc)
+
         path = cls._session_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(meta, indent=2, default=str))
+        # A captured SSO bearer is a secret — owner-only, like ~/.databrickscfg.
+        if has_secret:
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
         return path
 
     # ------------------------------------------------------------------ #
