@@ -3359,15 +3359,15 @@ class Table(DatabricksPath):
     #: Sub-prefix under the staging volume's storage root where Auto Loader
     #: staged files live (kept apart from the ``.sql/tmp`` insert scratch so a
     #: deployed auto_loader job never sweeps up arrow_insert's temp Parquet).
-    STAGE_SUBPATH: ClassVar[str] = ".ygg/stage"
+    STAGE_SUBPATH: ClassVar[str] = ".staging/data"
 
     #: Sub-prefix under the staging volume's storage root holding the Auto Loader
     #: streaming checkpoint + inferred schema. A sibling of :attr:`STAGE_SUBPATH`
-    #: (so the watched ``stage/`` dir never ingests checkpoint files) and on the
-    #: writable external staging storage rather than a MANAGED table's governed
-    #: ``__unitystorage`` location (which Unity Catalog forbids Auto Loader from
-    #: writing into — ``LOCATION_OVERLAP``).
-    CHECKPOINT_SUBPATH: ClassVar[str] = ".ygg/_autoloader"
+    #: under ``.staging/`` (so the watched ``data/`` dir never ingests checkpoint
+    #: files) and on the writable external staging storage rather than a MANAGED
+    #: table's governed ``__unitystorage`` location (which Unity Catalog forbids
+    #: Auto Loader from writing into — ``LOCATION_OVERLAP``).
+    CHECKPOINT_SUBPATH: ClassVar[str] = ".staging/_autoloader"
 
     @property
     def staging_location(self) -> "str | None":
