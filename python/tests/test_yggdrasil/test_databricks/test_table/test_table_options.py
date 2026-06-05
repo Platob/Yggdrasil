@@ -1,18 +1,13 @@
 """``TableOptions.engine`` (EngineType) → compute-engine dispatch.
 
 ``engine`` picks YGGDRASIL (native DeltaFolder) / DATABRICKS_SQL_WAREHOUSE /
-SPARK explicitly; ``None`` guesses best (active Spark → SPARK; a Delta table
-under its native-path size cap → YGGDRASIL **for reads only**; else →
-DATABRICKS_SQL_WAREHOUSE). A write never auto-routes to the native
-storage-path commit off the table being external — it defaults to the
-warehouse (staging volume + SQL) and takes the native path only when
-``engine=YGGDRASIL`` is set explicitly. The read cap is kept **tight** for
-EXTERNAL tables (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``, 8 MiB) — the direct
-external-storage scan reaches out of the workspace, so only small external
-tables auto-read native — while managed tables, scanned through governed
-storage, keep the larger ``_NATIVE_DELTA_MAX_BYTES`` (128 MiB) cap. A
-YGGDRASIL pick on a table that can't take the native path, or a UC-credential
-failure, degrades to the warehouse.
+SPARK explicitly; ``None`` guesses best (active Spark → SPARK; else →
+DATABRICKS_SQL_WAREHOUSE). The native DeltaFolder path is **never** auto-routed
+— for a read or a write — because reading/writing straight off the table's
+storage ``_delta_log`` bypasses the warehouse (and its governance / staging);
+it is taken only when ``engine=YGGDRASIL`` is set explicitly. A YGGDRASIL pick
+on a table that can't take the native path, or a UC-credential failure,
+degrades to the warehouse.
 """
 from __future__ import annotations
 
@@ -31,11 +26,7 @@ from databricks.sdk.service.catalog import (
 from yggdrasil.data.options import CastOptions
 from yggdrasil.enums import EngineType
 from yggdrasil.databricks.table.options import TableOptions
-from yggdrasil.databricks.table.table import (
-    Table,
-    _NATIVE_DELTA_MAX_BYTES,
-    _NATIVE_DELTA_MAX_BYTES_EXTERNAL,
-)
+from yggdrasil.databricks.table.table import Table
 
 WH = EngineType.DATABRICKS_SQL_WAREHOUSE
 YG = EngineType.YGGDRASIL
@@ -151,7 +142,8 @@ class TestResolveEngineExplicit:
 
 
 class TestResolveEngineGuess:
-    """``engine=None`` — active Spark vs Delta-size heuristic."""
+    """``engine=None`` — active Spark → SPARK, else warehouse. The native
+    DeltaFolder path is never auto-selected (read or write)."""
 
     def _ext(self):
         return _table(TableType.EXTERNAL, DataSourceFormat.DELTA)
@@ -159,61 +151,22 @@ class TestResolveEngineGuess:
     def test_active_spark_guesses_spark(self, monkeypatch):
         t = self._ext()
         monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: True))
-        monkeypatch.setattr(Table, "_delta_total_bytes", lambda self: 1)
         assert t._resolve_engine(TableOptions(), write=False) is SP
+        assert t._resolve_engine(TableOptions(), write=True) is SP
 
-    def test_small_external_delta_guesses_yggdrasil_read_only(self, monkeypatch):
-        # A small external Delta table (under the tight 8 MiB external cap)
-        # guesses native for a *read*; a write never auto-routes to native off
-        # the table type — it goes to the warehouse.
+    def test_external_delta_read_guesses_warehouse(self, monkeypatch):
+        # Even a small external Delta table no longer auto-reads native — the
+        # native path must be requested explicitly with ``engine=YGGDRASIL``.
         t = self._ext()
         monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
-        monkeypatch.setattr(
-            Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES_EXTERNAL - 1,
-        )
-        assert t._resolve_engine(TableOptions(), write=False) is YG
+        assert t._resolve_engine(TableOptions(), write=False) is WH
         assert t._resolve_engine(TableOptions(), write=True) is WH
 
-    def test_external_above_tight_cap_guesses_warehouse_read(self, monkeypatch):
-        # The external cap is *tight*: an external Delta table even a little
-        # over 8 MiB no longer auto-reads native — the out-of-workspace direct
-        # scan is avoided in favour of the warehouse.
-        t = self._ext()
-        monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
-        monkeypatch.setattr(
-            Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES_EXTERNAL + 1,
-        )
-        assert t._resolve_engine(TableOptions(), write=False) is WH
-
-    def test_large_external_delta_guesses_warehouse(self, monkeypatch):
-        # At/above the external cap a larger external table goes to the warehouse.
-        t = self._ext()
-        monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
-        monkeypatch.setattr(
-            Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES_EXTERNAL,
-        )
-        assert t._resolve_engine(TableOptions(), write=False) is WH
-
-    def test_managed_above_small_cap_guesses_warehouse(self, monkeypatch):
-        # A managed table keeps the small cap: above 128 MiB → warehouse (read).
+    def test_managed_delta_read_guesses_warehouse(self, monkeypatch):
         t = _table(TableType.MANAGED, DataSourceFormat.DELTA)
         monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
-        monkeypatch.setattr(Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES)
         assert t._resolve_engine(TableOptions(), write=False) is WH
-
-    def test_unknown_size_guesses_warehouse(self, monkeypatch):
-        t = self._ext()
-        monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
-        monkeypatch.setattr(Table, "_delta_total_bytes", lambda self: None)
-        assert t._resolve_engine(TableOptions(), write=False) is WH
-
-    def test_managed_write_guess_warehouse_even_when_small(self, monkeypatch):
-        t = _table(TableType.MANAGED, DataSourceFormat.DELTA)
-        monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
-        monkeypatch.setattr(Table, "_delta_total_bytes", lambda self: 1)
-        # managed write isn't delta-capable → warehouse; managed read is native
         assert t._resolve_engine(TableOptions(), write=True) is WH
-        assert t._resolve_engine(TableOptions(), write=False) is YG
 
 
 class TestCredentialFallback:
