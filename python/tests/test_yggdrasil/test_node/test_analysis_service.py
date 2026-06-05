@@ -12,8 +12,8 @@ import pyarrow.parquet as pq
 from yggdrasil.exceptions.api import BadRequestError
 from yggdrasil.node.api.schemas.analysis import (
     AggMeasure, AggregateRequest, CastSpec, ExportRequest, FilterSpec,
-    FinanceRequest, ForecastRequest, OhlcRequest, PivotRequest, SeriesRequest,
-    Transform,
+    FinanceRequest, ForecastRequest, IndicatorsRequest, OhlcRequest,
+    PivotRequest, PortfolioRequest, SeriesRequest, Transform,
 )
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService
@@ -396,6 +396,136 @@ class TestForecast(unittest.TestCase):
             home = Path(d); _series(home)
             with self.assertRaises(BadRequestError):
                 asyncio.run(_svc(home).forecast(ForecastRequest(path="s.parquet", column="nope")))
+
+
+def _price_walk(home: Path, name: str, n=120, seed=0, drift=0.001) -> None:
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    px = 100.0 * np.cumprod(1.0 + rng.normal(drift, 0.01, n))
+    pq.write_table(pa.table({"t": list(range(n)), "price": px.tolist()}), str(home / name))
+
+
+class TestIndicators(unittest.TestCase):
+    def test_all_indicators_present_and_named(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _price_walk(home, "p.parquet")
+            res = asyncio.run(_svc(home).indicators(IndicatorsRequest(
+                path="p.parquet", column="price", order_by="t",
+                indicators=["rsi", "macd", "bb", "atr", "stoch"], window=14)))
+            names = [s.name for s in res.indicators]
+            self.assertEqual(names, [
+                "rsi", "macd_line", "macd_signal", "macd_hist",
+                "bb_upper", "bb_mid", "bb_lower", "atr", "stoch_k", "stoch_d"])
+            self.assertEqual(len(res.price), 120)
+            self.assertEqual(len(res.index), 120)
+            self.assertFalse(res.truncated)
+            for s in res.indicators:
+                self.assertEqual(len(s.values), 120)
+
+    def test_rsi_bounded_0_100(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _price_walk(home, "p.parquet")
+            res = asyncio.run(_svc(home).indicators(IndicatorsRequest(
+                path="p.parquet", column="price", indicators=["rsi"], window=14)))
+            rsi = res.indicators[0].values
+            self.assertIsNone(rsi[0])                          # warmup window null
+            self.assertTrue(all(v is None or 0.0 <= v <= 100.0 for v in rsi))
+
+    def test_bb_bands_ordered(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _price_walk(home, "p.parquet")
+            res = asyncio.run(_svc(home).indicators(IndicatorsRequest(
+                path="p.parquet", column="price", indicators=["bb"], window=20)))
+            up = {s.name: s.values for s in res.indicators}
+            for u, m, lo in zip(up["bb_upper"], up["bb_mid"], up["bb_lower"]):
+                if None not in (u, m, lo):
+                    self.assertGreaterEqual(u, m)
+                    self.assertGreaterEqual(m, lo)
+
+    def test_unknown_indicator_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _price_walk(home, "p.parquet")
+            with self.assertRaises(BadRequestError):
+                asyncio.run(_svc(home).indicators(IndicatorsRequest(
+                    path="p.parquet", column="price", indicators=["bogus"])))
+
+    def test_missing_column_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _price_walk(home, "p.parquet")
+            with self.assertRaises(BadRequestError):
+                asyncio.run(_svc(home).indicators(IndicatorsRequest(
+                    path="p.parquet", column="ghost")))
+
+
+class TestPortfolio(unittest.TestCase):
+    def test_multi_asset_metrics_and_correlation(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            _price_walk(home, "a.parquet", seed=1)
+            _price_walk(home, "b.parquet", seed=2)
+            _price_walk(home, "c.parquet", seed=3)
+            res = asyncio.run(_svc(home).portfolio(PortfolioRequest(
+                paths=["a.parquet", "b.parquet", "c.parquet"],
+                columns=["price", "price", "price"], order_by="t")))
+            self.assertEqual(res.labels, ["a", "b", "c"])
+            self.assertEqual(len(res.correlation), 3)
+            self.assertEqual(len(res.correlation[0]), 3)
+            for i in range(3):
+                self.assertAlmostEqual(res.correlation[i][i], 1.0, places=6)
+            self.assertEqual(len(res.assets), 3)
+            for a in res.assets:
+                self.assertIsNotNone(a.sharpe)
+                self.assertIsNotNone(a.beta)
+                self.assertIsNotNone(a.max_drawdown)
+
+    def test_cvar_at_or_below_var(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            _price_walk(home, "a.parquet", seed=1)
+            _price_walk(home, "b.parquet", seed=2)
+            res = asyncio.run(_svc(home).portfolio(PortfolioRequest(
+                paths=["a.parquet", "b.parquet"], columns=["price", "price"],
+                order_by="t", confidence=0.95)))
+            self.assertIsNotNone(res.var_95)
+            self.assertLessEqual(res.cvar_95, res.var_95)
+
+    def test_aligns_to_shortest_series(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            _price_walk(home, "a.parquet", n=120, seed=1)
+            _price_walk(home, "b.parquet", n=80, seed=2)
+            res = asyncio.run(_svc(home).portfolio(PortfolioRequest(
+                paths=["a.parquet", "b.parquet"], columns=["price", "price"], order_by="t")))
+            self.assertEqual(len(res.index), 80)              # min length
+            self.assertEqual(len(res.prices[0]), 80)
+            self.assertEqual(len(res.prices[1]), 80)
+
+    def test_default_labels_from_file_stem(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            _price_walk(home, "tsla.parquet", seed=1)
+            _price_walk(home, "aapl.parquet", seed=2)
+            res = asyncio.run(_svc(home).portfolio(PortfolioRequest(
+                paths=["tsla.parquet", "aapl.parquet"], columns=["price", "price"],
+                labels=["TSLA"])))                            # second falls back to stem
+            self.assertEqual(res.labels, ["TSLA", "aapl"])
+
+    def test_length_mismatch_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d); _price_walk(home, "a.parquet")
+            with self.assertRaises(BadRequestError):
+                asyncio.run(_svc(home).portfolio(PortfolioRequest(
+                    paths=["a.parquet"], columns=["price", "price"])))
+
+    def test_too_many_assets_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            paths = [f"p{i}.parquet" for i in range(9)]
+            for i, p in enumerate(paths):
+                _price_walk(home, p, seed=i)
+            with self.assertRaises(BadRequestError):
+                asyncio.run(_svc(home).portfolio(PortfolioRequest(
+                    paths=paths, columns=["price"] * 9)))
 
 
 if __name__ == "__main__":

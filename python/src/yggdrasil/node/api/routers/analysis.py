@@ -13,10 +13,14 @@ from ..schemas.analysis import (
     FinanceResult,
     ForecastRequest,
     ForecastResult,
+    IndicatorsRequest,
+    IndicatorsResult,
     OhlcRequest,
     OhlcResult,
     PivotRequest,
     PivotResult,
+    PortfolioRequest,
+    PortfolioResult,
     SeriesRequest,
     SeriesResult,
 )
@@ -127,6 +131,34 @@ async def ohlc(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/ohlc", json_body=req.model_dump())
     return await service.ohlc(req)
+
+
+@router.post("/indicators", response_model=IndicatorsResult)
+async def indicators(
+    req: IndicatorsRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> IndicatorsResult:
+    """Technical indicators (RSI, MACD, Bollinger Bands, ATR, Stochastic) over
+    a price series. Runs where the data lives."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/indicators", json_body=req.model_dump())
+    return await service.indicators(req)
+
+
+@router.post("/portfolio", response_model=PortfolioResult)
+async def portfolio(
+    req: PortfolioRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> PortfolioResult:
+    """Multi-asset portfolio analytics: per-asset risk/return + beta, the
+    cross-asset correlation matrix, and equal-weight VaR/CVaR."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/portfolio", json_body=req.model_dump())
+    return await service.portfolio(req)
 
 
 @router.post("/export")

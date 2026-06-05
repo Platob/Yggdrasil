@@ -21,8 +21,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.node.api.schemas.analysis import (
-    AggMeasure, AggregateRequest, ForecastRequest, OhlcRequest, PivotRequest,
-    SeriesRequest,
+    AggMeasure, AggregateRequest, ForecastRequest, IndicatorsRequest,
+    OhlcRequest, PortfolioRequest, PivotRequest, SeriesRequest,
 )
 from yggdrasil.node.api.services.analysis import AnalysisService
 from yggdrasil.node.api.services.fs import FsService

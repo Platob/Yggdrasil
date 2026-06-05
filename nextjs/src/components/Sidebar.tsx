@@ -108,12 +108,18 @@ const Icons = {
       <path d="M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6" />
     </svg>
   ),
+  trading: (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 12h2.5M7.5 6v12M10 12h2.5M13.5 4v16M16 12h2.5M19.5 8v8" />
+    </svg>
+  ),
 };
 
 const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard", icon: Icons.dashboard, exact: true },
   { href: "/", label: "Home", icon: Icons.home, exact: true },
   { href: "/metrics", label: "Metrics", icon: Icons.metrics },
+  { href: "/trading", label: "Trading", icon: Icons.trading },
   { href: "/nodes", label: "Nodes", icon: Icons.nodes },
   { href: "/topology", label: "Topology", icon: Icons.topology },
   { href: "/functions", label: "Functions", icon: Icons.functions },

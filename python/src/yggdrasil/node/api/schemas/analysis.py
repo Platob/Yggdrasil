@@ -221,3 +221,65 @@ class ForecastResult(StrictModel):
     series: list[ForecastSeries]
     source_rows: int
     sampled: bool = False
+
+
+# -- trading indicators + portfolio analytics -------------------------------
+
+class IndicatorsRequest(StrictModel):
+    path: str
+    column: str
+    order_by: str | None = None
+    indicators: list[str] = ["rsi", "macd", "bb"]  # rsi|macd|bb|atr|stoch
+    window: int = 14
+    limit: int = 2000
+    filters: list[FilterSpec] = []
+
+
+class IndicatorSeries(StrictModel):
+    name: str
+    values: list[float | None]
+
+
+class IndicatorsResult(StrictModel):
+    node_id: str
+    path: str
+    column: str
+    index: list[Any]
+    price: list[float | None]
+    indicators: list[IndicatorSeries]
+    truncated: bool
+
+
+class PortfolioRequest(StrictModel):
+    paths: list[str]
+    columns: list[str]
+    labels: list[str] = []
+    order_by: str | None = None
+    window: int = 20
+    limit: int = 2000
+    risk_free: float = 0.0
+    periods_per_year: int = 252
+    confidence: float = 0.95
+
+
+class PortfolioAsset(StrictModel):
+    label: str
+    total_return: float | None = None
+    ann_return: float | None = None
+    ann_volatility: float | None = None
+    sharpe: float | None = None
+    max_drawdown: float | None = None
+    beta: float | None = None
+
+
+class PortfolioResult(StrictModel):
+    node_id: str
+    labels: list[str]
+    index: list[Any]
+    prices: list[list[float | None]]
+    returns: list[list[float | None]]
+    correlation: list[list[float | None]]
+    assets: list[PortfolioAsset]
+    var_95: float | None = None
+    cvar_95: float | None = None
+    truncated: bool

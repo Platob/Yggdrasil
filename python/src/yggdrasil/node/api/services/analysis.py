@@ -36,10 +36,16 @@ from ..schemas.analysis import (
     ForecastRequest,
     ForecastResult,
     ForecastSeries,
+    IndicatorSeries,
+    IndicatorsRequest,
+    IndicatorsResult,
     OhlcRequest,
     OhlcResult,
     PivotRequest,
     PivotResult,
+    PortfolioAsset,
+    PortfolioRequest,
+    PortfolioResult,
     SeriesRequest,
     SeriesResult,
     Transform,
@@ -95,6 +101,12 @@ class AnalysisService:
 
     async def forecast(self, req: "ForecastRequest") -> "ForecastResult":
         return await run_in_threadpool(partial(self._forecast, req))
+
+    async def indicators(self, req: "IndicatorsRequest") -> "IndicatorsResult":
+        return await run_in_threadpool(partial(self._indicators, req))
+
+    async def portfolio(self, req: "PortfolioRequest") -> "PortfolioResult":
+        return await run_in_threadpool(partial(self._portfolio, req))
 
     def _forecast(self, req: "ForecastRequest") -> "ForecastResult":
         """Forecast a value column over time (optionally per group key).
@@ -490,9 +502,10 @@ class AnalysisService:
                 col.quantile(0.50).alias(f"{c}|50%"), col.quantile(0.75).alias(f"{c}|75%"),
                 col.max().alias(f"{c}|max"),
             ]
+        exprs.append(pl.len().alias("__n"))
         row = lf.select(num).select(exprs).collect(engine="streaming")
         rows = [[_safe(row[f"{c}|{stat}"][0]) for c in num] for stat in _STATS]
-        source_rows = lf.select(pl.len()).collect(engine="streaming").item()
+        source_rows = int(row["__n"][0])
         return DescribeResult(
             node_id=self.settings.node_id, path=path,
             statistics=_STATS, columns=num, rows=rows,
@@ -572,6 +585,191 @@ class AnalysisService:
             roll_mean=_safe_list(roll_mean), roll_vol=_safe_list(roll_vol),
             ema=_safe_list(ema), drawdown=_safe_list(drawdown), metrics=metrics,
             truncated=truncated,
+        )
+
+    # -- trading indicators -------------------------------------------------
+
+    def _indicators(self, req: IndicatorsRequest) -> IndicatorsResult:
+        lf = self._apply_filters(self._frame(req.path), req.filters)
+        cols = set(lf.collect_schema().names())
+        if req.column not in cols:
+            raise BadRequestError(f"column {req.column!r} not found")
+        has_x = bool(req.order_by and req.order_by in cols)
+        keep = list(dict.fromkeys([req.column] + ([req.order_by] if has_x else [])))
+        plan = lf.select(keep)
+        if has_x:
+            plan = plan.sort(req.order_by)
+        cap = min(req.limit, self._row_cap_for_bytes(plan))
+        df = plan.head(cap + 1).collect(engine="streaming")
+        truncated = df.height > cap
+        if truncated:
+            df = df.head(cap)
+
+        val = df[req.column].cast(pl.Float64, strict=False)
+        index = df[req.order_by].to_list() if has_x else list(range(df.height))
+        win = max(2, req.window)
+        out: list[IndicatorSeries] = []
+
+        def _emit(name: str, series: pl.Series) -> None:
+            out.append(IndicatorSeries(name=name, values=_safe_list(series)))
+
+        for ind in req.indicators:
+            if ind == "rsi":
+                # RSI: rolling mean of gains over losses. Equal-weighted rolling
+                # avg (not Wilder's EMA) keeps it polars-native.
+                delta = val - val.shift(1)
+                gain = delta.clip(lower_bound=0.0)
+                loss = (-delta).clip(lower_bound=0.0)
+                avg_gain = gain.rolling_mean(window_size=win)
+                avg_loss = loss.rolling_mean(window_size=win)
+                rs = avg_gain / avg_loss
+                rsi = (100.0 - 100.0 / (1.0 + rs)).fill_nan(None)
+                # Zero average loss → no downside in the window → RSI 100 (but
+                # keep the leading NaN-warmup rows null, where avg_gain is null).
+                hot = (avg_loss == 0.0) & avg_gain.is_not_null()
+                rsi = rsi.zip_with(~hot, pl.repeat(100.0, rsi.len(), eager=True))
+                _emit("rsi", rsi)
+            elif ind == "macd":
+                ema12 = val.ewm_mean(span=12, ignore_nulls=True)
+                ema26 = val.ewm_mean(span=26, ignore_nulls=True)
+                macd_line = ema12 - ema26
+                signal = macd_line.ewm_mean(span=9, ignore_nulls=True)
+                hist = macd_line - signal
+                _emit("macd_line", macd_line)
+                _emit("macd_signal", signal)
+                _emit("macd_hist", hist)
+            elif ind == "bb":
+                mid = val.rolling_mean(window_size=win)
+                sd = val.rolling_std(window_size=win)
+                _emit("bb_upper", mid + 2.0 * sd)
+                _emit("bb_mid", mid)
+                _emit("bb_lower", mid - 2.0 * sd)
+            elif ind == "atr":
+                # Single-column fallback: true range collapses to the absolute
+                # bar-to-bar move when high/low aren't available.
+                tr = (val - val.shift(1)).abs()
+                _emit("atr", tr.rolling_mean(window_size=win))
+            elif ind == "stoch":
+                # Single-column fallback: %K over rolling price extremes.
+                lo = val.rolling_min(window_size=win)
+                hi = val.rolling_max(window_size=win)
+                k = (100.0 * (val - lo) / (hi - lo)).fill_nan(None)
+                d = k.rolling_mean(window_size=3)
+                _emit("stoch_k", k)
+                _emit("stoch_d", d)
+            else:
+                raise BadRequestError(
+                    f"unknown indicator {ind!r}; one of rsi|macd|bb|atr|stoch")
+
+        return IndicatorsResult(
+            node_id=self.settings.node_id, path=req.path, column=req.column,
+            index=[_safe(v) for v in index], price=_safe_list(val),
+            indicators=out, truncated=truncated,
+        )
+
+    # -- portfolio analytics ------------------------------------------------
+
+    def _portfolio(self, req: PortfolioRequest) -> PortfolioResult:
+        if len(req.paths) != len(req.columns):
+            raise BadRequestError(
+                f"paths ({len(req.paths)}) and columns ({len(req.columns)}) "
+                "must be the same length")
+        if not req.paths:
+            raise BadRequestError("portfolio needs at least one asset")
+        if len(req.paths) > 8:
+            raise BadRequestError(f"max 8 assets, got {len(req.paths)}")
+
+        ppy = max(1, req.periods_per_year)
+        labels: list[str] = []
+        prices: list[np.ndarray] = []
+        truncated = False
+        for i, (path, column) in enumerate(zip(req.paths, req.columns)):
+            lf = self._frame(path)
+            cols = set(lf.collect_schema().names())
+            if column not in cols:
+                raise BadRequestError(f"column {column!r} not found in {path!r}")
+            has_x = bool(req.order_by and req.order_by in cols)
+            keep = list(dict.fromkeys([column] + ([req.order_by] if has_x else [])))
+            plan = lf.select(keep)
+            if has_x:
+                plan = plan.sort(req.order_by)
+            cap = min(req.limit, self._row_cap_for_bytes(plan))
+            df = plan.head(cap + 1).collect(engine="streaming")
+            if df.height > cap:
+                truncated = True
+                df = df.head(cap)
+            prices.append(df[column].cast(pl.Float64, strict=False).to_numpy())
+            label = req.labels[i] if i < len(req.labels) else self.fs._resolve(path).stem
+            labels.append(label)
+
+        # Align by position to the shortest series — the simplest cross-asset
+        # join that needs no shared key (documented assumption).
+        n = min(p.shape[0] for p in prices)
+        px = np.vstack([p[:n].astype(float) for p in prices])  # (assets, n)
+        # Periodic simple returns; first column is NaN (no prior bar).
+        rets = np.full_like(px, np.nan)
+        rets[:, 1:] = px[:, 1:] / px[:, :-1] - 1.0
+
+        assets: list[PortfolioAsset] = []
+        import warnings
+        with warnings.catch_warnings():
+            # First column is all-NaN (no prior bar) → empty-slice mean; ignore.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            port_ret = np.nanmean(rets, axis=0)  # equal-weight portfolio return
+        for ai, label in enumerate(labels):
+            p = px[ai]
+            r = rets[ai][1:]
+            r = r[np.isfinite(r)]
+            metric = PortfolioAsset(label=label)
+            if r.size and np.isfinite(p[0]) and p[0]:
+                first, last = float(p[0]), float(p[-1])
+                metric.total_return = (last / first - 1.0) if first else None
+                mean_r = float(np.nanmean(r))
+                std_r = float(np.nanstd(r, ddof=1)) if r.size > 1 else 0.0
+                ann_ret = mean_r * ppy
+                ann_vol = std_r * math.sqrt(ppy)
+                metric.ann_return = ann_ret
+                metric.ann_volatility = ann_vol
+                metric.sharpe = ((ann_ret - req.risk_free) / ann_vol) if ann_vol else None
+                equity = np.cumprod(1.0 + np.nan_to_num(rets[ai], nan=0.0))
+                peak = np.maximum.accumulate(equity)
+                dd = equity / peak - 1.0
+                metric.max_drawdown = float(dd.min()) if dd.size else None
+                # Beta vs the equal-weight portfolio over aligned bars.
+                a = rets[ai][1:]
+                b = port_ret[1:]
+                mask = np.isfinite(a) & np.isfinite(b)
+                if mask.sum() > 1:
+                    var_b = float(np.var(b[mask], ddof=1))
+                    cov = float(np.cov(a[mask], b[mask], ddof=1)[0, 1])
+                    metric.beta = (cov / var_b) if var_b else None
+            assets.append(metric)
+
+        # Correlation matrix over the aligned per-asset return rows.
+        valid = rets[:, 1:]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.corrcoef(np.nan_to_num(valid, nan=0.0)) if n > 2 else np.full((len(labels), len(labels)), np.nan)
+        corr = np.atleast_2d(corr)
+        correlation = [[_safe(float(corr[i, j])) for j in range(len(labels))] for i in range(len(labels))]
+
+        # Equal-weight portfolio VaR/CVaR at the requested confidence: the
+        # loss quantile of the combined return distribution.
+        pr = port_ret[np.isfinite(port_ret)]
+        var = cvar = None
+        if pr.size:
+            q = max(0.0, min(1.0, 1.0 - req.confidence))
+            var = float(np.quantile(pr, q))
+            tail = pr[pr <= var]
+            cvar = float(tail.mean()) if tail.size else var
+
+        index = list(range(n))
+        return PortfolioResult(
+            node_id=self.settings.node_id, labels=labels,
+            index=[_safe(v) for v in index],
+            prices=[[_safe(float(v)) for v in px[i]] for i in range(len(labels))],
+            returns=[[_safe(float(v)) for v in rets[i]] for i in range(len(labels))],
+            correlation=correlation, assets=assets,
+            var_95=_safe(var), cvar_95=_safe(cvar), truncated=truncated,
         )
 
     # -- adaptive downsample ------------------------------------------------

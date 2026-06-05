@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  getCatalogs, getSchemas, getTables, finance,
-  type TableEntry, type FinanceResult,
+  getCatalogs, getSchemas, getTables, finance, analysisIndicators,
+  type FinanceResult, type IndicatorsResult,
 } from "@/lib/api";
 import Chart from "@/components/Chart";
 import { NUMERIC } from "@/lib/format";
@@ -19,6 +19,10 @@ function pct(v: number | null | undefined): string {
 }
 function num(v: number | null | undefined, d = 2): string {
   return v == null ? "--" : v.toFixed(d);
+}
+
+function ind(res: IndicatorsResult | null, name: string): (number | null)[] {
+  return res?.indicators.find((i) => i.name === name)?.values ?? [];
 }
 
 // A risk metric tile — green when "good", rose when adverse, so the strip reads
@@ -43,24 +47,32 @@ export default function FinancePanel({ node }: { node?: string }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
-  // Discover finance-ready tables by walking the (small) catalog tree once.
+  const [showRsi, setShowRsi] = useState(false);
+  const [showMacd, setShowMacd] = useState(false);
+  const [showBb, setShowBb] = useState(false);
+  const [indRes, setIndRes] = useState<IndicatorsResult | null>(null);
+  const [indBusy, setIndBusy] = useState(false);
+
+  // Discover finance-ready tables by walking the (small) catalog tree once. The
+  // walk fans out per-level with Promise.all so a deep catalog resolves in three
+  // round-trip waves instead of N sequential ones.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const cats = (await getCatalogs(node, true)).catalogs;
+        const schemaResults = await Promise.all(cats.map((c) => getSchemas(c.name, node, true)));
+        const pairs: { cat: string; sch: string }[] = [];
+        schemaResults.forEach((r, i) => r.schemas.forEach((s) => pairs.push({ cat: cats[i].name, sch: s.name })));
+        const tableResults = await Promise.all(pairs.map((p) => getTables(p.cat, p.sch, node, true)));
         const out: Series[] = [];
-        for (const c of cats) {
-          const schs = (await getSchemas(c.name, node, true)).schemas;
-          for (const s of schs) {
-            const tbls: TableEntry[] = (await getTables(c.name, s.name, node, true)).tables;
-            for (const t of tbls) {
-              if (t.object_type !== "TABLE" || !t.source_url) continue;
-              const numeric = (t.columns ?? []).filter((cc) => NUMERIC.test(cc.dtype)).map((cc) => cc.name);
-              if (numeric.length) out.push({ full_name: t.full_name, source_url: t.source_url, numeric });
-            }
-          }
-        }
+        tableResults.forEach((r) => {
+          r.tables.forEach((t) => {
+            if (t.object_type !== "TABLE" || !t.source_url) return;
+            const numeric = (t.columns ?? []).filter((cc) => NUMERIC.test(cc.dtype)).map((cc) => cc.name);
+            if (numeric.length) out.push({ full_name: t.full_name, source_url: t.source_url, numeric });
+          });
+        });
         if (cancelled) return;
         setSeries(out);
         // Auto-pick a price-like table + column for an instant, meaningful view.
@@ -87,8 +99,21 @@ export default function FinancePanel({ node }: { node?: string }) {
   // Auto-run whenever the selection settles.
   useEffect(() => { if (current && col) run(); }, [current, col, win, ppy, run]);
 
+  const fetchIndicators = useCallback(async () => {
+    if (!current || !col) { setIndRes(null); return; }
+    const inds = [...(showRsi ? ["rsi"] : []), ...(showMacd ? ["macd"] : []), ...(showBb ? ["bb"] : [])];
+    if (!inds.length) { setIndRes(null); return; }
+    setIndBusy(true);
+    try {
+      setIndRes(await analysisIndicators(current.source_url, col, { indicators: inds, node }));
+    } catch { setIndRes(null); } finally { setIndBusy(false); }
+  }, [current, col, showRsi, showMacd, showBb, node]);
+
+  useEffect(() => { fetchIndicators(); }, [fetchIndicators]);
+
   const m = res?.metrics;
   const labels = res?.index ?? [];
+  const indLabels = indRes?.index ?? [];
 
   return (
     <div className="flex flex-col gap-3 overflow-auto min-h-0 pr-1 animate-in">
@@ -123,7 +148,18 @@ export default function FinancePanel({ node }: { node?: string }) {
             <option value={12}>12 (monthly)</option>
           </select>
         </div>
-        {busy && <span className="text-[11px] text-muted">computing…</span>}
+        <div className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wider text-muted">Indicators</span>
+          <div className="flex gap-2">
+            {([["RSI", showRsi, setShowRsi], ["MACD", showMacd, setShowMacd], ["BB", showBb, setShowBb]] as const).map(([label, val, set]) => (
+              <button key={label} onClick={() => set(!val)}
+                className={`px-2 py-1 rounded text-[11px] font-mono border ${val ? "bg-frost/15 text-frost border-frost/30" : "bg-white/[0.03] text-muted border-white/[0.08]"}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        {(busy || indBusy) && <span className="text-[11px] text-muted">computing…</span>}
       </div>
 
       {err && <div className="glass-card p-3 text-rose/80 font-mono text-xs break-words">{err}</div>}
@@ -150,6 +186,44 @@ export default function FinancePanel({ node }: { node?: string }) {
             <span className="text-[10px] text-amber/80">— EMA({res.window})</span>
           </div>
           <Chart type="line" labels={labels} values={res.value} overlay={res.ema} color="var(--frost)" yLabel={col} height={220} />
+        </div>
+      )}
+
+      {/* Bollinger Bands — price with the ±2σ envelope */}
+      {showBb && indRes && (
+        <div className="glass-card p-3">
+          <span className="text-[11px] uppercase tracking-wide text-muted">Bollinger Bands (±2σ)</span>
+          <Chart type="area" labels={indLabels} values={indRes.price}
+            band={{ min: ind(indRes, "bb_lower"), max: ind(indRes, "bb_upper") }}
+            color="var(--frost)" yLabel="bb" height={200} />
+        </div>
+      )}
+
+      {/* RSI — momentum oscillator, 30/70 overbought/oversold bounds noted in label */}
+      {showRsi && indRes && (
+        <div className="glass-card p-3">
+          <span className="text-[11px] uppercase tracking-wide text-muted">RSI · OB:70 OS:30</span>
+          <Chart type="line" labels={indLabels} values={ind(indRes, "rsi")} color="var(--amber)" yLabel="rsi" height={120} />
+        </div>
+      )}
+
+      {/* MACD — macd line (frost) vs signal line (amber) */}
+      {showMacd && indRes && (
+        <div className="glass-card p-3">
+          <div className="flex items-center gap-3 mb-1">
+            <span className="text-[11px] uppercase tracking-wide text-muted">MACD</span>
+            <span className="text-[10px] text-frost/80">— line</span>
+            <span className="text-[10px] text-amber/80">— signal</span>
+          </div>
+          <Chart type="line" labels={indLabels} values={ind(indRes, "macd_line")} overlay={ind(indRes, "macd_signal")} color="var(--frost)" yLabel="macd" height={140} />
+        </div>
+      )}
+
+      {/* Rolling Volatility */}
+      {res && (
+        <div className="glass-card p-3">
+          <span className="text-[11px] uppercase tracking-wide text-muted">Rolling Volatility (σ={res.window})</span>
+          <Chart type="area" labels={labels} values={res.roll_vol} color="var(--amber)" yLabel="vol" height={120} />
         </div>
       )}
 

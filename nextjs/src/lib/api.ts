@@ -706,6 +706,71 @@ export function analysisForecast(
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
+// ── Technical indicators ────────────────────────────────────────────────────
+
+export interface IndicatorSeries { name: string; values: (number | null)[]; }
+export interface IndicatorsResult {
+  node_id: string;
+  path: string;
+  column: string;
+  index: (string | number)[];
+  price: (number | null)[];
+  indicators: IndicatorSeries[];
+  truncated: boolean;
+}
+
+export function analysisIndicators(
+  path: string,
+  column: string,
+  opts: {
+    order_by?: string; indicators?: string[]; window?: number;
+    limit?: number; filters?: FilterSpec[]; node?: string;
+  } = {},
+): Promise<IndicatorsResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/indicators${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
+// ── Portfolio analytics ─────────────────────────────────────────────────────
+
+export interface PortfolioAsset {
+  label: string;
+  total_return: number | null;
+  ann_return: number | null;
+  ann_volatility: number | null;
+  sharpe: number | null;
+  max_drawdown: number | null;
+  beta: number | null;
+}
+export interface PortfolioResult {
+  node_id: string;
+  labels: string[];
+  index: (string | number)[];
+  prices: (number | null)[][];
+  returns: (number | null)[][];
+  correlation: (number | null)[][];
+  assets: PortfolioAsset[];
+  var_95: number | null;
+  cvar_95: number | null;
+  truncated: boolean;
+}
+
+export function analysisPortfolio(
+  paths: string[],
+  columns: string[],
+  opts: {
+    labels?: string[]; order_by?: string; window?: number; limit?: number;
+    risk_free?: number; periods_per_year?: number; confidence?: number; node?: string;
+  } = {},
+): Promise<PortfolioResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/portfolio${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { paths, columns, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
 export interface ForecastSpec {
   source: string; column: string; x?: string | null; keys?: string[];
   horizon?: number; model?: string; period?: number | null; agg?: string;
