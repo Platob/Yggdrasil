@@ -33,6 +33,14 @@ def auto_load(
 ) -> dict[str, Any]:
     """Ingest files under *source* into *table* with Databricks Auto Loader.
 
+    Each micro-batch is **cast to the target table's schema before the append**
+    (via ``foreachBatch``): the target's columns are projected in order, source
+    columns cast to the target type and missing ones NULL-filled, so the write is
+    schema-stable and tolerant of source drift — extra columns are dropped and
+    type mismatches are cast rather than failing or evolving the target schema.
+    Appends are made idempotent with Delta's ``(txnAppId, txnVersion)`` marker
+    keyed on the batch id, preserving exactly-once across task retries.
+
     Args:
         table: Target table, ``catalog.schema.table``.
         source: Cloud path Auto Loader watches (``s3://…`` / ``/Volumes/…``).
@@ -96,16 +104,47 @@ def auto_load(
         )
     frame = reader.load(source)
 
+    # Idempotent app id so a re-run of the same micro-batch (e.g. after a task
+    # retry) is deduplicated by Delta's (txnAppId, txnVersion) transaction marker
+    # — preserving the exactly-once ``.toTable`` gave before foreachBatch.
+    app_id = f"ygg_autoloader::{table}"
+
+    def _write_batch(batch_df: Any, batch_id: int) -> None:
+        # Cast/align each micro-batch to the **target table** schema before the
+        # append: project the target's columns in order, casting each source
+        # column to the target type and NULL-filling any the batch doesn't carry.
+        # Per-batch alignment keeps the write schema-stable (no ``mergeSchema``)
+        # and tolerant of source drift — extra source columns are dropped and
+        # type mismatches are cast, rather than failing or silently evolving the
+        # target table's schema.
+        from pyspark.sql import functions as F
+
+        target_schema = batch_df.sparkSession.table(table).schema
+        present = set(batch_df.columns)
+        projection = [
+            (F.col(field.name) if field.name in present else F.lit(None))
+            .cast(field.dataType).alias(field.name)
+            for field in target_schema.fields
+        ]
+        (
+            batch_df.select(*projection)
+            .write.format("delta").mode("append")
+            # Idempotent append: Delta no-ops a replay of the same batch id.
+            .option("txnAppId", app_id)
+            .option("txnVersion", batch_id)
+            .saveAsTable(table)
+        )
+
     writer = (
         frame.writeStream.option("checkpointLocation", checkpoint)
-        .option("mergeSchema", "true")
+        .foreachBatch(_write_batch)
     )
     writer = (
         writer.trigger(availableNow=True)
         if available_now
         else writer.trigger(processingTime="1 minute")
     )
-    query = writer.toTable(table)
+    query = writer.start()
     query.awaitTermination()
 
     summary: dict[str, Any] = {"table": table, "source": source, "checkpoint": checkpoint}

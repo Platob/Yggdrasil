@@ -123,15 +123,19 @@ class TestAutoLoadEntryPoint:
         frame = reader.load.return_value
         writer = frame.writeStream
         writer.option.return_value = writer
+        writer.foreachBatch.return_value = writer
         writer.trigger.return_value = writer
         return spark, reader, frame, writer
 
-    def _with_pyspark(self, spark):
+    def _with_pyspark(self, spark, functions=None):
         pyspark = types.ModuleType("pyspark")
         pyspark_sql = types.ModuleType("pyspark.sql")
         session = MagicMock()
         session.builder.getOrCreate.return_value = spark
         pyspark_sql.SparkSession = session
+        if functions is not None:
+            # ``_write_batch`` does ``from pyspark.sql import functions as F``.
+            pyspark_sql.functions = functions
         return patch.dict(sys.modules, {"pyspark": pyspark, "pyspark.sql": pyspark_sql})
 
     def test_streams_cloudfiles_into_table_with_derived_checkpoint(self):
@@ -147,12 +151,59 @@ class TestAutoLoadEntryPoint:
             "cloudFiles.schemaLocation", "s3://bkt/tbl/_ygg_autoloader/_schema",
         )
         reader.load.assert_called_once_with("s3://src/landing")
-        # writeStream checkpoint + AvailableNow trigger, sinking into the table.
+        # writeStream checkpoint + AvailableNow trigger, sinking through a
+        # per-batch foreachBatch (cast-to-target) rather than a raw toTable.
         writer.option.assert_any_call("checkpointLocation", "s3://bkt/tbl/_ygg_autoloader")
         writer.trigger.assert_called_once_with(availableNow=True)
-        writer.toTable.assert_called_once_with("cat.sch.tbl")
-        writer.toTable.return_value.awaitTermination.assert_called_once()
+        writer.foreachBatch.assert_called_once()
+        writer.toTable.assert_not_called()
+        writer.start.assert_called_once_with()
+        writer.start.return_value.awaitTermination.assert_called_once()
         assert out["checkpoint"] == "s3://bkt/tbl/_ygg_autoloader"
+
+    def test_foreachbatch_casts_each_batch_to_target_schema(self):
+        spark, reader, frame, writer = self._spark()
+        functions = MagicMock(name="F")
+
+        # A micro-batch carrying only (a, b); the target table has (a, b, c).
+        batch = MagicMock()
+        batch.columns = ["a", "b"]
+
+        def _field(name):
+            f = MagicMock()
+            f.name = name
+            f.dataType = f"<dt:{name}>"
+            return f
+
+        batch.sparkSession.table.return_value.schema.fields = [
+            _field("a"), _field("b"), _field("c"),
+        ]
+        aligned = batch.select.return_value
+        wb = aligned.write.format.return_value.mode.return_value
+        wb.option.return_value = wb
+
+        # ``_write_batch`` imports pyspark.sql.functions lazily, so invoke the
+        # captured callback while the fake pyspark is still patched in.
+        with self._with_pyspark(spark, functions=functions):
+            auto_load("cat.sch.tbl", "s3://src", checkpoint="s3://ckpt")
+            fn = writer.foreachBatch.call_args.args[0]
+            fn(batch, 7)
+
+        # Schema read off the *target* table.
+        batch.sparkSession.table.assert_called_once_with("cat.sch.tbl")
+        # Every target column projected (3), the missing one NULL-filled, the
+        # present ones referenced — all cast to the target type.
+        assert batch.select.call_count == 1
+        assert len(batch.select.call_args.args) == 3
+        functions.col.assert_any_call("a")
+        functions.col.assert_any_call("b")
+        functions.lit.assert_called_once_with(None)
+        # Idempotent Delta append into the target table, keyed on the batch id.
+        aligned.write.format.assert_called_once_with("delta")
+        aligned.write.format.return_value.mode.assert_called_once_with("append")
+        wb.option.assert_any_call("txnAppId", "ygg_autoloader::cat.sch.tbl")
+        wb.option.assert_any_call("txnVersion", 7)
+        wb.saveAsTable.assert_called_once_with("cat.sch.tbl")
 
     def test_explicit_checkpoint_skips_describe_detail(self):
         spark, reader, _frame, writer = self._spark()
