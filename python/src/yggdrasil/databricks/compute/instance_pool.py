@@ -378,20 +378,32 @@ class InstancePools(DatabricksService):
             preloaded_spark_versions = self._local_python_preloaded_versions()
         preloaded = list(preloaded_spark_versions) if preloaded_spark_versions else None
 
-        pools: list[InstancePool] = []
-        for tier in tiers:
-            pools.append(
-                self.create_or_update(
-                    instance_pool_name=tier.pool_name(prefix),
-                    node_type_id=tier.node_type_id,
-                    max_capacity=tier.max_capacity,
-                    min_idle_instances=tier.min_idle_instances,
-                    idle_instance_autotermination_minutes=tier.idle_instance_autotermination_minutes,
-                    preloaded_spark_versions=preloaded,
-                    permissions=permissions,
-                )
+        tiers = list(tiers)
+
+        def _provision(tier: PoolTier) -> "InstancePool":
+            return self.create_or_update(
+                instance_pool_name=tier.pool_name(prefix),
+                node_type_id=tier.node_type_id,
+                max_capacity=tier.max_capacity,
+                min_idle_instances=tier.min_idle_instances,
+                idle_instance_autotermination_minutes=tier.idle_instance_autotermination_minutes,
+                preloaded_spark_versions=preloaded,
+                permissions=permissions,
             )
-        return pools
+
+        if len(tiers) == 1:
+            return [_provision(tiers[0])]
+
+        # The pools are independent SDK create/edit calls — fan them out so a
+        # whole-set provision costs roughly one round trip instead of N.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results: dict[str, "InstancePool"] = {}
+        with ThreadPoolExecutor(max_workers=len(tiers), thread_name_prefix="ygg-pool") as pool:
+            futures = {pool.submit(_provision, tier): tier.tier for tier in tiers}
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        return [results[tier.tier] for tier in tiers]
 
     # ------------------------------------------------------------------ #
     # CRUD

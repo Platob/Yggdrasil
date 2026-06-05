@@ -145,41 +145,38 @@ class SeedCommand:
                     ok = False
             else:
                 # Persist the version-pinned base environments under
-                # /Workspace/Shared/environments so jobs can reference them by path
-                # (serverless ``base_environment``) and classic clusters can install
-                # from them (``Library(requirements=...)``). One pair of files per
-                # Python — a serverless ``ygg-<version>-py3XX.yml`` and a cluster
-                # ``ygg-<version>-py3XX.requirements.txt`` — each listing that
-                # Python's whole transitive closure built as wheels into the
-                # workspace pypi registry (ensure_bundle), so the runtime installs
-                # with zero PyPI access. With --all-versions/--overwrite this covers
-                # every supported Python (3.10–3.13); otherwise just the local one.
+                # /Workspace/Shared/environments. Each Python gets its own
+                # self-contained folder — ``ygg-<version>-py3XX/`` holding a
+                # serverless ``ygg-<version>-py3XX.yml`` (referenced by path via
+                # ``base_environment``), a classic-cluster
+                # ``ygg-<version>-py3XX.requirements.txt``, and a ``binaries/``
+                # closure of that Python's whole transitive dependency set built
+                # as wheels under the env itself — so the runtime installs with
+                # zero PyPI access and the env is self-describing. With
+                # --all-versions/--overwrite this covers every supported Python
+                # (3.10–3.13); otherwise just the local one.
                 pythons = list(whl.SUPPORTED_PYTHONS) if all_versions else [None]
-                lines: list[str] = []
-                with style.Spinner("building base environment(s)…") as sp:
-                    for py in pythons:
-                        key = whl.environment_key_for(py)
-                        sp.update(f"building base environment {key} (wheel bundle)…")
-                        bundle = whl.ensure_bundle(
-                            client, "ygg", python=py, workspace_dir=workspace_dir, rebuild=rebuild,
-                        )
-                        env_name = f"ygg-{version}-{key}"
-                        env_yaml = whl.ensure_named_environment(
-                            client, env_name, dependencies=bundle,
-                            environment_version=whl.serverless_environment_version(py),
-                            filename=f"{env_name}.yml",
-                        )
-                        reqs = whl.ensure_cluster_requirements(client, env_name, dependencies=bundle)
-                        lines.append(
-                            f"    {style.dim(key)}  {len(bundle)} wheels  "
-                            f"{style.dim('serverless')} {env_yaml}\n"
-                        )
-                        lines.append(f"          {style.dim('cluster')}    {reqs}\n")
-                for line in lines:
-                    style.out(line)
+                # Each Python's environment is a self-contained folder with its
+                # own wheel binaries, so they share nothing and build in parallel.
+                plural = "s" if len(pythons) > 1 else ""
+                with style.Spinner(
+                    f"building {len(pythons)} base environment{plural} "
+                    f"(parallel, wheel bundle + binaries)…"
+                ):
+                    envs = whl.ensure_environments(
+                        client, versions=pythons,
+                        workspace_dir=whl.WORKSPACE_ENV_DIR, rebuild=rebuild,
+                    )
+                for env in envs:
+                    style.out(
+                        f"    {style.dim(env['key'])}  {env['n_wheels']} wheels  "
+                        f"{style.dim('dir')} {env['env_dir']}\n"
+                    )
+                    style.out(f"          {style.dim('serverless')} {env['serverless']}\n")
+                    style.out(f"          {style.dim('cluster')}    {env['cluster']}\n")
                 style.ok(
-                    f"base environments written for {len(pythons)} Python version(s) "
-                    f"(serverless + cluster)"
+                    f"base environments written for {len(envs)} Python version(s) "
+                    f"(serverless + cluster, binaries under each)"
                 )
         except Exception as exc:
             style.fail(f"environment step failed: {exc}")

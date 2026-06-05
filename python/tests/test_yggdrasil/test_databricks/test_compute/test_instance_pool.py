@@ -132,17 +132,21 @@ class TestSeedDefaultPools(DatabricksTestCase):
             self.instance_pools.defaults,
             preload_local_python_runtime=False,
         )
-        self.pools_api.list.return_value = iter([])
+        # Fresh empty iterator per call — the tiers are provisioned concurrently.
+        self.pools_api.list.side_effect = lambda: iter([])
 
-        # Each create() returns a distinct id and a matching get() so the
-        # resulting InstancePool can resolve details without another stub.
-        self._counter = {"n": 0}
+        # create() runs on one thread per tier; Mock's own call recording is not
+        # thread-safe, so capture the create specs under a lock and assert on
+        # that rather than ``call_args_list``.
+        import threading
+        self._lock = threading.Lock()
+        self._created: list[dict] = []
 
         def _create(**kwargs):
-            self._counter["n"] += 1
-            return CreateInstancePoolResponse(
-                instance_pool_id=f"pool-{self._counter['n']}",
-            )
+            with self._lock:
+                self._created.append(kwargs)
+                n = len(self._created)
+            return CreateInstancePoolResponse(instance_pool_id=f"pool-{n}")
 
         self.pools_api.create.side_effect = _create
         self.pools_api.get.side_effect = lambda instance_pool_id: (
@@ -170,31 +174,34 @@ class TestSeedDefaultPools(DatabricksTestCase):
             preloaded_spark_versions=["15.4.x-scala2.12"],
         )
 
+        # Returned in tier order regardless of (parallel) completion order.
         self.assertEqual(len(pools), len(DEFAULT_POOL_TIERS))
-        self.assertEqual(self.pools_api.create.call_count, len(DEFAULT_POOL_TIERS))
+        self.assertEqual(len(self._created), len(DEFAULT_POOL_TIERS))
 
-        created = [c.kwargs for c in self.pools_api.create.call_args_list]
+        # Completion order is non-deterministic under the thread pool — assert
+        # on the *set* of provisioned specs.
         self.assertEqual(
-            [k["instance_pool_name"] for k in created],
-            [f"{DEFAULT_POOL_NAME_PREFIX} {t.tier}" for t in DEFAULT_POOL_TIERS],
+            sorted(k["instance_pool_name"] for k in self._created),
+            sorted(f"{DEFAULT_POOL_NAME_PREFIX} {t.tier}" for t in DEFAULT_POOL_TIERS),
         )
         self.assertEqual(
-            [k["node_type_id"] for k in created],
-            ["r5d.xlarge", "r5d.2xlarge", "r5d.4xlarge"],
+            sorted(k["node_type_id"] for k in self._created),
+            sorted(["r5d.xlarge", "r5d.2xlarge", "r5d.4xlarge"]),
         )
         # Preloaded spark versions propagate to every pool (warm attach +
         # zero-PyPI wheel bundle install).
-        for k in created:
+        for k in self._created:
             self.assertEqual(k["preloaded_spark_versions"], ["15.4.x-scala2.12"])
 
     def test_seed_is_idempotent_updates_existing(self):
-        # An existing pool by name routes through edit(), not create().
+        # An existing pool by name routes through edit(), not create(). A single
+        # tier runs inline (no thread pool).
         existing = InstancePoolAndStats(
             instance_pool_id="pool-light",
             instance_pool_name=f"{DEFAULT_POOL_NAME_PREFIX} Light",
             node_type_id="r5d.xlarge",
         )
-        self.pools_api.list.return_value = iter([existing])
+        self.pools_api.list.side_effect = lambda: iter([existing])
         self.pools_api.get.side_effect = lambda instance_pool_id: (
             self.make_instance_pool_details(
                 instance_pool_id=instance_pool_id,

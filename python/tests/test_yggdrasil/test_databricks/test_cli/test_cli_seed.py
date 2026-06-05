@@ -32,6 +32,19 @@ def _client_with(*, user="me@co.com", warehouses=None, default_wh=...):
     return client
 
 
+def _env(python):
+    """A fake ``ensure_environment`` descriptor for one Python version."""
+    key = "py" + (python or "3X").replace(".", "")
+    name = f"ygg-1.0-{key}"
+    env_dir = f"/Workspace/Shared/environments/{name}"
+    return {
+        "python": python, "key": key, "env_name": name, "env_dir": env_dir,
+        "n_wheels": 2,
+        "serverless": f"{env_dir}/{name}.yml",
+        "cluster": f"{env_dir}/{name}.requirements.txt",
+    }
+
+
 class TestSeedHelp(unittest.TestCase):
     def test_seed_help_exits_zero(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -100,15 +113,11 @@ class TestSeedCheck(unittest.TestCase):
              patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=[]), \
              patch("yggdrasil.databricks.job.wheel.deployed_environments", return_value=[]), \
              patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure, \
-             patch("yggdrasil.databricks.job.wheel.ensure_bundle") as bundle, \
-             patch("yggdrasil.databricks.job.wheel.ensure_named_environment") as ene, \
-             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements") as ecr, \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments") as envs, \
              contextlib.redirect_stdout(io.StringIO()):
             main(["seed", "--check"])
         ensure.assert_not_called()
-        bundle.assert_not_called()
-        ene.assert_not_called()
-        ecr.assert_not_called()
+        envs.assert_not_called()
         client.warehouses.find_default.assert_not_called()
         client.compute.instance_pools.seed_default_pools.assert_not_called()
 
@@ -118,35 +127,20 @@ class TestSeedProvision(unittest.TestCase):
         wh = MagicMock(); wh.warehouse_name = "Starter Serverless"; wh.warehouse_id = "wid"
         wh.state = MagicMock(value="RUNNING")
         client = _client_with(default_wh=wh)
-        bundle = [
-            "/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl",
-            "/Workspace/Shared/pypi/pyarrow/pyarrow-1-cp312-cp312-linux.whl",
-        ]
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
              patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
                    return_value=["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]) as ensure, \
-             patch("yggdrasil.databricks.job.wheel.ensure_bundle", return_value=bundle) as build_bundle, \
-             patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
-                   return_value="/Workspace/Shared/environments/ygg-1.0.yml") as ene, \
-             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
-                   return_value="/Workspace/Shared/environments/ygg-1.0.requirements.txt") as ecr, \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]) as envs, \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed"])
         self.assertEqual(rc, 0)
         ensure.assert_called_once()
-        build_bundle.assert_called_once()
-        # The version-pinned base environment is persisted for both serverless
-        # (ygg-<version>.yml) and classic clusters (requirements.txt) from the
-        # built wheel bundle — only built wheels in pypi, zero PyPI at runtime.
-        ene.assert_called_once()
-        ecr.assert_called_once()
-        self.assertTrue(ene.call_args.args[1].startswith("ygg-"))
-        self.assertTrue(ene.call_args.kwargs["filename"].startswith("ygg-"))
-        self.assertTrue(ene.call_args.kwargs["filename"].endswith(".yml"))
-        self.assertEqual(ene.call_args.kwargs["dependencies"], bundle)
-        self.assertTrue(ecr.call_args.args[1].startswith("ygg-"))
-        self.assertEqual(ecr.call_args.kwargs["dependencies"], bundle)
+        # One self-contained base environment built for the local Python
+        # (serverless + cluster, wheel binaries under the env's own folder).
+        envs.assert_called_once()
+        self.assertEqual(envs.call_args.kwargs["versions"], [None])
         client.warehouses.find_default.assert_called_once()
         # The default Light/Medium/Heavy instance pools are provisioned too.
         client.compute.instance_pools.seed_default_pools.assert_called_once()
@@ -158,91 +152,69 @@ class TestSeedProvision(unittest.TestCase):
              patch("yggdrasil.cli.style.print_logo"), \
              patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_bundle",
-                   return_value=["/w/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
-                   return_value="/w/env/ygg-1.0-py312.yml"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
-                   return_value="/w/env/ygg-1.0-py312.requirements.txt"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--no-pools"])
         self.assertEqual(rc, 0)
         client.compute.instance_pools.seed_default_pools.assert_not_called()
 
     def test_seed_overwrite_skips_pool_step(self):
+        from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
         client = _client_with(default_wh=MagicMock())
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
              patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_bundle",
-                   return_value=["/w/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
-                   return_value="/w/env/ygg-1.0-py312.yml"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
-                   return_value="/w/env/ygg-1.0-py312.requirements.txt"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(v) for v in SUPPORTED_PYTHONS]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--overwrite"])
         self.assertEqual(rc, 0)
         # --overwrite ends after the env rewrite, before warehouses + pools.
         client.compute.instance_pools.seed_default_pools.assert_not_called()
 
-    def test_seed_all_versions_uses_matrix_builders(self):
+    def test_seed_all_versions_builds_every_python_environment(self):
         from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
-        n = len(SUPPORTED_PYTHONS)
         wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
         client = _client_with(default_wh=wh)
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
              patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]) as ensure, \
-             patch("yggdrasil.databricks.job.wheel.ensure_bundle",
-                   return_value=["/w/pypi/ygg/ygg-1.0-py3-none-any.whl"]) as build_bundle, \
-             patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
-                   return_value="/w/env/ygg-1.0-py312.yml") as ene, \
-             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
-                   return_value="/w/env/ygg-1.0-py312.requirements.txt") as ecr, \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(v) for v in SUPPORTED_PYTHONS]) as envs, \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--all-versions"])
         self.assertEqual(rc, 0)
         ensure.assert_called_once()              # per-Python wheel matrix
-        # One zero-PyPI bundle + serverless/cluster env pair per supported Python.
-        self.assertEqual(build_bundle.call_count, n)
-        self.assertEqual(ene.call_count, n)
-        self.assertEqual(ecr.call_count, n)
-        # Each bundle is pinned to a distinct Python.
-        pythons = [c.kwargs["python"] for c in build_bundle.call_args_list]
-        self.assertEqual(sorted(pythons), sorted(SUPPORTED_PYTHONS))
+        # A self-contained environment per supported Python, built in parallel.
+        envs.assert_called_once()
+        self.assertEqual(list(envs.call_args.kwargs["versions"]), list(SUPPORTED_PYTHONS))
 
     def test_seed_overwrite_rebuilds_all_wheels_and_ends(self):
-        """--overwrite forces a from-scratch rebuild (all Pythons + bundle),
-        rewrites the env, and ends before the warehouse step."""
+        """--overwrite forces a from-scratch rebuild (all Pythons + envs),
+        rewrites the envs, and ends before the warehouse step."""
         from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
-        n = len(SUPPORTED_PYTHONS)
         client = _client_with(default_wh=MagicMock())
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
              patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]) as ensure_all, \
              patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure_one, \
-             patch("yggdrasil.databricks.job.wheel.ensure_bundle",
-                   return_value=["/w/pypi/ygg/ygg-1.0-py3-none-any.whl"]) as build_bundle, \
-             patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
-                   return_value="/w/env/ygg-1.0-py312.yml") as ene, \
-             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
-                   return_value="/w/env/ygg-1.0-py312.requirements.txt") as ecr, \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(v) for v in SUPPORTED_PYTHONS]) as envs, \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--overwrite"])
         self.assertEqual(rc, 0)
         # All wheels rebuilt: the per-Python matrix (not the single-wheel builder)
-        # and a zero-PyPI bundle + env pair per supported Python, all forced fresh.
+        # and a self-contained environment per supported Python, all forced fresh.
         ensure_all.assert_called_once()
         self.assertTrue(ensure_all.call_args.kwargs["rebuild"])
         ensure_one.assert_not_called()
-        self.assertEqual(build_bundle.call_count, n)
-        self.assertTrue(all(c.kwargs["rebuild"] for c in build_bundle.call_args_list))
-        self.assertEqual(ene.call_count, n)
-        self.assertEqual(ecr.call_count, n)
+        envs.assert_called_once()
+        self.assertTrue(envs.call_args.kwargs["rebuild"])
+        self.assertEqual(list(envs.call_args.kwargs["versions"]), list(SUPPORTED_PYTHONS))
         # Ends before the warehouse step.
         client.warehouses.find_default.assert_not_called()
 
