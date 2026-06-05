@@ -803,8 +803,24 @@ class WarehouseStatementResult(StatementResult):
         writers MERGE-ing the same rows) are resolved by serialization —
         retrying in lockstep just re-collides. Stagger with full jitter so
         concurrent writers spread out and commit one after another.
+
+        Logs the impending retry at INFO — naming the SQL operation (so a
+        contended ``MERGE`` is obvious in the logs), the upcoming attempt
+        number, the backoff, and the transient conflict that triggered it.
         """
-        return self._jittered_backoff(self._attempts, wait, start)
+        delay = self._jittered_backoff(self._attempts, wait, start)
+        if logger.isEnabledFor(logging.INFO):
+            text = (self.statement.text or "").lstrip()
+            operation = text.split(None, 1)[0].upper() if text else "STATEMENT"
+            error = self._error_for_status()
+            detail = str(error).splitlines()[0][:200] if error else ""
+            logger.info(
+                "Retrying %s %s (attempt %d, backoff %.2fs) after transient "
+                "conflict: %s",
+                operation, self.statement_id or "(unsent)",
+                self._attempts + 1, delay, detail,
+            )
+        return delay
 
     def cancel(
         self,

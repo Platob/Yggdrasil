@@ -8,6 +8,7 @@ batch coercer (prevents stale/missing alias substitution on re-submit).
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -50,6 +51,7 @@ def _result_in_state(
     error_message: Optional[str] = None,
     iteration: int = 1,
     elapsed: Optional[float] = None,
+    text: str = "SELECT 1",
 ) -> WarehouseStatementResult:
     status = StatementStatus(
         state=state,
@@ -61,7 +63,7 @@ def _result_in_state(
         manifest=ResultManifest(total_row_count=0),
         result=ResultData(external_links=[]),
     )
-    stmt = WarehousePreparedStatement("SELECT 1", disposition=Disposition.EXTERNAL_LINKS)
+    stmt = WarehousePreparedStatement(text, disposition=Disposition.EXTERNAL_LINKS)
     r = WarehouseStatementResult(
         executor=_warehouse(),
         statement=stmt,
@@ -116,6 +118,76 @@ class TestRetryable:
         import time
         r.start_timestamp = time.time() - (_RETRYABLE_ELAPSED_LIMIT + 1)
         assert r.retryable is False
+
+
+# ---------------------------------------------------------------------------
+# Merge retry logging — DELTA_CONCURRENT_APPEND backoff
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRetryLog:
+    """The warehouse retry path emits a merge-aware INFO log naming the SQL
+    operation, attempt, and backoff — and a contended MERGE actually recovers
+    when the retry succeeds.
+
+    Logs are asserted by patching the module logger (the repo's ``yggdrasil``
+    logger has ``propagate=False`` in conftest, so ``caplog`` can't see them).
+    """
+
+    # The conflict code appears (formatted into) the retry log's detail arg.
+    @staticmethod
+    def _retry_calls(log) -> list:
+        return [
+            c for c in log.info.call_args_list
+            if c.args and isinstance(c.args[0], str) and c.args[0].startswith("Retrying %s")
+        ]
+
+    def test_retry_backoff_logs_merge_operation(self):
+        import time
+        from yggdrasil.dataclasses.waiting import WaitingConfig
+
+        code = next(iter(_RETRYABLE_ERROR_CODES))
+        r = _result_in_state(
+            StatementState.FAILED, error_message=code,
+            text="MERGE INTO main.s.t USING src ON t.id = src.id",
+        )
+        with patch("yggdrasil.databricks.warehouse.statement.logger") as log:
+            delay = r._retry_backoff(WaitingConfig.from_(True), time.time())
+
+        assert delay >= 0.0
+        calls = self._retry_calls(log)
+        assert calls, "expected a merge retry log line"
+        assert calls[0].args[1] == "MERGE"                       # operation named
+        assert any(code in str(a) for a in calls[0].args)        # conflict surfaced
+
+    def test_concurrent_append_retry_recovers_and_logs(self):
+        from yggdrasil.dataclasses.waiting import WaitingConfig
+
+        code = next(iter(_RETRYABLE_ERROR_CODES))
+        r = _result_in_state(
+            StatementState.FAILED, error_message=code,
+            text="MERGE INTO main.s.t USING src ON t.id = src.id",
+        )
+        # The retry (2nd attempt) succeeds: mock the warehouse re-submit to
+        # return a SUCCEEDED response instead of re-colliding.
+        ok = StatementResponse(
+            statement_id="stmt-2",
+            status=StatementStatus(state=StatementState.SUCCEEDED),
+            manifest=ResultManifest(total_row_count=0),
+            result=ResultData(external_links=[]),
+        )
+        submitted = MagicMock()
+        submitted.statement = r.statement
+        submitted._response = ok
+        r.executor.send = MagicMock(return_value=submitted)
+
+        with patch("yggdrasil.databricks.warehouse.statement.logger") as log:
+            r.wait(WaitingConfig(timeout=5.0, max_attempts=3), raise_error=True)
+
+        assert r.is_succeeded                       # the contended MERGE recovered
+        r.executor.send.assert_called_once()        # exactly one re-submit
+        calls = self._retry_calls(log)
+        assert calls and calls[0].args[1] == "MERGE"
 
 
 # ---------------------------------------------------------------------------
