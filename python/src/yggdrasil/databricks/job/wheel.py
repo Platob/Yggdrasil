@@ -33,6 +33,7 @@ __all__ = [
     "WORKSPACE_WHL_DIR",
     "SERVERLESS_ENVIRONMENT_VERSION",
     "SERVERLESS_ENVIRONMENT_VERSIONS",
+    "SERVERLESS_WHEEL_PLATFORMS",
     "SUPPORTED_PYTHONS",
     "serverless_environment_version",
     "environment_key_for",
@@ -93,6 +94,28 @@ SUPPORTED_PYTHONS: "tuple[str, ...]" = ("3.10", "3.11", "3.12", "3.13")
 #: Known serverless environment-version ↔ Python map. Configurable; a Python not
 #: listed here resolves to the latest (:data:`SERVERLESS_ENVIRONMENT_VERSION`).
 SERVERLESS_ENVIRONMENT_VERSIONS: "dict[str, str]" = {"3.10": "1", "3.11": "2"}
+
+#: Linux-x86_64 manylinux platform tags the Databricks serverless / classic
+#: compute can install. The bundled dependency closure is **pinned** to these so
+#: it's platform-correct no matter what OS/arch deploys it — a macOS-arm64 or
+#: linux-aarch64 host would otherwise emit wheels the compute rejects with
+#: ``ERROR_WHEEL_INSTALLATION`` (platform tag mismatch). ``manylinux2014``
+#: (glibc 2.17) is the broadly-shipped baseline; ``manylinux_2_28`` (glibc 2.28)
+#: covers packages that only publish a newer tag (e.g. recent ``pyarrow``) and
+#: still loads on every serverless runtime (glibc ≥ 2.31). Override via the
+#: ``YGG_DATABRICKS_WHEEL_PLATFORMS`` env var (comma-separated) for a runtime
+#: that needs a different/newer baseline.
+SERVERLESS_WHEEL_PLATFORMS: "tuple[str, ...]" = (
+    "manylinux2014_x86_64",
+    "manylinux_2_28_x86_64",
+)
+
+
+def _serverless_wheel_platforms() -> "list[str]":
+    raw = os.environ.get("YGG_DATABRICKS_WHEEL_PLATFORMS")
+    if raw:
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    return list(SERVERLESS_WHEEL_PLATFORMS)
 
 
 def _py_minor(python: "str | None" = None) -> str:
@@ -454,35 +477,67 @@ def build_bundle(
     wheels for a single Python version — the input to a *zero-PyPI* serverless /
     cluster environment.
 
-    The compiled dependency wheels must carry the target's ``cp3XX`` tag, so the
-    closure is resolved inside a throwaway **uv venv pinned to** *python*
-    (``uv venv --python X.Y`` downloads the interpreter); ``pip wheel`` run with
-    that interpreter produces wheels for its tag on the host platform — on the
-    Linux CI host that yields the ``manylinux`` wheels the serverless runtime
-    installs. The pure-python project wheel comes out ``py3-none-any`` (shared
-    across versions). Falls back to the current interpreter when uv isn't on
-    PATH (the bundle then matches the deploying host's Python)."""
+    The closure must install on Databricks compute — **Linux x86_64** — no matter
+    what OS/arch deploys it. So the two halves are fetched independently of the
+    host:
+
+    * the **project wheel** is built with ``uv build --wheel --python X.Y`` (or a
+      ``pip wheel --no-deps`` fallback); pure-python ``ygg`` comes out
+      ``py3-none-any``, host-independent by construction.
+    * the **dependency closure** is *downloaded* — not built — via ``pip
+      download --only-binary=:all:`` with explicit ``--python-version`` /
+      ``--implementation cp`` / ``--abi`` / ``--platform`` tags
+      (:data:`SERVERLESS_WHEEL_PLATFORMS`), so pip pulls the manylinux wheels the
+      serverless runtime installs even from a macOS-arm64 / linux-aarch64 box.
+      pip auto-includes universal (``py3-none-any`` / ``abi3``) wheels for the
+      pure-python deps.
+
+    The previous "``pip wheel`` inside a uv venv" path built the deps for the
+    *deploying host's* platform, so a non-Linux-x86_64 host poisoned the bundle
+    with wheels the compute rejects (``ERROR_WHEEL_INSTALLATION``)."""
     project = synthesize_project(package, extras=extras)
     out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-bundle-"))
     py = _py_minor(python)
+    abi = "cp" + py.replace(".", "")          # 3.12 → cp312
 
-    venv = Path(tempfile.mkdtemp(prefix="ygg-venv-"))
+    logger.info("building %s project wheel for Python %s into %s", package, py, out)
     try:
-        subprocess.run(["uv", "venv", "--python", py, str(venv)], check=True)
+        subprocess.run(
+            ["uv", "build", "--wheel", "--python", py,
+             "--out-dir", str(out), str(project)],
+            check=True,
+        )
     except FileNotFoundError:
-        logger.info("uv not found — building the bundle with the host interpreter")
-        return build_wheel(package, extras=extras, no_deps=False, dest_dir=out)
+        logger.info("uv not found — building the project wheel with the host interpreter")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "wheel", str(project),
+             "--no-deps", "--wheel-dir", str(out)],
+            check=True,
+        )
 
-    bindir = venv / ("Scripts" if os.name == "nt" else "bin")
-    vpy = bindir / ("python.exe" if os.name == "nt" else "python")
-    # uv venvs ship without pip; bootstrap it so ``pip wheel`` can resolve the
-    # closure (uv has no ``pip wheel`` equivalent that bundles dependencies).
-    subprocess.run([str(vpy), "-m", "ensurepip", "--upgrade"], check=True)
-    logger.info("building %s bundle for Python %s into %s", package, py, out)
-    subprocess.run(
-        [str(vpy), "-m", "pip", "wheel", str(project), "--wheel-dir", str(out)],
-        check=True,
-    )
+    # Download the dependency closure as Linux-x86_64 wheels for the *serverless
+    # runtime* (the target Python + manylinux), not the deploying host. pip
+    # resolves the transitive closure from the top-level requirements and only
+    # accepts wheels (``--only-binary=:all:`` is mandatory alongside ``--platform``).
+    deps = _project_dependencies(distribution_for(package), set(extras))
+    if deps:
+        platform_args: list[str] = []
+        for platform_tag in _serverless_wheel_platforms():
+            platform_args += ["--platform", platform_tag]
+        logger.info(
+            "downloading %d top-level dep requirement(s) as %s wheels (py%s)",
+            len(deps), "/".join(_serverless_wheel_platforms()), py,
+        )
+        subprocess.run(
+            [sys.executable, "-m", "pip", "download",
+             "--only-binary=:all:",
+             "--python-version", py,
+             "--implementation", "cp",
+             "--abi", abi, "--abi", "abi3", "--abi", "none",
+             *platform_args,
+             "--dest", str(out), *deps],
+            check=True,
+        )
 
     wheels = sorted(out.glob("*.whl"))
     if not wheels:
@@ -690,7 +745,8 @@ def ensure_bundle(
     from the index at install), this bundles everything — so a serverless /
     cluster environment that lists these wheel paths installs **entirely from
     them, with zero PyPI access** ("0 pip install"). The compiled dependency
-    wheels carry *python*'s ``cp3XX`` tag (:func:`build_bundle`).
+    wheels carry the **serverless runtime's** Linux-x86_64 manylinux + *python*
+    ``cp3XX`` tags (:func:`build_bundle`), independent of the deploying host.
 
     Each wheel lands in its **own distribution folder**
     (``<workspace_dir>/<dist>/<wheel>`` via :func:`registry_upload`) — the
@@ -711,7 +767,12 @@ def ensure_bundle(
     proj = _norm(dist)
     py = _py_minor(python)
     root = workspace_dir.rstrip("/")
-    manifest = f"{root}/{proj}/{proj}-{version}-{environment_key_for(py)}.bundle"
+    # The manifest stem carries a ``-linux_x86_64`` platform scheme so a bundle
+    # built by the *old* host-platform code path (whose manifest lacked it) is
+    # never reused — the first deploy after the platform fix rebuilds the closure
+    # with serverless-correct manylinux wheels instead of silently serving the
+    # poisoned cache.
+    manifest = f"{root}/{proj}/{proj}-{version}-{environment_key_for(py)}-linux_x86_64.bundle"
     mpath = DatabricksPath.from_(manifest, client=client)
 
     if not rebuild and mpath.exists():

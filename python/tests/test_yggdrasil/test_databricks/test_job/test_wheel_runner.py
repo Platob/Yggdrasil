@@ -153,6 +153,61 @@ class TestWheel:
         assert calls[0][:3] == ["uv", "build", "--wheel"]
         assert "wheel" in calls[1] and "--no-deps" in calls[1]   # pip fallback
 
+    def test_build_bundle_downloads_deps_as_serverless_platform_wheels(self):
+        # The project wheel is built (uv), then the dep closure is *downloaded*
+        # with explicit serverless Linux-x86_64 platform/abi/python tags — never
+        # built for the deploying host (the platform-tag-mismatch bug).
+        out = Path("/does-not-matter")
+        with patch("yggdrasil.databricks.job.wheel.synthesize_project", return_value=Path("/synth")), \
+             patch("yggdrasil.databricks.job.wheel.distribution_for", return_value="ygg"), \
+             patch("yggdrasil.databricks.job.wheel._project_dependencies", return_value=["pyarrow>=20"]), \
+             patch("yggdrasil.databricks.job.wheel.subprocess.run") as run, \
+             patch("yggdrasil.databricks.job.wheel.tempfile.mkdtemp", return_value=str(out)), \
+             patch("pathlib.Path.glob", return_value=[Path("/o/ygg-1-py3-none-any.whl"),
+                                                      Path("/o/pyarrow-20-cp312-manylinux2014_x86_64.whl")]):
+            wheel.build_bundle("ygg", python="3.12")
+
+        build_cmd, download_cmd = run.call_args_list[0].args[0], run.call_args_list[1].args[0]
+        # 1) project wheel via uv build for the target Python.
+        assert build_cmd[:4] == ["uv", "build", "--wheel", "--python"]
+        assert "3.12" in build_cmd
+        # 2) deps downloaded (not built) with serverless platform/abi/python pins.
+        assert download_cmd[1:3] == ["-m", "pip"] and download_cmd[3] == "download"
+        assert "--only-binary=:all:" in download_cmd
+        assert "--python-version" in download_cmd and "3.12" in download_cmd
+        assert download_cmd[download_cmd.index("--abi") + 1] == "cp312"
+        assert "manylinux2014_x86_64" in download_cmd
+        assert "manylinux_2_28_x86_64" in download_cmd
+        assert "pyarrow>=20" in download_cmd                 # the requirement, resolved transitively by pip
+
+    def test_build_bundle_platform_override_env(self, monkeypatch):
+        monkeypatch.setenv("YGG_DATABRICKS_WHEEL_PLATFORMS", "manylinux_2_31_x86_64, manylinux_2_34_x86_64")
+        out = Path("/x")
+        with patch("yggdrasil.databricks.job.wheel.synthesize_project", return_value=Path("/synth")), \
+             patch("yggdrasil.databricks.job.wheel.distribution_for", return_value="ygg"), \
+             patch("yggdrasil.databricks.job.wheel._project_dependencies", return_value=["pyarrow>=20"]), \
+             patch("yggdrasil.databricks.job.wheel.subprocess.run") as run, \
+             patch("yggdrasil.databricks.job.wheel.tempfile.mkdtemp", return_value=str(out)), \
+             patch("pathlib.Path.glob", return_value=[Path("/x/ygg-1-py3-none-any.whl")]):
+            wheel.build_bundle("ygg", python="3.12")
+        download_cmd = run.call_args_list[1].args[0]
+        assert "manylinux_2_31_x86_64" in download_cmd
+        assert "manylinux_2_34_x86_64" in download_cmd
+        assert "manylinux2014_x86_64" not in download_cmd    # default set overridden
+
+    def test_build_bundle_no_deps_skips_download(self):
+        # A dep-free project builds the project wheel only — no pip download step.
+        out = Path("/y")
+        with patch("yggdrasil.databricks.job.wheel.synthesize_project", return_value=Path("/synth")), \
+             patch("yggdrasil.databricks.job.wheel.distribution_for", return_value="ygg"), \
+             patch("yggdrasil.databricks.job.wheel._project_dependencies", return_value=[]), \
+             patch("yggdrasil.databricks.job.wheel.subprocess.run") as run, \
+             patch("yggdrasil.databricks.job.wheel.tempfile.mkdtemp", return_value=str(out)), \
+             patch("pathlib.Path.glob", return_value=[Path("/y/ygg-1-py3-none-any.whl")]):
+            wheel.build_bundle("ygg", python="3.12")
+        assert run.call_count == 1                            # only the project build, no download
+        assert run.call_args_list[0].args[0][:2] == ["uv", "build"]
+
     def test_ensure_builds_with_deps_and_uploads_all(self):
         client = MagicMock()
         built = [Path("/tmp/ygg-1.0-py3-none-any.whl"), Path("/tmp/pyarrow-1-py3-none-any.whl")]
