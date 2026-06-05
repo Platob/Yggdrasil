@@ -151,9 +151,11 @@ def test_send_pipeline_split_and_read_hits(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fresh_ram(monkeypatch):
-    """Each test gets an empty RAM tier so they don't cross-contaminate."""
+    """Each test gets an empty RAM tier + a frozen janitor (no loop thread)."""
     import yggdrasil.http_.response_cache as rc
     monkeypatch.setattr(rc, "_ram", rc._ByteLRU(rc._RAM_MAX_BYTES, rc._RAM_ITEM_MAX_BYTES))
+    monkeypatch.setattr(rc, "_janitor_started", True)   # construction won't spawn the loop
+    monkeypatch.setattr(rc, "_roots", set())
     yield
 
 
@@ -212,28 +214,48 @@ def test_prune_old_deletes_stale_keeps_fresh(tmp_path):
     assert fresh.exists()
 
 
-def test_cache_self_cleans_on_construction(tmp_path, monkeypatch):
-    # Constructing the cache schedules a one-shot prune of day-old responses.
+def test_construction_registers_root_for_janitor(tmp_path):
+    import pathlib
+    import yggdrasil.http_.response_cache as rc
+
+    rc.HttpResponseCache(path=str(tmp_path))           # _janitor_started frozen True
+    assert str(pathlib.Path(str(tmp_path)).expanduser()) in rc._roots
+
+
+def test_byte_lru_sweep_drops_stale_keeps_fresh():
+    import time
+    import yggdrasil.http_.response_cache as rc
+
+    lru = rc._ByteLRU(max_bytes=1000, item_max=1000)
+    lru.put(1, b"x" * 10)
+    time.sleep(0.03)
+    lru.put(2, b"y" * 10)                               # fresh
+    assert lru.sweep(0.02) == 1                         # key 1 is older than 0.02s
+    assert lru.get(1) is None
+    assert lru.get(2) == b"y" * 10
+    assert lru._bytes == 10                             # byte accounting stays correct
+
+
+def test_janitor_pass_prunes_old_disk_keeps_fresh(tmp_path, monkeypatch):
     import os
     import time
     import yggdrasil.http_.response_cache as rc
 
-    root = tmp_path / "self"
+    root = tmp_path / "j"
     (root / "ab").mkdir(parents=True)
     stale = root / "ab" / "old.arrow"
     stale.write_bytes(b"x")
+    fresh = root / "ab" / "new.arrow"
+    fresh.write_bytes(b"y")
     old = time.time() - 2 * 86400
     os.utime(stale, (old, old))
+    monkeypatch.setattr(rc, "_roots", {str(root)})
+    rc._ram.put(7, b"z")                                # fresh RAM entry
 
-    monkeypatch.setattr(rc, "_cleaned_roots", set())   # reset the per-process guard
-    cache = rc.HttpResponseCache(path=str(root))
-    # cleanup runs in a daemon thread — give it a moment, deterministically
-    for _ in range(200):
-        if not stale.exists():
-            break
-        time.sleep(0.01)
-    assert not stale.exists()
-    assert isinstance(cache, rc.HttpResponseCache)
+    rc._janitor_pass()                                  # active sweep (1-day TTL)
+
+    assert not stale.exists() and fresh.exists()        # day-old disk pruned, fresh kept
+    assert rc._ram.get(7) == b"z"                        # fresh RAM survives the sweep
 
 
 def test_send_pipeline_miss_for_uncached(tmp_path, monkeypatch):

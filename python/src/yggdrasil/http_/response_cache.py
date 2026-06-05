@@ -59,7 +59,11 @@ _RAM_ITEM_MAX_BYTES = _RAM_MAX_BYTES // 4
 
 
 class _ByteLRU:
-    """Thread-safe LRU bounded by total bytes (and a per-item byte cap)."""
+    """Thread-safe LRU bounded by total bytes (and a per-item byte cap).
+
+    Entries carry a creation time so a TTL :meth:`sweep` can *actively* drop the
+    stale ones — ``get`` / ``put`` stay O(1) and never expire lazily on the hot
+    path (that's the janitor's job)."""
 
     __slots__ = ("_max", "_item_max", "_d", "_bytes", "_lock")
 
@@ -67,7 +71,7 @@ class _ByteLRU:
         from collections import OrderedDict
         self._max = max_bytes
         self._item_max = item_max
-        self._d: "OrderedDict[int, bytes]" = OrderedDict()
+        self._d: "OrderedDict[int, tuple]" = OrderedDict()   # key -> (bytes, created_s)
         self._bytes = 0
         self._lock = threading.Lock()
 
@@ -75,10 +79,11 @@ class _ByteLRU:
         if self._max <= 0:
             return None
         with self._lock:
-            v = self._d.get(key)
-            if v is not None:
-                self._d.move_to_end(key)
-            return v
+            e = self._d.get(key)
+            if e is None:
+                return None
+            self._d.move_to_end(key)
+            return e[0]
 
     def put(self, key: int, val: bytes) -> None:
         n = len(val)
@@ -87,12 +92,24 @@ class _ByteLRU:
         with self._lock:
             old = self._d.pop(key, None)
             if old is not None:
-                self._bytes -= len(old)
-            self._d[key] = val
+                self._bytes -= len(old[0])
+            self._d[key] = (val, time.monotonic())
             self._bytes += n
             while self._bytes > self._max:
-                _, evicted = self._d.popitem(last=False)
+                _, (evicted, _ts) = self._d.popitem(last=False)
                 self._bytes -= len(evicted)
+
+    def sweep(self, max_age_s: float) -> int:
+        """Actively drop entries older than *max_age_s*; returns the count."""
+        if self._max <= 0 or max_age_s <= 0:
+            return 0
+        cutoff = time.monotonic() - max_age_s
+        with self._lock:
+            stale = [k for k, (_v, ts) in self._d.items() if ts < cutoff]
+            for k in stale:
+                val, _ts = self._d.pop(k)
+                self._bytes -= len(val)
+        return len(stale)
 
 
 _ram = _ByteLRU(_RAM_MAX_BYTES, _RAM_ITEM_MAX_BYTES)
@@ -105,10 +122,14 @@ _ram = _ByteLRU(_RAM_MAX_BYTES, _RAM_ITEM_MAX_BYTES)
 # public_hash, so the *looked-up* request (same identity) is reattached on read.
 _VERSION = 1
 
-#: Cached responses auto-expire after this (default 1 day; ``0`` disables).
+#: Cached responses auto-expire after this (default 1 day; ``0`` disables), on
+#: both tiers. The janitor wakes every _SWEEP_INTERVAL to enforce it actively —
+#: not lazily on access — so neither RAM nor disk lingers stale entries.
 _CLEAN_TTL = float(os.environ.get("YGG_HTTP_CACHE_TTL") or 86400.0)
-_cleaned_roots: "set[str]" = set()
-_clean_lock = threading.Lock()
+_SWEEP_INTERVAL = float(os.environ.get("YGG_HTTP_CACHE_SWEEP_INTERVAL") or 3600.0)
+_roots: "set[str]" = set()
+_janitor_lock = threading.Lock()
+_janitor_started = False
 
 
 def _prune_old(root: pathlib.Path, ttl: float) -> int:
@@ -135,20 +156,36 @@ def _prune_old(root: pathlib.Path, ttl: float) -> int:
     return removed
 
 
-def _schedule_clean(root: pathlib.Path) -> None:
-    """Once per root per process, prune day-old responses in a daemon thread —
-    the local cache self-expires so it never grows without bound."""
+def _janitor_pass() -> None:
+    """One active expiry sweep across every known disk root + the RAM tier."""
+    for r in list(_roots):
+        _prune_old(pathlib.Path(r), _CLEAN_TTL)
+    _ram.sweep(_CLEAN_TTL)
+
+
+def _start_janitor(root: pathlib.Path) -> None:
+    """Register *root* and (once per process) start the background janitor — an
+    immediate sweep, then one every _SWEEP_INTERVAL. A real daemon, not a
+    lazy-on-access expiry, so day-old responses are reclaimed even in a
+    long-lived process and never just linger in memory."""
+    global _janitor_started
     if _CLEAN_TTL <= 0:
         return
-    key = str(root)
-    with _clean_lock:
-        if key in _cleaned_roots:
+    with _janitor_lock:
+        _roots.add(str(root))
+        if _janitor_started:
             return
-        _cleaned_roots.add(key)
-    threading.Thread(
-        target=_prune_old, args=(root, _CLEAN_TTL),
-        name="ygg-http-cache-clean", daemon=True,
-    ).start()
+        _janitor_started = True
+
+    def _loop() -> None:
+        while True:
+            try:
+                _janitor_pass()
+            except Exception:        # never let the janitor die on a transient error
+                pass
+            time.sleep(_SWEEP_INTERVAL)
+
+    threading.Thread(target=_loop, name="ygg-http-cache-janitor", daemon=True).start()
 
 
 def _encode(status: int, received: "Any", headers: "Any", tags: "Any", body: bytes) -> bytes:
@@ -210,7 +247,7 @@ class HttpResponseCache(Folder):
         super().__init__(data, path=path, tabular_parent=tabular_parent, **kwargs)
         self._root: "Optional[pathlib.Path]" = None
         try:                                   # auto-expire day-old responses
-            _schedule_clean(self.root)
+            _start_janitor(self.root)
         except Exception:                      # never let cleanup break construction
             pass
 
