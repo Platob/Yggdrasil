@@ -339,6 +339,129 @@ class TestWheel:
                 client, "ygg", "9.9", workspace_dir="/ws/9.9", dist_only=True,
             ) == []
 
+    def test_ensure_bundles_for_versions_resolves_per_python_closure(self):
+        # Cold build: project wheel built once (shared), then one pip download per
+        # Python tagging cp310/cp312; pure-python deps dedupe across the set.
+        client = MagicMock()
+        downloads = {
+            "3.10": ["pyarrow-20-cp310-cp310-manylinux2014_x86_64.whl",
+                     "databricks_sdk-0.114-py3-none-any.whl"],
+            "3.12": ["pyarrow-20-cp312-cp312-manylinux2014_x86_64.whl",
+                     "databricks_sdk-0.114-py3-none-any.whl"],
+        }
+        seen_targets: list[str] = []
+
+        def _run(cmd, *a, **k):
+            # cmd: [..., "download", *reqs, ..., "--abi", "cp3X", ..., "--dest", target]
+            abi = cmd[cmd.index("--abi") + 1]
+            target = Path(cmd[cmd.index("--dest") + 1])
+            seen_targets.append(abi)
+            minor = f"3.{abi[3:]}"
+            for name in downloads[minor]:
+                (target / name).write_bytes(b"")
+            return MagicMock(returncode=0)
+
+        uploaded: list[str] = []
+
+        def _upload(c, w, *, workspace_dir):
+            uploaded.append(w.name)
+            return f"{workspace_dir}/{w.name}"
+
+        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=[]), \
+             patch("yggdrasil.databricks.job.wheel.build_wheel",
+                   return_value=[Path("/tmp/ygg-9.9-py3-none-any.whl")]), \
+             patch("yggdrasil.databricks.job.wheel._project_dependencies",
+                   return_value=["pyarrow>=20", "databricks-sdk>=0.107"]), \
+             patch("yggdrasil.databricks.job.wheel.subprocess.run", side_effect=_run), \
+             patch("yggdrasil.databricks.job.wheel.upload_wheel", side_effect=_upload):
+            out = wheel.ensure_bundles_for_versions(
+                client, "ygg", versions=("3.10", "3.12"), workspace_dir="/ws",
+            )
+        assert set(out) == {"3.10", "3.12"}
+        # Distinct cp wheels per Python.
+        assert any("cp310" in p for p in out["3.10"])
+        assert any("cp312" in p for p in out["3.12"])
+        assert all("cp312" not in p for p in out["3.10"])
+        # Shared pure-python ygg + databricks_sdk wheels uploaded once.
+        assert uploaded.count("ygg-9.9-py3-none-any.whl") == 1
+        assert uploaded.count("databricks_sdk-0.114-py3-none-any.whl") == 1
+        # Every version list carries the shared ygg wheel by path.
+        assert all(
+            any(p.endswith("ygg-9.9-py3-none-any.whl") for p in paths)
+            for paths in out.values()
+        )
+
+    def test_ensure_bundles_for_versions_reuses_deployed(self):
+        # Warm: every wheel already in the bundle dir; map cp tags back per Python
+        # with no build/download.
+        client = MagicMock()
+        deployed = [
+            "/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
+            "/ws/ygg-bundle/pyarrow-20-cp310-cp310-linux.whl",
+            "/ws/ygg-bundle/pyarrow-20-cp312-cp312-linux.whl",
+            "/ws/ygg-bundle/databricks_sdk-0.114-py3-none-any.whl",
+        ]
+        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=deployed), \
+             patch("yggdrasil.databricks.job.wheel.build_wheel") as bw, \
+             patch("yggdrasil.databricks.job.wheel.subprocess.run") as run:
+            out = wheel.ensure_bundles_for_versions(
+                client, "ygg", versions=("3.10", "3.12"), workspace_dir="/ws",
+            )
+        bw.assert_not_called()
+        run.assert_not_called()
+        # 3.10 gets cp310 + shared; the cp312 wheel is filtered out, and vice-versa.
+        assert "/ws/ygg-bundle/pyarrow-20-cp310-cp310-linux.whl" in out["3.10"]
+        assert "/ws/ygg-bundle/pyarrow-20-cp312-cp312-linux.whl" not in out["3.10"]
+        assert "/ws/ygg-bundle/pyarrow-20-cp312-cp312-linux.whl" in out["3.12"]
+        assert "/ws/ygg-bundle/ygg-9.9-py3-none-any.whl" in out["3.10"]
+
+    def test_write_environment_configs_serverless_and_cluster(self):
+        client = MagicMock()
+        bundles = {
+            "3.10": ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
+                     "/ws/ygg-bundle/pyarrow-20-cp310.whl"],
+            "3.11": ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
+                     "/ws/ygg-bundle/pyarrow-20-cp311.whl"],
+            "3.12": ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
+                     "/ws/ygg-bundle/pyarrow-20-cp312.whl"],
+            "3.13": ["/ws/ygg-bundle/ygg-9.9-py3-none-any.whl",
+                     "/ws/ygg-bundle/pyarrow-20-cp313.whl"],
+        }
+        bodies: dict[str, str] = {}
+
+        def _from(dest, *, client=None):
+            node = MagicMock()
+            node.write_text.side_effect = lambda b: bodies.__setitem__(dest, b)
+            return node
+
+        with patch("yggdrasil.databricks.path.DatabricksPath.from_", side_effect=_from):
+            written = wheel.write_environment_configs(
+                client, bundles, workspace_dir="/Workspace/Shared/environment",
+            )
+        names = set(written)
+        # Cluster config for every Python (incl. 3.13).
+        assert {
+            "cluster-py310.env.yaml", "cluster-py311.env.yaml",
+            "cluster-py312.env.yaml", "cluster-py313.env.yaml",
+        } <= names
+        # Serverless v1/v2/v5 for 3.10/3.11/3.12; NO serverless for 3.13.
+        assert "serverless-v1-py310.env.yaml" in names
+        assert "serverless-v2-py311.env.yaml" in names
+        assert "serverless-v5-py312.env.yaml" in names
+        assert not any(n.startswith("serverless-") and "py313" in n for n in names)
+
+        import yaml
+
+        sv = yaml.safe_load(bodies["/Workspace/Shared/environment/serverless-v5-py312.env.yaml"])
+        assert sv["environment_version"] == "5"
+        assert sv["dependencies"] == bundles["3.12"]
+        assert all(d.endswith(".whl") for d in sv["dependencies"])
+
+        cl = yaml.safe_load(bodies["/Workspace/Shared/environment/cluster-py313.env.yaml"])
+        assert cl["libraries"] == [{"whl": w} for w in bundles["3.13"]]
+
     def test_deployed_wheels_missing_dir(self):
         client = MagicMock()
         folder = MagicMock()

@@ -48,7 +48,9 @@ __all__ = [
     "ensure_ygg_wheel",
     "ensure_ygg_wheels",
     "ensure_bundle",
+    "ensure_bundles_for_versions",
     "ensure_named_environment",
+    "write_environment_configs",
     "ygg_runtime_dependencies",
     "ygg_environment",
     "ygg_environments",
@@ -71,6 +73,13 @@ WORKSPACE_WHL_DIR = WORKSPACE_PYPI_DIR
 #: a job references one by file path via ``Environment.base_environment`` instead
 #: of inlining the whole dependency list (see :func:`ensure_named_environment`).
 WORKSPACE_ENV_DIR = "/Workspace/Shared/ygg/environments"
+
+#: Where the **per-Python environment config files** land — one serverless config
+#: keyed by serverless environment version and one cluster config keyed by Python
+#: minor (see :func:`write_environment_configs`). Distinct from
+#: :data:`WORKSPACE_ENV_DIR` (the older ``<name>.env.yaml`` base-environments): this
+#: dir holds the **zero-pip** bundle configs that pin every dependency by wheel path.
+WORKSPACE_ENVIRONMENT_DIR = "/Workspace/Shared/environment"
 
 #: Latest serverless environment version — the fallback when the local Python
 #: isn't one we map to an older runtime.
@@ -612,6 +621,213 @@ def ensure_bundle(
     logger.info("building full %s %s bundle (project + deps) -> %s", dist, version, dist_dir)
     wheels = build_wheel(package, extras=extras, no_deps=False)
     return [upload_wheel(client, w, workspace_dir=dist_dir) for w in wheels]
+
+
+def ensure_bundles_for_versions(
+    client: Any,
+    package: str = "ygg",
+    *,
+    versions: "tuple[str, ...] | list[str]" = SUPPORTED_PYTHONS,
+    extras: "tuple[str, ...] | list[str]" = ("databricks",),
+    workspace_dir: str = WORKSPACE_PYPI_DIR,
+    rebuild: bool = False,
+) -> "dict[str, list[str]]":
+    """Build *package*'s **whole transitive dependency closure as cp3XX wheels,
+    one specialized set per Python version**, and upload them all into a single
+    co-located bundle dir (``<workspace_dir>/<dist>-bundle/``). Returns
+    ``{python: [wheel workspace paths]}``.
+
+    Where :func:`ensure_bundle` builds the closure for the *running* interpreter
+    only, this resolves the binary deps (pyarrow / polars / numpy / …) for **each**
+    target Python — so a serverless/cluster env on py3.10 installs the ``cp310``
+    builds, py3.11 the ``cp311`` builds, and so on, **with zero PyPI access**.
+
+    How it works (in-process, no extra interpreters needed):
+
+    - *package* itself is pure-python, so its universal ``py3-none-any`` wheel is
+      built **once** (uv ``build --wheel``, no deps) and shared across every
+      Python — that single file appears in every version's returned list.
+    - The declared dependency closure (:func:`_project_dependencies`, flattening
+      *extras*) is resolved+downloaded per version via ``pip download`` cross
+      targeting — ``--python-version 3.X --implementation cp --abi cp3X
+      --platform manylinux2014_x86_64 --only-binary=:all:`` — so pip picks the
+      ``cp3X`` artifact for binary deps and the shared ``py3-none-any`` artifact
+      for pure-python ones. Pure-python dep wheels are naturally deduped in the
+      co-located dir (same filename across versions).
+
+    All versions' wheels live side by side in one bundle dir (PEP 503-ish), like
+    the existing :func:`ensure_bundle` layout — :func:`write_environment_configs`
+    then maps each Python to its own ``cp3X`` subset by filename tag.
+
+    Cached per ``(dist, version)``: if the project wheel is already deployed in
+    the bundle dir and *not* ``rebuild``, every ``.whl`` already there is reused
+    and no download runs (dependency wheels are version-pinned and immutable)."""
+    dist = distribution_for(package)
+    pkg_version = ilmd.version(dist)
+    dist_dir = f"{workspace_dir.rstrip('/')}/{_norm(dist)}-bundle"
+
+    deployed = deployed_wheels(client, dist, pkg_version, workspace_dir=dist_dir)
+    if deployed and not rebuild:
+        logger.info(
+            "reusing %d-wheel %s %s multi-Python bundle at %s",
+            len(deployed), dist, pkg_version, dist_dir,
+        )
+        names = [p.rsplit("/", 1)[-1] for p in deployed]
+        return {_py_minor(v): _wheels_for_version_tag(names, deployed, v) for v in versions}
+
+    # The project itself is pure-python — build its universal wheel once and reuse
+    # it for every Python (uv, no deps). It's the one shared artifact across the set.
+    project_wheels = build_wheel(package, extras=extras, no_deps=True)
+    project_paths = [upload_wheel(client, w, workspace_dir=dist_dir) for w in project_wheels]
+    project_names = [w.name for w in project_wheels]
+
+    requirements = _project_dependencies(dist, set(extras))
+    work = Path(tempfile.mkdtemp(prefix="ygg-bundle-versions-"))
+    out: "dict[str, list[str]]" = {}
+    uploaded: "dict[str, str]" = {}  # wheel filename -> workspace path (dedupe pure-python)
+    for version in versions:
+        minor = _py_minor(version)
+        abi = "cp" + minor.replace(".", "")
+        target = work / abi
+        target.mkdir(exist_ok=True)
+        logger.info(
+            "resolving %s %s dependency closure for Python %s (cp%s wheels)",
+            dist, pkg_version, minor, minor.replace(".", ""),
+        )
+        # Cross-target pip download: pin the interpreter/ABI/platform so binary
+        # deps come back as the right cp3X build instead of whatever the build
+        # host happens to run. --only-binary=:all: makes a missing cp3X wheel a
+        # hard error (we'd rather fail loud than ship a source dist a zero-pip
+        # cluster can't build).
+        subprocess.run(
+            [sys.executable, "-m", "pip", "download", *requirements,
+             "--only-binary=:all:",
+             "--python-version", minor,
+             "--implementation", "cp",
+             "--abi", abi,
+             "--platform", "manylinux2014_x86_64",
+             "--dest", str(target)],
+            check=True,
+        )
+        version_paths = list(project_paths)
+        for whl in sorted(target.glob("*.whl")):
+            cached = uploaded.get(whl.name)
+            if cached is None:
+                cached = upload_wheel(client, whl, workspace_dir=dist_dir)
+                uploaded[whl.name] = cached
+            version_paths.append(cached)
+        out[minor] = version_paths
+        logger.info(
+            "bundled %s %s for Python %s: %d wheel(s) (%d shared project)",
+            dist, pkg_version, minor, len(version_paths), len(project_paths),
+        )
+    return out
+
+
+def _wheels_for_version_tag(
+    names: "list[str]", paths: "list[str]", python: str,
+) -> "list[str]":
+    """From a co-located bundle (parallel *names* / *paths*), the subset that
+    installs on *python*: the version-tagged ``cp3X`` wheels plus the shared
+    ``py3-none-any`` / ``abi3`` wheels (pure-python or stable-ABI, install
+    anywhere). A ``cp3Y`` wheel for a *different* Python is dropped."""
+    tag = "cp" + _py_minor(python).replace(".", "")
+    keep: "list[str]" = []
+    for name, path in zip(names, paths):
+        lower = name.lower()
+        cp = re.search(r"-cp(3\d)", lower)
+        if cp is None or f"cp{_py_minor(python).replace('.', '')}" == f"cp{cp.group(1)}" or "-abi3-" in lower or "-none-any" in lower:
+            keep.append(path)
+        elif tag in lower:
+            keep.append(path)
+    return keep
+
+
+def write_environment_configs(
+    client: Any,
+    bundles: "dict[str, list[str]]",
+    *,
+    workspace_dir: str = WORKSPACE_ENVIRONMENT_DIR,
+    serverless_versions: "dict[str, str]" = SERVERLESS_ENVIRONMENT_VERSIONS,
+) -> "dict[str, str]":
+    """Write the **zero-pip** environment config files for a multi-Python bundle
+    (the output of :func:`ensure_bundles_for_versions`) into *workspace_dir*
+    (default :data:`WORKSPACE_ENVIRONMENT_DIR`, ``/Workspace/Shared/environment``).
+    Returns ``{config name: workspace path}`` for every file written.
+
+    Two flavours come out, both pinning every dependency by wheel path so the
+    target installs entirely from the bundle:
+
+    - **Serverless**, one per Python that maps to a serverless environment
+      version (:data:`SERVERLESS_ENVIRONMENT_VERSIONS` plus the latest
+      :data:`SERVERLESS_ENVIRONMENT_VERSION` default) — filename
+      ``serverless-v<N>-py3X.env.yaml``, body ``environment_version: '<N>'`` +
+      ``dependencies:`` = that Python's cp3X wheel paths. A Python with no
+      serverless version mapping today (3.13) gets **no** serverless file —
+      that's expected, it's cluster-only.
+    - **Cluster**, one per Python — filename ``cluster-py3X.env.yaml``, body a
+      ``libraries:`` list of ``{whl: <path>}`` for DBR clusters that install
+      libraries by path.
+
+    YAML is hand-rolled (flat, predictable) like the other writers here, written
+    through :class:`DatabricksPath` (same as :func:`ensure_named_environment`)."""
+    from yggdrasil.databricks.path import DatabricksPath
+
+    base = workspace_dir.rstrip("/")
+    folder = DatabricksPath.from_(base, client=client)
+    folder.mkdir(parents=True, exist_ok=True)
+    written: "dict[str, str]" = {}
+
+    # One serverless env version can map from several Pythons; only the latest
+    # default (3.12 → "5") and the explicit map (3.10 → "1", 3.11 → "2") get a
+    # serverless file. 3.13 has no mapping today → cluster-only, by design.
+    serverless_for: "dict[str, str]" = dict(serverless_versions)
+    for python in bundles:
+        minor = _py_minor(python)
+        if minor not in serverless_for and minor in ("3.12",):
+            serverless_for[minor] = SERVERLESS_ENVIRONMENT_VERSION
+
+    def _write(name: str, body: str) -> None:
+        dest = f"{base}/{name}"
+        path = DatabricksPath.from_(dest, client=client)
+        path.write_text(body)
+        written[name] = dest
+
+    for python, wheels in bundles.items():
+        minor = _py_minor(python)
+        key = "py" + minor.replace(".", "")
+
+        # Cluster config — libraries-by-path, valid for any DBR on this Python.
+        cluster_lines = [
+            "# Generated by yggdrasil — zero-pip cluster libraries.",
+            f"# Python {minor}: install every wheel by path (no PyPI access).",
+            "libraries:",
+        ]
+        cluster_lines += [f"  - whl: {w}" for w in wheels]
+        _write(f"cluster-{key}.env.yaml", "\n".join(cluster_lines) + "\n")
+
+        # Serverless config — only when this Python maps to an env version.
+        env_version = serverless_for.get(minor)
+        if env_version is None:
+            logger.info(
+                "no serverless environment version for Python %s — cluster config only",
+                minor,
+            )
+            continue
+        serverless_lines = [
+            "# Generated by yggdrasil — zero-pip serverless environment.",
+            f"# Python {minor} -> serverless environment_version '{env_version}'.",
+            f"environment_version: '{env_version}'",
+            "dependencies:",
+        ]
+        serverless_lines += [f"  - {w}" for w in wheels]
+        _write(f"serverless-v{env_version}-{key}.env.yaml", "\n".join(serverless_lines) + "\n")
+
+    logger.info(
+        "wrote %d environment config(s) to %s (%s)",
+        len(written), base, ", ".join(sorted(written)),
+    )
+    return written
 
 
 def ensure_named_environment(
