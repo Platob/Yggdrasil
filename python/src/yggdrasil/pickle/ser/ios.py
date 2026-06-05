@@ -318,6 +318,14 @@ class IOSerialized(Serialized[object]):
         # the binary path, which already preserves ``_media_type`` via
         # :func:`_encode_media_type`.
         if isinstance(obj, IO):
+            from yggdrasil.path.folder import Folder
+
+            if isinstance(obj, Folder):
+                # A directory-backed holder (Folder & subclasses, e.g.
+                # HttpResponseCache / DeltaFolder) is not a byte stream — reading
+                # it raises IsADirectoryError. Fall through to the generic object
+                # serializer, which reconstructs it from its small path state.
+                return None
             return BinaryIOSerialized.from_value(obj, metadata=metadata, codec=codec)
 
         if isinstance(obj, io.BytesIO):

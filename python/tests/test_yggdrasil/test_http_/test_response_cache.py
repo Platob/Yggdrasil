@@ -47,6 +47,23 @@ def test_write_then_read_hit(tmp_path):
     assert hits[0].match_value("public_hash") == req.match_value("public_hash")
 
 
+def test_cache_is_serializable(tmp_path):
+    # Survives both stdlib pickle and the ygg transport serializer, and stays
+    # functional (same path) after a round-trip.
+    import pickle
+    from yggdrasil.pickle import dumps, loads
+
+    cache = _cache(tmp_path)
+    req = _req()
+    cache.write_arrow(Response.values_to_arrow_batch([_resp(req, body=b"S")]))
+    for round_trip in (lambda c: pickle.loads(pickle.dumps(c)), lambda c: loads(dumps(c))):
+        c2 = round_trip(cache)
+        assert isinstance(c2, HttpResponseCache)
+        assert c2.root == cache.root
+        hits, _ = c2.read_responses([req], config=CacheConfig())
+        assert hits and hits[0].content == b"S"
+
+
 def test_different_request_misses(tmp_path):
     cache = _cache(tmp_path)
     cache.write_arrow(Response.values_to_arrow_batch([_resp(_req("https://e.com/a?x=1"))]))
