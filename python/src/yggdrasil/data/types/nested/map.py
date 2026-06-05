@@ -1,0 +1,1270 @@
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable
+
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from yggdrasil.data.types.id import DataTypeId
+from yggdrasil.data.types.nested import NestedType
+from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
+from yggdrasil.environ.importlib import cached_from_import
+from yggdrasil.enums import Mode
+from yggdrasil.lazy_imports import field_class, struct_type_class
+from ._cast_json import (
+    cast_arrow_json_string_array,
+    cast_spark_json_string_column,
+    is_json_string_source,
+)
+from .array import ArrayType
+
+if TYPE_CHECKING:
+    import pandas as pd
+    import polars
+    import pyspark.sql as psql
+    import pyspark.sql.types as pst
+    from yggdrasil.data.options import CastOptions
+    from yggdrasil.data.data_field import Field
+    from .struct import StructType
+
+__all__ = [
+    "MapType",
+    "cast_arrow_map_array",
+    "cast_arrow_list_array_to_map",
+    "cast_arrow_struct_array_to_map",
+    "cast_polars_map_series",
+    "cast_polars_map_expr",
+    "cast_polars_list_series_to_map",
+    "cast_polars_list_expr_to_map",
+    "cast_polars_struct_series_to_map",
+    "cast_polars_struct_expr_to_map",
+    "cast_pandas_map_series",
+    "cast_pandas_list_series_to_map",
+    "cast_pandas_struct_series_to_map",
+    "cast_spark_map_column",
+    "cast_spark_list_column_to_map",
+    "cast_spark_struct_column_to_map",
+]
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, repr=False)
+class MapType(NestedType):
+    item_field: "Field"
+    keys_sorted: bool = False
+
+    @classmethod
+    def class_type_id(cls) -> DataTypeId:
+        return DataTypeId.MAP
+
+    def pretty_format(self, indent: int = 2, level: int = 0) -> str:
+        pad = " " * (indent * level)
+        body = ",\n".join(
+            child.pretty_format(indent=indent, level=level + 1)
+            for child in (self.key_field, self.value_field)
+        )
+        return f"{pad}map<\n{body}\n{pad}>"
+
+    def _merge_with_same_id(
+        self,
+        other: "MapType",
+        mode: Mode | None = None,
+        downcast: bool = False,
+        upcast: bool = False,
+    ) -> "MapType":
+        key = self.key_field.merge_with(
+            other.key_field,
+            mode=mode,
+            downcast=downcast,
+            upcast=upcast,
+        )
+        value = self.value_field.merge_with(
+            other.value_field,
+            mode=mode,
+            downcast=downcast,
+            upcast=upcast,
+        )
+
+        return self.from_key_value(
+            key,
+            value,
+            keys_sorted=self.keys_sorted or other.keys_sorted,
+        )
+
+    def default_pyobj(self, nullable: bool) -> Any:
+        return None if nullable else {}
+
+    @property
+    def children(self) -> list["Field"]:
+        return [self.item_field]
+
+    @property
+    def key_field(self) -> "Field":
+        return self.item_field.field_at(0)
+
+    @property
+    def value_field(self) -> "Field":
+        return self.item_field.field_at(1)
+
+    @classmethod
+    def handles_arrow_type(cls, dtype: pa.DataType) -> bool:
+        return pa.types.is_map(dtype)
+
+    @classmethod
+    def from_key_value(
+        cls,
+        key_field: "Field",
+        value_field: "Field",
+        keys_sorted: bool | None = None,
+    ) -> "MapType":
+        _f = field_class()
+        k = _f.from_any(key_field).with_nullable(False)
+
+        if not k.name:
+            k.with_name("key", inplace=True)
+
+        v = _f.from_any(value_field)
+        if not v.name:
+            v.with_name("value", inplace=True)
+
+        return cls(
+            item_field=_f(
+                name="entries",
+                dtype=struct_type_class()(fields=[k, v]),
+                nullable=False,
+            ),
+            keys_sorted=k.sorted if keys_sorted is None else bool(keys_sorted),
+        )
+
+    @classmethod
+    def from_arrow_type(cls, dtype: pa.MapType) -> "MapType":
+        if not pa.types.is_map(dtype):
+            raise TypeError(f"Unsupported Arrow data type: {dtype!r}")
+
+        _f = cached_from_import("yggdrasil.data.data_field", "Field")
+
+        entry_struct = cached_from_import(
+            "yggdrasil.data.types.nested",
+            "StructType",
+        )(fields=[
+            _f.from_arrow_field(dtype.key_field),
+            _f.from_arrow_field(dtype.item_field),
+        ])
+
+        return cls(
+            item_field=_f(
+                name="entries",
+                dtype=entry_struct,
+                nullable=False,
+            ),
+            keys_sorted=getattr(dtype, "keys_sorted", False),
+        )
+
+    def equals(
+        self,
+        other: "DataType",
+        check_names: bool = True,
+        check_dtypes: bool = True,
+        check_metadata: bool = True,
+    ) -> bool:
+        if not isinstance(other, MapType):
+            return False
+
+        if not self.key_field.name:
+            self.key_field.with_name(other.key_field.name, inplace=True)
+
+        if not self.value_field.name:
+            self.value_field.with_name(other.value_field.name, inplace=True)
+
+        return (
+            self.key_field.equals(other.key_field, check_names, check_dtypes, check_metadata)
+            and self.value_field.equals(other.value_field, check_names, check_dtypes, check_metadata)
+            and self.keys_sorted == other.keys_sorted
+        )
+
+    @classmethod
+    def handles_polars_type(cls, dtype: "polars.List") -> bool:
+        pl = polars_module()
+        return isinstance(dtype, pl.List) and isinstance(dtype.inner, pl.Struct)
+
+    @classmethod
+    def from_polars_type(cls, dtype: "polars.List") -> "MapType":
+        _f = field_class()
+
+        if not cls.handles_polars_type(dtype):
+            raise TypeError(f"Unsupported Polars data type: {dtype!r}")
+
+        fields = [_f.from_polars(f) for f in dtype.inner.fields]
+
+        if len(fields) != 2:
+            raise TypeError(f"Expected List[Struct[key, value]] for map type: {dtype!r}")
+
+        return cls(
+            item_field=_f(
+                name="entries",
+                dtype=struct_type_class()(fields=fields),
+                nullable=False,
+            ),
+            keys_sorted=False,
+        )
+
+    @classmethod
+    def handles_spark_type(cls, dtype: "pst.DataType") -> bool:
+        spark = spark_sql_module()
+        return isinstance(dtype, spark.types.MapType)
+
+    @classmethod
+    def from_spark_type(cls, dtype: "pst.DataType") -> "MapType":
+        _f = cached_from_import("yggdrasil.data.data_field", "Field")
+        StructType = cached_from_import("yggdrasil.data.types.nested", "StructType")
+        spark = spark_sql_module()
+
+        if not isinstance(dtype, spark.types.MapType):
+            raise TypeError(f"Unsupported Spark data type: {dtype!r}")
+
+        entry_struct = StructType(fields=[
+            _f.from_spark(spark.types.StructField("key", dtype.keyType, nullable=False)),
+            _f.from_spark(
+                spark.types.StructField(
+                    "value",
+                    dtype.valueType,
+                    nullable=dtype.valueContainsNull,
+                )
+            ),
+        ])
+
+        return cls(
+            item_field=_f(
+                name="entries",
+                dtype=entry_struct,
+                nullable=False,
+            ),
+            keys_sorted=False,
+        )
+
+    @classmethod
+    def handles_dict(cls, value: dict[str, Any]) -> bool:
+        return cls._matches_dict(value, DataTypeId.MAP)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any], default: Any = ...) -> "ArrayType":
+        try:
+            return cls(
+                item_field=field_class().from_dict(value["item_field"]),
+                keys_sorted=bool(value.get("keys_sorted", False)),
+            )
+        except Exception as e:
+            if default is ...:
+                raise ValueError(f"Could not parse {cls.__name__} from dict: {value!r}") from e
+            return default
+
+    def _default_pyhint(self) -> Any:
+        # Recurse into key / value fields so the nested annotation
+        # round-trips (``MapType(StringType(), IntegerType())`` →
+        # ``dict[str, int]``). Each child field forwards to its own
+        # dtype's ``to_pyhint`` so cached hints survive.
+        return dict[
+            self.key_field.dtype.to_pyhint(),
+            self.value_field.dtype.to_pyhint(),
+        ]
+
+    def to_arrow(self) -> pa.DataType:
+        return pa.map_(
+            self.key_field.to_arrow_field(),
+            self.value_field.to_arrow_field(),
+            keys_sorted=self.keys_sorted,
+        )
+
+    def _cast_arrow_array(
+        self,
+        array: pa.Array,
+        options: "CastOptions",
+    ) -> pa.MapArray | pa.ChunkedArray:
+        # Engine-level bypass — match the array variant. When the
+        # source's arrow type already matches the target, skip the
+        # ``check_source`` Field-from-arrow peek + the ``need_cast``
+        # walk and return ``array`` directly.
+        if array.type == self.to_arrow():
+            return array
+
+        options = options.check_source(array).check_target(self)
+
+        if options.need_cast(array, self):
+            source_type_id = options.source.dtype.type_id
+
+            if source_type_id == DataTypeId.NULL or array.null_count == len(array):
+                return options.target.default_arrow_array(
+                    size=len(array),
+                    memory_pool=options.arrow_memory_pool,
+                )
+
+            elif is_json_string_source(source_type_id):
+                return cast_arrow_json_string_array(array, options=options)
+
+            elif source_type_id == DataTypeId.MAP:
+                return cast_arrow_map_array(
+                    array,
+                    options=options,
+                )
+
+            elif source_type_id == DataTypeId.ARRAY:
+                return cast_arrow_list_array_to_map(
+                    array,
+                    options=options,
+                )
+
+            elif source_type_id == DataTypeId.STRUCT:
+                return cast_arrow_struct_array_to_map(
+                    array,
+                    options=options,
+                )
+
+            else:
+                raise pa.ArrowInvalid(
+                    f"Cannot cast {options.source} to {options.target}"
+                )
+        return array
+
+    def to_polars(self) -> "polars.DataType":
+        pl = polars_module()
+        return pl.List(self.item_field.dtype.to_polars())
+
+    def _cast_polars_series(
+        self,
+        series: "polars.Series",
+        options: "CastOptions",
+    ) -> "polars.Series":
+        # Engine-level bypass — see :meth:`StructType._cast_polars_series`.
+        # Polars represents Maps as ``pl.List(pl.Struct(...))`` so the
+        # dtype equality check naturally walks key/value child types.
+        if series.dtype == self.to_polars():
+            return series
+
+        pl = polars_module()
+        options = options.check_source(series).check_target(self)
+
+        source_type_id = options.source.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL or series.null_count() == len(series):
+            return options.target.default_polars_series(size=len(series))
+
+        if is_json_string_source(source_type_id):
+            # polars represents a Map as List<Struct<key, value>>, which
+            # ``str.json_decode`` can only populate from a JSON *list* of
+            # entries — not a plain JSON object.  Roundtrip via Arrow so
+            # ``{"a":1,"b":2}`` shaped input still decodes correctly.
+            arrow_input = series.to_arrow()
+            arrow_output = cast_arrow_json_string_array(
+                arrow_input, options=options
+            )
+            return pl.from_arrow(arrow_output).rename(
+                options.target.name
+            )
+
+        expr = self._cast_polars_expr(
+            pl.col(series.name),
+            options=options,
+        ).alias(options.target.name)
+
+        return pl.DataFrame({series.name: series}).select(expr).to_series()
+
+    def _cast_polars_expr(
+        self,
+        expr: Any,
+        options: "CastOptions",
+    ) -> Any:
+        options = options.check_target(self)
+
+        source_type_id = options.source.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL:
+            return options.target.default_polars_expr(alias=options.target.name)
+
+        elif is_json_string_source(source_type_id):
+            # JSON object → Map needs materialisation (see _cast_polars_series)
+            raise TypeError(
+                f"Cannot cast {options.source} to {options.target} "
+                "as an expression; use cast_polars_series for a JSON map source."
+            )
+
+        elif source_type_id == DataTypeId.MAP:
+            return cast_polars_map_expr(expr, options)
+
+        elif source_type_id == DataTypeId.ARRAY:
+            return cast_polars_list_expr_to_map(expr, options)
+
+        elif source_type_id == DataTypeId.STRUCT:
+            return cast_polars_struct_expr_to_map(expr, options)
+
+        else:
+            raise TypeError(
+                f"Cannot cast {options.source} to {options.target}"
+            )
+
+    def _cast_pandas_series(
+        self,
+        series: "pd.Series",
+        options: "CastOptions",
+    ) -> "pd.Series":
+        options = options.check_source(series).check_target(self)
+
+        source_type_id = options.source.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL or series.isna().all():
+            return options.target.default_pandas_series(size=len(series))
+
+        elif is_json_string_source(source_type_id):
+            return _cast_pandas_via_arrow(series, options, cast_arrow_json_string_array)
+
+        elif source_type_id == DataTypeId.MAP:
+            return cast_pandas_map_series(series, options)
+
+        elif source_type_id == DataTypeId.ARRAY:
+            return cast_pandas_list_series_to_map(series, options)
+
+        elif source_type_id == DataTypeId.STRUCT:
+            return cast_pandas_struct_series_to_map(series, options)
+
+        else:
+            raise TypeError(
+                f"Cannot cast {options.source} to {options.target}"
+            )
+
+    def _cast_spark_column(
+        self,
+        column: Any,
+        options: "CastOptions",
+    ) -> Any:
+        options = options.check_source(column).check_target(self)
+
+        source_type_id = options.source.dtype.type_id
+
+        if source_type_id == DataTypeId.NULL:
+            return options.target.default_spark_column()
+
+        elif is_json_string_source(source_type_id):
+            return cast_spark_json_string_column(column, options)
+
+        elif source_type_id == DataTypeId.MAP:
+            return cast_spark_map_column(column, options)
+
+        elif source_type_id == DataTypeId.ARRAY:
+            return cast_spark_list_column_to_map(column, options)
+
+        elif source_type_id == DataTypeId.STRUCT:
+            return cast_spark_struct_column_to_map(column, options)
+
+        else:
+            raise TypeError(
+                f"Cannot cast {options.source} to {options.target}"
+            )
+
+    def _cast_spark_tabular(
+        self,
+        frame: "psql.DataFrame",
+        options: "CastOptions",
+    ) -> "psql.DataFrame":
+        raise TypeError(
+            f"Cannot cast tabular source {type(frame)!r} directly to {self.__class__.__name__}"
+        )
+
+    def to_spark(self) -> Any:
+        spark = spark_sql_module()
+        return spark.types.MapType(
+            keyType=self.key_field.dtype.to_spark(),
+            valueType=self.value_field.dtype.to_spark(),
+            valueContainsNull=self.value_field.nullable,
+        )
+
+    def as_spark(self) -> "MapType":
+        spark_key = self.key_field.as_spark()
+        spark_value = self.value_field.as_spark()
+        if spark_key is self.key_field and spark_value is self.value_field:
+            return self
+        return MapType.from_key_value(
+            key_field=spark_key,
+            value_field=spark_value,
+            keys_sorted=self.keys_sorted,
+        )
+
+    def as_polars(self) -> "MapType":
+        polars_key = self.key_field.as_polars()
+        polars_value = self.value_field.as_polars()
+        if polars_key is self.key_field and polars_value is self.value_field:
+            return self
+        return MapType.from_key_value(
+            key_field=polars_key,
+            value_field=polars_value,
+            keys_sorted=self.keys_sorted,
+        )
+
+    def to_spark_name(self) -> str:
+        return f"MAP<{self.key_field.dtype.to_spark_name()}, {self.value_field.dtype.to_spark_name()}>"
+
+    def to_dict(self) -> dict[str, Any]:
+        base = super(MapType, self).to_dict()
+        base["item_field"] = self.item_field.to_dict()
+        if self.keys_sorted:
+            base["keys_sorted"] = self.keys_sorted
+        return base
+
+    def _convert_pyobj(self, value: Any, safe: bool = False) -> dict | None:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                value = bytes(value).decode("utf-8")
+            except UnicodeDecodeError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot decode bytes as UTF-8 for {type(self).__name__}: "
+                        f"{value!r}"
+                    )
+                return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse map from empty string for "
+                        f"{type(self).__name__}."
+                    )
+                return None
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                if safe:
+                    raise ValueError(
+                        f"Cannot parse map from {value!r} for {type(self).__name__}."
+                    )
+                return None
+            value = decoded
+
+        # A JSON list of [key, value] pairs is a valid map representation.
+        if isinstance(value, (list, tuple)):
+            pairs: list[tuple[Any, Any]] = []
+            for entry in value:
+                if isinstance(entry, dict):
+                    k = entry.get(self.key_field.name, entry.get("key"))
+                    v = entry.get(self.value_field.name, entry.get("value"))
+                elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                    k, v = entry
+                else:
+                    if safe:
+                        raise ValueError(
+                            f"Cannot parse map entry {entry!r} for "
+                            f"{type(self).__name__}."
+                        )
+                    return None
+                pairs.append((k, v))
+        elif isinstance(value, dict):
+            pairs = list(value.items())
+        elif hasattr(value, "asDict"):
+            pairs = list(value.asDict(recursive=True).items())
+        else:
+            if safe:
+                raise ValueError(
+                    f"Cannot convert {type(value).__name__} to map "
+                    f"for {type(self).__name__}: {value!r}."
+                )
+            return None
+
+        key_dtype = self.key_field.dtype
+        value_dtype = self.value_field.dtype
+        value_nullable = self.value_field.nullable
+
+        out: dict[Any, Any] = {}
+        for raw_key, raw_value in pairs:
+            converted_key = key_dtype.convert_pyobj(
+                raw_key, nullable=False, safe=safe
+            )
+            if converted_key is None:
+                if safe:
+                    raise ValueError(
+                        f"Map key {raw_key!r} converted to None for "
+                        f"{type(self).__name__}; map keys must be non-null."
+                    )
+                continue
+            out[converted_key] = value_dtype.convert_pyobj(
+                raw_value, nullable=value_nullable, safe=safe
+            )
+        return out
+
+
+_STRING_KEY_SOURCE_FIELD: "Field | None" = None
+
+
+def _string_key_source_field() -> "Field":
+    global _STRING_KEY_SOURCE_FIELD
+    if _STRING_KEY_SOURCE_FIELD is None:
+        Field = cached_from_import("yggdrasil.data.data_field", "Field")
+        DataType = cached_from_import("yggdrasil.data.types", "DataType")
+        _STRING_KEY_SOURCE_FIELD = Field(
+            name="key",
+            dtype=DataType.from_arrow_type(pa.string()),
+            nullable=False,
+        )
+    return _STRING_KEY_SOURCE_FIELD
+
+
+def _struct_to_map_layout(
+    null_mask: pa.BooleanArray,
+    *,
+    row_count: int,
+    child_count: int,
+) -> tuple[pa.Array, pa.Array]:
+    """Vectorised build of (take_indices, offsets) for struct → map.
+
+    ``keys_child_major`` and ``values_child_major`` hold the per-child
+    arrays concatenated in c-major layout (length ``row_count *
+    child_count``).  The output map wants entries in row-major order,
+    with null parent rows contributing zero entries.
+
+    *Offsets* — ``child_count`` per non-null row, ``0`` per null row,
+    cumulative-summed and prepended with ``0``.  Pure
+    ``pyarrow.compute`` (``if_else`` + ``cumulative_sum`` +
+    ``concat_arrays``).
+
+    *Take indices* — for each non-null row ``r`` and each child
+    ``c ∈ [0, N)``, emit ``c * row_count + r``.  Polars handles the
+    outer product without per-row Python: ``int_range`` and
+    ``filter`` lift the valid row indices, ``gather`` selects them
+    by ``i // N``, and the closed-form ``i % N * row_count +
+    row_at(i)`` produces the final flat int64 array.
+    """
+    import polars as pl
+
+    valid_mask = pc.invert(null_mask)
+
+    counts = pc.if_else(
+        valid_mask,
+        pa.scalar(child_count, type=pa.int32()),
+        pa.scalar(0, type=pa.int32()),
+    )
+    cumsum = pc.cumulative_sum(counts)
+    if isinstance(cumsum, pa.ChunkedArray):
+        cumsum = cumsum.combine_chunks()
+    offsets = pa.concat_arrays(
+        [pa.array([0], type=pa.int32()), cumsum.cast(pa.int32())],
+    )
+
+    valid_rows_pl = (
+        pl.int_range(0, row_count, dtype=pl.Int64, eager=True)
+        .filter(pl.from_arrow(valid_mask))
+    )
+    n_valid = valid_rows_pl.len()
+    if n_valid == 0:
+        return pa.array([], type=pa.int64()), offsets
+
+    total = n_valid * child_count
+    i = pl.int_range(0, total, dtype=pl.Int64, eager=True)
+    c_part = i % child_count
+    row_idx = i // child_count
+    row_part = valid_rows_pl.gather(row_idx)
+    take_pl = c_part * row_count + row_part
+    take_indices = take_pl.to_arrow().cast(pa.int64())
+    return take_indices, offsets
+
+
+def _cast_pandas_via_arrow(
+    series: "pd.Series",
+    options: "CastOptions",
+    caster: Callable[[pa.Array, "CastOptions"], pa.Array | pa.ChunkedArray],
+) -> "pd.Series":
+    # Round-trip pandas <-> Arrow without per-row Python materialisation:
+    # ``pa.array(series, from_pandas=True, type=...)`` consumes the Series
+    # via the pandas → Arrow C bridge, and ``Array.to_pandas()`` rebuilds
+    # the Series on the way out — no ``.tolist()`` / ``.to_pylist()`` hop
+    # in either direction.
+    source_arrow_type = options.source.dtype.to_arrow()
+    source_array = pa.array(series, type=source_arrow_type, from_pandas=True)
+    casted = caster(source_array, options)
+
+    if isinstance(casted, pa.ChunkedArray):
+        casted = casted.combine_chunks()
+
+    result = casted.to_pandas()
+    result.index = series.index
+    result.name = options.target.name
+    return result
+
+
+def cast_arrow_map_array(
+    array: pa.MapArray | pa.ChunkedArray,
+    options: "CastOptions",
+) -> pa.MapArray | pa.ChunkedArray:
+    options = options.check_source(array)
+
+    if options.target is None:
+        return array
+    elif options.source.dtype.type_id != DataTypeId.MAP:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source} to {options.target}"
+        )
+
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [
+            cast_arrow_map_array(
+                chunk,
+                options=options,
+            )
+            for chunk in array.chunks
+        ]
+        return pa.chunked_array(
+            chunks,
+            type=options.target.dtype.to_arrow(),
+        )
+
+    source_field: Field = options.source
+    target_field: Field = options.target
+
+    source_type: MapType = source_field.dtype
+    target_type: MapType = target_field.dtype
+
+    target_key_array = target_type.key_field.cast_arrow_array(
+        array.keys,
+        options=options.copy(
+            source=source_type.key_field,
+            target=target_type.key_field,
+        ),
+    )
+
+    target_value_array = target_type.value_field.cast_arrow_array(
+        array.items,
+        options=options.copy(
+            source=source_type.value_field,
+            target=target_type.value_field,
+        ),
+    )
+
+    return pa.MapArray.from_arrays(
+        offsets=array.offsets,
+        keys=target_key_array,
+        items=target_value_array,
+        mask=array.is_null(),
+        type=target_type.to_arrow(),
+        pool=options.arrow_memory_pool,
+    )
+
+
+def cast_arrow_list_array_to_map(
+    array: pa.ListArray | pa.ChunkedArray,
+    options: "CastOptions",
+) -> pa.MapArray | pa.ChunkedArray:
+    options = options.check_source(array)
+
+    if options.target is None:
+        return array
+    elif options.source.dtype.type_id != DataTypeId.ARRAY:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source} to {options.target}"
+        )
+
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [
+            cast_arrow_list_array_to_map(
+                chunk,
+                options=options,
+            )
+            for chunk in array.chunks
+        ]
+        return pa.chunked_array(
+            chunks,
+            type=options.target.dtype.to_arrow(),
+        )
+
+    source_field: Field = options.source
+    target_field: Field = options.target
+
+    source_type: ArrayType = source_field.dtype
+    target_type: MapType = target_field.dtype
+
+    source_item_field = source_type.item_field
+    source_item_dtype = source_item_field.dtype
+
+    if source_item_dtype.type_id != DataTypeId.STRUCT:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source} to {options.target}"
+        )
+
+    if len(source_item_dtype.children) != 2:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source} to {options.target}"
+        )
+
+    source_key_field = source_item_dtype.field_at(0)
+    source_value_field = source_item_dtype.field_at(1)
+
+    values: pa.StructArray = array.values
+
+    target_key_array = target_type.key_field.cast_arrow_array(
+        values.field(source_key_field.name),
+        options=options.copy(
+            source=source_key_field,
+            target=target_type.key_field,
+        ),
+    )
+
+    target_value_array = target_type.value_field.cast_arrow_array(
+        values.field(source_value_field.name),
+        options=options.copy(
+            source=source_value_field,
+            target=target_type.value_field,
+        ),
+    )
+
+    return pa.MapArray.from_arrays(
+        offsets=array.offsets,
+        keys=target_key_array,
+        items=target_value_array,
+        mask=array.is_null(),
+        type=target_type.to_arrow(),
+        pool=options.arrow_memory_pool,
+    )
+
+
+def cast_arrow_struct_array_to_map(
+    array: pa.StructArray | pa.ChunkedArray,
+    options: "CastOptions",
+) -> pa.MapArray | pa.ChunkedArray:
+    options = options.check_source(array)
+
+    if options.target is None:
+        return array
+    elif options.source.dtype.type_id != DataTypeId.STRUCT:
+        raise pa.ArrowInvalid(
+            f"Cannot cast {options.source} to {options.target}"
+        )
+
+    if isinstance(array, pa.ChunkedArray):
+        chunks = [
+            cast_arrow_struct_array_to_map(
+                chunk,
+                options=options,
+            )
+            for chunk in array.chunks
+        ]
+        return pa.chunked_array(
+            chunks,
+            type=options.target.dtype.to_arrow(),
+        )
+
+    source_field: Field = options.source
+    target_field: Field = options.target
+
+    source_type: StructType = source_field.dtype
+    target_type: MapType = target_field.dtype
+
+    row_count = len(array)
+    child_count = len(source_type.children)
+
+    if child_count == 0:
+        offsets = pa.array([0] * (row_count + 1), type=pa.int32())
+        empty_keys = pa.array([], type=target_type.key_field.dtype.to_arrow())
+        empty_items = pa.array([], type=target_type.value_field.dtype.to_arrow())
+        return pa.MapArray.from_arrays(
+            offsets=offsets,
+            keys=empty_keys,
+            items=empty_items,
+            mask=array.is_null(),
+            type=target_type.to_arrow(),
+            pool=options.arrow_memory_pool,
+        )
+
+    key_arrays: list[pa.Array] = []
+    value_arrays: list[pa.Array] = []
+
+    for child in source_type.children:
+        key_arr = pa.array(
+            [child.name] * row_count,
+            type=pa.string(),
+            memory_pool=options.arrow_memory_pool,
+        )
+        casted_key_arr = target_type.key_field.cast_arrow_array(
+            key_arr,
+            options=options.copy(
+                source=_string_key_source_field(),
+                target=target_type.key_field,
+            ),
+        )
+        casted_value_arr = target_type.value_field.cast_arrow_array(
+            array.field(child.name),
+            options=options.copy(
+                source=child,
+                target=target_type.value_field,
+            ),
+        )
+        key_arrays.append(casted_key_arr)
+        value_arrays.append(casted_value_arr)
+
+    keys_child_major = pa.concat_arrays(key_arrays, memory_pool=options.arrow_memory_pool)
+    values_child_major = pa.concat_arrays(value_arrays, memory_pool=options.arrow_memory_pool)
+
+    take_indices, offsets = _struct_to_map_layout(
+        array.is_null(),
+        row_count=row_count,
+        child_count=child_count,
+    )
+
+    flat_keys = pc.take(keys_child_major, take_indices, memory_pool=options.arrow_memory_pool)
+    flat_values = pc.take(values_child_major, take_indices, memory_pool=options.arrow_memory_pool)
+
+    return pa.MapArray.from_arrays(
+        offsets=offsets,
+        keys=flat_keys,
+        items=flat_values,
+        mask=array.is_null(),
+        type=target_type.to_arrow(),
+        pool=options.arrow_memory_pool,
+    )
+
+
+def cast_polars_map_expr(
+    expr: Any,
+    options: "CastOptions",
+) -> Any:
+    pl = polars_module()
+
+    if options.target is None:
+        return expr
+    elif options.source.dtype.type_id != DataTypeId.MAP:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
+
+    source_field: Field = options.source
+    source_type: "MapType" = source_field.dtype
+    target_type: MapType = options.target.dtype
+
+    source_key_name = source_type.key_field.name
+    source_value_name = source_type.value_field.name
+    target_key_name = target_type.key_field.name
+    target_value_name = target_type.value_field.name
+
+    entry_expr = pl.struct([
+        target_type.key_field.cast_polars_expr(
+            pl.element().struct.field(source_key_name),
+            options=options.copy(
+                source=source_type.key_field,
+                target=target_type.key_field,
+            ),
+        ).alias(target_key_name),
+        target_type.value_field.cast_polars_expr(
+            pl.element().struct.field(source_value_name),
+            options=options.copy(
+                source=source_type.value_field,
+                target=target_type.value_field,
+            ),
+        ).alias(target_value_name),
+    ])
+
+    casted = expr.list.eval(entry_expr).cast(target_type.to_polars())
+    return options.polars_alias(casted)
+
+
+def cast_polars_list_expr_to_map(
+    expr: Any,
+    options: "CastOptions",
+) -> Any:
+    pl = polars_module()
+
+    if options.target is None:
+        return expr
+    elif options.source.dtype.type_id != DataTypeId.ARRAY:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
+
+    source_field: Field = options.source
+    target_field: Field = options.target
+
+    source_type: ArrayType = source_field.dtype
+    target_type: MapType = target_field.dtype
+
+    source_item_dtype = source_type.item_field.dtype
+
+    if source_item_dtype.type_id != DataTypeId.STRUCT or len(source_item_dtype.children) != 2:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
+
+    source_key_field = source_item_dtype.field_at(0)
+    source_value_field = source_item_dtype.field_at(1)
+
+    target_key_name = target_type.key_field.name
+    target_value_name = target_type.value_field.name
+
+    entry_expr = pl.struct([
+        target_type.key_field.cast_polars_expr(
+            pl.element().struct.field(source_key_field.name),
+            options=options.copy(
+                source=source_key_field,
+                target=target_type.key_field,
+            ),
+        ),
+        target_type.value_field.cast_polars_expr(
+            pl.element().struct.field(source_value_field.name),
+            options=options.copy(
+                source=source_value_field,
+                target=target_type.value_field,
+            ),
+        ),
+    ])
+
+    casted = expr.list.eval(entry_expr).cast(target_type.to_polars())
+    return options.polars_alias(casted)
+
+
+def cast_polars_struct_expr_to_map(
+    expr: Any,
+    options: "CastOptions",
+) -> Any:
+    pl = polars_module()
+
+    if options.target is None:
+        return expr
+    elif options.source.dtype.type_id != DataTypeId.STRUCT:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
+
+    source_field: Field = options.source
+    target_field: Field = options.target
+
+    source_type: StructType = source_field.dtype
+    target_type: MapType = target_field.dtype
+
+    target_key_name = target_type.key_field.name
+    target_value_name = target_type.value_field.name
+
+    entries = []
+    for child in source_type.children:
+        key_expr = target_type.key_field.cast_polars_expr(
+            pl.lit(child.name),
+            options=options.copy(
+                source=_string_key_source_field(),
+                target=target_type.key_field,
+            ),
+        )
+
+        value_expr = target_type.value_field.cast_polars_expr(
+            expr.struct.field(child.name),
+            options=options.copy(
+                source=child,
+                target=target_type.value_field,
+            ),
+        )
+
+        entries.append(
+            pl.struct([
+                key_expr.alias(target_key_name),
+                value_expr.alias(target_value_name),
+            ])
+        )
+
+    list_expr = pl.concat_list(entries).cast(target_type.to_polars())
+
+    casted = pl.when(expr.is_null()).then(pl.lit(None)).otherwise(list_expr)
+    return options.polars_alias(casted)
+
+
+def cast_polars_map_series(
+    series: "polars.Series",
+    options: "CastOptions",
+) -> "polars.Series":
+    pl = polars_module()
+    expr = cast_polars_map_expr(pl.col(series.name), options)
+    casted = pl.DataFrame({series.name: series}).select(expr).to_series()
+    return options.polars_alias(casted)
+
+
+def cast_polars_list_series_to_map(
+    series: "polars.Series",
+    options: "CastOptions",
+) -> "polars.Series":
+    pl = polars_module()
+    expr = cast_polars_list_expr_to_map(pl.col(series.name), options)
+    casted = pl.DataFrame({series.name: series}).select(expr).to_series()
+    return options.polars_alias(casted)
+
+
+def cast_polars_struct_series_to_map(
+    series: "polars.Series",
+    options: "CastOptions",
+) -> "polars.Series":
+    pl = polars_module()
+    expr = cast_polars_struct_expr_to_map(pl.col(series.name), options)
+    casted = pl.DataFrame({series.name: series}).select(expr).to_series()
+    return options.polars_alias(casted)
+
+
+def cast_pandas_map_series(
+    series: "pd.Series",
+    options: "CastOptions",
+) -> "pd.Series":
+    return _cast_pandas_via_arrow(series, options, cast_arrow_map_array)
+
+
+def cast_pandas_list_series_to_map(
+    series: "pd.Series",
+    options: "CastOptions",
+) -> "pd.Series":
+    return _cast_pandas_via_arrow(series, options, cast_arrow_list_array_to_map)
+
+
+def cast_pandas_struct_series_to_map(
+    series: "pd.Series",
+    options: "CastOptions",
+) -> "pd.Series":
+    return _cast_pandas_via_arrow(series, options, cast_arrow_struct_array_to_map)
+
+
+def cast_spark_map_column(
+    column: Any,
+    options: "CastOptions",
+) -> Any:
+    spark = spark_sql_module()
+    F = spark.functions
+
+    options = options.check_source(column)
+
+    if options.target is None:
+        return column
+    elif options.source.dtype.type_id != DataTypeId.MAP:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
+
+    source_field: Field = options.source
+    target_field: Field = options.target
+
+    source_type: MapType = source_field.dtype
+    target_type: MapType = target_field.dtype
+
+    entries = F.map_entries(column)
+
+    key_array = F.transform(
+        entries,
+        lambda x: target_type.key_field.cast_spark_column(
+            x[source_type.key_field.name],
+            options=options.copy(
+                source=source_type.key_field,
+                target=target_type.key_field,
+            ),
+        ),
+    )
+
+    value_array = F.transform(
+        entries,
+        lambda x: target_type.value_field.cast_spark_column(
+            x[source_type.value_field.name],
+            options=options.copy(
+                source=source_type.value_field,
+                target=target_type.value_field,
+            ),
+        ),
+    )
+
+    casted = F.when(
+        column.isNull(),
+        F.lit(None),
+    ).otherwise(F.map_from_arrays(key_array, value_array))
+    return options.spark_alias(casted)
+
+
+def cast_spark_list_column_to_map(
+    column: Any,
+    options: "CastOptions",
+) -> Any:
+    spark = spark_sql_module()
+    F = spark.functions
+
+    options = options.check_source(column)
+
+    if options.target is None:
+        return column
+    elif options.source.dtype.type_id != DataTypeId.ARRAY:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
+
+    source_field: Field = options.source
+    target_field: Field = options.target
+
+    source_type: ArrayType = source_field.dtype
+    target_type: MapType = target_field.dtype
+
+    source_item_dtype = source_type.item_field.dtype
+
+    if source_item_dtype.type_id != DataTypeId.STRUCT or len(source_item_dtype.children) != 2:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
+
+    source_key_field = source_item_dtype.field_at(0)
+    source_value_field = source_item_dtype.field_at(1)
+
+    key_array = F.transform(
+        column,
+        lambda x: target_type.key_field.cast_spark_column(
+            x[source_key_field.name],
+            options=options.copy(
+                source=source_key_field,
+                target=target_type.key_field,
+            ),
+        ),
+    )
+
+    value_array = F.transform(
+        column,
+        lambda x: target_type.value_field.cast_spark_column(
+            x[source_value_field.name],
+            options=options.copy(
+                source=source_value_field,
+                target=target_type.value_field,
+            ),
+        ),
+    )
+
+    casted = F.when(
+        column.isNull(),
+        F.lit(None),
+    ).otherwise(F.map_from_arrays(key_array, value_array))
+    return options.spark_alias(casted)
+
+
+def cast_spark_struct_column_to_map(
+    column: Any,
+    options: "CastOptions",
+) -> Any:
+    spark = spark_sql_module()
+    F = spark.functions
+
+    options = options.check_source(column)
+
+    if options.target is None:
+        return column
+    elif options.source.dtype.type_id != DataTypeId.STRUCT:
+        raise TypeError(f"Cannot cast {options.source} to {options.target}")
+
+    source_field: Field = options.source
+    target_field: Field = options.target
+
+    source_type: StructType = source_field.dtype
+    target_type: MapType = target_field.dtype
+
+    key_array = F.array(*[
+        target_type.key_field.cast_spark_column(
+            F.lit(child.name),
+            options=options.copy(
+                source=_string_key_source_field(),
+                target=target_type.key_field,
+            ),
+        )
+        for child in source_type.children
+    ])
+
+    value_array = F.array(*[
+        target_type.value_field.cast_spark_column(
+            column[child.name],
+            options=options.copy(
+                source=child,
+                target=target_type.value_field,
+            ),
+        )
+        for child in source_type.children
+    ])
+
+    casted = F.when(
+        column.isNull(),
+        F.lit(None),
+    ).otherwise(F.map_from_arrays(key_array, value_array))
+    return options.spark_alias(casted)

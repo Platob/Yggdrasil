@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import orjson
+
+from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
+
+from ..deps import get_backend_service
+from ..schemas.backend import BackendResponse, NodeBackend
+from ..services.backend import BackendService
+
+router = APIRouter(tags=["backend"])
+
+
+@router.get("", response_model=BackendResponse)
+async def get_backend(
+    service: BackendService = Depends(get_backend_service),
+) -> BackendResponse:
+    snap = service.snapshot()
+    return BackendResponse(backend=snap)
+
+
+@router.get("/summary")
+async def get_summary(
+    service: BackendService = Depends(get_backend_service),
+) -> dict:
+    """Lightweight health check — CPU, memory, run counts only.
+
+    Skips GPU collection, network IO, and disk stats for minimal latency.
+    Designed for peer health polling where you just need the basics.
+    """
+    cpu_percent = 0.0
+    mem_total = 0.0
+    mem_used = 0.0
+    try:
+        import psutil
+        cpu_percent = psutil.cpu_percent(interval=0)
+        mem = psutil.virtual_memory()
+        mem_used = mem.used / (1024 * 1024)
+        mem_total = mem.total / (1024 * 1024)
+    except ImportError:
+        pass
+
+    memory_percent = round(mem_used / mem_total * 100, 1) if mem_total > 0 else 0.0
+    return {
+        "node_id": service.settings.node_id,
+        "cpu_percent": cpu_percent,
+        "memory_percent": memory_percent,
+        "active_runs": service._active_runs_fn(),
+        "total_runs": service._total_runs_fn(),
+    }
+
+
+@router.get("/history")
+async def get_history(
+    limit: int = 60,
+    service: BackendService = Depends(get_backend_service),
+) -> list[NodeBackend]:
+    return service.history(limit=limit)
+
+
+@router.get("/stream")
+async def stream_backend(
+    interval: float = 1.0,
+    service: BackendService = Depends(get_backend_service),
+) -> StreamingResponse:
+    """SSE stream of node resource snapshots.
+
+    ``interval`` (seconds) sets the emit cadence — the dashboard's
+    refresh-rate selector passes it through. Clamped to [0.25, 30] so a
+    client can't pin the CPU with a tight loop or stall the connection.
+
+    orjson + bytes-direct keeps the per-snapshot encode under 50us; the
+    pydantic .model_dump() and json.dumps stack was 5x slower.
+    """
+    import asyncio
+
+    period = min(max(interval, 0.25), 30.0)
+
+    async def event_stream():
+        while True:
+            snap = service.snapshot()
+            # orjson is ~5x faster than json.dumps on dicts of this size
+            # and avoids the str-encode-then-utf8-encode double pass.
+            yield b"data: " + orjson.dumps(snap.model_dump()) + b"\n\n"
+            await asyncio.sleep(period)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            # Disable proxy buffering so each SSE event reaches the browser
+            # immediately. Otherwise nginx/cloudflare will hold them up to 8 KB.
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+        },
+    )
