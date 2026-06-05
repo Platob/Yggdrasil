@@ -72,7 +72,9 @@ WORKSPACE_WHL_DIR = WORKSPACE_PYPI_DIR
 #: Where reusable serverless **base environments** (``<name>.env.yaml``) live —
 #: a job references one by file path via ``Environment.base_environment`` instead
 #: of inlining the whole dependency list (see :func:`ensure_named_environment`).
-WORKSPACE_ENV_DIR = "/Workspace/Shared/ygg/environments"
+#: Their dependencies are **built wheels in the workspace pypi registry**
+#: (:func:`ensure_bundle`), so the runtime installs with zero PyPI access.
+WORKSPACE_ENV_DIR = "/Workspace/Shared/environments"
 
 #: Latest serverless environment version — the fallback when the local Python
 #: isn't one we map to an older runtime.
@@ -623,23 +625,29 @@ def ensure_named_environment(
     dependencies: "list[str] | tuple[str, ...]",
     environment_version: "str | None" = None,
     workspace_dir: str = WORKSPACE_ENV_DIR,
+    filename: "str | None" = None,
 ) -> str:
-    """Create-or-update a reusable serverless **base environment** *name* as an
-    ``env.yaml`` in the workspace and return its path.
+    """Create-or-update a reusable serverless **base environment** *name* as a
+    YAML file in the workspace and return its path.
 
     A serverless job can reference this file via
     ``Environment.base_environment`` instead of inlining the whole dependency
-    list — so one shared, named environment (e.g. ``yellow``) is defined once and
-    every ygg job points at it. The file is the documented serverless env spec::
+    list — so one shared, named environment is defined once and every ygg job
+    points at it. The file is the documented serverless env spec; its
+    *dependencies* are **built wheels in the workspace pypi registry**
+    (:func:`ensure_bundle`) so the runtime installs with zero PyPI access::
 
         environment_version: '5'
         dependencies:
-          - /Workspace/Shared/pypi/ygg/ygg-0.8.54-py3-none-any.whl
-          - pyarrow==...
+          - /Workspace/Shared/pypi/ygg-bundle/ygg-0.8.54-py3-none-any.whl
+          - /Workspace/Shared/pypi/ygg-bundle/pyarrow-...-cp312-...-.whl
 
-    Written (overwritten) on every call — upsert semantics, so redeploying keeps
-    *name* pointing at the current image. *dependencies* are wheel workspace paths
-    and/or pip requirement lines."""
+    The file is ``<name>.env.yaml`` unless *filename* overrides it — the seed
+    writes a version-pinned ``ygg-<version>.yml`` so jobs can point at an exact
+    image. Written (overwritten) on every call — upsert semantics, so redeploying
+    keeps the file pointing at the current image. *dependencies* are wheel
+    workspace paths (and/or pip requirement lines, when an index resolve is
+    wanted instead)."""
     from yggdrasil.databricks.path import DatabricksPath
 
     version = environment_version or serverless_environment_version()
@@ -647,7 +655,7 @@ def ensure_named_environment(
     lines += [f"  - {dep}" for dep in dependencies]
     body = "\n".join(lines) + "\n"
 
-    dest = f"{workspace_dir.rstrip('/')}/{name}.env.yaml"
+    dest = f"{workspace_dir.rstrip('/')}/{filename or f'{name}.env.yaml'}"
     path = DatabricksPath.from_(dest, client=client)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
@@ -698,7 +706,8 @@ def ensure_cluster_requirements(
 
 def deployed_environments(client: Any, *, workspace_dir: str = WORKSPACE_ENV_DIR) -> list[str]:
     """Workspace paths of persisted environment files under *workspace_dir* —
-    serverless base environments (``*.env.yaml``) and cluster requirement files
+    serverless base environments (``*.env.yaml`` / ``*.yml``, e.g. the
+    version-pinned ``ygg-<version>.yml``) and cluster requirement files
     (``*.requirements.txt``).
 
     The environment-layer counterpart of :func:`deployed_wheels`: lets
@@ -713,7 +722,7 @@ def deployed_environments(client: Any, *, workspace_dir: str = WORKSPACE_ENV_DIR
     return [
         child.full_path()
         for child in folder.iterdir()
-        if str(child.name).endswith((".env.yaml", ".requirements.txt"))
+        if str(child.name).endswith((".env.yaml", ".yml", ".requirements.txt"))
     ]
 
 
