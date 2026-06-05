@@ -110,8 +110,11 @@ _SIGNED_FOR_UINT = {8: pa.int8, 16: pa.int16, 32: pa.int32, 64: pa.int64}
 #: How long a cached latest :class:`Snapshot` is trusted before
 #: ``snapshot()`` re-checks the ``_delta_log`` (and incrementally applies any
 #: new commits). Bounds how stale a long-lived reader can be vs. an external
-#: writer without an explicit ``fresh=True`` / :meth:`refresh`.
-_SNAPSHOT_TTL = 30.0
+#: writer without an explicit ``fresh=True`` / :meth:`refresh`. Configurable via
+#: ``YGG_DELTA_SNAPSHOT_TTL`` — set ``0`` to re-list on **every** access (serve
+#: the cached parse only while the listing is unchanged: freshest, at one LIST
+#: per read); a larger value trades freshness for fewer LISTs on hot re-reads.
+_SNAPSHOT_TTL = float(os.environ.get("YGG_DELTA_SNAPSHOT_TTL", "30") or 30)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -206,7 +209,8 @@ class DeltaFolder(Folder):
             return Snapshot.from_log(self._log, version)
 
         now = time.monotonic()
-        if not fresh and self._snapshot is not None and (now - self._snapshot_at) <= _SNAPSHOT_TTL:
+        if (not fresh and _SNAPSHOT_TTL > 0 and self._snapshot is not None
+                and (now - self._snapshot_at) <= _SNAPSHOT_TTL):
             return self._snapshot
 
         # Re-list the log fresh, then either full-rebuild (fresh / cold) or

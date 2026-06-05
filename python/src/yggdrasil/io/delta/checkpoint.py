@@ -92,13 +92,8 @@ def update_last_checkpoint(*, log_path: "Path", version: int, size: int,
         payload["v2Checkpoint"] = v2
     body = ygg_json.dumps(payload, separators=(",", ":"))
     if isinstance(body, str): body = body.encode("utf-8")
-    pointer = log_path / LAST_CHECKPOINT_NAME
-    with pointer.open("wb") as bio:
+    with (log_path / LAST_CHECKPOINT_NAME).open("wb") as bio:
         bio.truncate(0); bio.write_bytes(body)
-    # The pointer just changed — drop any cached copy so readers in this process
-    # pick up the new checkpoint instead of the short-TTL stale one.
-    from yggdrasil.io.delta.log import _pointer_cache, _cache_key
-    _pointer_cache.pop(_cache_key(pointer), None)
 
 
 def _to_arrow(actions: "List[dict]") -> pa.Table:

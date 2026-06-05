@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from yggdrasil.enums import Mode
 from yggdrasil.io.delta.delta_folder import _SNAPSHOT_TTL
+from yggdrasil.io.delta.log import DeltaLog
 from yggdrasil.io.delta.snapshot import Snapshot
 from yggdrasil.io.delta.tests import DeltaTestCase
 
@@ -37,6 +38,29 @@ class TestSnapshotCacheTTL(DeltaTestCase):
         with patch.object(Snapshot, "from_log", wraps=Snapshot.from_log) as spy:
             d.snapshot(fresh=True)
         self.assertTrue(spy.called)  # full read rebuilds via Snapshot.from_log
+
+
+class TestSnapshotTTLKnob(DeltaTestCase):
+    """``YGG_DELTA_SNAPSHOT_TTL`` knob: 0 ⇒ re-list every access (listing-driven
+    freshness); >0 ⇒ serve the cached parse without a LIST within the window."""
+
+    def test_positive_ttl_skips_relist_within_window(self) -> None:
+        d = self.new_table(self.pa.table({"id": [1]}))
+        d.snapshot()  # populate the cache
+        with patch.object(DeltaLog, "latest_version", autospec=True,
+                          side_effect=DeltaLog.latest_version) as spy:
+            d.snapshot()  # within the default 30s TTL
+        self.assertFalse(spy.called)  # served from cache, no re-list
+
+    def test_ttl_zero_relists_every_access(self) -> None:
+        d = self.new_table(self.pa.table({"id": [1]}))
+        v = d.snapshot().version
+        with patch("yggdrasil.io.delta.delta_folder._SNAPSHOT_TTL", 0.0), \
+             patch.object(DeltaLog, "latest_version", autospec=True,
+                          side_effect=DeltaLog.latest_version) as spy:
+            again = d.snapshot()
+        self.assertTrue(spy.called)            # re-listed to detect new commits
+        self.assertEqual(again.version, v)     # nothing changed → same state
 
 
 class TestIncrementalAdvance(DeltaTestCase):
