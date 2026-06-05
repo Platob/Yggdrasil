@@ -26,7 +26,23 @@ _CONTENT_CACHE_MAX_BYTES = 1 * 1024 * 1024
 #: files (commit JSONs, checkpoint sidecars); on object stores each open() is a
 #: high-latency round-trip, so fan them out rather than read serially.
 _MAX_FETCH_WORKERS = 32
-_content_cache: ExpiringDict[str, bytes] = ExpiringDict(default_ttl=60.0, max_size=1024)
+
+#: Process-level content cache for **immutable** Delta log files — versioned
+#: commit JSONs, checkpoint parquet/manifests, sidecars. A given path's content
+#: is write-once, so a long TTL is safe: re-reading a snapshot (or advancing past
+#: a checkpoint) turns repeated GETs into cache hits. The only staleness window
+#: is a table dropped and *recreated at the exact same path* (version numbers
+#: reused) within the TTL — bounded here to 5 minutes. The directory listing is
+#: deliberately NOT cached here (it's how new commits are discovered).
+_IMMUTABLE_TTL = 300.0
+_content_cache: ExpiringDict[str, bytes] = ExpiringDict(default_ttl=_IMMUTABLE_TTL, max_size=4096)
+
+#: Short-lived cache for the mutable ``_last_checkpoint`` pointer (overwritten
+#: on each new checkpoint). Kept fresh so a newer checkpoint is picked up
+#: promptly; a stale pointer is correctness-safe anyway (fall back to the
+#: listing / an older checkpoint + replay). Evicted on a local checkpoint write.
+_POINTER_TTL = 60.0
+_pointer_cache: ExpiringDict[str, bytes] = ExpiringDict(default_ttl=_POINTER_TTL, max_size=1024)
 
 
 @dataclasses.dataclass(slots=True)
@@ -53,6 +69,9 @@ class DeltaLog:
     def invalidate(self) -> None:
         self._last_checkpoint = None
         self._listing = None
+        # Drop the process-level pointer entry too, so a local checkpoint write
+        # (or a detected concurrent one) is re-read fresh, not served stale.
+        _pointer_cache.pop(_cache_key(self.log_path / LAST_CHECKPOINT_NAME), None)
 
     def extend_listing(self, *names: str) -> None:
         if self._listing is None: return
@@ -73,7 +92,8 @@ class DeltaLog:
         if self._last_checkpoint is not None:
             return self._last_checkpoint or None
         try:
-            payload = ygg_json.loads(_read_cached(self.log_path / LAST_CHECKPOINT_NAME))
+            payload = ygg_json.loads(
+                _read_cached(self.log_path / LAST_CHECKPOINT_NAME, cache=_pointer_cache))
         except Exception:
             self._last_checkpoint = {}; return None
         self._last_checkpoint = payload or {}
@@ -235,14 +255,14 @@ def _cache_key(path: "Path") -> str:
     return fn() if callable(fn) else str(path)
 
 
-def _read_cached(path: "Path") -> bytes:
+def _read_cached(path: "Path", *, cache: "ExpiringDict[str, bytes]" = _content_cache) -> bytes:
     key = _cache_key(path)
-    cached = _content_cache.get(key)
+    cached = cache.get(key)
     if cached is not None: return cached
     with path.open("rb") as bio:
         raw = bio.read()
     if len(raw) <= _CONTENT_CACHE_MAX_BYTES:
-        _content_cache[key] = raw
+        cache[key] = raw
     return raw
 
 
