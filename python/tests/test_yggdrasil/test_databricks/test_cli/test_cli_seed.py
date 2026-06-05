@@ -20,6 +20,15 @@ def _client_with(*, user="me@co.com", warehouses=None, default_wh=...):
     client.warehouses.list_warehouses.return_value = iter(warehouses or [])
     if default_wh is not ...:
         client.warehouses.find_default.return_value = default_wh
+
+    # Default instance-pools wiring: seed_default_pools returns a concrete list
+    # the seed step can iterate; find() returns a pool so --check sees them
+    # present (tests that assert absence override this).
+    pool = MagicMock()
+    pool.instance_pool_name = "Yggdrasil Light"
+    pool.node_type_id = "r5d.xlarge"
+    client.compute.instance_pools.seed_default_pools.return_value = [pool]
+    client.compute.instance_pools.find.return_value = pool
     return client
 
 
@@ -68,6 +77,22 @@ class TestSeedCheck(unittest.TestCase):
             rc = main(["seed", "--check"])
         self.assertEqual(rc, 1)
 
+    def test_check_missing_pools_returns_one(self):
+        """Everything else present, but the default pools are absent → fail."""
+        wh = MagicMock(); wh.warehouse_name = "Starter"; wh.warehouse_id = "abc"
+        client = _client_with(warehouses=[wh])
+        client.compute.instance_pools.find.return_value = None   # no pools
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels",
+                   return_value=["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.deployed_environments",
+                   return_value=["/Workspace/Shared/environments/ygg-1.0.yml",
+                                 "/Workspace/Shared/environments/ygg-1.0.requirements.txt"]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--check"])
+        self.assertEqual(rc, 1)
+
     def test_check_never_provisions(self):
         client = _client_with(warehouses=[])
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
@@ -85,6 +110,7 @@ class TestSeedCheck(unittest.TestCase):
         ene.assert_not_called()
         ecr.assert_not_called()
         client.warehouses.find_default.assert_not_called()
+        client.compute.instance_pools.seed_default_pools.assert_not_called()
 
 
 class TestSeedProvision(unittest.TestCase):
@@ -122,6 +148,44 @@ class TestSeedProvision(unittest.TestCase):
         self.assertTrue(ecr.call_args.args[1].startswith("ygg-"))
         self.assertEqual(ecr.call_args.kwargs["dependencies"], bundle)
         client.warehouses.find_default.assert_called_once()
+        # The default Light/Medium/Heavy instance pools are provisioned too.
+        client.compute.instance_pools.seed_default_pools.assert_called_once()
+
+    def test_seed_no_pools_skips_pool_step(self):
+        wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
+        client = _client_with(default_wh=wh)
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_bundle",
+                   return_value=["/w/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
+                   return_value="/w/env/ygg-1.0-py312.yml"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
+                   return_value="/w/env/ygg-1.0-py312.requirements.txt"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--no-pools"])
+        self.assertEqual(rc, 0)
+        client.compute.instance_pools.seed_default_pools.assert_not_called()
+
+    def test_seed_overwrite_skips_pool_step(self):
+        client = _client_with(default_wh=MagicMock())
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_bundle",
+                   return_value=["/w/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
+                   return_value="/w/env/ygg-1.0-py312.yml"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
+                   return_value="/w/env/ygg-1.0-py312.requirements.txt"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--overwrite"])
+        self.assertEqual(rc, 0)
+        # --overwrite ends after the env rewrite, before warehouses + pools.
+        client.compute.instance_pools.seed_default_pools.assert_not_called()
 
     def test_seed_all_versions_uses_matrix_builders(self):
         from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS

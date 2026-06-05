@@ -7,7 +7,7 @@ One command to answer "is this workspace ready, and if not, make it ready":
     ygg databricks seed --check    # read-only readiness report (CI gate)
     ygg databricks seed --overwrite  # rebuild every wheel + the env from scratch, then end
 
-It walks four areas:
+It walks five areas:
 
 - **config**      — connectivity, host, current user, default catalog/schema.
 - **wheels**      — the versioned ygg image wheel in the workspace registry.
@@ -19,6 +19,11 @@ It walks four areas:
   pypi registry**, so the runtime installs with zero PyPI access. ``--all-versions``
   (and ``--overwrite``) writes the pair for every supported Python (3.10–3.13).
 - **warehouses**  — a default SQL warehouse to execute statements against.
+- **pools**       — the default Light / Medium / Heavy Yggdrasil instance pools
+  (AWS r5d memory-optimized, local NVMe), each preloading the local-Python DBR
+  runtime so pool-backed clusters attach warm against the seeded zero-PyPI wheel
+  bundle. Lazy by default (no idle nodes → no cost until attached). Skip with
+  ``--no-pools``.
 
 In the default (seed) mode it builds/uploads the wheel, assembles and writes
 the environment files, and ensures a default warehouse exists. With ``--check``
@@ -51,7 +56,9 @@ class SeedCommand:
                             help="Seed a wheel + environment for every supported Python (3.10–3.13).")
         parser.add_argument("--overwrite", action="store_true",
                             help="Rebuild every wheel (all Pythons + the bundle) from scratch and rewrite "
-                                 "the environment files, then end (skips the warehouse step).")
+                                 "the environment files, then end (skips the warehouse + pools steps).")
+        parser.add_argument("--no-pools", dest="no_pools", action="store_true",
+                            help="Skip the default Light/Medium/Heavy instance pools step.")
         parser.set_defaults(handler=cls._seed)
 
     @classmethod
@@ -208,6 +215,45 @@ class SeedCommand:
         except Exception as exc:
             style.fail(f"warehouse step failed: {exc}")
             ok = False
+
+        # -- instance pools ----------------------------------------------
+        # The default Light / Medium / Heavy pools (r5d, local-Python DBR
+        # preloaded) so ygg's pool-backed compute attaches fast against the
+        # seeded zero-PyPI wheel bundle. Lazy by default — no idle nodes, no
+        # cost until a cluster attaches. ``--no-pools`` opts out.
+        if not args.no_pools:
+            style.info("pools")
+            try:
+                from yggdrasil.databricks.compute.instance_pool import DEFAULT_POOL_TIERS
+
+                pools_svc = client.compute.instance_pools
+                if check:
+                    missing: list[str] = []
+                    for tier in DEFAULT_POOL_TIERS:
+                        name = tier.pool_name()
+                        if pools_svc.find(name=name) is None:
+                            style.warn(f"instance pool {name!r} not provisioned")
+                            missing.append(name)
+                        else:
+                            style.out(f"    {style.dim('found')}  {name}  {style.dim(tier.node_type_id)}\n")
+                    if missing:
+                        ok = False
+                    else:
+                        style.ok(f"{len(DEFAULT_POOL_TIERS)} default instance pool(s) present")
+                else:
+                    pools = pools_svc.seed_default_pools()
+                    for pool in pools:
+                        style.out(
+                            f"    {style.dim('pool')}   {pool.instance_pool_name}  "
+                            f"{style.dim(pool.node_type_id or '')}\n"
+                        )
+                    style.ok(
+                        f"{len(pools)} default instance pool(s) ready "
+                        f"(Light/Medium/Heavy, r5d)"
+                    )
+            except Exception as exc:
+                style.fail(f"pools step failed: {exc}")
+                ok = False
 
         # -- summary -----------------------------------------------------
         style.out("\n")

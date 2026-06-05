@@ -77,6 +77,11 @@ _NODETYPE_ALIASES: dict[str, str] = {
     "r5.2xlarge":   "r5.2xlarge",
     "r5.4xlarge":   "r5.4xlarge",
 
+    # AWS memory-optimized + local NVMe (r5d — fast shuffle/spill)
+    "r5d.xlarge":   "r5d.xlarge",
+    "r5d.2xlarge":  "r5d.2xlarge",
+    "r5d.4xlarge":  "r5d.4xlarge",
+
     # Azure general-purpose (Dds_v5 family — modern default for Databricks Azure)
     "standard_d4ds_v5":  "Standard_D4ds_v5",
     "standard_d8ds_v5":  "Standard_D8ds_v5",
@@ -122,6 +127,11 @@ class NodeType(str, Enum):
     R5_XLARGE       = "r5.xlarge"
     R5_2XLARGE      = "r5.2xlarge"
     R5_4XLARGE      = "r5.4xlarge"
+
+    # --- AWS memory-optimized + local NVMe (r5d) -----------------------
+    R5D_XLARGE      = "r5d.xlarge"
+    R5D_2XLARGE     = "r5d.2xlarge"
+    R5D_4XLARGE     = "r5d.4xlarge"
 
     # --- Azure general-purpose (Dds_v5) --------------------------------
     AZURE_D4DS_V5   = "Standard_D4ds_v5"
@@ -357,6 +367,12 @@ _NODE_SPECS: dict[NodeType, NodeSpec] = {
     NodeType.R5_XLARGE:     NodeSpec(cpu_cores=4,  ram_gib=32,  cloud="aws"),
     NodeType.R5_2XLARGE:    NodeSpec(cpu_cores=8,  ram_gib=64,  cloud="aws"),
     NodeType.R5_4XLARGE:    NodeSpec(cpu_cores=16, ram_gib=128, cloud="aws"),
+
+    # AWS memory-optimized + local NVMe (r5d) — r5 RAM ratio plus a local
+    # SSD (~37.5 GiB per vCPU), so shuffle / spill stays off remote storage.
+    NodeType.R5D_XLARGE:    NodeSpec(cpu_cores=4,  ram_gib=32,  local_disk_gib=150, cloud="aws"),
+    NodeType.R5D_2XLARGE:   NodeSpec(cpu_cores=8,  ram_gib=64,  local_disk_gib=300, cloud="aws"),
+    NodeType.R5D_4XLARGE:   NodeSpec(cpu_cores=16, ram_gib=128, local_disk_gib=600, cloud="aws"),
 
     # Azure Dds_v5 — local NVMe disk scales with vCPU (~37.5 GiB per vCPU).
     NodeType.AZURE_D4DS_V5:  NodeSpec(cpu_cores=4,  ram_gib=16, local_disk_gib=150,  cloud="azure"),
