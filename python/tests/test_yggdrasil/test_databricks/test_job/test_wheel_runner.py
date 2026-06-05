@@ -255,7 +255,8 @@ class TestWheel:
                 client, "yellow",
                 dependencies=["/ws/pypi/ygg-1.0-py3-none-any.whl", "pyarrow==1"],
             )
-        assert dest == "/Workspace/Shared/environments/yellow.env.yaml"
+        # Each env now lives in its own ``<name>/`` folder.
+        assert dest == "/Workspace/Shared/environments/yellow/yellow.env.yaml"
         DP.from_.assert_called_once_with(dest, client=client)
         path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
         body = path.write_text.call_args.args[0]
@@ -278,7 +279,7 @@ class TestWheel:
                 dependencies=["/ws/pypi/ygg/ygg-1.2.3-py3-none-any.whl"],
                 filename="ygg-1.2.3.yml",
             )
-        assert dest == "/Workspace/Shared/environments/ygg-1.2.3.yml"
+        assert dest == "/Workspace/Shared/environments/ygg-1.2.3/ygg-1.2.3.yml"
         DP.from_.assert_called_once_with(dest, client=client)
 
     def test_ensure_cluster_requirements_writes_flat_requirements_txt(self):
@@ -290,38 +291,105 @@ class TestWheel:
                 client, "yellow",
                 dependencies=["/ws/pypi/ygg-1.0-py3-none-any.whl", "pyarrow==1"],
             )
-        assert dest == "/Workspace/Shared/environments/yellow.requirements.txt"
+        assert dest == "/Workspace/Shared/environments/yellow/yellow.requirements.txt"
         DP.from_.assert_called_once_with(dest, client=client)
         path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
         body = path.write_text.call_args.args[0]
         # Flat pip requirements — no environment_version, no list indentation.
         assert body == "/ws/pypi/ygg-1.0-py3-none-any.whl\npyarrow==1\n"
 
-    def test_deployed_environments_filters_env_and_requirements_files(self):
+    def test_deployed_environments_descends_into_per_env_folders(self):
+        # Each env is its own ``<name>/`` folder now; deployed_environments
+        # descends one level and still picks up legacy flat files.
         client = MagicMock()
-        folder = MagicMock()
-        folder.exists.return_value = True
 
-        def _child(name):
+        def _file(name, full):
             c = MagicMock()
             c.name = name
-            c.full_path.return_value = f"/ws/env/{name}"
+            c.full_path.return_value = full
+            c.is_dir.return_value = False
             return c
 
+        def _dir(name, children):
+            c = MagicMock()
+            c.name = name
+            c.is_dir.return_value = True
+            c.iterdir.return_value = children
+            return c
+
+        env_folder = _dir("ygg-1.0-py312", [
+            _file("ygg-1.0-py312.yml", "/ws/env/ygg-1.0-py312/ygg-1.0-py312.yml"),
+            _file("ygg-1.0-py312.requirements.txt",
+                  "/ws/env/ygg-1.0-py312/ygg-1.0-py312.requirements.txt"),
+            _dir("binaries", []),          # ignored — no spec suffix
+        ])
+        folder = MagicMock()
+        folder.exists.return_value = True
         folder.iterdir.return_value = [
-            _child("ygg-1.0.yml"),         # version-pinned serverless env
-            _child("yellow.env.yaml"),
-            _child("yellow.requirements.txt"),
-            _child("README.md"),          # ignored
+            _file("yellow.env.yaml", "/ws/env/yellow.env.yaml"),   # legacy flat
+            env_folder,
+            _file("README.md", "/ws/env/README.md"),               # ignored
         ]
         with patch("yggdrasil.databricks.path.DatabricksPath") as DP:
             DP.from_.return_value = folder
             paths = wheel.deployed_environments(client)
         assert paths == [
-            "/ws/env/ygg-1.0.yml",
             "/ws/env/yellow.env.yaml",
-            "/ws/env/yellow.requirements.txt",
+            "/ws/env/ygg-1.0-py312/ygg-1.0-py312.yml",
+            "/ws/env/ygg-1.0-py312/ygg-1.0-py312.requirements.txt",
         ]
+
+    def test_ensure_environment_lays_out_self_contained_folder(self):
+        # Binaries land under the env's own ``binaries/`` folder; the spec files
+        # reference that closure and sit beside it.
+        client = MagicMock()
+        bundle = [
+            "/ws/env/ygg-9.9-py312/binaries/ygg/ygg-9.9-py3-none-any.whl",
+            "/ws/env/ygg-9.9-py312/binaries/pyarrow/pyarrow-1-cp312.whl",
+        ]
+        with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_bundle", return_value=bundle) as eb, \
+             patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
+                   return_value="/ws/env/ygg-9.9-py312/ygg-9.9-py312.yml") as ene, \
+             patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
+                   return_value="/ws/env/ygg-9.9-py312/ygg-9.9-py312.requirements.txt") as ecr:
+            out = wheel.ensure_environment(client, python="3.12")
+
+        # Bundle uploaded under the env's own binaries folder.
+        assert eb.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/environments/ygg-9.9-py312/binaries"
+        assert eb.call_args.kwargs["python"] == "3.12"
+        # Spec files written into the env folder, referencing the closure.
+        assert ene.call_args.kwargs["dependencies"] == bundle
+        assert ene.call_args.kwargs["filename"] == "ygg-9.9-py312.yml"
+        assert ecr.call_args.kwargs["dependencies"] == bundle
+        assert out == {
+            "python": "3.12", "key": "py312", "env_name": "ygg-9.9-py312",
+            "env_dir": "/Workspace/Shared/environments/ygg-9.9-py312",
+            "n_wheels": 2,
+            "serverless": "/ws/env/ygg-9.9-py312/ygg-9.9-py312.yml",
+            "cluster": "/ws/env/ygg-9.9-py312/ygg-9.9-py312.requirements.txt",
+        }
+
+    def test_ensure_environments_runs_every_version_order_preserved(self):
+        # ensure_environments fans the per-version builds out across threads;
+        # record under a lock (Mock isn't thread-safe) and assert on that.
+        import threading
+
+        client = MagicMock()
+        seen: list = []
+        lock = threading.Lock()
+
+        def _fake(c, *, python, workspace_dir, rebuild):
+            with lock:
+                seen.append(python)
+            return {"python": python, "key": wheel.environment_key_for(python)}
+
+        versions = ["3.10", "3.11", "3.12", "3.13"]
+        with patch("yggdrasil.databricks.job.wheel.ensure_environment", side_effect=_fake):
+            out = wheel.ensure_environments(client, versions=versions)
+
+        assert sorted(seen) == sorted(versions)                 # every version built
+        assert [o["python"] for o in out] == versions           # input order preserved
 
     def test_deployed_environments_empty_when_dir_absent(self):
         client = MagicMock()

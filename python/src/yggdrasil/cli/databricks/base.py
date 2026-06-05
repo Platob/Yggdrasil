@@ -178,7 +178,8 @@ class DatabricksCLI(ABC):
         args = parser.parse_args(argv)
 
         if getattr(args, "debug", False):
-            logging.basicConfig(level=logging.DEBUG)
+            from yggdrasil.cli.style import install_logging
+            install_logging(logging.DEBUG, force=True)
             logging.getLogger("yggdrasil").setLevel(logging.DEBUG)
 
         try:

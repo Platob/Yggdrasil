@@ -23,10 +23,31 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _run_build(cmd: "list[str]") -> None:
+    """Run a wheel-build subprocess (uv / pip) **quietly**.
+
+    The build tools are chatty — their progress belongs behind the CLI's
+    spinner, not flooding the caller's stdout. Output is captured and, on a
+    non-zero exit, the (trimmed) tail is folded into the raised
+    :class:`RuntimeError` so a failure stays diagnosable. A missing executable
+    still surfaces as :class:`FileNotFoundError` (so callers can fall back from
+    ``uv`` to ``pip``)."""
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        tail = (exc.stderr or exc.stdout or "").strip()
+        logger.error("build command failed (%s): %s\n%s", exc.returncode, " ".join(cmd), tail)
+        raise RuntimeError(
+            f"build command failed (exit {exc.returncode}): "
+            f"{' '.join(cmd[:4])} … — {tail[-2000:]}"
+        ) from exc
 
 __all__ = [
     "WORKSPACE_PYPI_DIR",
@@ -56,6 +77,8 @@ __all__ = [
     "ensure_bundles",
     "ensure_named_environment",
     "ensure_cluster_requirements",
+    "ensure_environment",
+    "ensure_environments",
     "ygg_base_environment_name",
     "deployed_environments",
     "ygg_runtime_dependencies",
@@ -76,11 +99,20 @@ WORKSPACE_PYPI_DIR = "/Workspace/Shared/pypi"
 #: Back-compat alias — the registry root (was an isolated ``.ygg/whl`` path).
 WORKSPACE_WHL_DIR = WORKSPACE_PYPI_DIR
 
-#: Where reusable serverless **base environments** (``<name>.env.yaml``) live —
-#: a job references one by file path via ``Environment.base_environment`` instead
-#: of inlining the whole dependency list (see :func:`ensure_named_environment`).
-#: Their dependencies are **built wheels in the workspace pypi registry**
-#: (:func:`ensure_bundle`), so the runtime installs with zero PyPI access.
+#: Where reusable serverless **base environments** live. Each named environment
+#: is a **self-contained folder** under this root — ``<env-name>/`` holding its
+#: spec files and its wheel binaries::
+#:
+#:     /Workspace/Shared/environments/ygg-<version>-py3XX/
+#:         ygg-<version>-py3XX.yml             serverless base_environment
+#:         ygg-<version>-py3XX.requirements.txt  classic-cluster requirements
+#:         binaries/<dist>/<wheel>             the zero-PyPI wheel closure
+#:
+#: A job references the ``.yml`` by file path via ``Environment.base_environment``
+#: instead of inlining the whole dependency list (see
+#: :func:`ensure_named_environment`); its dependencies are the **wheels under the
+#: env's own ``binaries/`` folder** (:func:`ensure_environment`), so the env is
+#: self-describing and the runtime installs with zero PyPI access.
 WORKSPACE_ENV_DIR = "/Workspace/Shared/environments"
 
 #: Latest serverless environment version — the fallback when the local Python
@@ -404,16 +436,12 @@ def build_wheel(
     if no_deps and not requirements:
         logger.info("building wheel for %s into %s (uv)", package, out)
         try:
-            subprocess.run(
-                ["uv", "build", "--wheel", "--out-dir", str(out), str(project)],
-                check=True,
-            )
+            _run_build(["uv", "build", "--wheel", "--out-dir", str(out), str(project)])
         except FileNotFoundError:
             logger.info("uv not found — falling back to pip for %s", package)
-            subprocess.run(
+            _run_build(
                 [sys.executable, "-m", "pip", "wheel", str(project),
-                 "--no-deps", "--wheel-dir", str(out)],
-                check=True,
+                 "--no-deps", "--wheel-dir", str(out)]
             )
     else:
         logger.info("building wheel (+ dependencies) for %s into %s (pip)", package, out)
@@ -424,11 +452,10 @@ def build_wheel(
             capture_output=True,
         ).returncode != 0:
             logger.info("pip not present in %s — bootstrapping via ensurepip", sys.executable)
-            subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=True)
-        subprocess.run(
+            _run_build([sys.executable, "-m", "ensurepip", "--upgrade"])
+        _run_build(
             [sys.executable, "-m", "pip", "wheel", str(project), *requirements,
-             "--wheel-dir", str(out)],
-            check=True,
+             "--wheel-dir", str(out)]
         )
 
     wheels = sorted(out.glob("*.whl"))
@@ -459,17 +486,15 @@ def build_wheels_for_versions(
     wheels: list[Path] = []
     for version in versions:
         try:
-            subprocess.run(
+            _run_build(
                 ["uv", "build", "--wheel", "--python", version,
-                 "--out-dir", str(out), str(project)],
-                check=True,
+                 "--out-dir", str(out), str(project)]
             )
         except FileNotFoundError:
             logger.info("uv not found — building one wheel for the current interpreter")
-            subprocess.run(
+            _run_build(
                 [sys.executable, "-m", "pip", "wheel", str(project),
-                 "--no-deps", "--wheel-dir", str(out)],
-                check=True,
+                 "--no-deps", "--wheel-dir", str(out)]
             )
         for whl in sorted(out.glob("*.whl")):
             if whl.name not in seen:
@@ -519,17 +544,15 @@ def build_bundle(
 
     logger.info("building %s project wheel for Python %s into %s", package, py, out)
     try:
-        subprocess.run(
+        _run_build(
             ["uv", "build", "--wheel", "--python", py,
-             "--out-dir", str(out), str(project)],
-            check=True,
+             "--out-dir", str(out), str(project)]
         )
     except FileNotFoundError:
         logger.info("uv not found — building the project wheel with the host interpreter")
-        subprocess.run(
+        _run_build(
             [sys.executable, "-m", "pip", "wheel", str(project),
-             "--no-deps", "--wheel-dir", str(out)],
-            check=True,
+             "--no-deps", "--wheel-dir", str(out)]
         )
 
     # Download the dependency closure as Linux-x86_64 wheels for the *serverless
@@ -545,15 +568,14 @@ def build_bundle(
             "downloading %d top-level dep requirement(s) as %s wheels (py%s)",
             len(deps), "/".join(_serverless_wheel_platforms()), py,
         )
-        subprocess.run(
+        _run_build(
             [sys.executable, "-m", "pip", "download",
              "--only-binary=:all:",
              "--python-version", py,
              "--implementation", "cp",
              "--abi", abi, "--abi", "abi3", "--abi", "none",
              *platform_args,
-             "--dest", str(out), *deps],
-            check=True,
+             "--dest", str(out), *deps]
         )
 
     # Drop runtime-provided distributions (e.g. ``certifi``) so the bundle never
@@ -889,7 +911,10 @@ def ensure_named_environment(
     lines += [f"  - {dep}" for dep in dependencies]
     body = "\n".join(lines) + "\n"
 
-    dest = f"{workspace_dir.rstrip('/')}/{filename or f'{name}.env.yaml'}"
+    # Each named environment lives in its own ``<workspace_dir>/<name>/`` folder
+    # (alongside its requirements file + ``binaries/`` closure) so the env is a
+    # self-contained, browsable unit rather than a loose file in a flat directory.
+    dest = f"{workspace_dir.rstrip('/')}/{name}/{filename or f'{name}.env.yaml'}"
     path = DatabricksPath.from_(dest, client=client)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
@@ -927,7 +952,8 @@ def ensure_cluster_requirements(
     from yggdrasil.databricks.path import DatabricksPath
 
     body = "\n".join(str(dep) for dep in dependencies) + "\n"
-    dest = f"{workspace_dir.rstrip('/')}/{name}.requirements.txt"
+    # Sits beside the serverless ``.yml`` in the env's own ``<name>/`` folder.
+    dest = f"{workspace_dir.rstrip('/')}/{name}/{name}.requirements.txt"
     path = DatabricksPath.from_(dest, client=client)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
@@ -938,26 +964,129 @@ def ensure_cluster_requirements(
     return dest
 
 
+def ensure_environment(
+    client: Any,
+    *,
+    python: "str | None" = None,
+    version: "str | None" = None,
+    workspace_dir: str = WORKSPACE_ENV_DIR,
+    rebuild: bool = False,
+) -> "dict[str, Any]":
+    """Build + persist one **self-contained** ygg base environment for a single
+    Python version, returning a small descriptor of what was written.
+
+    Lays the environment out as its own folder under *workspace_dir*::
+
+        <workspace_dir>/ygg-<version>-py3XX/
+            ygg-<version>-py3XX.yml             serverless base_environment
+            ygg-<version>-py3XX.requirements.txt   classic-cluster requirements
+            binaries/<dist>/<wheel>             the zero-PyPI wheel closure
+
+    The wheel closure is built (:func:`build_bundle`) and uploaded **under the
+    env's own ``binaries/`` folder** (:func:`ensure_bundle` with that folder as
+    its root), so the env carries its binaries rather than pointing into the
+    shared pypi registry — every environment is independent (and so safely built
+    in parallel, see :func:`ensure_environments`). The serverless ``.yml`` and
+    cluster ``requirements.txt`` then list those wheel paths, so the runtime
+    installs with zero PyPI access.
+
+    Returns ``{python, key, env_name, env_dir, n_wheels, serverless, cluster}``.
+    """
+    version = version or ilmd.version("ygg")
+    key = environment_key_for(python)
+    env_name = f"ygg-{version}-{key}"
+    env_dir = f"{workspace_dir.rstrip('/')}/{env_name}"
+
+    bundle = ensure_bundle(
+        client, "ygg", python=python, workspace_dir=f"{env_dir}/binaries", rebuild=rebuild,
+    )
+    serverless = ensure_named_environment(
+        client, env_name, dependencies=bundle,
+        environment_version=serverless_environment_version(python),
+        workspace_dir=workspace_dir, filename=f"{env_name}.yml",
+    )
+    cluster = ensure_cluster_requirements(
+        client, env_name, dependencies=bundle, workspace_dir=workspace_dir,
+    )
+    return {
+        "python": python,
+        "key": key,
+        "env_name": env_name,
+        "env_dir": env_dir,
+        "n_wheels": len(bundle),
+        "serverless": serverless,
+        "cluster": cluster,
+    }
+
+
+def ensure_environments(
+    client: Any,
+    *,
+    versions: "tuple[str | None, ...] | list[str | None]" = (None,),
+    workspace_dir: str = WORKSPACE_ENV_DIR,
+    rebuild: bool = False,
+    max_workers: "int | None" = None,
+) -> "list[dict[str, Any]]":
+    """:func:`ensure_environment` for several Python versions, **in parallel**.
+
+    Each version's environment is an independent folder with its own wheel
+    closure, so the builds share nothing and run concurrently on a
+    :class:`~concurrent.futures.ThreadPoolExecutor` (the work is subprocess-bound
+    — uv / pip — so threads give real overlap). Results are returned in the input
+    order regardless of completion order. A single version skips the pool and
+    runs inline."""
+    versions = list(versions) or [None]
+    if len(versions) == 1:
+        return [ensure_environment(
+            client, python=versions[0], workspace_dir=workspace_dir, rebuild=rebuild,
+        )]
+
+    results: "dict[Any, dict[str, Any]]" = {}
+    with ThreadPoolExecutor(
+        max_workers=max_workers or len(versions), thread_name_prefix="ygg-env",
+    ) as pool:
+        futures = {
+            pool.submit(
+                ensure_environment,
+                client, python=py, workspace_dir=workspace_dir, rebuild=rebuild,
+            ): py
+            for py in versions
+        }
+        for future in as_completed(futures):
+            py = futures[future]
+            results[py] = future.result()
+    return [results[py] for py in versions]
+
+
 def deployed_environments(client: Any, *, workspace_dir: str = WORKSPACE_ENV_DIR) -> list[str]:
     """Workspace paths of persisted environment files under *workspace_dir* —
     serverless base environments (``*.env.yaml`` / ``*.yml``, e.g. the
-    version-pinned ``ygg-<version>.yml``) and cluster requirement files
+    version-pinned ``ygg-<version>-py3XX.yml``) and cluster requirement files
     (``*.requirements.txt``).
 
-    The environment-layer counterpart of :func:`deployed_wheels`: lets
-    ``ygg databricks seed --check`` report whether :func:`ensure_named_environment`
-    / :func:`ensure_cluster_requirements` have actually written the reusable
-    environment files. Empty when the directory is absent or holds none."""
+    Each environment lives in its **own ``<env-name>/`` folder** now
+    (:func:`ensure_environment`), so this descends one level into those folders;
+    loose files left directly under *workspace_dir* by older deploys are still
+    picked up for back-compat. The environment-layer counterpart of
+    :func:`deployed_wheels`: lets ``ygg databricks seed --check`` report whether
+    the reusable environment files were written. Empty when the directory is
+    absent or holds none."""
     from yggdrasil.databricks.path import DatabricksPath
 
     folder = DatabricksPath.from_(workspace_dir, client=client)
     if not folder.exists():
         return []
-    return [
-        child.full_path()
-        for child in folder.iterdir()
-        if str(child.name).endswith((".env.yaml", ".yml", ".requirements.txt"))
-    ]
+
+    suffixes = (".env.yaml", ".yml", ".requirements.txt")
+    found: list[str] = []
+    for child in folder.iterdir():
+        if str(child.name).endswith(suffixes):     # legacy flat file
+            found.append(child.full_path())
+        elif child.is_dir():                        # per-env folder
+            for sub in child.iterdir():
+                if str(sub.name).endswith(suffixes):
+                    found.append(sub.full_path())
+    return found
 
 
 def ygg_runtime_dependencies() -> list[str]:

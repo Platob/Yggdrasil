@@ -32,7 +32,7 @@ from databricks.sdk.errors import InvalidParameterValue
 
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Scheme, MediaTypes
-from yggdrasil.io.io_stats import IOStats, IOKind
+from yggdrasil.io.io_stats import IOStats, IOKind, format_bytes
 from yggdrasil.path.remote_path import _STAT_CACHE_TTL
 from yggdrasil.url import URL
 
@@ -657,8 +657,9 @@ class DBFSPath(DatabricksPath):
                     media_type=self.media_type,
                 )
             )
-            logger.info("Uploaded DBFS file %r (size=%d)", self, size)
-        else:
+            if logger.isEnabledFor(logging.INFO):
+                logger.info("Uploaded DBFS file %r (size=%s)", self, format_bytes(size))
+        elif logger.isEnabledFor(logging.INFO):
             logger.info("Uploaded DBFS file %r (size=stream)", self)
         return size
 

@@ -482,6 +482,44 @@ class TestFullNameAndPath:
 
 
 # ===========================================================================
+# DatabricksPath dispatch → resource subclasses
+# ===========================================================================
+
+
+class TestResourceDispatch:
+    """``DatabricksPath("/Volumes/…", service=…)`` resolves to the right
+    resource by depth.
+
+    Regression: the resource paths (Volume / UCSchema / UCCatalog) are
+    ``DatabricksPath`` subclasses, so Python re-runs their ``__init__`` after
+    the dispatcher's ``__new__`` with the original positional path string. That
+    used to collide with their ``service``-first signature
+    (``__init__() got multiple values for argument 'service'``); they now
+    absorb it as an ignored leading ``data`` arg.
+    """
+
+    def test_dispatch_to_volume(self, volumes_service):
+        p = DatabricksPath("/Volumes/main/sales/raw", service=volumes_service)
+        assert isinstance(p, Volume)
+        assert (p.catalog_name, p.schema_name, p.volume_name) == ("main", "sales", "raw")
+
+    def test_dispatch_to_schema(self, volumes_service):
+        p = DatabricksPath("/Volumes/main/sales", service=volumes_service)
+        assert isinstance(p, UCSchema)
+        assert (p.catalog_name, p.schema_name) == ("main", "sales")
+
+    def test_dispatch_to_catalog(self, volumes_service):
+        p = DatabricksPath("/Volumes/main", service=volumes_service)
+        assert isinstance(p, UCCatalog)
+        assert p.catalog_name == "main"
+
+    def test_dispatch_to_volume_path(self, volumes_service):
+        p = DatabricksPath("/Volumes/main/sales/raw/sub/f.txt", service=volumes_service)
+        assert isinstance(p, VolumePath)
+        assert p.full_path() == "/Volumes/main/sales/raw/sub/f.txt"
+
+
+# ===========================================================================
 # Navigation between resources
 # ===========================================================================
 

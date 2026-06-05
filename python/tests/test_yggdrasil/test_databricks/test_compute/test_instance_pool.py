@@ -18,8 +18,10 @@ from databricks.sdk.service.compute import (
 
 from yggdrasil.databricks.compute.instance_pool import (
     DEFAULT_POOL_NAME_PREFIX,
+    DEFAULT_POOL_TIERS,
     InstancePool,
     InstancePoolDefaults,
+    PoolTier,
 )
 from yggdrasil.databricks.tests import DatabricksTestCase
 
@@ -117,6 +119,101 @@ class TestInstancePoolsCreate(DatabricksTestCase):
         self.assertEqual(kwargs["idle_instance_autotermination_minutes"], 15)
         self.assertFalse(kwargs["enable_elastic_disk"])
         self.assertEqual(kwargs["custom_tags"]["Team"], "ML")
+
+
+class TestSeedDefaultPools(DatabricksTestCase):
+    """``seed_default_pools()`` — the Light/Medium/Heavy r5d default set."""
+
+    def setUp(self):
+        super().setUp()
+        # Keep the create path hermetic — no clusters API round-trip for the
+        # preloaded spark version; we pass an explicit list instead.
+        self.instance_pools.defaults = replace(
+            self.instance_pools.defaults,
+            preload_local_python_runtime=False,
+        )
+        # Fresh empty iterator per call — the tiers are provisioned concurrently.
+        self.pools_api.list.side_effect = lambda: iter([])
+
+        # create() runs on one thread per tier; Mock's own call recording is not
+        # thread-safe, so capture the create specs under a lock and assert on
+        # that rather than ``call_args_list``.
+        import threading
+        self._lock = threading.Lock()
+        self._created: list[dict] = []
+
+        def _create(**kwargs):
+            with self._lock:
+                self._created.append(kwargs)
+                n = len(self._created)
+            return CreateInstancePoolResponse(instance_pool_id=f"pool-{n}")
+
+        self.pools_api.create.side_effect = _create
+        self.pools_api.get.side_effect = lambda instance_pool_id: (
+            self.make_instance_pool_details(
+                instance_pool_id=instance_pool_id,
+                instance_pool_name="seeded",
+            )
+        )
+
+    def test_default_tiers_are_light_medium_heavy_r5d(self):
+        names = [t.tier for t in DEFAULT_POOL_TIERS]
+        self.assertEqual(names, ["Light", "Medium", "Heavy"])
+        node_types = [t.node_type_id for t in DEFAULT_POOL_TIERS]
+        self.assertEqual(node_types, ["r5d.xlarge", "r5d.2xlarge", "r5d.4xlarge"])
+
+    def test_pool_name_uses_prefix(self):
+        self.assertEqual(
+            DEFAULT_POOL_TIERS[0].pool_name(),
+            f"{DEFAULT_POOL_NAME_PREFIX} Light",
+        )
+        self.assertEqual(PoolTier("Big", "r5d.4xlarge", 1).pool_name("Acme"), "Acme Big")
+
+    def test_seed_creates_one_pool_per_tier(self):
+        pools = self.instance_pools.seed_default_pools(
+            preloaded_spark_versions=["15.4.x-scala2.12"],
+        )
+
+        # Returned in tier order regardless of (parallel) completion order.
+        self.assertEqual(len(pools), len(DEFAULT_POOL_TIERS))
+        self.assertEqual(len(self._created), len(DEFAULT_POOL_TIERS))
+
+        # Completion order is non-deterministic under the thread pool — assert
+        # on the *set* of provisioned specs.
+        self.assertEqual(
+            sorted(k["instance_pool_name"] for k in self._created),
+            sorted(f"{DEFAULT_POOL_NAME_PREFIX} {t.tier}" for t in DEFAULT_POOL_TIERS),
+        )
+        self.assertEqual(
+            sorted(k["node_type_id"] for k in self._created),
+            sorted(["r5d.xlarge", "r5d.2xlarge", "r5d.4xlarge"]),
+        )
+        # Preloaded spark versions propagate to every pool (warm attach +
+        # zero-PyPI wheel bundle install).
+        for k in self._created:
+            self.assertEqual(k["preloaded_spark_versions"], ["15.4.x-scala2.12"])
+
+    def test_seed_is_idempotent_updates_existing(self):
+        # An existing pool by name routes through edit(), not create(). A single
+        # tier runs inline (no thread pool).
+        existing = InstancePoolAndStats(
+            instance_pool_id="pool-light",
+            instance_pool_name=f"{DEFAULT_POOL_NAME_PREFIX} Light",
+            node_type_id="r5d.xlarge",
+        )
+        self.pools_api.list.side_effect = lambda: iter([existing])
+        self.pools_api.get.side_effect = lambda instance_pool_id: (
+            self.make_instance_pool_details(
+                instance_pool_id=instance_pool_id,
+                instance_pool_name=f"{DEFAULT_POOL_NAME_PREFIX} Light",
+            )
+        )
+
+        self.instance_pools.seed_default_pools(
+            tiers=[DEFAULT_POOL_TIERS[0]],
+            preloaded_spark_versions=["15.4.x-scala2.12"],
+        )
+        self.pools_api.create.assert_not_called()
 
 
 class TestInstancePoolsPool(DatabricksTestCase):

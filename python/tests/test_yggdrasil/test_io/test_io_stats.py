@@ -2,7 +2,31 @@
 
 from __future__ import annotations
 
-from yggdrasil.io.io_stats import IOKind, IOStats
+from yggdrasil.io.io_stats import IOKind, IOStats, format_bytes
+
+
+class TestFormatBytes:
+    def test_sub_step_stays_exact_bytes(self):
+        assert format_bytes(0) == "0 B"
+        assert format_bytes(512) == "512 B"
+        assert format_bytes(1023) == "1023 B"
+
+    def test_binary_units_are_iec_1024_step(self):
+        assert format_bytes(1024) == "1.0 KiB"
+        assert format_bytes(1536) == "1.5 KiB"
+        assert format_bytes(1048576) == "1.0 MiB"
+        assert format_bytes(1073741824) == "1.0 GiB"
+        assert format_bytes(5 * 1024 ** 4) == "5.0 TiB"
+
+    def test_si_units_are_1000_step(self):
+        assert format_bytes(1500, binary=False) == "1.5 kB"
+        assert format_bytes(1_000_000, binary=False) == "1.0 MB"
+
+    def test_none_is_unknown(self):
+        assert format_bytes(None) == "unknown"
+
+    def test_negative_keeps_sign(self):
+        assert format_bytes(-2048) == "-2.0 KiB"
 
 
 class TestIOKind:

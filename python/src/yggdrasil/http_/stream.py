@@ -17,6 +17,7 @@ import ssl
 import socket
 from typing import TYPE_CHECKING, Any, Optional
 
+from yggdrasil.io.io_stats import format_bytes
 from yggdrasil.path.memory_stream import MemoryStream
 
 if TYPE_CHECKING:
@@ -93,10 +94,12 @@ class HTTPStream(MemoryStream):
                 f"{len(payload)} bytes (limit={_MAX_PICKLE_SIZE}) "
                 f"and no request/session to replay from."
             )
-        logger.info(
-            "HTTPStream pickling %s %s as replay (body=%d bytes > %d limit)",
-            self._request.method, self._request.url, total, _MAX_PICKLE_SIZE,
-        )
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "HTTPStream pickling %s %s as replay (body=%s > %s limit)",
+                self._request.method, self._request.url,
+                format_bytes(total), format_bytes(_MAX_PICKLE_SIZE),
+            )
         return {
             "replay": True,
             "request": self._request,
@@ -165,10 +168,11 @@ class HTTPStream(MemoryStream):
                 if not chunk:
                     break
                 remaining -= len(chunk)
-            logger.debug(
-                "HTTPStream drained %d bytes to reach offset %d",
-                offset - remaining, offset,
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "HTTPStream drained %s to reach offset %d",
+                    format_bytes(offset - remaining), offset,
+                )
 
     def _open_range_connection(self, offset: int) -> Any:
         """Issue a Range request and bind the response as the new source.

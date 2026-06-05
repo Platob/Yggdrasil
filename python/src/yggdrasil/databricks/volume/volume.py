@@ -151,6 +151,7 @@ class Volume(DatabricksPath):
 
     def __init__(
         self,
+        data: Any = None,
         service: "Volumes | None" = None,
         catalog_name: str | None = None,
         schema_name: str | None = None,
@@ -163,7 +164,13 @@ class Volume(DatabricksPath):
         singleton_ttl: "int | None" = ...,
         **kwargs
     ) -> None:
-        del singleton_ttl
+        # ``data`` is only ever populated by the :class:`DatabricksPath`
+        # dispatcher's post-``__new__`` auto-``__init__`` pass — it re-passes
+        # the original positional path string after :meth:`from_url` already
+        # built (and cached) this volume. Every real caller uses keywords, so
+        # it stays ``None`` and is discarded here; the ``_initialized`` guard
+        # below then no-ops the redundant pass.
+        del singleton_ttl, data
 
         if service is None:
             from .volumes import Volumes

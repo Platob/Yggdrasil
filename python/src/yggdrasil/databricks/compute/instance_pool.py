@@ -69,6 +69,8 @@ __all__ = [
     "InstancePools",
     "InstancePool",
     "InstancePoolDefaults",
+    "PoolTier",
+    "DEFAULT_POOL_TIERS",
     "DEFAULT_POOL_NAME_PREFIX",
     "databricks_pool_remote_compute",
 ]
@@ -184,6 +186,61 @@ class InstancePoolDefaults:
 DEFAULTS = InstancePoolDefaults()
 
 
+# ---------------------------------------------------------------------------
+# Default seeded pool tiers — Light / Medium / Heavy
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PoolTier:
+    """One named tier in the default Yggdrasil instance-pool set.
+
+    A tier pins an opinionated ``(node_type_id, capacity, autotermination)``
+    triple to a human-readable size name (``"Light"`` / ``"Medium"`` /
+    ``"Heavy"``). :meth:`InstancePools.seed_default_pools` (driven by
+    ``ygg databricks seed``) materialises one pool per tier so a workspace
+    gets a ready, sensibly-sized attach point for ygg's pool-backed compute
+    out of the box.
+
+    Attributes
+    ----------
+    tier
+        Size label, suffixed onto the pool-name prefix (``"Yggdrasil Light"``).
+    node_type_id
+        Worker SKU for the tier. The defaults use the AWS r5d
+        memory-optimized family (local NVMe → fast shuffle / spill for the
+        tabular + Arrow workloads ygg runs).
+    max_capacity
+        Cap on total pool size (idle + in-use). Smaller for the heavier,
+        pricier tiers.
+    min_idle_instances
+        Pre-warmed nodes kept alive. ``0`` (the default) is fully lazy — no
+        cost until a cluster actually attaches.
+    idle_instance_autotermination_minutes
+        Idle grace before Databricks releases a pool node.
+    """
+
+    tier: str
+    node_type_id: str
+    max_capacity: int
+    min_idle_instances: int = 0
+    idle_instance_autotermination_minutes: int = 30
+
+    def pool_name(self, prefix: str = DEFAULT_POOL_NAME_PREFIX) -> str:
+        """Effective pool name for this tier (``"Yggdrasil Light"``)."""
+        return f"{prefix} {self.tier}"
+
+
+#: The default Light / Medium / Heavy pools ``ygg databricks seed`` provisions.
+#: All three use the AWS r5d memory-optimized family (local NVMe), sized up per
+#: tier and lazy by default (``min_idle_instances=0`` → no cost until attached).
+DEFAULT_POOL_TIERS: "tuple[PoolTier, ...]" = (
+    PoolTier("Light",  NodeType.R5D_XLARGE.value,  max_capacity=20, idle_instance_autotermination_minutes=20),
+    PoolTier("Medium", NodeType.R5D_2XLARGE.value, max_capacity=10, idle_instance_autotermination_minutes=30),
+    PoolTier("Heavy",  NodeType.R5D_4XLARGE.value, max_capacity=5,  idle_instance_autotermination_minutes=45),
+)
+
+
 def _set_cached_pool_id(client: DatabricksClient, name: str, pool_id: str) -> None:
     host = client.base_url.to_string()
     existing = _NAME_ID_CACHE.get(host)
@@ -292,6 +349,61 @@ class InstancePools(DatabricksService):
         defaults for this one call.
         """
         return self.pool(self.default_pool_name(), **overrides)
+
+    def seed_default_pools(
+        self,
+        *,
+        tiers: Sequence[PoolTier] = DEFAULT_POOL_TIERS,
+        prefix: str = DEFAULT_POOL_NAME_PREFIX,
+        preloaded_spark_versions: Optional[Sequence[str]] = None,
+        permissions: Optional[list[str | InstancePoolAccessControlRequest]] = None,
+    ) -> list["InstancePool"]:
+        """Provision the default Light / Medium / Heavy Yggdrasil pools.
+
+        Creates (or updates, idempotently) one workspace-shared instance pool
+        per :class:`PoolTier` — by default the r5d-backed
+        :data:`DEFAULT_POOL_TIERS` (``"Yggdrasil Light"`` /
+        ``"Yggdrasil Medium"`` / ``"Yggdrasil Heavy"``). This is what
+        ``ygg databricks seed`` calls so a freshly-seeded workspace has ready,
+        sensibly-sized attach points for ygg's pool-backed compute.
+
+        Each pool preloads ``preloaded_spark_versions`` (defaulting to the
+        latest DBR runtime whose Python minor matches the local interpreter, via
+        :meth:`_local_python_preloaded_versions`) so the first attach is warm
+        and the pool's clusters install the seeded zero-PyPI ygg wheel bundle
+        without a runtime download. Returns the resulting pools, tier order
+        preserved.
+        """
+        if preloaded_spark_versions is None:
+            preloaded_spark_versions = self._local_python_preloaded_versions()
+        preloaded = list(preloaded_spark_versions) if preloaded_spark_versions else None
+
+        tiers = list(tiers)
+
+        def _provision(tier: PoolTier) -> "InstancePool":
+            return self.create_or_update(
+                instance_pool_name=tier.pool_name(prefix),
+                node_type_id=tier.node_type_id,
+                max_capacity=tier.max_capacity,
+                min_idle_instances=tier.min_idle_instances,
+                idle_instance_autotermination_minutes=tier.idle_instance_autotermination_minutes,
+                preloaded_spark_versions=preloaded,
+                permissions=permissions,
+            )
+
+        if len(tiers) == 1:
+            return [_provision(tiers[0])]
+
+        # The pools are independent SDK create/edit calls — fan them out so a
+        # whole-set provision costs roughly one round trip instead of N.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results: dict[str, "InstancePool"] = {}
+        with ThreadPoolExecutor(max_workers=len(tiers), thread_name_prefix="ygg-pool") as pool:
+            futures = {pool.submit(_provision, tier): tier.tier for tier in tiers}
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        return [results[tier.tier] for tier in tiers]
 
     # ------------------------------------------------------------------ #
     # CRUD

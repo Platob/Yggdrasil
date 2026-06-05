@@ -87,9 +87,18 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_BYTE_SIZE = 32 * ByteUnit.MIB
-# Module-level — single source of truth for retryable error codes.
+# Module-level — single source of truth for retryable error codes. All are
+# Delta concurrent-append conflicts: a sibling writer committed between this
+# statement's read and commit. They're transient — re-running the statement
+# against the new table version succeeds — so the retry loop serializes the
+# contending writers via jittered backoff:
+#   - ROW_LEVEL_CHANGES — row-level conflict detection flagged overlapping rows.
+#   - PARTITIONED_TABLE_WITHOUT_MERGE_SOURCE — a concurrent MERGE appended to a
+#     partitioned table where row-level conflict detection can't run; Delta's
+#     own message says "Please retry the operation."
 _RETRYABLE_ERROR_CODES: frozenset[str] = frozenset({
     "DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES",
+    "DELTA_CONCURRENT_APPEND.PARTITIONED_TABLE_WITHOUT_MERGE_SOURCE",
 })
 
 _RETRYABLE_ELAPSED_LIMIT: float = 120.0
@@ -708,8 +717,9 @@ class WarehouseStatementResult(StatementResult):
         when:
 
         - the statement ran and failed (``_compute_error`` returned an error),
-        - the failure code is one we know is transient
-          (``DELTA_CONCURRENT_APPEND.ROW_LEVEL_CHANGES`` today),
+        - the failure code is one we know is transient (a
+          ``DELTA_CONCURRENT_APPEND`` conflict — see
+          :data:`_RETRYABLE_ERROR_CODES`),
         - we haven't blown the elapsed budget (5 min) or the attempt
           budget (2 retries).
 
@@ -803,8 +813,24 @@ class WarehouseStatementResult(StatementResult):
         writers MERGE-ing the same rows) are resolved by serialization —
         retrying in lockstep just re-collides. Stagger with full jitter so
         concurrent writers spread out and commit one after another.
+
+        Logs the impending retry at INFO — naming the SQL operation (so a
+        contended ``MERGE`` is obvious in the logs), the upcoming attempt
+        number, the backoff, and the transient conflict that triggered it.
         """
-        return self._jittered_backoff(self._attempts, wait, start)
+        delay = self._jittered_backoff(self._attempts, wait, start)
+        if logger.isEnabledFor(logging.INFO):
+            text = (self.statement.text or "").lstrip()
+            operation = text.split(None, 1)[0].upper() if text else "STATEMENT"
+            error = self._error_for_status()
+            detail = str(error).splitlines()[0][:200] if error else ""
+            logger.info(
+                "Retrying %s %s (attempt %d, backoff %.2fs) after transient "
+                "conflict: %s",
+                operation, self.statement_id or "(unsent)",
+                self._attempts + 1, delay, detail,
+            )
+        return delay
 
     def cancel(
         self,

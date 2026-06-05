@@ -230,6 +230,7 @@ class UCSchema(DatabricksPath):
 
     def __init__(
         self,
+        data: Any = None,
         service: "Schemas | None" = None,
         catalog_name: str | None = None,
         schema_name: str | None = None,
@@ -243,8 +244,12 @@ class UCSchema(DatabricksPath):
     ):
         # ``singleton_ttl`` is consumed by ``__new__``; accept it here
         # too so Python's auto-call after ``__new__`` doesn't trip on
-        # an unexpected kwarg.
-        del singleton_ttl
+        # an unexpected kwarg. ``data`` is only populated by the
+        # :class:`DatabricksPath` dispatcher's post-``__new__`` auto-``__init__``
+        # pass (the original positional path string); :meth:`from_url` already
+        # built this schema, so it's discarded and the ``_initialized`` guard
+        # no-ops the redundant pass.
+        del singleton_ttl, data
         # Singleton-cached re-entry: a second ``Schema(service=…,
         # catalog_name=…, schema_name=…)`` call returns the live
         # instance via ``__new__``; skip the second pass so the
