@@ -390,6 +390,40 @@ class TestWait:
         assert result is t
         assert not t.is_done
 
+    def test_wait_zero_timeout_does_not_raise(self):
+        # timeout=0 means "don't wait" (fire-and-forget), NOT a 0s deadline that
+        # instantly expires — a still-running task must come back without a
+        # spurious TimeoutError.
+        t = _SlowTask(polls_until_done=999)
+        t._state = State.RUNNING
+        wc = WaitingConfig(timeout=0, interval=0.001, backoff=1.0, max_interval=0.01)
+        result = t.wait(wait=wc)
+        assert result is t
+        assert t.is_running and not t.is_done
+
+    def test_start_zero_timeout_does_not_raise(self):
+        # Same contract through start(): a 0-timeout config fires-and-forgets.
+        t = _SlowTask(polls_until_done=999)
+        wc = WaitingConfig(timeout=0, interval=0.001, backoff=1.0, max_interval=0.01)
+        result = t.start(wait=wc)
+        assert result is t
+        assert not t.is_done
+
+    def test_wait_numeric_zero_does_not_raise(self):
+        # ``wait=0`` is the numeric sugar for the same fire-and-forget config.
+        t = _SlowTask(polls_until_done=999)
+        t._state = State.RUNNING
+        result = t.wait(wait=0)
+        assert result is t and not t.is_done
+
+    def test_wait_zero_timeout_still_surfaces_failure(self):
+        # Fire-and-forget still reports a *real* failure when raise_error is set.
+        t = _FailingTask()
+        t._state = State.RUNNING
+        wc = WaitingConfig(timeout=0, interval=0.001, backoff=1.0, max_interval=0.01)
+        with pytest.raises(RuntimeError):
+            t.wait(wait=wc)
+
     def test_wait_raises_on_failure(self):
         t = _FailingTask()
         t._state = State.RUNNING
