@@ -280,7 +280,7 @@ function PortfolioTab({ series }: { series: Series[] }) {
             <option value={52}>52 (weekly)</option>
             <option value={12}>12 (monthly)</option>
           </select>
-          <button onClick={analyze} className="px-3 py-1.5 rounded text-[11px] font-mono gradient-frost text-background font-semibold">Analyze</button>
+          <button onClick={analyze} className="px-3 py-1.5 rounded text-[11px] font-mono bg-frost/20 text-frost border border-frost/40 font-semibold hover:bg-frost/30">Analyze</button>
           {busy && <span className="text-[11px] text-muted">computing…</span>}
         </div>
       </div>
