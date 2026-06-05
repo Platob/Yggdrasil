@@ -115,6 +115,10 @@ def _bench_size(session, base_url, size, n, reps, tmp):
     old_peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
 
+    # --- the cache's own resident RAM (the hot tier — hard-capped) ------
+    from yggdrasil.http_.response_cache import _ram, _RAM_MAX_BYTES
+    ram_tier = _ram._bytes
+
     # --- on-disk footprint ----------------------------------------------
     new_disk = sum(f.stat().st_size for f in (tmp / f"new_{size}").rglob("*") if f.is_file())
     old_disk = sum(f.stat().st_size for f in (tmp / f"old_{size}").rglob("*") if f.is_file())
@@ -131,7 +135,10 @@ def _bench_size(session, base_url, size, n, reps, tmp):
     print(f"  write N     new {new_write:8.2f} ms | old {old_write:8.2f} ms | "
           f"{old_write / new_write:4.1f}x")
     print(f"  read peak   new {new_peak/1e6:8.2f} MB | old {old_peak/1e6:8.2f} MB | "
-          f"{old_peak / max(new_peak,1):4.1f}x lighter")
+          f"{old_peak / max(new_peak,1):4.1f}x lighter "
+          f"(incl. the {n}-response result the caller asked for)")
+    print(f"  RAM tier    new {ram_tier/1e6:8.2f} MB  (hard cap {_RAM_MAX_BYTES/1e6:.0f} MB — "
+          f"the cache's own resident memory, can't balloon)")
     print(f"  on disk     new {new_disk/1e6:8.2f} MB | old {old_disk/1e6:8.2f} MB")
     return http_one, new_one
 

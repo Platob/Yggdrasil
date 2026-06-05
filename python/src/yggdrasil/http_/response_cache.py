@@ -13,8 +13,14 @@ path. A lookup is then a single O(1) file read + Response rebuild (the looked-up
 request, same identity, is reattached), a write a single atomic file replace
 (upsert). No dataset scan, partitioning, predicate, schema, or Arrow round-trip.
 
+Over the on-disk store sits a small **byte-bounded RAM hot tier** (default 32 MB,
+process-wide) keyed by ``public_hash``: the most-recent / most-reused responses
+are served straight from memory, everything else from the per-key file — so the
+cache's RAM can never balloon (an oversized response is kept disk-only rather
+than evicting the hot set), and day-old files are pruned on construction.
+
 A cache hit measures **several times faster than even a localhost HTTP call**,
-with lighter memory than the generic tabular cache — see
+with bounded memory vs the generic tabular cache — see
 ``benchmarks/http_/bench_response_cache.py``. The remote (Databricks Table)
 backend is untouched and keeps the tabular path.
 """
@@ -41,6 +47,55 @@ _MATCH_KEY = "public_hash"
 #: Column carrying the producing request's public_hash in a response batch.
 _MATCH_COLUMN = "request_public_hash"
 _MAX_WORKERS = 32
+
+# In-RAM hot tier over disk: a byte-bounded LRU of the encoded records keyed by
+# the request public_hash. The most-recent / most-reused responses are served
+# straight from RAM; everything else falls through to the per-key file on disk.
+# RAM stays capped (default 32 MB, process-wide; ``0`` disables) so the cache can
+# never balloon — a single big response (> a quarter of the budget) is kept on
+# disk only rather than evicting the whole hot set.
+_RAM_MAX_BYTES = int(os.environ.get("YGG_HTTP_RAM_CACHE_BYTES") or 32 * 1024 * 1024)
+_RAM_ITEM_MAX_BYTES = _RAM_MAX_BYTES // 4
+
+
+class _ByteLRU:
+    """Thread-safe LRU bounded by total bytes (and a per-item byte cap)."""
+
+    __slots__ = ("_max", "_item_max", "_d", "_bytes", "_lock")
+
+    def __init__(self, max_bytes: int, item_max: int) -> None:
+        from collections import OrderedDict
+        self._max = max_bytes
+        self._item_max = item_max
+        self._d: "OrderedDict[int, bytes]" = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: int) -> "Optional[bytes]":
+        if self._max <= 0:
+            return None
+        with self._lock:
+            v = self._d.get(key)
+            if v is not None:
+                self._d.move_to_end(key)
+            return v
+
+    def put(self, key: int, val: bytes) -> None:
+        n = len(val)
+        if self._max <= 0 or n > self._item_max:   # too big for RAM → disk only
+            return
+        with self._lock:
+            old = self._d.pop(key, None)
+            if old is not None:
+                self._bytes -= len(old)
+            self._d[key] = val
+            self._bytes += n
+            while self._bytes > self._max:
+                _, evicted = self._d.popitem(last=False)
+                self._bytes -= len(evicted)
+
+
+_ram = _ByteLRU(_RAM_MAX_BYTES, _RAM_ITEM_MAX_BYTES)
 
 # On-disk record: ``\x01`` + uint32 meta-len + meta(JSON) + raw body. The meta
 # is the minimum to rebuild a Response — status, received-at (µs), headers, tags
@@ -197,7 +252,12 @@ class HttpResponseCache(Folder):
             return [], []
 
         def _load(req):
-            data = _read_bytes(self._file(req.match_value(_MATCH_KEY)))
+            key = req.match_value(_MATCH_KEY)
+            data = _ram.get(key)                    # hot tier
+            if data is None:
+                data = _read_bytes(self._file(key))  # disk
+                if data is not None:
+                    _ram.put(key, data)
             if data is None:
                 return req, None
             return req, _decode(data, req)
@@ -250,11 +310,14 @@ class HttpResponseCache(Folder):
                          if "received_at" in cols else [None] * len(keys))
             tags = (batch.column("tags").to_pylist()
                     if "tags" in cols else [None] * len(keys))
-            records = [
-                (self._file(int(key)),
-                 _encode(statuses[i], receiveds[i], headers[i], tags[i], bodies[i]))
-                for i, key in enumerate(keys) if key is not None
-            ]
+            records = []
+            for i, key in enumerate(keys):
+                if key is None:
+                    continue
+                k = int(key)
+                enc = _encode(statuses[i], receiveds[i], headers[i], tags[i], bodies[i])
+                _ram.put(k, enc)                    # populate the hot tier too
+                records.append((self._file(k), enc))
             self._write_many(records)
 
     @staticmethod

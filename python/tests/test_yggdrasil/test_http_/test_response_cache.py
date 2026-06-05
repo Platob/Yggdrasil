@@ -149,6 +149,49 @@ def test_send_pipeline_split_and_read_hits(tmp_path, monkeypatch):
     assert b"SP" in bodies
 
 
+@pytest.fixture(autouse=True)
+def _fresh_ram(monkeypatch):
+    """Each test gets an empty RAM tier so they don't cross-contaminate."""
+    import yggdrasil.http_.response_cache as rc
+    monkeypatch.setattr(rc, "_ram", rc._ByteLRU(rc._RAM_MAX_BYTES, rc._RAM_ITEM_MAX_BYTES))
+    yield
+
+
+def test_ram_tier_serves_hit_without_disk(tmp_path):
+    # After a read warms the RAM tier, deleting the file still yields a hit.
+    cache = _cache(tmp_path)
+    req = _req()
+    cache.write_arrow(Response.values_to_arrow_batch([_resp(req, body=b"RAM")]))
+    cache.read_responses([req], config=CacheConfig())     # warm RAM
+    for f in tmp_path.rglob("*.arrow"):                    # nuke the disk copy
+        f.unlink()
+    hits, misses = cache.read_responses([req], config=CacheConfig())
+    assert len(hits) == 1 and hits[0].content == b"RAM" and not misses
+
+
+def test_byte_lru_bounded_at_max(tmp_path):
+    import yggdrasil.http_.response_cache as rc
+    lru = rc._ByteLRU(max_bytes=1000, item_max=1000)
+    for i in range(50):
+        lru.put(i, b"x" * 100)            # 50 * 100 = 5000 B into a 1000 B budget
+    assert lru._bytes <= 1000             # never exceeds the cap
+    assert lru.get(0) is None             # oldest evicted
+    assert lru.get(49) == b"x" * 100      # newest kept
+
+
+def test_byte_lru_skips_oversized(tmp_path):
+    import yggdrasil.http_.response_cache as rc
+    lru = rc._ByteLRU(max_bytes=1000, item_max=250)
+    lru.put(1, b"x" * 251)                # bigger than per-item cap → disk only
+    assert lru.get(1) is None
+    assert lru._bytes == 0
+
+
+def test_ram_max_is_32mb_default():
+    import yggdrasil.http_.response_cache as rc
+    assert rc._RAM_MAX_BYTES == 32 * 1024 * 1024
+
+
 def test_prune_old_deletes_stale_keeps_fresh(tmp_path):
     import os
     import time
