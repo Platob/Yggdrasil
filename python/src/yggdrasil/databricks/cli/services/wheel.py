@@ -26,9 +26,10 @@ class WheelCommand:
     @classmethod
     def register(cls, subparsers: Any) -> None:
         parser = subparsers.add_parser(
-            "wheel", help="Build, upload, and browse wheels in the workspace registry."
+            "wheels", aliases=["wheel"],
+            help="Build, upload, and browse wheels in the workspace registry.",
         )
-        sub = parser.add_subparsers(dest="wheel_action")
+        sub = parser.add_subparsers(dest="wheels_action")
 
         build = sub.add_parser(
             "build", help="Build wheel(s) from the live package on disk (no upload)."

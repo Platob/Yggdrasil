@@ -24,8 +24,10 @@ class JobsCommand:
 
     @classmethod
     def register(cls, subparsers: Any) -> None:
-        parser = subparsers.add_parser("job", help="Manage Databricks jobs and runs.")
-        sub = parser.add_subparsers(dest="job_action")
+        parser = subparsers.add_parser(
+            "jobs", aliases=["job"], help="Manage Databricks jobs and runs.",
+        )
+        sub = parser.add_subparsers(dest="jobs_action")
 
         ls = sub.add_parser("list", help="List jobs in the workspace.")
         ls.add_argument("--name", default=None, help="Filter by job name.")
