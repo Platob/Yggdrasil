@@ -10,12 +10,15 @@ It walks four areas:
 
 - **config**      — connectivity, host, current user, default catalog/schema.
 - **wheels**      — the versioned ygg image wheel in the workspace registry.
-- **environments**— the serverless ``JobEnvironment`` ygg jobs run under.
+- **environments**— the reusable ``yellow`` base environment ygg jobs run
+  under, persisted to the workspace as ``yellow.env.yaml`` (serverless
+  ``base_environment``) and ``yellow.requirements.txt`` (classic-cluster
+  ``Library(requirements=...)``).
 - **warehouses**  — a default SQL warehouse to execute statements against.
 
-In the default (seed) mode it builds/uploads the wheel, assembles the
-environment, and ensures a default warehouse exists. With ``--check`` it
-touches nothing and exits non-zero when something is missing — so a
+In the default (seed) mode it builds/uploads the wheel, assembles and writes
+the environment files, and ensures a default warehouse exists. With ``--check``
+it touches nothing and exits non-zero when something is missing — so a
 pipeline can gate on ``ygg databricks seed --check``.
 """
 from __future__ import annotations
@@ -106,13 +109,21 @@ class SeedCommand:
         style.info("environments")
         try:
             if check:
-                # Pure-local: the serverless version is chosen off the local
-                # Python and the deps come from installed metadata — no build.
+                # The serverless version is chosen off the local Python and the
+                # deps come from installed metadata (no build); then we verify the
+                # reusable environment files were actually written (read-only).
                 env_version = whl.serverless_environment_version()
                 deps = whl.ygg_runtime_dependencies()
                 style.out(f"    {style.dim('env version')}  {env_version} {style.dim('(matches local Python)')}\n")
                 style.out(f"    {style.dim('runtime deps')} {len(deps)}\n")
-                style.ok("environment config resolvable")
+                persisted = whl.deployed_environments(client)
+                if persisted:
+                    for path in persisted[:6]:
+                        style.out(f"    {style.dim('found')}  {path}\n")
+                    style.ok("base environment files present (serverless + cluster)")
+                else:
+                    style.warn(f"no base environment files under {whl.WORKSPACE_ENV_DIR}")
+                    ok = False
             else:
                 # rebuild=False: reuse the wheel just built above.
                 if args.all_versions:
@@ -124,6 +135,23 @@ class SeedCommand:
                               f"{style.dim('v' + str(env.spec.environment_version))}  "
                               f"{style.dim(str(len(env.spec.dependencies)) + ' deps')}\n")
                 style.ok(f"{len(envs)} JobEnvironment(s) ready")
+
+                # Persist the canonical reusable "yellow" base environment so jobs
+                # can reference it by path (serverless ``base_environment``) and
+                # classic clusters can install from it (``Library(requirements=...)``).
+                # Derived from the local-matched "default" image (envs[0]).
+                base = envs[0]
+                env_yaml = whl.ensure_named_environment(
+                    client, "yellow",
+                    dependencies=base.spec.dependencies,
+                    environment_version=base.spec.environment_version,
+                )
+                reqs = whl.ensure_cluster_requirements(
+                    client, "yellow", dependencies=base.spec.dependencies,
+                )
+                style.out(f"    {style.dim('serverless')} {env_yaml}\n")
+                style.out(f"    {style.dim('cluster')}    {reqs}\n")
+                style.ok("base environment 'yellow' written (serverless + cluster)")
         except Exception as exc:
             style.fail(f"environment step failed: {exc}")
             ok = False

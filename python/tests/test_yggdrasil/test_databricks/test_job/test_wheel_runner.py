@@ -183,6 +183,51 @@ class TestWheel:
             "  - pyarrow==1\n"
         )
 
+    def test_ensure_cluster_requirements_writes_flat_requirements_txt(self):
+        client = MagicMock()
+        path = MagicMock()
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP:
+            DP.from_.return_value = path
+            dest = wheel.ensure_cluster_requirements(
+                client, "yellow",
+                dependencies=["/ws/pypi/ygg-1.0-py3-none-any.whl", "pyarrow==1"],
+            )
+        assert dest == "/Workspace/Shared/ygg/environments/yellow.requirements.txt"
+        DP.from_.assert_called_once_with(dest, client=client)
+        path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
+        body = path.write_text.call_args.args[0]
+        # Flat pip requirements — no environment_version, no list indentation.
+        assert body == "/ws/pypi/ygg-1.0-py3-none-any.whl\npyarrow==1\n"
+
+    def test_deployed_environments_filters_env_and_requirements_files(self):
+        client = MagicMock()
+        folder = MagicMock()
+        folder.exists.return_value = True
+
+        def _child(name):
+            c = MagicMock()
+            c.name = name
+            c.full_path.return_value = f"/ws/env/{name}"
+            return c
+
+        folder.iterdir.return_value = [
+            _child("yellow.env.yaml"),
+            _child("yellow.requirements.txt"),
+            _child("README.md"),          # ignored
+        ]
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP:
+            DP.from_.return_value = folder
+            paths = wheel.deployed_environments(client)
+        assert paths == ["/ws/env/yellow.env.yaml", "/ws/env/yellow.requirements.txt"]
+
+    def test_deployed_environments_empty_when_dir_absent(self):
+        client = MagicMock()
+        folder = MagicMock()
+        folder.exists.return_value = False
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP:
+            DP.from_.return_value = folder
+            assert wheel.deployed_environments(client) == []
+
     def test_import_packages_for_inverts_distribution_for(self):
         # ``ygg`` (pip/dist name) → its top-level import package ``yggdrasil``.
         assert wheel.import_packages_for("ygg") == ["yggdrasil"]

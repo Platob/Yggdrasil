@@ -49,6 +49,8 @@ __all__ = [
     "ensure_ygg_wheels",
     "ensure_bundle",
     "ensure_named_environment",
+    "ensure_cluster_requirements",
+    "deployed_environments",
     "ygg_runtime_dependencies",
     "ygg_environment",
     "ygg_environments",
@@ -654,6 +656,65 @@ def ensure_named_environment(
         name, dest, len(dependencies), version,
     )
     return dest
+
+
+def ensure_cluster_requirements(
+    client: Any,
+    name: str = "yellow",
+    *,
+    dependencies: "list[str] | tuple[str, ...]",
+    workspace_dir: str = WORKSPACE_ENV_DIR,
+) -> str:
+    """Create-or-update a plain ``<name>.requirements.txt`` in the workspace and
+    return its path — the **classic-cluster** counterpart of
+    :func:`ensure_named_environment`.
+
+    Serverless references a base environment by path (``environment_version`` +
+    dependencies); a classic cluster has no such concept — it installs from a
+    pip requirements file via ``Library(requirements=<path>)``. So the same ygg
+    image is written here as a flat requirements list (wheel workspace paths +
+    pinned index requirements, no ``environment_version`` line)::
+
+        /Workspace/Shared/pypi/ygg/ygg-0.8.54-py3-none-any.whl
+        pyarrow==...
+
+    Written (overwritten) on every call — upsert semantics, so redeploying keeps
+    *name* pointing at the current image. *dependencies* are wheel workspace
+    paths and/or pip requirement lines (typically the same list fed to
+    :func:`ensure_named_environment`)."""
+    from yggdrasil.databricks.path import DatabricksPath
+
+    body = "\n".join(str(dep) for dep in dependencies) + "\n"
+    dest = f"{workspace_dir.rstrip('/')}/{name}.requirements.txt"
+    path = DatabricksPath.from_(dest, client=client)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    logger.info(
+        "wrote cluster requirements %r -> %s (%d deps)",
+        name, dest, len(dependencies),
+    )
+    return dest
+
+
+def deployed_environments(client: Any, *, workspace_dir: str = WORKSPACE_ENV_DIR) -> list[str]:
+    """Workspace paths of persisted environment files under *workspace_dir* —
+    serverless base environments (``*.env.yaml``) and cluster requirement files
+    (``*.requirements.txt``).
+
+    The environment-layer counterpart of :func:`deployed_wheels`: lets
+    ``ygg databricks seed --check`` report whether :func:`ensure_named_environment`
+    / :func:`ensure_cluster_requirements` have actually written the reusable
+    environment files. Empty when the directory is absent or holds none."""
+    from yggdrasil.databricks.path import DatabricksPath
+
+    folder = DatabricksPath.from_(workspace_dir, client=client)
+    if not folder.exists():
+        return []
+    return [
+        child.full_path()
+        for child in folder.iterdir()
+        if str(child.name).endswith((".env.yaml", ".requirements.txt"))
+    ]
 
 
 def ygg_runtime_dependencies() -> list[str]:
