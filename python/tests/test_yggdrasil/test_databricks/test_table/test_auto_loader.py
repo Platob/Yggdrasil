@@ -33,7 +33,8 @@ class TestTableAutoLoader:
         # The on-cluster cloudFiles entry point is the job's target.
         assert args[0] is auto_load
         assert kwargs["name"] == "[YGG][AUTOLOADER] cat.sch.tbl"
-        assert kwargs["trigger"] is None
+        # File-arrival is the default trigger — the job fires when files land.
+        assert kwargs["trigger"].file_arrival.url == "s3://bkt/landing/"
         # Positional job parameters: target table, source, format, checkpoint, mode.
         assert kwargs["parameters"] == [
             "cat.sch.tbl", "s3://bkt/landing", "json", "", True, False, "8 days",
@@ -64,6 +65,20 @@ class TestTableAutoLoader:
         assert trigger is not None
         assert trigger.file_arrival.url == "s3://bkt/landing/"
 
+    def test_file_arrival_disabled_deploys_without_trigger(self):
+        tbl = _table()
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://bkt/landing", file_arrival=False)
+        assert Flow.call_args.kwargs["trigger"] is None
+
+    def test_explicit_trigger_overrides_default_file_arrival(self):
+        tbl = _table()
+        sentinel = object()
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://bkt/landing", trigger=sentinel)
+        # An explicit trigger wins over the default file-arrival one.
+        assert Flow.call_args.kwargs["trigger"] is sentinel
+
     def test_deploy_false_returns_flow_without_creating(self):
         tbl = _table()
         with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
@@ -77,13 +92,17 @@ class TestTableAutoLoader:
             tbl.auto_loader("s3://x", deploy=False)
         assert Flow.call_args.kwargs["name"] == "[YGG][AUTOLOADER] cat.sch.tbl"
 
-    def test_defaults_bundle_and_yellow_environment(self):
+    def test_defaults_bundle_and_canonical_ygg_environment(self):
+        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+
         tbl = _table()
         with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
             tbl.auto_loader("s3://x", deploy=False)
         flow = Flow.return_value
         assert flow.bundle_dependencies is True
-        assert flow.base_environment_name == "yellow"
+        # Default env is the version-pinned ygg image the seed writes, not "yellow".
+        assert flow.base_environment_name == ygg_base_environment_name()
+        assert flow.base_environment_name.startswith("ygg-")
 
     def test_environment_override_and_disable(self):
         tbl = _table()

@@ -163,13 +163,14 @@ class _Runnable:
     #: reproducible env build. Mutually exclusive with :attr:`all_environments`
     #: (bundles target the deploy host's single Python).
     bundle_dependencies: bool = False
-    #: Reference a reusable, named serverless **base environment** (an
-    #: ``<name>.env.yaml`` in the workspace) instead of inlining the dependency
-    #: list — the ygg image is written there once (create-or-update) and the job
-    #: points at it by file path, so jobs share one cached env. ``None`` keeps the
-    #: classic inline environment. Any user package layers on top as extra
-    #: dependencies. Ignored when :attr:`all_environments` is set (the per-Python
-    #: matrix stays inline). Falls back to inline if the env can't be written.
+    #: Reference a reusable, named serverless **base environment** (a
+    #: ``<name>.yml`` in the workspace, the same convention ``ygg databricks
+    #: seed`` writes) instead of inlining the dependency list — the ygg image is
+    #: written there once (create-or-update) and the job points at it by file
+    #: path, so jobs share one cached env. ``None`` keeps the classic inline
+    #: environment. Any user package layers on top as extra dependencies. Ignored
+    #: when :attr:`all_environments` is set (the per-Python matrix stays inline).
+    #: Falls back to inline if the env can't be written.
     base_environment_name: "str | None" = None
 
     _wheel_paths: "tuple[str, ...]" = ()
@@ -356,6 +357,11 @@ class _Runnable:
                     client, self.base_environment_name,
                     dependencies=ygg_base,
                     environment_version=self.environment_version,
+                    # Match the seed's ``<name>.yml`` convention so a job whose
+                    # base_environment_name is the canonical ``ygg-<version>-py3XX``
+                    # references the very file the seed writes (not a parallel
+                    # ``.env.yaml``).
+                    filename=f"{self.base_environment_name}.yml",
                 )
                 self._user_layer = list(user_layer)
             except Exception:  # noqa: BLE001 — degrade to inline deps on any failure
@@ -428,7 +434,7 @@ class _Runnable:
             )
 
         if getattr(self, "_base_environment_path", None):
-            # Reference the shared "yellow"-style base env; layer the user
+            # Reference the shared, version-pinned ygg base env; layer the user
             # package (empty for ygg-only jobs) on top. base_environment carries
             # the environment_version, so it isn't set alongside it.
             return [

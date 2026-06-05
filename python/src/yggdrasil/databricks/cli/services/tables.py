@@ -3,14 +3,15 @@
 Currently exposes Auto Loader ingestion::
 
     ygg databricks tables autoload catalog.schema.table
-    ygg databricks tables autoload my_cat.my_sch.events --file-arrival
+    ygg databricks tables autoload my_cat.my_sch.events --no-file-arrival
     ygg databricks tables autoload c.s.t --source s3://bucket/drop/ --format json --run --wait 900
 
 ``autoload`` get-or-creates the serverless ``cloudFiles`` ingestion job built by
 :meth:`yggdrasil.databricks.table.table.Table.auto_loader` (named
 ``[YGG][AUTOLOADER] <table>``), shipping the ygg image as a reusable named base
-environment (``--environment``, default ``yellow``) with the whole dependency
-closure bundled for a zero-pip-install cluster env.
+environment (``--environment``; default: the version-pinned ygg image
+``ygg-<version>-py3XX`` the seed writes) with the whole dependency closure
+bundled for a zero-pip-install cluster env.
 """
 from __future__ import annotations
 
@@ -38,14 +39,16 @@ class TablesCommand:
                         help="Checkpoint + schema location (default: derived next to the table).")
         al.add_argument("--continuous", action="store_true",
                         help="Continuous 1-minute micro-batch stream (default: one AvailableNow sweep).")
-        al.add_argument("--file-arrival", dest="file_arrival", action="store_true",
-                        help="Attach a file-arrival trigger on the source.")
+        al.add_argument("--no-file-arrival", dest="file_arrival", action="store_false",
+                        help="Deploy without the default file-arrival trigger on the source.")
+        al.set_defaults(file_arrival=True)
         al.add_argument("--clean-source", dest="clean_source", action="store_true",
                         help="Delete each staged file once ingested + past retention (self-cleaning).")
         al.add_argument("--clean-source-retention", dest="clean_source_retention", default="8 days",
                         help="Retention window for --clean-source (> 7 days; default '8 days').")
-        al.add_argument("--environment", default="yellow",
-                        help="Reusable serverless base environment name (default: yellow).")
+        al.add_argument("--environment", default=None,
+                        help="Reusable serverless base environment name "
+                             "(default: the version-pinned ygg image, ygg-<version>-py3XX).")
         al.add_argument("--no-environment", dest="no_environment", action="store_true",
                         help="Inline the dependency list on the job instead of a named base env.")
         al.add_argument("--no-bundle", dest="no_bundle", action="store_true",
@@ -68,7 +71,13 @@ class TablesCommand:
         client = build_client(args)
         table = client.tables.table(args.table)
 
-        environment = None if args.no_environment else args.environment
+        if args.no_environment:
+            environment = None                       # inline the deps on the job
+        elif args.environment is not None:
+            environment = args.environment           # explicit shared env name
+        else:
+            from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+            environment = ygg_base_environment_name()  # canonical version-pinned ygg image
         deploy = not args.no_deploy
 
         style.step(
@@ -77,8 +86,7 @@ class TablesCommand:
         )
         bits = [f"format={args.file_format}",
                 "continuous" if args.continuous else "available-now"]
-        if args.file_arrival:
-            bits.append("file-arrival")
+        bits.append("file-arrival" if args.file_arrival else "no-trigger")
         bits.append(f"env={environment or 'inline'}")
         bits.append("bundle" if not args.no_bundle else "no-bundle")
         style.info(style.dim(" · ".join(bits)))

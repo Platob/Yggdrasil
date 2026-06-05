@@ -196,6 +196,16 @@ class Awaitable(ABC):
         wait: WaitingConfig,
         raise_error: bool = True,
     ) -> "Awaitable":
+        if wait.timeout <= 0:
+            # A non-positive timeout means "don't wait" — the same fire-and-forget
+            # contract as ``wait=False`` and ``WaitingConfig.__bool__`` (which is
+            # ``timeout > 0``). Poll once to capture the current state and surface
+            # a *real* failure when asked, but never raise a TimeoutError: a 0s
+            # budget isn't a timeout, it's opting out of waiting.
+            self._poll()
+            if self.is_failed and raise_error:
+                self.raise_for_status()
+            return self
         start = time.time()
         iteration = 0
         next_log_at = 120.0
@@ -307,6 +317,14 @@ class Awaitable(ABC):
         import asyncio
         if wait is None:
             wait = WaitingConfig.from_(True)
+        if wait.timeout <= 0:
+            # timeout<=0 ⇒ don't wait (fire-and-forget), same as the sync _wait /
+            # WaitingConfig.__bool__: poll once, surface a real failure if asked,
+            # never raise a TimeoutError for a 0s budget.
+            self._poll()
+            if self.is_failed and raise_error:
+                self.raise_for_status()
+            return self
         start = time.time()
         iteration = 0
         next_log_at = 120.0

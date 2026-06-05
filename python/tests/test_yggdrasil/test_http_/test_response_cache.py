@@ -284,3 +284,61 @@ def test_send_pipeline_miss_for_uncached(tmp_path, monkeypatch):
     req = _req("https://e.com/never-cached")
     local, remote, misses = cfg.split_requests([req])
     assert not local and misses == [req]
+
+
+# -- remote-cache window probe (only-new-data) -----------------------------
+
+def test_remote_probe_skips_stale_when_only_new_data_requested(tmp_path):
+    """A stale row in a (generic Folder) remote cache must NOT count as a hit
+    when the caller asks for fresh data only — otherwise the batch reads the
+    full remote row just to drop it and re-fetch. With a ``received_from``
+    window the presence probe excludes it, so the request stays a miss."""
+    from yggdrasil.http_.send_config import SendConfig
+
+    req = _req("https://e.com/only-new")
+    old = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+
+    # Generic Folder backend (not the content-addressed local cache) → exercises
+    # the predicate-scanned probe path that powers the remote (Databricks) cache.
+    remote = CacheConfig(tabular=str(tmp_path / "remote"))
+    remote.write_responses([_resp(req, received_at=old)])
+
+    # Sanity: with no window, the stale row is a remote hit (and no miss).
+    warm = SendConfig(remote_cache=remote)
+    _local, remote_h, misses = warm.split_requests([req])
+    assert req.match_value("public_hash") in remote_h and not misses
+
+    # Asking for data received from 2020 onward → the 2000 row is excluded by
+    # the probe itself: no remote hit, the request is a clean miss.
+    fresh = SendConfig(
+        remote_cache=remote.copy(
+            received_from=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
+        ),
+    )
+    _local, remote_h, misses = fresh.split_requests([req])
+    assert not remote_h and misses == [req]
+
+
+def test_remote_cache_full_read_is_lazy_in_fetch(tmp_path):
+    """``_fetch`` must NOT materialise the remote cache — its window-aware probe
+    already guarantees every remote hit is valid, so the (potentially Databricks)
+    full read stays lazy until the batch is consumed."""
+    from yggdrasil.http_.send_config import SendConfig
+    from yggdrasil.http_.response_batch import HTTPResponseBatch
+
+    req = _req("https://e.com/lazy-remote")
+    remote = CacheConfig(tabular=str(tmp_path / "remote"))
+    remote.write_responses([_resp(req, body=b"REMOTE")])
+
+    batch = HTTPResponseBatch(SendConfig(remote_cache=remote), [req])
+    batch._fetch()                                  # resolve split + (no) misses
+
+    # The request was a remote hit (no misses, no network), but the remote rows
+    # are still unread — the holder sits at its lazy sentinel.
+    assert not batch.misses
+    assert batch._remote_tabular is ...
+
+    # Consuming the batch is what triggers the remote read.
+    bodies = [r.content for r in batch.responses()]
+    assert b"REMOTE" in bodies
+    assert batch._remote_tabular is not ...
