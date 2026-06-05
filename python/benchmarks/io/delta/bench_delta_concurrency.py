@@ -206,8 +206,12 @@ def _live(threads: int, appends: int) -> None:
     c = DatabricksClient()
     cat = os.environ.get("DATABRICKS_INTEGRATION_CATALOG", "trading_tgp_dev")
     sch = os.environ.get("DATABRICKS_INTEGRATION_SCHEMA", "ygg_integration")
+    base = os.environ.get("YGG_TEST_EXTERNAL_LOCATION")
+    if not base:
+        print("# --live needs YGG_TEST_EXTERNAL_LOCATION (writable s3:// base prefix)")
+        return
+    base = base.rstrip("/")
     runid = secrets.token_hex(4)
-    base = "s3://odp-aws-dls3-eu-central-1-a-apps/trading-tgp/ygg_delta_concurrency"
     loc = f"{base}/bench_{runid}/t"
     full = f"{cat}.{sch}.yg_conc_bench_{runid}"
     from yggdrasil.data.schema import Schema
