@@ -6,11 +6,13 @@ under its native-path size cap → YGGDRASIL **for reads only**; else →
 DATABRICKS_SQL_WAREHOUSE). A write never auto-routes to the native
 storage-path commit off the table being external — it defaults to the
 warehouse (staging volume + SQL) and takes the native path only when
-``engine=YGGDRASIL`` is set explicitly. The read cap is relaxed for EXTERNAL
-tables (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``, 4 GiB) since UC vends READ_WRITE
-creds for them, and kept small (``_NATIVE_DELTA_MAX_BYTES``, 128 MiB) for
-managed tables. A YGGDRASIL pick on a table that can't take the native path,
-or a UC-credential failure, degrades to the warehouse.
+``engine=YGGDRASIL`` is set explicitly. The read cap is kept **tight** for
+EXTERNAL tables (``_NATIVE_DELTA_MAX_BYTES_EXTERNAL``, 8 MiB) — the direct
+external-storage scan reaches out of the workspace, so only small external
+tables auto-read native — while managed tables, scanned through governed
+storage, keep the larger ``_NATIVE_DELTA_MAX_BYTES`` (128 MiB) cap. A
+YGGDRASIL pick on a table that can't take the native path, or a UC-credential
+failure, degrades to the warehouse.
 """
 from __future__ import annotations
 
@@ -160,28 +162,31 @@ class TestResolveEngineGuess:
         monkeypatch.setattr(Table, "_delta_total_bytes", lambda self: 1)
         assert t._resolve_engine(TableOptions(), write=False) is SP
 
-    def test_small_delta_guesses_yggdrasil_read_only(self, monkeypatch):
-        # A small Delta table guesses native for a *read*; a write never
-        # auto-routes to native off the table type — it goes to the warehouse.
+    def test_small_external_delta_guesses_yggdrasil_read_only(self, monkeypatch):
+        # A small external Delta table (under the tight 8 MiB external cap)
+        # guesses native for a *read*; a write never auto-routes to native off
+        # the table type — it goes to the warehouse.
         t = self._ext()
         monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
-        monkeypatch.setattr(Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES - 1)
+        monkeypatch.setattr(
+            Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES_EXTERNAL - 1,
+        )
         assert t._resolve_engine(TableOptions(), write=False) is YG
         assert t._resolve_engine(TableOptions(), write=True) is WH
 
-    def test_external_above_small_cap_still_yggdrasil_read_only(self, monkeypatch):
-        # The external cap is relaxed for *reads*: an external Delta table
-        # several times the 128 MiB managed cap still reads native. A write
-        # still defaults to the warehouse regardless of size.
+    def test_external_above_tight_cap_guesses_warehouse_read(self, monkeypatch):
+        # The external cap is *tight*: an external Delta table even a little
+        # over 8 MiB no longer auto-reads native — the out-of-workspace direct
+        # scan is avoided in favour of the warehouse.
         t = self._ext()
         monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
-        monkeypatch.setattr(Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES * 4)
-        assert t._resolve_engine(TableOptions(), write=False) is YG
-        assert t._resolve_engine(TableOptions(), write=True) is WH
+        monkeypatch.setattr(
+            Table, "_delta_total_bytes", lambda self: _NATIVE_DELTA_MAX_BYTES_EXTERNAL + 1,
+        )
+        assert t._resolve_engine(TableOptions(), write=False) is WH
 
     def test_large_external_delta_guesses_warehouse(self, monkeypatch):
-        # At/above the external cap a very large external table still goes to
-        # the warehouse.
+        # At/above the external cap a larger external table goes to the warehouse.
         t = self._ext()
         monkeypatch.setattr(Table, "_has_active_spark", staticmethod(lambda o: False))
         monkeypatch.setattr(

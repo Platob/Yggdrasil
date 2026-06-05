@@ -103,30 +103,33 @@ def colored_name(name: str) -> str:
 
 # -- logo ------------------------------------------------------------------
 
+# Each logo is a rectangle: every row is the same visual width and the
+# glyph columns line up across rows (composed from fixed-width per-letter
+# cells), so the gradient paints cleanly and nothing drifts horizontally.
 _LOGOS: dict[str, tuple[str, ...]] = {
     "YGG": (
-        r" __   __ ___ ___ ",
-        r" \ \ / // __/ __|",
-        r"  \ V /| (_ | (_ |",
-        r"   |_|  \___|\___| ",
+        r"__   __ ___   ___  ",
+        r"\ \ / // __| / __| ",
+        r" \ V / | (_ || (_ |",
+        r"  |_|   \___| \___|",
     ),
     "YGGNODE": (
-        r" __   __ ___ ___  _  _  ___  ___  ___",
-        r" \ \ / // __/ __|| \| |/ _ \|   \| __|",
-        "  \\ V /| (_ | (_ | .` | (_) | |) | _| ",
-        r"   |_|  \___|\___||_|\_|\___/|___/|___|",
+        r"__   __ ___   ___   _  _  ___    ___   ___ ",
+        r"\ \ / // __| / __| | \| |/ _ \  |   \ | __|",
+        r" \ V / | (_ || (_ || .` || (_) || |) || _| ",
+        r"  |_|   \___| \___||_|\_| \___/ |___/ |___|",
     ),
     "YGGCHAT": (
-        r" __   __ ___ ___   ___ _  _    _  _____",
-        r" \ \ / // __/ __| / __| || |  / \|_   _|",
-        r"  \ V /| (_ | (_ | (__| __ | / _ \ | |  ",
-        r"   |_|  \___|\___| \___|_||_|/_/ \_\|_|  ",
+        r"__   __ ___   ___   ___  _  _   _   _____  ",
+        r"\ \ / // __| / __| / __|| || | /_\   |_  _|",
+        r" \ V / | (_ || (_ || (__| __ |/ _ \   | |  ",
+        r"  |_|   \___| \___|\___||_||_|_/ \_\  |_|  ",
     ),
     "YGGDBKS": (
-        " __   __ ___ ___  ___  ___ _  __ ___",
-        r" \ \ / // __/ __||   \| _ ) |/ // __|",
-        "  \\ V /| (_ | (_ | |) | _ \\ ' < \\__ \\",
-        r"   |_|  \___|\___||___/|___/_|\_\|___/",
+        r"__   __ ___   ___   ___   ___ _  __  ___ ",
+        r"\ \ / // __| / __| |   \ | _ )| |/ // __|",
+        r" \ V / | (_ || (_ || |) || _ \| ' < \__ \ ",
+        r"  |_|   \___| \___||___/ |___/|_|\_\|___/",
     ),
 }
 
@@ -140,6 +143,10 @@ def logo(suffix: str = "") -> str:
     """Render the YGG logo with an optional suffix like BOT, CHAT, GENIE."""
     key = suffix or "YGG"
     lines = _LOGOS.get(key, _LOGOS["YGG"])
+    # Pad every row to the widest so the block is a true rectangle — guards
+    # the gradient / right edge against trailing-space drift in the literals.
+    width = max((len(ln) for ln in lines), default=0)
+    lines = [ln.ljust(width) for ln in lines]
     if not _COLOR:
         parts = ["  " + ln for ln in lines]
         if key not in _LOGOS and suffix:

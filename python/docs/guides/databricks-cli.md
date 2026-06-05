@@ -20,6 +20,7 @@ ygg databricks <group> <action> [flags]
 
 | Group | What it manages |
 |---|---|
+| [`configure`](#configure) | Write a `~/.databrickscfg` profile and remember it as the current session |
 | [`clusters`](#clusters) | All-purpose compute clusters — list/get/create/delete/start/stop |
 | [`warehouses`](#warehouses) | SQL warehouses — list/get/create/delete/start/stop |
 | [`sql`](#sql) | Run SQL and export results — query/export (incl. `export --statement-id`) |
@@ -81,6 +82,93 @@ the extensible sub-service base described in
 The CLI paints its coral **YGGDBKS** banner and colored status glyphs even
 when stdout is not a TTY (so it renders inside a Databricks job or notebook
 panel). Set `NO_COLOR=1` to opt out.
+
+---
+
+## Configure
+
+Set up authentication once, the way `databricks configure` does — write a
+profile into `~/.databrickscfg` — then have ygg **remember it as the
+current session** so later tooling can default to "the workspace I last
+configured".
+
+```bash
+ygg databricks configure <action> [flags]
+```
+
+### Bare `configure`
+
+Write (or update) a profile, verify the credentials, and remember the
+session. Host and token are taken from flags, or **prompted for
+interactively** (the token hidden) when omitted — exactly like
+`databricks configure --token`. Existing profiles in the file are
+preserved; only the named section is rewritten, and the file is chmod'd to
+`600`.
+
+```bash
+# Interactive — prompts for host, then a hidden token
+ygg databricks configure
+
+# Non-interactive — write the DEFAULT profile
+ygg databricks configure --host https://my-ws.cloud.databricks.com --token dapi...
+
+# A named profile
+ygg databricks configure --profile prod --host https://prod... --token dapi...
+
+# OAuth service principal instead of a PAT
+ygg databricks configure --profile sp --host https://ws \
+  --client-id <id> --client-secret <secret>
+
+# SSO — interactive browser login; no secret on disk, the session token
+# is captured into the remembered session
+ygg databricks configure --profile browser --host https://ws --sso
+```
+
+| Flag | Purpose |
+|---|---|
+| `--profile` | Profile name to write (default `DEFAULT`) |
+| `--host` | Workspace URL (prompted if omitted; `https://` is prepended when missing) |
+| `--token` | Personal access token (prompted hidden if omitted) |
+| `--client-id` / `--client-secret` | OAuth service-principal credentials — written instead of a token |
+| `--sso` | Authenticate via SSO (interactive browser). No static secret is written; the resolved session token is dumped into the session |
+| `--auth-type` | Explicit auth type (`external-browser`, `azure-cli`, `databricks-cli`, …); implies `--sso` when no token/secret is given |
+| `--account-id` | Account id for account-level profiles |
+| `--config-file` | Config file path (default `$DATABRICKS_CONFIG_FILE` or `~/.databrickscfg`) |
+| `--no-verify` | Skip the credential check (don't call the workspace) |
+| `--no-session` | Write the profile but don't remember it as the current session |
+
+After writing, the freshly-saved profile is loaded into a
+`DatabricksClient`, the current user is resolved to confirm the
+credentials work, that client becomes the process **current** client, and
+a non-sensitive snapshot of the session — profile, host, user,
+workspace/account ids, timestamp — is dumped into the session folder
+`~/.config/databricks-sdk-py/sessions/` as `<hostname>.json` (the
+per-machine default). **No secrets** (token / client secret) are written
+into the session file. A failed verification still keeps the profile on
+disk (it just warns).
+
+For an **SSO** login (`--sso` / `--auth-type`) the credential isn't on disk
+— it's an ephemeral bearer minted by the interactive flow — so the
+resolved session token *is* captured into the snapshot (`access_token`),
+letting later tooling replay the session without re-prompting the browser.
+The session file is then locked to owner-only (`600`).
+
+### `configure list`
+
+List the profiles in `~/.databrickscfg` (`profile<TAB>host`), marking the
+one remembered as the current session.
+
+```bash
+ygg databricks configure list
+```
+
+### `configure session`
+
+Print the remembered latest-session metadata (the JSON snapshot).
+
+```bash
+ygg databricks configure session
+```
 
 ---
 
@@ -691,7 +779,7 @@ There are two surfaces in the tree:
 
 - **`yggdrasil.databricks.cli`** — the working `ygg databricks` CLI
   documented above. Each group is a small command class
-  (`ClustersCommand`, `WarehousesCommand`, `SQLCommand`, `JobsCommand`, `FSCommand`,
+  (`ConfigureCommand`, `ClustersCommand`, `WarehousesCommand`, `SQLCommand`, `JobsCommand`, `FSCommand`,
   `WheelCommand`, `DeployCommand`, `SeedCommand`) that registers an argparse sub-parser and dispatches
   straight into the service layer. To add a group, write a class with a
   `register(subparsers)` classmethod and add it to

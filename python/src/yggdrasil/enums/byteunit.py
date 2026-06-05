@@ -353,6 +353,33 @@ class ByteUnit(IntEnum):
                 return f"{n / unit.value:.{precision}f} {token}"
         return f"{n} B"
 
+    @classmethod
+    def pretty(
+        cls,
+        v: float,
+        unit: "ByteUnit | str | None" = None,
+        *,
+        iec: bool = True,
+        precision: int = 1,
+    ) -> str:
+        """Human-readable rendering of a quantity ``v`` expressed in ``unit``.
+
+        ``v`` is a scalar *count of* ``unit`` (bytes by default); it's
+        scaled to a byte count and handed to :meth:`format`. The companion
+        to :meth:`format` for the common "I have N MiB, show it nicely"
+        case::
+
+            ByteUnit.pretty(1536)             # "1.5 KiB"
+            ByteUnit.pretty(8, ByteUnit.MIB)  # "8.0 MiB"
+            ByteUnit.pretty(1.5, "gb")        # "1.5 GiB"
+
+        ``unit`` defaults to :attr:`B` (resolved at call time so the class
+        default is usable inside the method body); pass ``iec=False`` for
+        the colloquial short form.
+        """
+        base = cls.B if unit is None else cls.from_(unit)
+        return cls.format(int(round(v * int(base.value))), iec=iec, precision=precision)
+
     # ── Dunder ──────────────────────────────────────────────────────────────
 
     def __repr__(self) -> str:

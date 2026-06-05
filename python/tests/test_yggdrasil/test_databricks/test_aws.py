@@ -324,6 +324,53 @@ class TestRefresherKeyIsolation:
         assert AWSDatabricksVolumeCredentials.__name__ in key_r
 
 
+class TestRefresherKeyPersistsSingleton:
+    """A refresher-backed client must collapse to one singleton even though
+    the seed credentials rotate on every vend — the ``refresher_key`` is the
+    identity, not the ephemeral temporary creds."""
+
+    @staticmethod
+    def _rotating_refresher():
+        import datetime as dt
+        from yggdrasil.aws.config import AwsCredentials
+        n = {"i": 0}
+
+        def refresher():
+            n["i"] += 1
+            return AwsCredentials(
+                access_key_id=f"AKIA-{n['i']}",
+                secret_access_key=f"secret-{n['i']}",
+                session_token=f"token-{n['i']}",
+                expiration=dt.datetime(2099, 1, 1, tzinfo=dt.timezone.utc).isoformat(),
+            )
+        return refresher
+
+    def test_rotating_seed_creds_collapse_to_one_client(self) -> None:
+        refresher = self._rotating_refresher()
+        key = "AWSDatabricksTableCredentials:tid-A:READ_ONLY"
+        c1 = AWSClient.from_refresher(refresher, region="us-east-1", refresher_key=key)
+        c2 = AWSClient.from_refresher(refresher, region="us-east-1", refresher_key=key)
+        # Different seed creds (AKIA-1 vs AKIA-2) must NOT fragment the cache.
+        assert c1 is c2
+
+    def test_distinct_refresher_keys_stay_distinct(self) -> None:
+        refresher = self._rotating_refresher()
+        c_read = AWSClient.from_refresher(
+            refresher, region="us-east-1", refresher_key="X:tid-A:READ_ONLY")
+        c_write = AWSClient.from_refresher(
+            refresher, region="us-east-1", refresher_key="X:tid-A:OVERWRITE")
+        assert c_read is not c_write
+
+    def test_no_refresher_key_still_keys_on_creds(self) -> None:
+        # Without a refresher_key the seed creds remain the identity (legacy
+        # behaviour for ad-hoc refresher clients) — distinct creds, distinct
+        # clients.
+        refresher = self._rotating_refresher()
+        c1 = AWSClient.from_refresher(refresher, region="us-east-1")
+        c2 = AWSClient.from_refresher(refresher, region="us-east-1")
+        assert c1 is not c2
+
+
 # ===========================================================================
 # Auto self-grant EXTERNAL_USE_SCHEMA on credential mint failure
 # ===========================================================================

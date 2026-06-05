@@ -2,6 +2,7 @@
 
 Subcommands::
 
+    ygg databricks configure   (write a ~/.databrickscfg profile + remember it as the current session)
     ygg databricks clusters list/get/create/delete
     ygg databricks warehouses list/get/create/delete
     ygg databricks sql query/export   (run SQL; export --statement-id/--query → --target)
@@ -21,6 +22,7 @@ from typing import Any, Optional, Sequence
 
 from .services import (
     ClustersCommand,
+    ConfigureCommand,
     DeployCommand,
     FSCommand,
     JobsCommand,
@@ -66,6 +68,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     subparsers = parser.add_subparsers(dest="command")
     ClustersCommand.register(subparsers)
+    ConfigureCommand.register(subparsers)
     DeployCommand.register(subparsers)
     FSCommand.register(subparsers)
     JobsCommand.register(subparsers)

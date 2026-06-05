@@ -60,6 +60,7 @@ from yggdrasil.databricks.sql.sql_utils import (
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
+from yggdrasil.enums.byteunit import ByteUnit
 from yggdrasil.enums.engine_type import EngineType
 from yggdrasil.execution.expr import (
     Predicate,
@@ -102,13 +103,14 @@ _VIEW_TABLE_TYPES: frozenset[TableType] = frozenset({
 # Below this on-disk size, the ``engine=None`` guess reads/writes a Delta table
 # natively (DeltaFolder); at or above it the SQL warehouse parallelises the
 # scan/commit better. Matches Delta's default target file size.
-_NATIVE_DELTA_MAX_BYTES: int = 128 * 1024 * 1024
+_NATIVE_DELTA_MAX_BYTES: int = 128 * ByteUnit.MIB
 
-# EXTERNAL Delta tables prefer the direct storage-path write across a much
-# larger range: UC vends READ_WRITE credentials for external tables, so the
-# native DeltaFolder commit avoids a warehouse round-trip. Only very large
-# external tables fall back to the warehouse.
-_NATIVE_DELTA_MAX_BYTES_EXTERNAL: int = 4 * 1024 * 1024 * 1024
+# EXTERNAL Delta tables can read direct off external storage (UC vends
+# READ_WRITE credentials for them, so the native DeltaFolder path avoids a
+# warehouse round-trip) — but only auto-engage it for *small* tables: the
+# direct external-storage scan reaches out of the workspace, so above this
+# cap the warehouse (which keeps the scan inside Databricks) is preferred.
+_NATIVE_DELTA_MAX_BYTES_EXTERNAL: int = 8 * ByteUnit.MIB
 
 
 def _coerce_tag_str(value: Any) -> str:
@@ -1043,7 +1045,17 @@ class Table(DatabricksPath):
                 else _NATIVE_DELTA_MAX_BYTES
             )
             size = self._delta_total_bytes()
-            if size is not None and size < cap:
+            native = size is not None and size < cap
+            if logger.isEnabledFor(logging.DEBUG):
+                # Render the byte counts as binary IEC sizes (1 KiB = 1024 B).
+                logger.debug(
+                    "Engine guess for %r: size=%s cap=%s → %s",
+                    self,
+                    ByteUnit.pretty(size) if size is not None else "unknown",
+                    ByteUnit.pretty(cap),
+                    "native" if native else "warehouse",
+                )
+            if native:
                 return EngineType.YGGDRASIL
         return EngineType.DATABRICKS_SQL_WAREHOUSE
 
@@ -1454,7 +1466,24 @@ class Table(DatabricksPath):
         return f"{self.full_name()}.{column_name}"
 
     def __repr__(self) -> str:
-        return f"Table({self.url.to_string()!r})"
+        # Identify the table by its workspace Catalog-Explorer deep link so a
+        # logged ``%r`` is clickable; fall back to the qualified name when the
+        # workspace URL can't be resolved (no host / offline). Repr must never
+        # raise.
+        try:
+            ident = self.explore_url.to_string()
+        except Exception:
+            ident = self.full_name(safe=False)
+        # Reflect already-fetched ``infos`` (cache-only — never a network
+        # round-trip) so the repr reads like the resolved table, not just its
+        # address: a logged ``%r`` after an info fetch shows the table type.
+        infos = self._infos if self._is_fresh(self._infos_fetched_at) else None
+        ttype = None
+        if infos is not None:
+            ttype = getattr(infos.table_type, "value", None) or getattr(infos.table_type, "name", None)
+        if ttype:
+            return f"Table({ident!r}, {ttype})"
+        return f"Table({ident!r})"
 
     def __str__(self):
         return self.full_name(safe=True)
@@ -1533,10 +1562,11 @@ class Table(DatabricksPath):
                 media_type=MediaTypes.DATABRICKS_UNITY_CATALOG_TABLE,
             )
         )
+        # ``%r`` already carries the table type (the repr reflects the
+        # just-stored infos), so the log only adds the id + column count.
         logger.debug(
-            "Stored info for table %r (id=%s, columns=%d, type=%s)",
-            self, getattr(infos, "table_id", None),
-            len(self._columns), getattr(infos, "table_type", None),
+            "Stored info for table %r (id=%s, columns=%d)",
+            self, getattr(infos, "table_id", None), len(self._columns),
         )
         return infos
 
