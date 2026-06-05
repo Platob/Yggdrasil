@@ -1,14 +1,22 @@
-"""Delta transaction-log parser (concurrent reads; no byte cache — the parsed
-Snapshot is cached a layer up in DeltaFolder)."""
+"""Delta transaction-log parser.
+
+Immutable log files (commit JSONs, checkpoints, sidecars) are read through the
+two-tier byte cache in :mod:`yggdrasil.io.delta._cache` (small RAM LRU + disk
+under ``~/.cache``); the mutable ``_last_checkpoint`` pointer and the directory
+listing are read fresh. Above all this, the parsed
+:class:`~yggdrasil.io.delta.snapshot.Snapshot` is cached on the (location-keyed
+singleton) ``DeltaFolder`` and advances incrementally off a fresh listing, so the
+log files are (re)read only when the listing actually changes."""
 
 from __future__ import annotations
 
 import concurrent.futures as cf
 import dataclasses
-from typing import TYPE_CHECKING, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Tuple
 
 from yggdrasil.pickle import json as ygg_json
 
+from yggdrasil.io.delta import _cache
 from yggdrasil.io.delta._names import (
     LAST_CHECKPOINT_NAME, LOG_DIR_NAME, SIDECARS_DIR_NAME,
     format_commit_name, version_from_log_name,
@@ -21,17 +29,6 @@ if TYPE_CHECKING:
 __all__ = ["DeltaLog", "LogSegment"]
 
 _VERSION_FMT = "{:020d}"
-#: Cap on concurrent log-file GETs. Delta replay reads many small, independent
-#: files (commit JSONs, checkpoint sidecars); on object stores each open() is a
-#: high-latency round-trip, so fan them out rather than read serially.
-#:
-#: Note there is intentionally **no byte-content cache** here. The high-leverage
-#: cache is the parsed :class:`~yggdrasil.io.delta.snapshot.Snapshot` held by the
-#: (location-keyed singleton) ``DeltaFolder``, which advances incrementally off a
-#: fresh listing — so the log files are (re)read only when the listing actually
-#: changes, and caching the raw bytes underneath it would just duplicate that at
-#: a memory cost.
-_MAX_FETCH_WORKERS = 32
 
 
 @dataclasses.dataclass(slots=True)
@@ -169,7 +166,7 @@ class DeltaLog:
             elif name.endswith(".json"): v2_manifests.append(name)
 
         if v2_manifests:
-            try: raw = _read_path(self.log_path / v2_manifests[0]).decode("utf-8")
+            try: raw = _cache.cached_read(self.log_path / v2_manifests[0]).decode("utf-8")
             except Exception: return ()
             sidecars = []
             for line in raw.splitlines():
@@ -206,7 +203,7 @@ class DeltaLog:
             # sidecar parquet are fetched concurrently, then parsed in order.
             remote = [p for p in segment.checkpoint_files
                       if not getattr(p, "is_local_path", False)]
-            remote_blobs = iter(_read_many(remote))
+            remote_blobs = iter(_cache.cached_read_many(remote))
             for path in segment.checkpoint_files:
                 if getattr(path, "is_local_path", False):
                     try: table = pq.read_table(path.full_path())
@@ -226,7 +223,7 @@ class DeltaLog:
         # Commit JSONs are small and independent — prefetch them concurrently
         # (one S3 GET each otherwise serialises the whole replay), then parse in
         # ascending version order so later commits still override earlier ones.
-        for blob in _read_many(segment.commit_files):
+        for blob in _cache.cached_read_many(segment.commit_files):
             if blob is None: continue                 # missing → skip
             for line in blob.decode("utf-8").splitlines():
                 line = line.strip()
@@ -236,38 +233,6 @@ class DeltaLog:
 
 
 def _read_path(path: "Path") -> bytes:
+    """Plain (uncached) read — for the mutable ``_last_checkpoint`` pointer."""
     with path.open("rb") as bio:
         return bio.read()
-
-
-def _read_many(paths: "Iterable[Path]") -> "List[Optional[bytes]]":
-    """Bytes for each path, in input order, fetched **concurrently**.
-
-    Delta replay reads many small, independent files (commit JSONs, checkpoint
-    sidecars). On an object store each ``open()`` is a high-latency GET, so
-    reading them serially dominates construction time — fan them across a
-    bounded thread pool (the per-request HTTP / boto clients are independent),
-    preserving order for deterministic replay. A missing file (concurrently
-    checkpointed away) maps to ``None`` — the caller skips it, matching the
-    previous per-file ``FileNotFoundError``.
-
-    No content caching: the parsed :class:`Snapshot` is cached a layer up and
-    only rebuilt when the listing changes, so these reads already only happen
-    for genuinely new / first-seen files.
-    """
-    paths = list(paths)
-    if not paths:
-        return []
-
-    def _fetch(p: "Path") -> "Optional[bytes]":
-        try:
-            with p.open("rb") as bio:
-                return bio.read()
-        except FileNotFoundError:
-            return None
-
-    if len(paths) == 1:
-        return [_fetch(paths[0])]
-    with cf.ThreadPoolExecutor(max_workers=min(len(paths), _MAX_FETCH_WORKERS)) as ex:
-        return list(ex.map(_fetch, paths))
-    return out
