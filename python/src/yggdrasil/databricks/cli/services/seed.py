@@ -118,10 +118,11 @@ class SeedCommand:
                     style.warn(f"ygg {version} wheel not deployed under {dist_dir}")
                     ok = False
             else:
-                if all_versions:
-                    paths = whl.ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=rebuild)
-                else:
-                    paths = whl.ensure_ygg_wheel(client, workspace_dir=workspace_dir, rebuild=rebuild)
+                with style.Spinner(f"building ygg {version} wheel…"):
+                    if all_versions:
+                        paths = whl.ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=rebuild)
+                    else:
+                        paths = whl.ensure_ygg_wheel(client, workspace_dir=workspace_dir, rebuild=rebuild)
                 for path in paths:
                     style.out(f"    {style.dim('wheel')}  {path}\n")
                 style.ok(f"ygg {version} wheel ready ({len(paths)})")
@@ -154,23 +155,28 @@ class SeedCommand:
                 # with zero PyPI access. With --all-versions/--overwrite this covers
                 # every supported Python (3.10–3.13); otherwise just the local one.
                 pythons = list(whl.SUPPORTED_PYTHONS) if all_versions else [None]
-                for py in pythons:
-                    bundle = whl.ensure_bundle(
-                        client, "ygg", python=py, workspace_dir=workspace_dir, rebuild=rebuild,
-                    )
-                    key = whl.environment_key_for(py)
-                    env_name = f"ygg-{version}-{key}"
-                    env_yaml = whl.ensure_named_environment(
-                        client, env_name, dependencies=bundle,
-                        environment_version=whl.serverless_environment_version(py),
-                        filename=f"{env_name}.yml",
-                    )
-                    reqs = whl.ensure_cluster_requirements(client, env_name, dependencies=bundle)
-                    style.out(
-                        f"    {style.dim(key)}  {len(bundle)} wheels  "
-                        f"{style.dim('serverless')} {env_yaml}\n"
-                    )
-                    style.out(f"          {style.dim('cluster')}    {reqs}\n")
+                lines: list[str] = []
+                with style.Spinner("building base environment(s)…") as sp:
+                    for py in pythons:
+                        key = whl.environment_key_for(py)
+                        sp.update(f"building base environment {key} (wheel bundle)…")
+                        bundle = whl.ensure_bundle(
+                            client, "ygg", python=py, workspace_dir=workspace_dir, rebuild=rebuild,
+                        )
+                        env_name = f"ygg-{version}-{key}"
+                        env_yaml = whl.ensure_named_environment(
+                            client, env_name, dependencies=bundle,
+                            environment_version=whl.serverless_environment_version(py),
+                            filename=f"{env_name}.yml",
+                        )
+                        reqs = whl.ensure_cluster_requirements(client, env_name, dependencies=bundle)
+                        lines.append(
+                            f"    {style.dim(key)}  {len(bundle)} wheels  "
+                            f"{style.dim('serverless')} {env_yaml}\n"
+                        )
+                        lines.append(f"          {style.dim('cluster')}    {reqs}\n")
+                for line in lines:
+                    style.out(line)
                 style.ok(
                     f"base environments written for {len(pythons)} Python version(s) "
                     f"(serverless + cluster)"
@@ -241,7 +247,8 @@ class SeedCommand:
                     else:
                         style.ok(f"{len(DEFAULT_POOL_TIERS)} default instance pool(s) present")
                 else:
-                    pools = pools_svc.seed_default_pools()
+                    with style.Spinner("provisioning Light/Medium/Heavy pools…"):
+                        pools = pools_svc.seed_default_pools()
                     for pool in pools:
                         style.out(
                             f"    {style.dim('pool')}   {pool.instance_pool_name}  "

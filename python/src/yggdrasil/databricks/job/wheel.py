@@ -28,6 +28,26 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _run_build(cmd: "list[str]") -> None:
+    """Run a wheel-build subprocess (uv / pip) **quietly**.
+
+    The build tools are chatty — their progress belongs behind the CLI's
+    spinner, not flooding the caller's stdout. Output is captured and, on a
+    non-zero exit, the (trimmed) tail is folded into the raised
+    :class:`RuntimeError` so a failure stays diagnosable. A missing executable
+    still surfaces as :class:`FileNotFoundError` (so callers can fall back from
+    ``uv`` to ``pip``)."""
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        tail = (exc.stderr or exc.stdout or "").strip()
+        logger.error("build command failed (%s): %s\n%s", exc.returncode, " ".join(cmd), tail)
+        raise RuntimeError(
+            f"build command failed (exit {exc.returncode}): "
+            f"{' '.join(cmd[:4])} … — {tail[-2000:]}"
+        ) from exc
+
 __all__ = [
     "WORKSPACE_PYPI_DIR",
     "WORKSPACE_WHL_DIR",
@@ -404,16 +424,12 @@ def build_wheel(
     if no_deps and not requirements:
         logger.info("building wheel for %s into %s (uv)", package, out)
         try:
-            subprocess.run(
-                ["uv", "build", "--wheel", "--out-dir", str(out), str(project)],
-                check=True,
-            )
+            _run_build(["uv", "build", "--wheel", "--out-dir", str(out), str(project)])
         except FileNotFoundError:
             logger.info("uv not found — falling back to pip for %s", package)
-            subprocess.run(
+            _run_build(
                 [sys.executable, "-m", "pip", "wheel", str(project),
-                 "--no-deps", "--wheel-dir", str(out)],
-                check=True,
+                 "--no-deps", "--wheel-dir", str(out)]
             )
     else:
         logger.info("building wheel (+ dependencies) for %s into %s (pip)", package, out)
@@ -424,11 +440,10 @@ def build_wheel(
             capture_output=True,
         ).returncode != 0:
             logger.info("pip not present in %s — bootstrapping via ensurepip", sys.executable)
-            subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=True)
-        subprocess.run(
+            _run_build([sys.executable, "-m", "ensurepip", "--upgrade"])
+        _run_build(
             [sys.executable, "-m", "pip", "wheel", str(project), *requirements,
-             "--wheel-dir", str(out)],
-            check=True,
+             "--wheel-dir", str(out)]
         )
 
     wheels = sorted(out.glob("*.whl"))
@@ -459,17 +474,15 @@ def build_wheels_for_versions(
     wheels: list[Path] = []
     for version in versions:
         try:
-            subprocess.run(
+            _run_build(
                 ["uv", "build", "--wheel", "--python", version,
-                 "--out-dir", str(out), str(project)],
-                check=True,
+                 "--out-dir", str(out), str(project)]
             )
         except FileNotFoundError:
             logger.info("uv not found — building one wheel for the current interpreter")
-            subprocess.run(
+            _run_build(
                 [sys.executable, "-m", "pip", "wheel", str(project),
-                 "--no-deps", "--wheel-dir", str(out)],
-                check=True,
+                 "--no-deps", "--wheel-dir", str(out)]
             )
         for whl in sorted(out.glob("*.whl")):
             if whl.name not in seen:
@@ -519,17 +532,15 @@ def build_bundle(
 
     logger.info("building %s project wheel for Python %s into %s", package, py, out)
     try:
-        subprocess.run(
+        _run_build(
             ["uv", "build", "--wheel", "--python", py,
-             "--out-dir", str(out), str(project)],
-            check=True,
+             "--out-dir", str(out), str(project)]
         )
     except FileNotFoundError:
         logger.info("uv not found — building the project wheel with the host interpreter")
-        subprocess.run(
+        _run_build(
             [sys.executable, "-m", "pip", "wheel", str(project),
-             "--no-deps", "--wheel-dir", str(out)],
-            check=True,
+             "--no-deps", "--wheel-dir", str(out)]
         )
 
     # Download the dependency closure as Linux-x86_64 wheels for the *serverless
@@ -545,15 +556,14 @@ def build_bundle(
             "downloading %d top-level dep requirement(s) as %s wheels (py%s)",
             len(deps), "/".join(_serverless_wheel_platforms()), py,
         )
-        subprocess.run(
+        _run_build(
             [sys.executable, "-m", "pip", "download",
              "--only-binary=:all:",
              "--python-version", py,
              "--implementation", "cp",
              "--abi", abi, "--abi", "abi3", "--abi", "none",
              *platform_args,
-             "--dest", str(out), *deps],
-            check=True,
+             "--dest", str(out), *deps]
         )
 
     # Drop runtime-provided distributions (e.g. ``certifi``) so the bundle never
