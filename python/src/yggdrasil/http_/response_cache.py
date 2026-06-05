@@ -35,19 +35,29 @@ _MATCH_KEY = "public_hash"
 _MATCH_COLUMN = "request_public_hash"
 _MAX_WORKERS = 32
 
+#: The HTTP response Arrow schema is static and already lives in the package
+#: (:data:`yggdrasil.http_.schemas.RESPONSE_SCHEMA`). Cache files therefore store
+#: only the record-batch **body** (``RecordBatch.serialize``) and reattach this
+#: schema on read (``read_record_batch``) — instead of embedding + re-parsing the
+#: full (~13 KB, deeply nested) schema in every per-response file.
+_ARROW_SCHEMA: "Any" = None
 
-def _ipc_to_table(data: bytes) -> "Any":
+
+def _schema() -> "Any":
+    global _ARROW_SCHEMA
+    if _ARROW_SCHEMA is None:
+        from yggdrasil.http_.schemas import RESPONSE_SCHEMA
+        _ARROW_SCHEMA = RESPONSE_SCHEMA.to_arrow_schema()
+    return _ARROW_SCHEMA
+
+
+def _batch_to_bytes(batch: "Any") -> bytes:
+    return batch.serialize().to_pybytes()
+
+
+def _bytes_to_batch(data: bytes) -> "Any":
     import pyarrow as pa
-    return pa.ipc.open_stream(pa.BufferReader(data)).read_all()
-
-
-def _table_to_ipc(table: "Any") -> bytes:
-    import pyarrow as pa
-    sink = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        for batch in table.to_batches():
-            writer.write_batch(batch)
-    return sink.getvalue().to_pybytes()
+    return pa.ipc.read_record_batch(pa.py_buffer(data), _schema())
 
 
 def _read_bytes(path: pathlib.Path) -> "Optional[bytes]":
@@ -121,7 +131,7 @@ class HttpResponseCache(Folder):
             data = _read_bytes(self._file(req.match_value(_MATCH_KEY)))
             if data is None:
                 return req, None
-            for resp in Response.from_arrow_tabular(_ipc_to_table(data)):
+            for resp in Response.from_arrow_tabular(_bytes_to_batch(data)):
                 return req, resp
             return req, None
 
@@ -156,11 +166,21 @@ class HttpResponseCache(Folder):
             if to_arrow is None:
                 return
             data = to_arrow()
-        table = pa.Table.from_batches([data]) if isinstance(data, pa.RecordBatch) else data
-        if table.num_rows == 0:
-            return
-        keys = table.column(_MATCH_COLUMN).to_pylist()
-        for i, key in enumerate(keys):
-            if key is None:
+        batches = data.to_batches() if isinstance(data, pa.Table) else [data]
+        schema = _schema()
+        for batch in batches:
+            if batch.num_rows == 0:
                 continue
-            _write_atomic(self._file(int(key)), _table_to_ipc(table.slice(i, 1)))
+            if batch.schema != schema:
+                # Align to the canonical schema so the schema-less body reads
+                # back correctly; skip rows we can't coerce (best-effort cache).
+                try:
+                    batch = pa.RecordBatch.from_arrays(
+                        [batch.column(n) for n in schema.names], schema=schema)
+                except Exception:
+                    continue
+            keys = batch.column(_MATCH_COLUMN).to_pylist()
+            for i, key in enumerate(keys):
+                if key is None:
+                    continue
+                _write_atomic(self._file(int(key)), _batch_to_bytes(batch.slice(i, 1)))
