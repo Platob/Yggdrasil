@@ -97,9 +97,23 @@ class TestRetryable:
         assert r.retryable is False
 
     def test_true_for_retryable_code(self) -> None:
-        # Any code in ``_RETRYABLE_ERROR_CODES`` must yield ``retryable=True``.
-        code = next(iter(_RETRYABLE_ERROR_CODES))
-        r = _result_in_state(StatementState.FAILED, error_message=code)
+        # Every code in ``_RETRYABLE_ERROR_CODES`` must yield ``retryable=True``.
+        for code in _RETRYABLE_ERROR_CODES:
+            r = _result_in_state(StatementState.FAILED, error_message=code)
+            assert r.retryable is True, code
+
+    def test_true_for_partitioned_table_concurrent_append(self) -> None:
+        # The partitioned-table concurrent-MERGE conflict (row-level detection
+        # can't run) is transient — Delta itself says "Please retry". Match it
+        # in the full message shape the warehouse surfaces.
+        msg = (
+            "[DELTA_CONCURRENT_APPEND.PARTITIONED_TABLE_WITHOUT_MERGE_SOURCE] "
+            "Transaction conflict detected. A concurrent MERGE added data to "
+            "table trading_tgp_prd.src_meteologica.curated_data_europe_germany "
+            "committed at version 7770. Row-level conflict detection could not "
+            "be performed on this partitioned table. Please retry the operation."
+        )
+        r = _result_in_state(StatementState.FAILED, error_message=msg)
         assert r.retryable is True
 
     def test_false_when_iteration_limit_exhausted(self) -> None:
