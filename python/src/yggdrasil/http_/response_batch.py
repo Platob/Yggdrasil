@@ -164,23 +164,34 @@ class HTTPResponseBatch(Tabular):
         ordered: bool = False,
         max_in_flight: int | None = None,
     ) -> "HTTPResponseBatch":
-        """Resolve cache hits, fetch misses, write back."""
+        """Resolve cache hits, fetch misses, write back.
+
+        Only the **local** cache is materialised here, and only to reject stale
+        hits: its probe (``HttpResponseCache.probe_hashes``) is presence-only, so
+        a file can be reported as a hit yet fail the received-window filter on
+        read — those keys must fall back to misses or they'd silently vanish from
+        the result. That read is O(1) per key (and memoised in-memory after).
+
+        The **remote** cache is deliberately *not* read here. Its probe is
+        window-aware (``SendConfig.split_requests`` pushes ``received_from`` /
+        ``received_to`` into the predicate), so every remote hit is already valid
+        — there's nothing to reject. Touching ``remote_tabular`` would force a
+        full (potentially Databricks) read eagerly; leaving it lazy means the
+        remote rows are fetched only when the consumer iterates the batch.
+        """
         cfg = self._send_config
 
         misses = list(self.misses)
         local_tab = self.local_tabular
-        remote_tab = self.remote_tabular
 
         served = set()
-        for tab in (local_tab, remote_tab):
-            if tab is None:
-                continue
-            for resp in HTTPResponse.from_arrow_tabular(tab.read_arrow_batches()):
+        if local_tab is not None:
+            for resp in HTTPResponse.from_arrow_tabular(local_tab.read_arrow_batches()):
                 req = resp.request
                 if req is not None:
                     served.add(req.match_value(MATCH_KEY))
 
-        rejected = (self._local_hashes | self._remote_hashes) - served
+        rejected = self._local_hashes - served
         if rejected:
             misses = misses + [
                 r for r in self._requests

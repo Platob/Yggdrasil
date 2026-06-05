@@ -317,3 +317,28 @@ def test_remote_probe_skips_stale_when_only_new_data_requested(tmp_path):
     )
     _local, remote_h, misses = fresh.split_requests([req])
     assert not remote_h and misses == [req]
+
+
+def test_remote_cache_full_read_is_lazy_in_fetch(tmp_path):
+    """``_fetch`` must NOT materialise the remote cache — its window-aware probe
+    already guarantees every remote hit is valid, so the (potentially Databricks)
+    full read stays lazy until the batch is consumed."""
+    from yggdrasil.http_.send_config import SendConfig
+    from yggdrasil.http_.response_batch import HTTPResponseBatch
+
+    req = _req("https://e.com/lazy-remote")
+    remote = CacheConfig(tabular=str(tmp_path / "remote"))
+    remote.write_responses([_resp(req, body=b"REMOTE")])
+
+    batch = HTTPResponseBatch(SendConfig(remote_cache=remote), [req])
+    batch._fetch()                                  # resolve split + (no) misses
+
+    # The request was a remote hit (no misses, no network), but the remote rows
+    # are still unread — the holder sits at its lazy sentinel.
+    assert not batch.misses
+    assert batch._remote_tabular is ...
+
+    # Consuming the batch is what triggers the remote read.
+    bodies = [r.content for r in batch.responses()]
+    assert b"REMOTE" in bodies
+    assert batch._remote_tabular is not ...
