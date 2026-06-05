@@ -195,6 +195,34 @@ class TestWheel:
         assert "manylinux_2_34_x86_64" in download_cmd
         assert "manylinux2014_x86_64" not in download_cmd    # default set overridden
 
+    def test_build_bundle_excludes_runtime_provided_certifi(self):
+        # certifi is provided by the Databricks runtime — it must be dropped from
+        # the closure (re-shipping it broke the base-environment install).
+        out = Path("/z")
+        unlinked: list[str] = []
+        glob_wheels = [
+            Path("/z/ygg-1-py3-none-any.whl"),
+            Path("/z/certifi-2024.1-py3-none-any.whl"),
+            Path("/z/pyarrow-20-cp312-manylinux_2_28_x86_64.whl"),
+        ]
+        with patch("yggdrasil.databricks.job.wheel.synthesize_project", return_value=Path("/synth")), \
+             patch("yggdrasil.databricks.job.wheel.distribution_for", return_value="ygg"), \
+             patch("yggdrasil.databricks.job.wheel._project_dependencies", return_value=["pyarrow>=20"]), \
+             patch("yggdrasil.databricks.job.wheel.subprocess.run"), \
+             patch("yggdrasil.databricks.job.wheel.tempfile.mkdtemp", return_value=str(out)), \
+             patch("pathlib.Path.glob", return_value=glob_wheels), \
+             patch("pathlib.Path.unlink", autospec=True,
+                   side_effect=lambda self, **kw: unlinked.append(self.name)):
+            wheels = wheel.build_bundle("ygg", python="3.12")
+        names = [w.name for w in wheels]
+        assert "certifi-2024.1-py3-none-any.whl" not in names      # excluded
+        assert "certifi-2024.1-py3-none-any.whl" in unlinked       # and physically dropped
+        assert names == ["pyarrow-20-cp312-manylinux_2_28_x86_64.whl", "ygg-1-py3-none-any.whl"]
+
+    def test_bundle_exclude_env_override(self, monkeypatch):
+        monkeypatch.setenv("YGG_DATABRICKS_BUNDLE_EXCLUDE", "urllib3, charset-normalizer")
+        assert wheel._bundle_exclude() == {"urllib3", "charset-normalizer"}
+
     def test_build_bundle_no_deps_skips_download(self):
         # A dep-free project builds the project wheel only — no pip download step.
         out = Path("/y")

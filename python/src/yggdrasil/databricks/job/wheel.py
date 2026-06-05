@@ -34,6 +34,7 @@ __all__ = [
     "SERVERLESS_ENVIRONMENT_VERSION",
     "SERVERLESS_ENVIRONMENT_VERSIONS",
     "SERVERLESS_WHEEL_PLATFORMS",
+    "BUNDLE_EXCLUDE",
     "SUPPORTED_PYTHONS",
     "serverless_environment_version",
     "environment_key_for",
@@ -116,6 +117,22 @@ def _serverless_wheel_platforms() -> "list[str]":
     if raw:
         return [p.strip() for p in raw.split(",") if p.strip()]
     return list(SERVERLESS_WHEEL_PLATFORMS)
+
+
+#: Distributions never shipped in the zero-PyPI dependency closure — the
+#: Databricks runtime already provides them, and re-bundling our own copy has
+#: broken the base-environment install (``certifi`` is pip-installed into the
+#: serverless image; a second copy from the bundle conflicts). Resolved
+#: transitively by pip from the runtime/index instead. Normalized (PEP 503)
+#: names; override via ``YGG_DATABRICKS_BUNDLE_EXCLUDE`` (comma-separated).
+BUNDLE_EXCLUDE: "frozenset[str]" = frozenset({"certifi"})
+
+
+def _bundle_exclude() -> "set[str]":
+    raw = os.environ.get("YGG_DATABRICKS_BUNDLE_EXCLUDE")
+    if raw:
+        return {_norm(p.strip()) for p in raw.split(",") if p.strip()}
+    return set(BUNDLE_EXCLUDE)
 
 
 def _py_minor(python: "str | None" = None) -> str:
@@ -539,7 +556,17 @@ def build_bundle(
             check=True,
         )
 
-    wheels = sorted(out.glob("*.whl"))
+    # Drop runtime-provided distributions (e.g. ``certifi``) so the bundle never
+    # ships a second copy the base-environment install conflicts on — pip
+    # resolves them from the serverless image / index at install time.
+    exclude = _bundle_exclude()
+    wheels: list[Path] = []
+    for whl in sorted(out.glob("*.whl")):
+        if _wheel_dist(whl.name) in exclude:
+            logger.info("excluding runtime-provided %s from bundle", whl.name)
+            whl.unlink(missing_ok=True)
+            continue
+        wheels.append(whl)
     if not wheels:
         raise FileNotFoundError(f"no wheels produced in {out}")
     return wheels
