@@ -25,13 +25,7 @@ except ImportError:
     # whole ``yggdrasil.databricks`` package — and ``client.py`` is the first
     # module its ``__init__`` imports, so auto-installing it here (into the
     # running interpreter, via the project's import-or-install guard) makes
-    # every ``databricks.sdk.*`` import across the package resolve. Set
-    # ``YGG_DATABRICKS_AUTO_INSTALL=0`` to opt out — then a missing SDK raises
-    # the normal ImportError.
-    if os.getenv("YGG_DATABRICKS_AUTO_INSTALL", "1").strip().lower() in (
-        "0", "false", "no", "off",
-    ):
-        raise
+    # every ``databricks.sdk.*`` import across the package resolve.
     from yggdrasil.lazy_imports import _lazy_import
 
     _lazy_import("databricks.sdk", "databricks-sdk", install=True)

@@ -379,26 +379,51 @@ def _local_load_notice(agent: Any, style: Any, engine: "str | None") -> None:
 
 def _stream_reply(agent: Any, style: Any, line: str, state: dict,
                   *, engine: "str | None" = None, system: "str | None" = None) -> str:
-    """Stream a reasoned reply to the terminal token-by-token; return the full text.
+    """Submit the reply asynchronously and yield it to the terminal as it lands.
 
-    A spinner fills the wait before the first token (remote-API round-trip, or a
-    local model warming up) so the turn never sits silent; it's cleared the
-    instant real output starts."""
+    The reasoning stream runs on a worker thread that feeds a queue; the main
+    thread shows a spinner until the first token, then drains the queue,
+    printing tokens the instant they arrive. Decoupling production from the UI
+    keeps the spinner smooth across token gaps and the terminal responsive,
+    and surfaces a stream error back on the main thread."""
+    import queue
+    import threading
+
     _local_load_notice(agent, style, engine)
+    q: "queue.Queue[Any]" = queue.Queue()
+    done = object()
+    error: list[BaseException] = []
+
+    def produce() -> None:
+        try:
+            for chunk in agent.reason_stream(line, engine=engine,
+                                             tier=state["tier"], system=system):
+                q.put(chunk)
+        except BaseException as exc:           # surfaced + re-raised on the main thread
+            error.append(exc)
+        finally:
+            q.put(done)
+
+    threading.Thread(target=produce, daemon=True).start()   # submit
+
     parts: list[str] = []
     spin = style.Spinner("thinking…").start()
     try:
-        for chunk in agent.reason_stream(line, engine=engine,
-                                         tier=state["tier"], system=system):
-            if spin is not None:           # first token — drop the spinner, open output
+        while True:
+            chunk = q.get()                    # yield as tokens land
+            if chunk is done:
+                break
+            if spin is not None:               # first token — drop the spinner, open output
                 spin.stop()
                 spin = None
                 style.out("  ")
             style.out(chunk)
             parts.append(chunk)
     finally:
-        if spin is not None:               # stream raised before any token
+        if spin is not None:                   # nothing streamed (empty or error)
             spin.stop()
+    if error:
+        raise error[0]
     style.out("\n\n")
     return "".join(parts)
 
