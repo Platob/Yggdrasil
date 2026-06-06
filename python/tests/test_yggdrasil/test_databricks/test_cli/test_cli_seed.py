@@ -90,6 +90,22 @@ class TestSeedCheck(unittest.TestCase):
             rc = main(["seed", "--check"])
         self.assertEqual(rc, 1)
 
+    def test_check_missing_cluster_returns_one(self):
+        """Everything else present, but the default single-user cluster is absent."""
+        wh = MagicMock(); wh.warehouse_name = "Starter"; wh.warehouse_id = "abc"
+        client = _client_with(warehouses=[wh])
+        client.compute.clusters.find_cluster.return_value = None   # no default cluster
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.deployed_environments",
+                   return_value=["/w/env/yellow.yml", "/w/env/yellow.requirements.txt"]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--check"])
+        self.assertEqual(rc, 1)
+        client.compute.clusters.all_purpose_cluster.assert_not_called()  # check provisions nothing
+
     def test_check_missing_pools_returns_one(self):
         """Everything else present, but the default pools are absent → fail."""
         wh = MagicMock(); wh.warehouse_name = "Starter"; wh.warehouse_id = "abc"
@@ -144,6 +160,53 @@ class TestSeedProvision(unittest.TestCase):
         client.warehouses.find_default.assert_called_once()
         # The default Light/Medium/Heavy instance pools are provisioned too.
         client.compute.instance_pools.seed_default_pools.assert_called_once()
+
+    def test_seed_provisions_default_single_user_cluster(self):
+        wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
+        client = _client_with(user="alice@co.com", default_wh=wh)
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed"])
+        self.assertEqual(rc, 0)
+        # A default all-purpose cluster is provisioned in single-user (dedicated)
+        # mode for the current user, without blocking on start-up.
+        client.compute.clusters.all_purpose_cluster.assert_called_once_with(
+            single_user_name="alice@co.com", wait=False,
+        )
+
+    def test_seed_no_cluster_skips_cluster_step(self):
+        wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
+        client = _client_with(default_wh=wh)
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--no-cluster"])
+        self.assertEqual(rc, 0)
+        client.compute.clusters.all_purpose_cluster.assert_not_called()
+
+    def test_seed_overwrite_skips_cluster_step(self):
+        from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
+        client = _client_with(default_wh=MagicMock())
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(v) for v in SUPPORTED_PYTHONS]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--overwrite"])
+        self.assertEqual(rc, 0)
+        # --overwrite ends after the env rewrite, before the cluster step.
+        client.compute.clusters.all_purpose_cluster.assert_not_called()
 
     def test_seed_no_pools_skips_pool_step(self):
         wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"

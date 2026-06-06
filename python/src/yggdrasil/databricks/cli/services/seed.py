@@ -7,7 +7,7 @@ One command to answer "is this workspace ready, and if not, make it ready":
     ygg databricks seed --check    # read-only readiness report (CI gate)
     ygg databricks seed --overwrite  # rebuild every wheel + the env from scratch, then end
 
-It walks five areas:
+It walks six areas:
 
 - **config**      — connectivity, host, current user, default catalog/schema.
 - **wheels**      — the versioned ygg image wheel in the workspace registry.
@@ -24,6 +24,10 @@ It walks five areas:
   runtime so pool-backed clusters attach warm against the seeded zero-PyPI wheel
   bundle. Lazy by default (no idle nodes → no cost until attached). Skip with
   ``--no-pools``.
+- **cluster**     — a default **single-user (dedicated)** all-purpose cluster
+  owned by the current user, so interactive ygg work has compute on hand. Lazy:
+  created with autotermination and not waited on (starts on attach, self-stops
+  when idle → no cost until used). Skip with ``--no-cluster``.
 
 In the default (seed) mode it builds/uploads the wheel, assembles and writes
 the environment files, and ensures a default warehouse exists. With ``--check``
@@ -59,6 +63,8 @@ class SeedCommand:
                                  "the environment files, then end (skips the warehouse + pools steps).")
         parser.add_argument("--no-pools", dest="no_pools", action="store_true",
                             help="Skip the default Light/Medium/Heavy instance pools step.")
+        parser.add_argument("--no-cluster", dest="no_cluster", action="store_true",
+                            help="Skip the default single-user (dedicated) all-purpose cluster step.")
         parser.set_defaults(handler=cls._seed)
 
     @classmethod
@@ -257,6 +263,60 @@ class SeedCommand:
                     )
             except Exception as exc:
                 style.fail(f"pools step failed: {exc}")
+                ok = False
+
+        # -- cluster -----------------------------------------------------
+        # A default single-user (dedicated) all-purpose cluster owned by the
+        # current user, so interactive ygg work has compute on hand. Lazy:
+        # created with autotermination and not waited on — it starts on attach
+        # and self-stops when idle, so seeding it costs nothing until used.
+        # ``--no-cluster`` opts out.
+        if not args.no_cluster:
+            style.info("cluster")
+            try:
+                clusters_svc = client.compute.clusters
+                default_name = client.user_scoped_name("All Purpose")
+                if check:
+                    found = clusters_svc.find_cluster(
+                        cluster_name=default_name, raise_error=False,
+                    )
+                    if found is None:
+                        style.warn(f"default cluster {default_name!r} not provisioned")
+                        ok = False
+                    else:
+                        style.out(
+                            f"    {style.dim('found')}  {default_name}  "
+                            f"{style.dim(str(found.cluster_id))}\n"
+                        )
+                        style.ok("default single-user cluster present")
+                else:
+                    with style.Spinner("provisioning default single-user cluster…"):
+                        # ``single_user_name`` flips the cluster to dedicated
+                        # (single-user) access mode for the current user;
+                        # ``wait=False`` returns without blocking on start-up.
+                        cluster = clusters_svc.all_purpose_cluster(
+                            single_user_name=user, wait=False,
+                        )
+                    details = None
+                    try:
+                        details = cluster.details
+                    except Exception:
+                        pass
+                    mode = getattr(
+                        getattr(details, "data_security_mode", None), "value", None,
+                    )
+                    style.out(
+                        f"    {style.dim('cluster')} {cluster.cluster_name}  "
+                        f"{style.dim(str(cluster.cluster_id))}\n"
+                    )
+                    style.out(
+                        f"    {style.dim('access')}  "
+                        f"{mode or 'dedicated (single user)'}  "
+                        f"{style.dim('single_user=' + str(user))}\n"
+                    )
+                    style.ok("default single-user cluster ready (dedicated, autoterminating)")
+            except Exception as exc:
+                style.fail(f"cluster step failed: {exc}")
                 ok = False
 
         # -- summary -----------------------------------------------------
