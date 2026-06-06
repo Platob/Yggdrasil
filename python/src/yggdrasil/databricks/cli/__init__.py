@@ -11,7 +11,7 @@ Subcommands::
     ygg databricks fs ls/cat/write/put/get/mkdir/rm/stat/cp/mv  (Workspace/Volumes/DBFS)
     ygg databricks wheel [build/upload/deploy/list]  (build+upload ygg wheel; workspace PyPI-like registry)
     ygg databricks environment [list]  (build / get-or-install the base environment(s) from wheels)
-    ygg databricks deploy [ygg|wheel <package>|environment]  (wheels + serverless env configs)
+    ygg databricks deploy [project [path]|ygg|wheel <package>|environment]  (bare = deploy the cwd project)
     ygg databricks seed [--check]  (provision/verify wheels, environments, default warehouse, config)
 """
 from __future__ import annotations

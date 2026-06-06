@@ -174,21 +174,42 @@ class TestDeployProject(unittest.TestCase):
 
 
 class TestDeployDefault(unittest.TestCase):
-    def test_bare_deploy_ships_wheel_then_environment(self):
-        env = MagicMock()
-        env.as_dict.return_value = {"environment_key": "default"}
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
+    def _info(self):
+        return {
+            "name": "myproj", "version": "0.1.0",
+            "env_name": "myproj", "env_dir": "/Workspace/Shared/environments/myproj",
+            "dependencies": ["/Workspace/Shared/pypi/myproj/myproj-0.1.0-py3-none-any.whl"],
+            "n_wheels": 1,
+            "serverless": "/Workspace/Shared/environments/myproj/myproj.yml",
+            "cluster": "/Workspace/Shared/environments/myproj/myproj.requirements.txt",
+            "requires_python": ">=3.10",
+        }
+
+    def test_bare_deploy_is_an_alias_for_deploy_project(self):
+        client = MagicMock()
+        client.workspace_client.return_value.current_user.me.return_value.user_name = "me@co.com"
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure, \
-             patch("yggdrasil.databricks.job.wheel.ygg_environment", return_value=env) as build, \
+             patch("yggdrasil.databricks.job.wheel.ensure_project_environment",
+                   return_value=self._info()) as ensure, \
              contextlib.redirect_stdout(io.StringIO()):
-            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
             rc = main(["deploy"])
         self.assertEqual(rc, 0)
+        # bare deploy → project deploy, discovered from the cwd (path is None)
         ensure.assert_called_once()
-        build.assert_called_once()
-        # The wheel was just built; the environment step must not rebuild it again.
-        self.assertFalse(build.call_args.kwargs["rebuild"])
+        self.assertIsNone(ensure.call_args.args[1])
+        client.compute.clusters.all_purpose_cluster.assert_called_once()
+
+    def test_bare_deploy_no_cluster_skips_cluster(self):
+        client = MagicMock()
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_project_environment",
+                   return_value=self._info()), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["deploy", "--no-cluster", "--mode", "overwrite"])
+        self.assertEqual(rc, 0)
+        client.compute.clusters.all_purpose_cluster.assert_not_called()
 
 
 if __name__ == "__main__":

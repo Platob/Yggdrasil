@@ -1,19 +1,22 @@
-"""``ygg databricks deploy`` — ship wheels and serverless environment configs.
+"""``ygg databricks deploy`` — take a project (or the ygg image) to the workspace.
 
 The deploy machinery in :mod:`yggdrasil.databricks.job.wheel` builds a wheel from
-the **live** package on disk, uploads it into the workspace's PyPI-like registry
+the package on disk, uploads it into the workspace's PyPI-like registry
 (``/Workspace/Shared/pypi/<dist>/``), and assembles the serverless
 ``JobEnvironment`` that installs it. This command surfaces that machinery:
 
-    ygg databricks deploy                 # ygg image: wheel(s) + JobEnvironment JSON
+    ygg databricks deploy                 # alias for ``deploy project`` (cwd)
+    ygg databricks deploy project [path]  # discover a pyproject.toml → wheel +
+                                          # environment + a default cluster
     ygg databricks deploy ygg             # get-or-build the versioned ygg wheel(s)
     ygg databricks deploy wheel <package> # build + upload any package's wheel(s)
     ygg databricks deploy environment     # print the serverless JobEnvironment(s)
-    ygg databricks deploy project [path]  # discover a pyproject.toml → wheel +
-                                          # environment + a default cluster
 
-``--all-versions`` builds/keys a wheel + environment for every supported Python
-(3.10–3.13); without it the deploy targets the local interpreter's Python.
+Bare ``deploy`` is an **alias for ``deploy project``** — it discovers the nearest
+``pyproject.toml`` from the cwd and ships it. To deploy a project at another
+location, pass it to the ``project`` subcommand (``deploy project <path>``).
+``--all-versions`` (on ``ygg`` / ``wheel`` / ``environment``) builds/keys for
+every supported Python (3.10–3.13); without it those target the local Python.
 
 ``project`` discovers the nearest ``pyproject.toml`` (from *path* or the cwd),
 builds the **project's own wheel** *and its whole dependency closure* as wheels
@@ -40,15 +43,26 @@ class DeployCommand:
     @classmethod
     def register(cls, subparsers: Any) -> None:
         parser = subparsers.add_parser(
-            "deploy", help="Ship wheels and serverless environment configs to the workspace."
+            "deploy", help="Deploy a project to the workspace (alias for `deploy project`)."
         )
-        # Bare ``deploy`` ships the ygg image — wheel(s) + JobEnvironment JSON.
+        # Bare ``deploy`` is an alias for ``deploy project`` — it discovers the
+        # nearest pyproject.toml from the cwd and ships it (wheel closure +
+        # environment + a default cluster). The ygg-image deploys live under the
+        # ``ygg`` / ``wheel`` / ``environment`` subcommands. (A specific project
+        # path is given via ``deploy project <path>`` — the bare form, sharing the
+        # parser with the subcommands, discovers from the cwd.)
         parser.add_argument("--workspace-dir", dest="workspace_dir", default=None,
                             help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
-        parser.add_argument("--rebuild", action="store_true",
-                            help="Force a fresh build even if the version is already deployed.")
-        parser.add_argument("--all-versions", dest="all_versions", action="store_true",
-                            help="A wheel + environment for every supported Python (3.10–3.13).")
+        parser.add_argument("--extra", action="append", default=None,
+                            help="optional-dependency extra to include in the env (repeatable).")
+        parser.add_argument("--mode", default="auto", choices=["auto", "append", "overwrite"],
+                            help="Idempotency policy: overwrite (rebuild + update all), "
+                                 "append (add only what's missing), auto (get-or-create wheels, "
+                                 "overwrite env config files). Default: auto.")
+        parser.add_argument("--no-cluster", dest="no_cluster", action="store_true",
+                            help="Build the wheel + environment only; don't create the default cluster.")
+        parser.add_argument("--single-user", dest="single_user_name", default=None,
+                            help="Single-user owner for the cluster (default: the current user).")
         sub = parser.add_subparsers(dest="deploy_action")
 
         ygg = sub.add_parser("ygg", help="Build + upload the versioned ygg image wheel(s).")
@@ -108,7 +122,8 @@ class DeployCommand:
                           help="Single-user owner for the cluster (default: the current user).")
         proj.set_defaults(handler=cls._project)
 
-        parser.set_defaults(handler=cls._default)
+        # Bare ``deploy`` → ``deploy project`` discovered from the cwd.
+        parser.set_defaults(handler=cls._project, path=None)
 
     # -- handlers --------------------------------------------------------
     @classmethod
@@ -233,32 +248,4 @@ class DeployCommand:
             f"default cluster {cluster.cluster_name!r} ready "
             f"(project deps, single-user, autoterminating)"
         )
-        return 0
-
-    @classmethod
-    def _default(cls, args: Any, build_client: Any) -> int:
-        """Bare ``deploy`` — ship the ygg image: wheel(s) then the JobEnvironment(s)."""
-        from yggdrasil.cli import style
-        from yggdrasil.databricks.job.wheel import (
-            WORKSPACE_PYPI_DIR, ensure_ygg_wheel, ensure_ygg_wheels,
-            ygg_environment, ygg_environments,
-        )
-
-        client = build_client(args)
-        workspace_dir = args.workspace_dir or WORKSPACE_PYPI_DIR
-        # Build (and possibly rebuild) the wheel once, then assemble the
-        # environment off that fresh build — no second rebuild.
-        if args.all_versions:
-            paths = ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
-            for path in paths:
-                style.ok(f"deployed {style.brand(path)}")
-            envs = ygg_environments(client, workspace_dir=workspace_dir, rebuild=False)
-            payload: Any = [env.as_dict() for env in envs]
-        else:
-            paths = ensure_ygg_wheel(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
-            for path in paths:
-                style.ok(f"deployed {style.brand(path)}")
-            env = ygg_environment(client, workspace_dir=workspace_dir, rebuild=False)
-            payload = env.as_dict()
-        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
         return 0

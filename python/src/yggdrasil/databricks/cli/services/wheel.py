@@ -1,8 +1,8 @@
 """``ygg databricks wheel`` — build, upload, and browse wheels in the
 workspace's PyPI-like registry.
 
-Where ``deploy`` ships the whole ygg image (wheel + serverless
-``JobEnvironment``) in one shot, this group exposes the wheel lifecycle on
+Where ``deploy ygg`` / ``deploy environment`` ship the whole ygg image (wheel +
+serverless ``JobEnvironment``), this group exposes the wheel lifecycle on
 its own:
 
     ygg databricks wheel                     # build + upload the ygg wheel(s) to shared pypi

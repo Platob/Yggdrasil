@@ -653,24 +653,24 @@ serverless `JobEnvironment` that installs it.
 ygg databricks deploy [subcommand] [flags]
 ```
 
-Shared flags (accepted on `deploy` and most subcommands):
-
-| Flag | Purpose |
-|---|---|
-| `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`) |
-| `--rebuild` | Force a fresh build even if the version is already deployed |
-| `--all-versions` | One wheel + environment per supported Python (3.10–3.13) |
+`--workspace-dir` (PyPI-like registry root, default `/Workspace/Shared/pypi`)
+is accepted on `deploy` and every subcommand. `--rebuild` / `--all-versions`
+(force a fresh build / one wheel + environment per supported Python 3.10–3.13)
+apply to the **ygg-image** subcommands `ygg` / `wheel` / `environment`.
 
 ### Bare `deploy`
 
-Ships the **ygg image**: builds/uploads the wheel(s), then prints the
-serverless `JobEnvironment` JSON assembled off that fresh build (no double
-build).
+An **alias for [`deploy project`](#deploy-project)** — discovers the nearest
+`pyproject.toml` from the current directory and ships it (wheel closure +
+environment + a default cluster). It accepts the same flags as `deploy project`
+(`--extra`, `--mode`, `--no-cluster`, `--single-user`, `--workspace-dir`). To
+deploy a project elsewhere, pass the path to the `project` subcommand
+(`deploy project <path>`).
 
 ```bash
-ygg databricks deploy
-ygg databricks deploy --rebuild
-ygg databricks deploy --all-versions
+ygg databricks deploy                      # deploy the cwd project (auto mode)
+ygg databricks deploy --mode overwrite     # rebuild + update everything
+ygg databricks deploy --no-cluster         # env only, no cluster
 ```
 
 ### `deploy ygg`
