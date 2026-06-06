@@ -28,7 +28,26 @@ if TYPE_CHECKING:
     from .engine import TokenEngine
     from .tools import Toolbox
 
-__all__ = ["Loki"]
+__all__ = ["Loki", "ROUTES"]
+
+#: Problem-category signals for :meth:`Loki.route`. Data over code — extend the
+#: keyword lists, not the routing branches.
+ROUTES: dict[str, tuple[str, ...]] = {
+    "databricks": (
+        "databricks", "genie", "unity catalog", "warehouse", "cluster",
+        "dbfs", "delta", "spark", "serving endpoint", "notebook", "job run",
+        "dbu", "catalog.", "uc ",
+    ),
+    "sql": (
+        "select ", "insert ", "update ", " join ", "query", "sql", "schema",
+        "group by", "where ",
+    ),
+    "files": (
+        "fix ", "refactor", "edit ", "create file", "write a", "implement",
+        "modify", "rename", "add a ", "scaffold", "build a", "generate code",
+        ".py", ".ts", ".md", "patch", "the codebase",
+    ),
+}
 
 
 class Loki:
@@ -283,6 +302,54 @@ class Loki:
             "completed": completed,
             "files_changed": list(box.changed),
         }
+
+    # -- reasoning router --------------------------------------------------
+
+    def route(self, text: str) -> dict[str, Any]:
+        """Categorize a request and decide how to solve it.
+
+        Loki reasoning, optimized: rather than throwing every prompt at one
+        engine, it first *categorizes the problem* (data-driven, see
+        :data:`ROUTES`) and picks a *solution path* — answer (``reason``),
+        act on files (``act``), or ask Genie (``genie``) — and whether to
+        **isolate** the work to a specialized agent. Databricks problems are
+        handed to :class:`~yggdrasil.databricks.loki.DatabricksLoki` (the
+        "databricks on databricks" scheme: a workspace-resident brain answers
+        workspace questions) when one is reachable.
+
+        Returns ``{"category", "action", "specialist", "why"}``.
+        """
+        low = text.lower()
+        if any(s in low for s in ROUTES["databricks"]):
+            action = "genie" if "genie" in low else "reason"
+            return {"category": "databricks", "action": action,
+                    "specialist": "databricks",
+                    "why": "matched a Databricks/Unity/warehouse signal"}
+        if self.has("databricks") and any(s in low for s in ROUTES["sql"]):
+            return {"category": "databricks", "action": "reason",
+                    "specialist": "databricks", "why": "SQL with a live workspace"}
+        if any(s in low for s in ROUTES["files"]):
+            return {"category": "files", "action": "act", "specialist": None,
+                    "why": "matched a file/code-change signal"}
+        return {"category": "chat", "action": "reason", "specialist": None,
+                "why": "no specialized signal — plain reasoning"}
+
+    def specialist(self, name: str) -> "Optional[Loki]":
+        """A specialized agent to isolate a category of work, or ``None``.
+
+        ``"databricks"`` resolves the workspace-bound
+        :class:`~yggdrasil.databricks.loki.DatabricksLoki` when the SDK and a
+        session are present; otherwise falls back to ``self``.
+        """
+        if name == "databricks":
+            try:
+                from yggdrasil.databricks.loki import DatabricksLoki
+
+                agent = DatabricksLoki.current()
+            except Exception:
+                return None
+            return agent if agent.has("databricks") else None
+        return None
 
     # -- behaviors ---------------------------------------------------------
 

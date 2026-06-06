@@ -47,8 +47,13 @@ class OpenAIEngine(TokenEngine):
         )
         choice = resp.choices[0]
         usage = getattr(resp, "usage", None)
+        text = choice.message.content or ""
+        in_tok = getattr(usage, "prompt_tokens", None) if usage else None
+        out_tok = getattr(usage, "completion_tokens", None) if usage else None
+        self._record(model, input_tokens=in_tok, output_tokens=out_tok,
+                     messages=messages, system=system, text=text)
         return Completion(
-            text=choice.message.content or "",
+            text=text,
             model=getattr(resp, "model", model),
             usage=usage.model_dump() if hasattr(usage, "model_dump") else {},
             raw=resp,

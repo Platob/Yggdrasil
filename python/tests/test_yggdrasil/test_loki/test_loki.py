@@ -282,5 +282,82 @@ class TestAgentAct(unittest.TestCase):
             loki.act("anything", root=self.dir)
 
 
+class TestReasoningRouter(unittest.TestCase):
+    """Loki categorizes a request and picks a solution path / specialist."""
+
+    def test_databricks_signal_routes_to_specialist(self):
+        plan = Loki().route("how do I size a Databricks SQL warehouse?")
+        self.assertEqual(plan["category"], "databricks")
+        self.assertEqual(plan["specialist"], "databricks")
+
+    def test_genie_signal_picks_genie_action(self):
+        self.assertEqual(Loki().route("ask genie for revenue by region")["action"], "genie")
+
+    def test_file_signal_routes_to_act(self):
+        plan = Loki().route("fix the bug in calc.py and add a test")
+        self.assertEqual(plan["category"], "files")
+        self.assertEqual(plan["action"], "act")
+        self.assertIsNone(plan["specialist"])
+
+    def test_plain_request_is_chat_reason(self):
+        plan = Loki().route("what is the capital of France?")
+        self.assertEqual(plan["category"], "chat")
+        self.assertEqual(plan["action"], "reason")
+
+    def test_specialist_unknown_is_none(self):
+        self.assertIsNone(Loki().specialist("nope"))
+
+
+class TestReplCommands(unittest.TestCase):
+    """The interactive session's slash commands and budget prompt."""
+
+    def setUp(self):
+        from yggdrasil.loki.usage import METER
+
+        self.METER = METER
+        self._saved = dict(METER._rows)
+        self._limit = METER.limit
+        METER.reset()
+
+    def tearDown(self):
+        self.METER.reset()
+        self.METER._rows.update(self._saved)
+        self.METER.limit = self._limit
+
+    def test_tier_and_budget_commands(self):
+        from yggdrasil.cli import style
+        from yggdrasil.loki import cli
+
+        loki = Loki()
+        state = {"tier": None, "root": "."}
+        self.assertTrue(cli._repl_command(loki, style, state, "/tier deep"))
+        self.assertEqual(state["tier"], "deep")
+        self.assertTrue(cli._repl_command(loki, style, state, "/tier auto"))
+        self.assertIsNone(state["tier"])
+        cli._repl_command(loki, style, state, "/budget 1000")
+        self.assertEqual(self.METER.limit, 1000)
+        cli._repl_command(loki, style, state, "/budget +500")
+        self.assertEqual(self.METER.limit, 1500)
+        cli._repl_command(loki, style, state, "/budget off")
+        self.assertIsNone(self.METER.limit)
+
+    def test_budget_prompt_raises_step_on_enter(self):
+        from yggdrasil.cli import style
+        from yggdrasil.loki import cli
+
+        self.METER.set_limit(100)
+        with patch("builtins.input", return_value=""):
+            self.assertTrue(cli._budget_prompt(style))
+        self.assertEqual(self.METER.limit, 100 + self.METER.step)
+
+    def test_budget_prompt_stop_returns_false(self):
+        from yggdrasil.cli import style
+        from yggdrasil.loki import cli
+
+        self.METER.set_limit(100)
+        with patch("builtins.input", return_value="s"):
+            self.assertFalse(cli._budget_prompt(style))
+
+
 if __name__ == "__main__":
     unittest.main()

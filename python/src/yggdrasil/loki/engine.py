@@ -124,6 +124,41 @@ class TokenEngine(ABC):
             return f"{self.MODELS.get('deep', self.default_model)} (adaptive)"
         return str(self.default_model)
 
+    # -- token monitoring --------------------------------------------------
+
+    def _record(
+        self,
+        model: Optional[str],
+        *,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        messages: Optional[list[dict[str, Any]]] = None,
+        system: Optional[str] = None,
+        text: Optional[str] = None,
+    ) -> None:
+        """Record one completion's token spend into the global meter.
+
+        Uses the provider's usage numbers when present; falls back to a cheap
+        char-based estimate so KPIs still move on engines (or mocks) that
+        report none.
+        """
+        from .usage import METER, estimate_tokens
+
+        if input_tokens is None:
+            parts = [system or ""] + [
+                str(m.get("content", "")) for m in (messages or [])
+            ]
+            input_tokens = sum(estimate_tokens(p) for p in parts)
+        if output_tokens is None:
+            output_tokens = estimate_tokens(text or "")
+        METER.record(self.name, model or self.model_label, input_tokens, output_tokens)
+
+    def usage(self) -> list[Any]:
+        """This engine's per-model usage rows from the global meter."""
+        from .usage import METER
+
+        return METER.rows_for(self.name)
+
     # -- contract ----------------------------------------------------------
 
     @abstractmethod

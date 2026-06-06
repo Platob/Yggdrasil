@@ -221,12 +221,62 @@ job = loki.deploy(behavior="reason", prompt="nightly health check")
 job.run()
 ```
 
+## Interactive session
+
+On a terminal, bare `ygg loki` opens a **modern interactive session** (a
+pipe / CI / Databricks job falls back to a static `status`). Type a request
+and Loki **routes it**: it categorizes the problem and picks a solution path
+— answer (`reason`), act on files (`act`), or ask Genie — and **isolates**
+Databricks problems to the workspace-resident `DatabricksLoki` ("databricks
+on databricks") when one is reachable. Each turn streams a live token/USD
+KPI line.
+
+```text
+⟢ auto ›  how do I size a Databricks SQL warehouse?
+  ▹ databricks · matched a Databricks/Unity/warehouse signal  →  databricks-loki (isolated)
+  …answer…
+  usage  ↑16 ↓111  127 tok  $0.0006  (+67)  49,873 left
+```
+
+Slash commands: `/status` `/engines` `/usage` `/tier fast|deep|auto`
+`/root <dir>` `/budget [N|+N|off]` `/reset` `/help` `/quit`.
+
+### Token budget
+
+Every session starts with a default **token budget** (50 000 tokens). When
+you reach it, Loki stops and asks — raise by one step (25 000), set a custom
+cap, turn it off, or stop — so a runaway session never spends without bound:
+
+```text
+▲ token budget reached — 50,120 ≥ 50,000
+  raise by 25,000 [Enter] · set N · off · stop [s]:
+```
+
+## Token monitoring (`ygg loki usage`)
+
+Every engine records its spend into a process-global meter
+(`yggdrasil.loki.METER`), keyed by `(engine, model)`. `ygg loki usage` (and
+`/usage` in the session) shows the live KPIs — calls, input/output tokens,
+total, and **USD** per model plus a global roll-up — priced from
+per-model-per-engine defaults in `yggdrasil.loki.usage.PRICING` (Opus 4.8
+$5/$25 per 1M, Haiku 4.5 $1/$5, gpt-4o $2.5/$10, …; retune per workspace).
+
+```python
+from yggdrasil.loki import METER
+METER.set_limit(100_000)          # cap total tokens (None = unlimited)
+loki.reason("…")                  # engines record automatically
+METER.total().total_tokens        # global tokens; METER.total_cost → USD
+engine.usage()                    # this engine's per-model rows
+```
+
 ## CLI
 
 ```bash
-ygg loki                  # status: identity + backends + engines + behaviors
-ygg loki capabilities     # the detected backends and their signals
+ygg loki                  # interactive session on a terminal (else status)
+ygg loki status           # identity + backends + engines + behaviors
 ygg loki engines          # the reasoning engines and which are available
+ygg loki usage            # live token + USD KPIs, per model and global
+ygg loki capabilities     # the detected backends and their signals
 ygg loki behaviors        # the registered behavior catalog
 ygg loki tools            # the tools the autonomous agent acts through
 ygg loki token --probe    # the Databricks credentials Loki provides

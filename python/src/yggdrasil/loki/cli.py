@@ -1,9 +1,11 @@
 """``ygg loki`` — drive the global yggdrasil agent from the terminal.
 
 ```text
-ygg loki                 # status: identity + reachable backends + behaviors
+ygg loki                 # interactive session (modern REPL) on a terminal
+ygg loki status          # identity + reachable backends + engines + behaviors
 ygg loki capabilities    # the detected backends and why
-ygg loki behaviors       # the registered behavior catalog
+ygg loki engines         # the reasoning engines and which are available
+ygg loki usage           # live token usage + USD KPIs, per model and global
 ygg loki tools           # the tools the autonomous agent acts through
 ygg loki reason "..."    # one-shot reasoning with the best engine
 ygg loki do "..."        # act autonomously: discover + modify files
@@ -22,10 +24,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ygg loki", description="Loki — the global yggdrasil agent.")
     sub = parser.add_subparsers(dest="action")
 
-    sub.add_parser("status", help="Identity + reachable backends + engines + behaviors (default).")
+    sub.add_parser("chat", aliases=["repl"], help="Interactive session (the default on a terminal).")
+    sub.add_parser("status", help="Identity + reachable backends + engines + behaviors.")
     sub.add_parser("capabilities", help="The detected backends and their signals.")
     sub.add_parser("behaviors", help="The registered behavior catalog.")
     sub.add_parser("engines", help="The reasoning engines and which are available.")
+    sub.add_parser("usage", help="Live token usage + USD KPIs, per model and global.")
 
     reason = sub.add_parser("reason", help="Reason about a prompt with the best (or named) engine.")
     reason.add_argument("prompt", help="The prompt to reason about.")
@@ -61,12 +65,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     import os
+    import sys
 
     from yggdrasil.cli import style
 
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    action = args.action or "status"
+    action = args.action
+    if action == "repl":
+        action = "chat"
+    if action is None:
+        # No subcommand: open the interactive session on a real terminal,
+        # otherwise (pipe, CI, Databricks job) fall back to a static status.
+        interactive = (
+            sys.stdin.isatty()
+            and sys.stdout.isatty()
+            and not os.getenv("DATABRICKS_RUNTIME_VERSION")
+        )
+        action = "chat" if interactive else "status"
 
     # On the Databricks runtime (a deployed agent job) ``ygg loki`` *is* the
     # specialized DatabricksLoki — same single entry point, workspace-aware
@@ -82,6 +98,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     style.print_logo("YGGLOKI")
 
+    if action == "chat":
+        return _repl(loki, style)
+    if action == "usage":
+        return _usage_table(style)
     if action == "status":
         return _status(loki, style)
     if action == "capabilities":
@@ -139,13 +159,222 @@ def _engines(loki: Any, style: Any) -> int:
     return 0
 
 
+# -- interactive session ---------------------------------------------------
+
+def _repl(loki: Any, style: Any) -> int:
+    """A modern interactive session: route → reason/act, live token KPIs, budget."""
+    from yggdrasil.loki.usage import METER
+
+    METER.set_limit(METER.DEFAULT_LIMIT)
+    state: dict[str, Any] = {"tier": None, "root": "."}
+
+    best = loki.engine()
+    eng_line = style.brand(best.name) if best else style.bad("none — set a key / log in")
+    style.out(f"  {style.bold('interactive session')}  {style.dim('·')}  engine {eng_line}\n")
+    style.out(f"  {style.dim('budget')} {style.brand(f'{METER.limit:,}')} {style.dim('tokens')}  "
+              f"{style.dim('·  type your request, or /help · /usage · /quit')}\n\n")
+
+    while True:
+        try:
+            raw = input(_prompt(style, state))
+        except (EOFError, KeyboardInterrupt):
+            style.out("\n")
+            break
+        line = raw.strip()
+        if not line:
+            continue
+        if line in ("/quit", "/exit", "/q"):
+            break
+        if line.startswith("/"):
+            if not _repl_command(loki, style, state, line):
+                break
+            continue
+        # Pre-turn budget gate: at/over the cap, offer to raise before spending.
+        if METER.over_budget() and not _budget_prompt(style):
+            continue
+        _repl_turn(loki, style, state, line)
+
+    style.out("\n")
+    _usage_line(style, prefix="session")
+    style.ok("session ended")
+    return 0
+
+
+def _prompt(style: Any, state: dict) -> str:
+    tag = state["tier"] or "auto"
+    return f"  {style.brand('⟢')} {style.dim(tag)} {style.bold('›')} "
+
+
+def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
+    from yggdrasil.loki.usage import METER
+
+    before = METER.total_tokens
+    plan = loki.route(line)
+
+    agent, tail = loki, ""
+    if plan["specialist"]:
+        spec = loki.specialist(plan["specialist"])
+        if spec is not None:
+            agent, tail = spec, f"  →  {style.brand(spec.name)} {style.dim('(isolated)')}"
+    style.out(f"  {style.dim('▹ ' + plan['category'] + ' · ' + plan['why'])}{tail}\n")
+
+    try:
+        if plan["action"] == "act":
+            res = agent.act(line, root=state["root"], tier=state["tier"],
+                            on_step=lambda r: _act_step(style, r))
+            reply = res["answer"]
+            if res.get("files_changed"):
+                style.out(f"  {style.good('✎')} {', '.join(res['files_changed'])}\n")
+        elif plan["action"] == "genie":
+            res = agent.run("genie", question=line)
+            reply = res.get("text", "") if isinstance(res, dict) else str(res)
+        else:
+            with style.Spinner("thinking…"):
+                reply = agent.reason(line, tier=state["tier"])
+    except Exception as exc:  # never let one turn kill the session
+        style.fail(exc.args[0] if exc.args else str(exc))
+        return
+    style.out(f"\n  {reply}\n\n")
+    _usage_line(style, delta=METER.total_tokens - before)
+
+
+def _act_step(style: Any, rec: dict) -> None:
+    if rec.get("done"):
+        return
+    call = f"{rec['tool']}({', '.join(f'{k}={_short(v)}' for k, v in rec['args'].items())})"
+    style.out(f"  {style.dim(str(rec['n']).rjust(2))} {style.brand(call)}\n")
+
+
+def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
+    """Handle a /slash command. Returns False only to end the session."""
+    from yggdrasil.loki.usage import METER
+
+    parts = line[1:].split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd in ("help", "h", "?"):
+        style.out(
+            f"  {style.bold('commands')}\n"
+            f"    {style.brand('/status')}   identity + backends + engines + behaviors\n"
+            f"    {style.brand('/engines')}  reasoning engines and adaptive models\n"
+            f"    {style.brand('/usage')}    token KPIs (per model + global, USD)\n"
+            f"    {style.brand('/tier')}     fast | deep | auto  (model tier for this session)\n"
+            f"    {style.brand('/root')}     set the working tree for file tasks\n"
+            f"    {style.brand('/budget')}   show, set N, +N step, or off\n"
+            f"    {style.brand('/reset')}    zero the usage meter\n"
+            f"    {style.brand('/quit')}     leave\n"
+            f"  {style.dim('plain text is routed automatically — reason, act on files, or a Databricks specialist')}\n"
+        )
+    elif cmd == "status":
+        _status(loki, style)
+    elif cmd == "engines":
+        _engines(loki, style)
+    elif cmd == "usage":
+        _usage_table(style)
+    elif cmd == "tier":
+        state["tier"] = None if arg in ("", "auto") else arg
+        style.ok(f"tier → {state['tier'] or 'auto (adaptive)'}")
+    elif cmd == "root":
+        state["root"] = arg or "."
+        style.ok(f"root → {state['root']}")
+    elif cmd == "budget":
+        if arg in ("off", "none"):
+            METER.set_limit(None); style.ok("budget off (unlimited)")
+        elif arg.startswith("+") and arg[1:].isdigit():
+            METER.raise_limit(int(arg[1:])); style.ok(f"budget → {METER.limit:,}")
+        elif arg.isdigit():
+            METER.set_limit(int(arg)); style.ok(f"budget → {METER.limit:,}")
+        else:
+            lim = "off" if METER.limit is None else f"{METER.limit:,}"
+            style.out(f"  {style.dim('budget')} {style.brand(lim)}  "
+                      f"{style.dim('used')} {METER.total_tokens:,}\n")
+    elif cmd == "reset":
+        METER.reset(); style.ok("usage meter reset")
+    else:
+        style.warn(f"unknown command /{cmd} — try /help")
+    return True
+
+
+def _budget_prompt(style: Any) -> bool:
+    """At/over budget: ask to raise step-by-step, set a custom cap, or stop."""
+    from yggdrasil.loki.usage import METER
+
+    style.warn(f"token budget reached — {METER.total_tokens:,} ≥ {METER.limit:,}")
+    try:
+        ans = input(
+            f"  raise by {METER.step:,} [Enter] · set N · off · stop [s]: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if ans in ("s", "stop", "n", "no"):
+        return False
+    if ans in ("off", "none"):
+        METER.set_limit(None); style.ok("budget off (unlimited)"); return True
+    if ans.isdigit():
+        METER.set_limit(int(ans)); style.ok(f"budget → {METER.limit:,}"); return True
+    METER.raise_limit(); style.ok(f"budget → {METER.limit:,}"); return True
+
+
+def _usage_line(style: Any, *, delta: int | None = None, prefix: str = "usage") -> None:
+    from yggdrasil.loki.usage import METER
+
+    t = METER.total()
+    bits = [
+        f"{style.dim('↑')}{t.input_tokens:,} {style.dim('↓')}{t.output_tokens:,}",
+        f"{style.bold(f'{t.total_tokens:,}')} {style.dim('tok')}",
+        style.good(f"${METER.total_cost:.4f}"),
+    ]
+    if delta:
+        bits.append(style.dim(f"(+{delta:,})"))
+    if METER.limit is not None:
+        rem = METER.remaining() or 0
+        bits.append((style.good if rem > 0 else style.bad)(f"{rem:,} left"))
+    style.out(f"  {style.dim(prefix)}  " + "  ".join(bits) + "\n")
+
+
+def _usage_table(style: Any) -> int:
+    from yggdrasil.loki.usage import METER
+
+    rows = METER.rows()
+    style.out(f"\n  {style.bold('token usage')}  {style.dim('· live per model · in/out · USD')}\n")
+    head = (f"  {'engine · model'.ljust(32)}{'calls'.rjust(6)}{'in'.rjust(9)}"
+            f"{'out'.rjust(9)}{'tokens'.rjust(10)}{'usd'.rjust(11)}")
+    style.out(style.dim(head) + "\n")
+    if not rows:
+        style.out(f"  {style.dim('(no completions yet — reason or act to populate)')}\n")
+    for r in rows:
+        name = f"{r.engine} · {r.model}"
+        style.out(
+            f"  {style.brand(name.ljust(32))}{str(r.calls).rjust(6)}"
+            f"{f'{r.input_tokens:,}'.rjust(9)}{f'{r.output_tokens:,}'.rjust(9)}"
+            f"{f'{r.total_tokens:,}'.rjust(10)}{f'${r.cost_usd:.4f}'.rjust(11)}\n"
+        )
+    t = METER.total()
+    style.out("  " + style.dim("─" * 77) + "\n")
+    style.out(
+        f"  {style.bold('global'.ljust(32))}{str(t.calls).rjust(6)}"
+        f"{f'{t.input_tokens:,}'.rjust(9)}{f'{t.output_tokens:,}'.rjust(9)}"
+        f"{style.bold(f'{t.total_tokens:,}'.rjust(10))}"
+        f"{style.good(f'${METER.total_cost:.4f}'.rjust(11))}\n"
+    )
+    if METER.limit is not None:
+        rem = METER.remaining() or 0
+        g = style.good if rem > 0 else style.bad
+        style.out(f"  {style.dim('budget')} {style.brand(f'{METER.limit:,}')}  "
+                  f"{g(f'{rem:,} left')}\n")
+    style.out(f"  {style.dim('pricing USD/1M tok — defaults in yggdrasil.loki.usage.PRICING')}\n")
+    return 0
+
+
 def _reason(loki: Any, style: Any, args: Any) -> int:
     try:
         out = loki.reason(args.prompt, system=args.system, engine=args.engine, tier=args.tier)
     except (KeyError, RuntimeError) as exc:
         style.fail(exc.args[0] if exc.args else str(exc))
         return 1
-    style.out(f"\n{out}\n")
+    style.out(f"\n{out}\n\n")
+    _usage_line(style)
     return 0
 
 
@@ -192,6 +421,8 @@ def _do(loki: Any, style: Any, args: Any) -> int:
         style.ok(result["answer"] or "done")
     else:
         style.warn(result["answer"] or "did not finish")
+    style.out("\n")
+    _usage_line(style)
     return 0 if result["completed"] else 1
 
 

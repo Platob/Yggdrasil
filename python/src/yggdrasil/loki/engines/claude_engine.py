@@ -125,10 +125,13 @@ class ClaudeEngine(TokenEngine):
         resp = client.messages.create(**kwargs)
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
         usage = getattr(resp, "usage", None)
+        in_tok = getattr(usage, "input_tokens", None) if usage else None
+        out_tok = getattr(usage, "output_tokens", None) if usage else None
+        self._record(model, input_tokens=in_tok, output_tokens=out_tok,
+                     messages=messages, system=system, text=text)
         return Completion(
             text=text,
             model=getattr(resp, "model", model),
-            usage={"input_tokens": getattr(usage, "input_tokens", None),
-                   "output_tokens": getattr(usage, "output_tokens", None)} if usage else {},
+            usage={"input_tokens": in_tok, "output_tokens": out_tok} if usage else {},
             raw=resp,
         )

@@ -74,8 +74,16 @@ class DatabricksServingEngine(TokenEngine):
                 model=self.endpoint, messages=msgs, max_tokens=max_tokens, **options,
             )
             choice = resp.choices[0]
+            text = choice.message.content or ""
+            usage = getattr(resp, "usage", None)
+            self._record(
+                self.endpoint,
+                input_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+                output_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+                messages=messages, system=system, text=text,
+            )
             return Completion(
-                text=choice.message.content or "",
+                text=text,
                 model=getattr(resp, "model", self.endpoint),
                 raw=resp,
             )
@@ -92,4 +100,5 @@ class DatabricksServingEngine(TokenEngine):
         )
         choices = getattr(resp, "choices", None) or []
         text = choices[0].message.content if choices else ""
+        self._record(self.endpoint, messages=messages, system=system, text=text or "")
         return Completion(text=text or "", model=self.endpoint, raw=resp)
