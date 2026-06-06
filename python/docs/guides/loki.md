@@ -129,8 +129,8 @@ agent and whatever model backs it. Three are built in:
 
 | Engine | Backend | Credentials |
 |---|---|---|
-| `ClaudeEngine` | Anthropic Messages API (`claude-opus-4-8`) | `ANTHROPIC_API_KEY`, **or** a Claude Code OAuth login (no key) |
-| `OpenAIEngine` | OpenAI Chat Completions | `OPENAI_API_KEY` |
+| `ClaudeEngine` | Anthropic Messages API (Haiku ↔ Opus, adaptive) | `ANTHROPIC_API_KEY`, **or** a Claude Code OAuth login (no key) |
+| `OpenAIEngine` | OpenAI Chat Completions (mini ↔ 4o, adaptive) | `OPENAI_API_KEY` |
 | `DatabricksServingEngine` | a Databricks serving endpoint | the Databricks session (no extra key) |
 
 ### Reasoning with Claude **without an API key**
@@ -161,6 +161,39 @@ loki.reason("summarize today's failed jobs", system="be terse")
 `Loki.ENGINE_PREFERENCE` picks the engine when none is named (`claude` →
 `openai` → `databricks` for the global agent). Implement `TokenEngine` to
 add another backend.
+
+### Adaptive model selection (the default)
+
+Each engine declares a small **tier map** — a `fast` model and a `deep`
+(more capable) one — and **by default the model is chosen adaptively**: a
+short, light request resolves to the fast model; a long or reasoning-heavy
+one (sized on the message content, plus signal words like *refactor*,
+*debug*, *design*, *optimize*) resolves to the deep model. This keeps cheap
+turns cheap without ever capping the hard ones.
+
+| Engine | `fast` | `deep` |
+|---|---|---|
+| `ClaudeEngine` | `claude-haiku-4-5` | `claude-opus-4-8` |
+| `OpenAIEngine` | `gpt-4o-mini` | `gpt-4o` |
+| `DatabricksServingEngine` | (pinned to one workspace endpoint — no fast/deep pair) | — |
+
+Adaptivity is only the **default**, never an override of an explicit
+decision:
+
+```python
+loki.reason("classify this ticket")                 # short → fast (Haiku)
+loki.reason("refactor the planner for correctness")  # signalled → deep (Opus)
+loki.reason("anything", tier="deep")                 # force the deep tier
+loki.engine("claude").model = "claude-sonnet-4-6"    # a hard pin always wins
+loki.act("tidy utils.py", tier="fast")               # pin the whole agent loop
+```
+
+In the agent loop, leaving `tier` unset lets each turn adapt on its own —
+cheap scouting turns early, the capable model once the transcript (and the
+reasoning) grows. `ygg loki reason` and `ygg loki do` take `--tier fast|deep`;
+`ygg loki engines` shows each engine's adaptive ceiling (e.g.
+`claude-opus-4-8 (adaptive)`). Override `TokenEngine.choose_tier` for a
+smarter policy.
 
 ## DatabricksLoki — the specialized agent
 
@@ -197,7 +230,8 @@ ygg loki engines          # the reasoning engines and which are available
 ygg loki behaviors        # the registered behavior catalog
 ygg loki tools            # the tools the autonomous agent acts through
 ygg loki token --probe    # the Databricks credentials Loki provides
-ygg loki reason "summarize failed jobs" --system "be terse"
+ygg loki reason "summarize failed jobs" --system "be terse"   # adaptive model
+ygg loki reason "prove this refactor is safe" --tier deep      # force the deep tier
 ygg loki do "fix the failing test in tests/test_io.py"
 ygg loki run genie --kwarg question='"top customers"' --json
 ```

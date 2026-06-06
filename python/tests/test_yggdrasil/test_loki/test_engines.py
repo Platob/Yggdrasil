@@ -143,6 +143,73 @@ class TestClaudeEngine(unittest.TestCase):
         self.assertEqual(system[1]["text"], "be terse")
 
 
+class TestAdaptiveModelSelection(unittest.TestCase):
+    """The default model adapts to the request; pins/tiers override it."""
+
+    def test_choose_tier_short_is_fast_long_is_deep(self):
+        eng = ClaudeEngine(api_key="k")
+        self.assertEqual(eng.choose_tier([{"role": "user", "content": "hi"}]), "fast")
+        big = [{"role": "user", "content": "x" * 5000}]
+        self.assertEqual(eng.choose_tier(big), "deep")
+
+    def test_choose_tier_reasoning_signal_forces_deep(self):
+        eng = ClaudeEngine(api_key="k")
+        msgs = [{"role": "user", "content": "refactor the parser"}]
+        self.assertEqual(eng.choose_tier(msgs), "deep")
+
+    def test_resolve_model_pin_wins(self):
+        eng = ClaudeEngine(api_key="k", model="claude-sonnet-4-6")
+        self.assertEqual(
+            eng.resolve_model(messages=[{"role": "user", "content": "hi"}]),
+            "claude-sonnet-4-6",
+        )
+
+    def test_resolve_model_forced_tier(self):
+        eng = ClaudeEngine(api_key="k")
+        self.assertEqual(eng.resolve_model(tier="deep"), "claude-opus-4-8")
+        self.assertEqual(eng.resolve_model(tier="fast"), "claude-haiku-4-5")
+
+    def test_resolve_model_adaptive_default(self):
+        eng = ClaudeEngine(api_key="k")
+        self.assertEqual(
+            eng.resolve_model(messages=[{"role": "user", "content": "hello"}]),
+            "claude-haiku-4-5",  # short → fast
+        )
+        self.assertEqual(
+            eng.resolve_model(messages=[{"role": "user", "content": "x" * 4000}]),
+            "claude-opus-4-8",   # long → deep
+        )
+
+    def test_model_label_reports_adaptive_ceiling(self):
+        self.assertEqual(ClaudeEngine(api_key="k").model_label, "claude-opus-4-8 (adaptive)")
+        self.assertEqual(ClaudeEngine(api_key="k", model="m").model_label, "m")
+
+    def test_claude_complete_uses_adaptive_model(self):
+        fake, client = _fake_anthropic()
+        with patch.dict(sys.modules, {"anthropic": fake}):
+            ClaudeEngine(api_key="k").generate("hi")              # short → fast
+        self.assertEqual(client.messages.create.call_args.kwargs["model"], "claude-haiku-4-5")
+
+    def test_claude_complete_forced_tier_overrides(self):
+        fake, client = _fake_anthropic()
+        with patch.dict(sys.modules, {"anthropic": fake}):
+            ClaudeEngine(api_key="k").generate("hi", tier="deep")  # short but forced
+        self.assertEqual(client.messages.create.call_args.kwargs["model"], "claude-opus-4-8")
+
+    def test_openai_complete_uses_adaptive_model(self):
+        fake_openai = types.ModuleType("openai")
+        client = MagicMock()
+        msg = MagicMock(); msg.content = "ok"
+        client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=msg)], model="x", usage=None,
+        )
+        fake_openai.OpenAI = MagicMock(return_value=client)
+        with patch.dict(sys.modules, {"openai": fake_openai}):
+            OpenAIEngine(api_key="sk-x").generate("design a distributed scheduler")
+        # "design" is a reasoning signal → deep tier.
+        self.assertEqual(client.chat.completions.create.call_args.kwargs["model"], "gpt-4o")
+
+
 class TestDatabricksServingEngine(unittest.TestCase):
     def test_defaults_to_the_lowest_endpoint(self):
         # The smallest / cheapest broadly-available Foundation Model endpoint —

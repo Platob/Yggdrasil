@@ -34,6 +34,9 @@ class DatabricksServingEngine(TokenEngine):
     ) -> None:
         # The endpoint name *is* the model selector here.
         super().__init__(model=model or endpoint or DEFAULT_ENDPOINT)
+        # The serving endpoint *is* the model selector and is workspace-specific
+        # (no assumed fast/deep pair), so this engine pins to one endpoint rather
+        # than adapting; ``tier`` is accepted for contract parity and ignored.
         self.endpoint = endpoint or model or DEFAULT_ENDPOINT
         self._client = client
 
@@ -57,6 +60,7 @@ class DatabricksServingEngine(TokenEngine):
         *,
         system: Optional[str] = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        tier: Optional[str] = None,
         **options: Any,
     ) -> Completion:
         msgs = ([{"role": "system", "content": system}] if system else []) + list(messages)

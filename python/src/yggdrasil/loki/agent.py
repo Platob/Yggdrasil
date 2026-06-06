@@ -161,9 +161,14 @@ class Loki:
         *,
         system: "Optional[str]" = None,
         engine: "Optional[str]" = None,
+        tier: "Optional[str]" = None,
         **options: Any,
     ) -> str:
-        """Reason about *prompt* with the best (or named) engine → reply text."""
+        """Reason about *prompt* with the best (or named) engine → reply text.
+
+        ``tier`` (``"fast"`` / ``"deep"``) forces the model tier; the default
+        (``None``) lets the engine pick adaptively from the prompt.
+        """
         eng = self.engine(engine)
         if eng is None or not eng.available():
             raise RuntimeError(
@@ -171,7 +176,7 @@ class Loki:
                 "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a "
                 "Databricks session"
             )
-        return eng.generate(prompt, system=system, **options)
+        return eng.generate(prompt, system=system, tier=tier, **options)
 
     # -- autonomous action loop -------------------------------------------
 
@@ -181,6 +186,7 @@ class Loki:
         *,
         root: str = ".",
         engine: "Optional[str]" = None,
+        tier: "Optional[str]" = None,
         max_steps: int = 12,
         read_only: bool = False,
         allow_shell: bool = False,
@@ -195,6 +201,10 @@ class Loki:
         and Loki runs it and feeds the observation back, until the engine
         declares it's ``done`` or *max_steps* is hit. The tools are confined
         to *root* (the working tree the agent was pointed at).
+
+        ``tier`` pins the model tier for every turn; left ``None`` the engine
+        adapts per turn — cheap early scouting turns, the capable model once
+        the transcript (and the reasoning) grows.
 
         Returns a transcript: the resolved ``engine``, every ``step`` (its
         ``thought``/``tool``/``args``/``observation``), the final ``answer``,
@@ -231,7 +241,7 @@ class Loki:
         answer, completed = "", False
 
         for n in range(1, max_steps + 1):
-            reply = eng.complete(messages, system=system, max_tokens=4000).text
+            reply = eng.complete(messages, system=system, max_tokens=4000, tier=tier).text
             decision = _parse_decision(reply)
             if decision is None:
                 # Nudge the model back onto the protocol rather than aborting.
@@ -307,7 +317,7 @@ class Loki:
             "backends": [b.to_dict() for b in self.backends(refresh=refresh)],
             "token": self.token_info(),
             "engines": [
-                {"name": e.name, "model": e.model, "available": e.available()}
+                {"name": e.name, "model": e.model_label, "available": e.available()}
                 for e in self.engines()
             ],
             "behaviors": [b.to_dict() for b in self.behaviors()],

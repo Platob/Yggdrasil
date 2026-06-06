@@ -31,11 +31,13 @@ def _build_parser() -> argparse.ArgumentParser:
     reason.add_argument("prompt", help="The prompt to reason about.")
     reason.add_argument("--system", default=None, help="Optional system instruction.")
     reason.add_argument("--engine", default=None, help="Force an engine (claude/openai/databricks).")
+    reason.add_argument("--tier", default=None, choices=["fast", "deep"], help="Force a model tier (default: adaptive).")
 
     do = sub.add_parser("do", help="Act autonomously: discover + modify files to do a task.")
     do.add_argument("task", help="What Loki should accomplish.")
     do.add_argument("--root", default=".", help="Working tree the agent is confined to (default '.').")
     do.add_argument("--engine", default=None, help="Force an engine (claude/openai/databricks).")
+    do.add_argument("--tier", default=None, choices=["fast", "deep"], help="Force a model tier (default: adaptive).")
     do.add_argument("--max-steps", type=int, default=12, help="Tool-call budget (default 12).")
     do.add_argument("--read-only", action="store_true", help="Discovery only — no file writes.")
     do.add_argument("--allow-shell", action="store_true", help="Also give the agent a shell tool.")
@@ -115,7 +117,7 @@ def _status(loki: Any, style: Any) -> int:
     for eng in loki.engines():
         glyph = style.green("●") if eng.available() else style.dim("○")
         star = style.dim(" (default)") if best is not None and eng.name == best.name else ""
-        style.out(f"    {glyph} {eng.name.ljust(11)} {style.dim(str(eng.model))}{star}\n")
+        style.out(f"    {glyph} {eng.name.ljust(11)} {style.dim(str(eng.model_label))}{star}\n")
     style.out(f"\n  {style.bold('behaviors')}\n")
     for beh in loki.behaviors():
         ok = beh.available(loki)
@@ -131,7 +133,7 @@ def _engines(loki: Any, style: Any) -> int:
     for eng in loki.engines():
         glyph = style.green("●") if eng.available() else style.dim("○")
         star = style.dim(" (default)") if best is not None and eng.name == best.name else ""
-        style.out(f"  {glyph} {style.bold(eng.name)}  {style.dim(str(eng.model))}{star}\n")
+        style.out(f"  {glyph} {style.bold(eng.name)}  {style.dim(str(eng.model_label))}{star}\n")
     if best is None:
         style.warn("no engine available — log into Claude Code, or set ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a Databricks session")
     return 0
@@ -139,7 +141,7 @@ def _engines(loki: Any, style: Any) -> int:
 
 def _reason(loki: Any, style: Any, args: Any) -> int:
     try:
-        out = loki.reason(args.prompt, system=args.system, engine=args.engine)
+        out = loki.reason(args.prompt, system=args.system, engine=args.engine, tier=args.tier)
     except (KeyError, RuntimeError) as exc:
         style.fail(exc.args[0] if exc.args else str(exc))
         return 1
@@ -166,7 +168,7 @@ def _do(loki: Any, style: Any, args: Any) -> int:
 
     try:
         result = loki.act(
-            args.task, root=args.root, engine=args.engine, max_steps=args.max_steps,
+            args.task, root=args.root, engine=args.engine, tier=args.tier, max_steps=args.max_steps,
             read_only=args.read_only, allow_shell=args.allow_shell,
             on_step=None if args.json else on_step,
         )

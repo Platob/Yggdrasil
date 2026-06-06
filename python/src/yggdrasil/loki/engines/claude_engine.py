@@ -51,15 +51,22 @@ class ClaudeEngine(TokenEngine):
     name = "claude"
     #: The most capable current Claude model (see the claude-api reference).
     default_model: ClassVar[str] = "claude-opus-4-8"
+    #: Adaptive tiers, fast → capable: Haiku for light turns, Opus for the
+    #: hard ones (Sonnet sits between if a caller pins ``model=``).
+    MODELS: ClassVar[dict[str, str]] = {
+        "fast": "claude-haiku-4-5",
+        "deep": "claude-opus-4-8",
+    }
 
     def __init__(
         self,
         *,
         model: Optional[str] = None,
+        tier: Optional[str] = None,
         api_key: Optional[str] = None,
         auth_token: Optional[str] = None,
     ) -> None:
-        super().__init__(model=model)
+        super().__init__(model=model, tier=tier)
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         # OAuth / subscription token: explicit arg → env → Claude Code creds file.
         self.auth_token = (
@@ -83,13 +90,17 @@ class ClaudeEngine(TokenEngine):
         *,
         system: Optional[str] = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        tier: Optional[str] = None,
         **options: Any,
     ) -> Completion:
         import anthropic
 
+        # Adaptive default: pick fast/deep from the request unless pinned.
+        model = self.resolve_model(messages=messages, system=system, tier=tier)
+
         # Anthropic keeps the system prompt out of the message list.
         kwargs: dict[str, Any] = {
-            "model": self.model,
+            "model": model,
             "max_tokens": max_tokens,
             "messages": list(messages),
         }
@@ -116,7 +127,7 @@ class ClaudeEngine(TokenEngine):
         usage = getattr(resp, "usage", None)
         return Completion(
             text=text,
-            model=getattr(resp, "model", self.model),
+            model=getattr(resp, "model", model),
             usage={"input_tokens": getattr(usage, "input_tokens", None),
                    "output_tokens": getattr(usage, "output_tokens", None)} if usage else {},
             raw=resp,
