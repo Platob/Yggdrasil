@@ -58,16 +58,18 @@ class TestDatabricksBehaviors(_Base):
         self.assertEqual((out["space_id"], out["text"]), ("s1", "hi"))
         client.genie.spaces.assert_called_once()
 
-    def test_sql_executes_and_returns_rows(self):
+    def test_sql_executes_and_returns_tabular_result(self):
         client = MagicMock()
         result = MagicMock(); result.statement_id = "st1"
-        result.to_polars.return_value = MagicMock(height=3)
+        result.__len__ = lambda self: 3      # the statement result is a Tabular
         client.sql.execute.return_value = result
         loki = self._loki_with_client(client)
         out = loki.run("databricks-sql", query="select 1")
         client.sql.execute.assert_called_once_with("select 1")
         self.assertEqual(out["statement_id"], "st1")
         self.assertEqual(out["row_count"], 3)
+        # The raw Tabular result is returned (not pre-serialized).
+        self.assertIs(out["rows"], result)
 
     def test_catalogs_list_and_schemas(self):
         client = MagicMock()

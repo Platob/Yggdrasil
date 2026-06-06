@@ -560,6 +560,24 @@ class Loki:
             return made("guide", "guide",
                         why="how-to: the optimized yggdrasil implementation path")
 
+        # With a live Databricks session, a precise NL request ("list catalogs",
+        # "tables in cat.sch", "describe cat.sch.tbl", "who am i") dispatches the
+        # specialized databricks-* skill directly rather than just reasoning.
+        if self.has("databricks") and not re.search(r"https?://", text):
+            try:
+                from yggdrasil.databricks.loki.router import route as _dbx_route
+
+                hit = _dbx_route(text)
+            except Exception:
+                hit = None
+            if hit is not None:
+                skill, kw = hit
+                p = made("databricks", "skill", specialist="databricks",
+                         why=f"databricks request → {skill}")
+                p.skill = skill
+                p.skill_kwargs = {k: v for k, v in kw.items() if v is not None}
+                return p
+
         url_match = re.search(r"https?://\S+", text)
         if url_match or any(s in low for s in ROUTES["web"]):
             url = url_match.group(0).rstrip(").,") if url_match else None

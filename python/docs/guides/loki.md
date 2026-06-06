@@ -84,7 +84,7 @@ Loki knows the project it lives in. The **`guide`** skill is its
 *do-it-the-yggdrasil-way* adviser: for a task it matches a curated set of
 recipes (`yggdrasil.loki.guides.GUIDES`) — naming the right abstraction (the io
 handlers, `HTTPSession`, `Field`/`DataType` casting, the `dbc` accessors,
-`dataproto`, …), the idiomatic snippet, and the hand-rolled anti-pattern to
+`Tabular.display`, …), the idiomatic snippet, and the hand-rolled anti-pattern to
 avoid — and, with `plan=True`, has the engine synthesize a concrete plan
 **grounded only in those features**.
 
@@ -515,9 +515,8 @@ action `tabular`) instead of a plain page fetch — the `tabular` behavior:
 3. **proposes next steps** — reuse the cache, store elsewhere
    (Parquet / Arrow / CSV / Delta), or load it into Databricks.
 
-The frame preview it returns is the **token-efficient `dataproto` encoding**
-(see *Sharing data with a model* below), so the sample handed to the LLM is
-compact.
+The frame preview it returns is **`Tabular.display()`** (see *Showing data*
+below) — an aligned sample of the rows, no hand-rolled serialization.
 
 ```text
 ⟢ get EUR/USD exchange rates over the last 2 weeks from https://api.frankfurter.dev/…
@@ -536,36 +535,31 @@ res = loki.run("tabular", url="https://…/rates.json")   # fetch → frame → 
 loki.run("tabular", cache=res["cached_to"], store="prices.parquet")   # reuse + store
 ```
 
-## Sharing data with a model (`yggdrasil.loki.dataproto`)
+## Showing data — `Tabular.display()`
 
-Putting a table in front of an LLM is a token-budget problem: the model reads
-text, and verbose encodings spend most tokens on punctuation. `dataproto` picks
-the **most compact legible encoding — CSV with a one-line schema header** — and
-keeps the binary channel separate. Measured on a 100-row × 5-col frame:
-
-| format | tokens (vs CSV) | role |
-|---|---|---|
-| **csv** | **1.00×** | into the model's context |
-| tsv | 1.00× | — |
-| markdown | 1.28× | (avoided — punctuation tax) |
-| Arrow IPC (zstd, base64) | 1.40× | binary wire only, *not* a prompt |
-| json records | 2.01× | (avoided) |
-
-So tabular previews/observations go to the model via `dataproto.encode(df)`
-(schema header + CSV, truncated with a note), while the **compressed Arrow IPC**
-channel (`dataproto.to_ipc` / `from_ipc`) carries data between tools, agents,
-and the cache where no model reads it — smallest on the wire, but token-hostile
-in a prompt. `dataproto.compare(df)` reports the bytes/tokens per format (plug a
-real tokenizer) so the choice stays evidence-based.
+Every row set in yggdrasil — a Databricks statement result, an `IO` leaf, a
+Genie answer — **is a `Tabular`**, so there's nothing to serialize by hand.
+`Tabular.display(n)` renders an aligned first-`n`-rows preview (header + values,
+padded, long cells truncated), reading only enough Arrow batches to fill `n`
+rows before stopping — cheap even on a large source:
 
 ```python
-from yggdrasil.loki import dataproto
-
-dataproto.encode(df)                 # "# 150 rows × 3 cols | date:str, …\ndate,sym,…"
-dataproto.best_text_format(df)       # "csv"
-ipc = dataproto.to_ipc(df)           # compressed Arrow IPC bytes (inter-agent)
-dataproto.from_ipc(ipc)              # → frame, lossless round-trip
+print(dbc.sql.execute("SELECT * FROM samples.nyctaxi.trips").display())
+print(IO.from_("data.parquet").display(5))
 ```
+
+```text
+tpep_pickup_datetime       trip_distance  fare_amount  pickup_zip
+-------------------------  -------------  -----------  ----------
+2016-02-14 16:52:13+00:00  4.94           19.0         10282
+2016-02-04 18:44:19+00:00  0.28           3.5          10110
+… (first 10 rows)
+```
+
+For other representations, ask the same object: `to_pylist()` (records, e.g. for
+`--json`), `to_polars()`/`to_arrow()` (frame / Arrow), and `from_`/`select`/
+`filter`/`cast` to wrap and transform first. The Loki skills hand back the raw
+`Tabular` (not a pre-baked string), and the CLI shows it with `display()`.
 
 ## Auto-installing optional deps (`YGG_LOKI_AUTO_INSTALL`)
 

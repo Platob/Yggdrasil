@@ -250,8 +250,6 @@ class TabularSkill(LokiSkill):
     ) -> dict[str, Any]:
         from yggdrasil.io.holder import IO
 
-        from . import dataproto
-
         if cache:                       # reuse a previously cached frame
             df, source = IO.from_(str(cache)).to_polars(), cache
         elif url:                       # http → session; local/s3/dbfs → io handlers
@@ -287,7 +285,7 @@ class TabularSkill(LokiSkill):
             "source": source,
             "rows": df.height,
             "columns": list(df.columns),
-            "preview": dataproto.encode(df),   # token-efficient view for the LLM
+            "preview": IO.from_(str(cached_to)).display(),  # aligned rows, via Tabular
             "cached_to": str(cached_to),
             "stored": stored,
             "next_steps": steps,
@@ -329,8 +327,6 @@ class TransformSkill(LokiSkill):
         from yggdrasil.data import DataType, Field
         from yggdrasil.io.holder import IO
 
-        from . import dataproto
-
         if cache:
             df, source = IO.from_(str(cache)).to_polars(), cache
         elif url:                       # http → session; local/s3/dbfs → io handlers
@@ -367,7 +363,7 @@ class TransformSkill(LokiSkill):
             "rows": df.height,
             "columns": list(df.columns),
             "schema": {c: str(t) for c, t in zip(df.columns, df.dtypes)},
-            "preview": dataproto.encode(df),   # token-efficient view for the LLM
+            "preview": IO.from_(str(cached_to)).display(),  # aligned rows, via Tabular
             "cached_to": str(cached_to),
             "next_steps": [
                 f"reuse:  loki.run('tabular', cache={str(cached_to)!r})",
@@ -395,7 +391,8 @@ class PythonProjectSkill(LokiSkill):
         "Reach for its abstractions before stdlib or third-party equivalents: "
         "IO.from_(path) for tabular IO (CSV/JSON/Parquet/Arrow/XLSX/Delta), "
         "HTTPSession for HTTP, DataType/Field for casting, dbc.<service> for "
-        "Databricks, dataproto for model-facing data. Return runnable code only — "
+        "Databricks, Tabular.display()/to_pylist for model-facing data. Return "
+        "runnable code only — "
         "no prose, no markdown fences."
     )
 

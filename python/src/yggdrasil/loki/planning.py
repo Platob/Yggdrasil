@@ -125,9 +125,11 @@ class AgentTask:
 class AgentPlan(AgentTask):
     """An :class:`AgentTask` plus how to execute it (mapping-compatible)."""
 
-    action: str = "reason"            #: reason | act | web | tabular | genie
+    action: str = "reason"            #: reason | act | web | tabular | genie | skill
     specialist: Optional[str] = None  #: a specialized agent to isolate to
     url: Optional[str] = None
+    skill: Optional[str] = None       #: a specific skill to dispatch (action="skill")
+    skill_kwargs: dict = field(default_factory=dict)  #: kwargs for that skill
 
     # -- mapping compatibility (drop-in for the old routing dict) ----------
     def __getitem__(self, key: str) -> Any:

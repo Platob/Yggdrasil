@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from yggdrasil.loki.skill import register
 
-from ..loki.base import DatabricksServiceSkill, tabular
+from ..loki.base import DatabricksServiceSkill
 
 if TYPE_CHECKING:
     from yggdrasil.loki import Loki
@@ -36,7 +36,11 @@ class DatabricksSQLSkill(DatabricksServiceSkill):
         result = self._client(agent).sql.execute(query)
         out: dict[str, Any] = {"query": query, "statement_id": getattr(result, "statement_id", None)}
         if rows:
-            frame = tabular(result)
-            out["rows"] = frame
-            out["row_count"] = getattr(frame, "height", None)
+            # The statement result *is* a Tabular — keep it (display()/to_pylist
+            # on demand), don't pre-serialize.
+            out["rows"] = result
+            try:
+                out["row_count"] = len(result)
+            except Exception:
+                out["row_count"] = None
         return out

@@ -4,7 +4,7 @@ Loki knows the project it lives in. This is its *do-it-the-yggdrasil-way*
 adviser: a curated map of recipes that, for a given task, names the right
 abstraction to reach for (the io handlers, ``HTTPSession``, Arrow, ``Field`` /
 ``DataType`` casting, execution plans, the Databricks ``dbc`` accessors,
-``dataproto`` …), shows the short idiomatic snippet, and calls out the
+``Tabular.display`` …), shows the short idiomatic snippet, and calls out the
 hand-rolled anti-pattern to avoid.
 
 Data over code: the knowledge is the :data:`GUIDES` list; the skill just
@@ -110,20 +110,20 @@ GUIDES: tuple[Guide, ...] = (
     ),
     Guide(
         id="llm-data",
-        title="Share data with a model via dataproto",
+        title="Share data with a model via the Tabular abstraction",
         signals=("llm", "model", "prompt", "context", "token", "share data",
-                 "send data", "compress", "preview", "agent"),
-        summary="Put tables in a prompt as CSV + a one-line schema header "
-                "(`dataproto.encode`) — measured most token-efficient — and move data "
-                "between tools/agents as compressed Arrow IPC (`dataproto.to_ipc`).",
-        use=("yggdrasil.loki.dataproto.encode(df) — schema header + CSV, truncated",
-             "dataproto.to_ipc/from_ipc — compressed Arrow IPC for the binary channel",
-             "dataproto.compare(df) — measure bytes/tokens per format before choosing"),
-        example="from yggdrasil.loki import dataproto\n"
-                "prompt_blob = dataproto.encode(df)         # CSV+header → into the model\n"
-                "wire = dataproto.to_ipc(df)                # Arrow IPC → between agents",
-        avoid=("dumping JSON records into a prompt (~2x the tokens of CSV)",
-               "base64'd binary in a prompt (token-hostile)"),
+                 "send data", "preview", "display", "show rows", "agent"),
+        summary="Don't serialize by hand — every row set (a statement result, an "
+                "IO leaf) is a Tabular: `display(n)` for an aligned preview into a "
+                "prompt, `to_pylist()` for records, `to_arrow()` for the binary wire.",
+        use=("Tabular.display(n) — aligned first-n-rows preview, cheap (early-stops)",
+             "Tabular.to_pylist()/to_polars()/to_arrow() — records / frame / Arrow",
+             "Tabular.from_(obj) to wrap, .select/.filter/.cast to transform first"),
+        example="rows = dbc.sql.execute('SELECT * FROM t LIMIT 100')\n"
+                "print(rows.display(10))     # aligned preview for a human/prompt\n"
+                "records = rows.to_pylist()  # JSON-able records",
+        avoid=("hand-rolling CSV/markdown/JSON from a frame — Tabular already converts",
+               "materializing a whole result just to show a few rows (use display)"),
     ),
     Guide(
         id="databricks-compute",

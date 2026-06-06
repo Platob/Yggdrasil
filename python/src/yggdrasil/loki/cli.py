@@ -438,6 +438,11 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
         elif plan["action"] == "genie":
             res = agent.run("genie", question=line)
             reply = res.get("text", "") if isinstance(res, dict) else str(res)
+        elif plan["action"] == "skill" and plan.get("skill"):
+            # A precise databricks request → dispatch the specialized skill
+            # (already printed by _print_dbx, so don't echo the reply again).
+            reply = _dispatch_skill(agent, style, plan["skill"], plan.get("skill_kwargs") or {})
+            streamed = True
         elif plan["action"] == "guide":
             res = agent.run("guide", task=line, plan=True)
             _print_guide(style, res)
@@ -526,6 +531,44 @@ def _print_web(style: Any, res: dict) -> None:
         body = (res.get("text") or "").strip()
         if body:
             style.out(style.dim("  " + body[:600].replace("\n", "\n  ")) + "\n")
+
+
+def _dispatch_skill(agent: Any, style: Any, skill: str, kwargs: dict) -> str:
+    """Run a specialized skill the planner picked, print it, return a memory line."""
+    shown = f" {style.dim(str(kwargs))}" if kwargs else ""
+    style.out(f"  {style.dim('▹ dispatched')} {style.brand(skill)}{shown}\n")
+    try:
+        res = agent.run(skill, **kwargs)
+    except Exception as exc:
+        style.fail(f"{skill}: {exc.args[0] if exc.args else exc}")
+        return f"{skill} failed: {exc}"
+    _print_dbx(style, res)
+    return _short(_jsonable(res))
+
+
+def _print_dbx(style: Any, res: Any) -> None:
+    """Compact print of a Databricks skill result.
+
+    Row sets render through the object's own preview — ``Tabular.display()`` for
+    a statement result / io leaf, polars' own aligned repr for a frame — never a
+    hand-rolled table.
+    """
+    if not isinstance(res, dict):
+        style.out(f"    {_short(res)}\n")
+        return
+    for k, v in res.items():
+        if callable(getattr(v, "display", None)):        # a yggdrasil Tabular
+            block = v.display().replace("\n", "\n    ")
+            style.out(f"    {style.good('▦')} {style.bold(k)}\n    {style.dim(block)}\n")
+        elif hasattr(v, "to_dicts") and hasattr(v, "head"):   # a polars frame
+            block = str(v.head(10)).replace("\n", "\n    ")
+            style.out(f"    {style.good('▦')} {style.bold(k)}\n    {style.dim(block)}\n")
+        elif isinstance(v, list):
+            style.out(f"    {style.dim(k)} {style.dim('(' + str(len(v)) + ')')}\n")
+            for item in v[:30]:
+                style.out(f"      {style.brand('·')} {style.dim(_short(item))}\n")
+        else:
+            style.out(f"    {style.dim(k.ljust(12))} {_short(v)}\n")
 
 
 def _print_guide(style: Any, res: dict) -> None:
@@ -877,13 +920,16 @@ def _jsonable(obj: Any) -> Any:
         return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_jsonable(v) for v in obj]
-    to_dicts = getattr(obj, "to_dicts", None)        # polars DataFrame → records
-    if callable(to_dicts):
-        try:
-            rows = to_dicts()
-            return _jsonable(rows[:1000] if len(rows) > 1000 else rows)
-        except Exception:
-            return str(obj)
+    # Row sets convert through their own method — Tabular.to_pylist (statement
+    # result / io leaf) or polars to_dicts — capped; never re-serialized by hand.
+    for method in ("to_pylist", "to_dicts"):
+        fn = getattr(obj, method, None)
+        if callable(fn):
+            try:
+                rows = list(fn())
+                return _jsonable(rows[:1000] if len(rows) > 1000 else rows)
+            except Exception:
+                return str(obj)
     to_dict = getattr(obj, "to_dict", None)          # pandas / Pydantic models
     if callable(to_dict):
         try:

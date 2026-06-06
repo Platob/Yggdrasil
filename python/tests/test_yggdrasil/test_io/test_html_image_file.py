@@ -74,3 +74,43 @@ class TestHtmlImageLeaves(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTabularDisplay(unittest.TestCase):
+    """Tabular.display() renders an aligned first-n-rows preview."""
+
+    def test_aligned_preview(self):
+        try:
+            import polars  # noqa: F401
+        except Exception:
+            self.skipTest("polars not installed")
+        import tempfile
+        from pathlib import Path
+
+        from yggdrasil.io.holder import IO
+
+        p = Path(tempfile.mkdtemp()) / "d.csv"
+        p.write_text("city,pop\nParis,2161\nTokyo,13960\n")
+        out = IO.from_(str(p)).display()
+        lines = out.splitlines()
+        self.assertIn("city", lines[0])
+        self.assertIn("pop", lines[0])
+        self.assertTrue(set(lines[1]) <= {"-", " "})   # the rule row
+        self.assertIn("Paris", out)
+        # Columns are aligned: the 'pop' header sits at a fixed offset on rows.
+        self.assertEqual(lines[0].index("pop"), lines[2].index("2161"))
+
+    def test_limit_and_empty(self):
+        try:
+            import polars  # noqa: F401
+        except Exception:
+            self.skipTest("polars not installed")
+        import tempfile
+        from pathlib import Path
+
+        from yggdrasil.io.holder import IO
+
+        p = Path(tempfile.mkdtemp()) / "d.csv"
+        p.write_text("n\n" + "\n".join(str(i) for i in range(100)) + "\n")
+        out = IO.from_(str(p)).display(5)
+        self.assertIn("first 5 rows", out)

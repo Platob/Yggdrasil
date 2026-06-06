@@ -135,13 +135,14 @@ class TestTabularBehavior(unittest.TestCase):
         self.assertEqual(t["schema"]["date"], "Date")
         self.assertEqual(t["schema"]["usd"], "Float64")
 
-    def test_preview_is_compact_dataproto(self):
+    def test_preview_is_tabular_display(self):
         res = _loki().run("tabular", url=f"{self.base}/data.csv",
                           cache_dir=self.cache, key="cities")
-        # The LLM-facing preview is the token-efficient dataproto encoding:
-        # a schema header line + CSV body.
-        self.assertTrue(res["preview"].startswith("# 2 rows × 2 cols"))
-        self.assertIn("city,pop", res["preview"])
+        # The preview is Tabular.display() — an aligned table (header + rows),
+        # not a hand-rolled serialization.
+        self.assertIn("city", res["preview"])
+        self.assertIn("pop", res["preview"])
+        self.assertIn("Paris", res["preview"])
 
 
 class TestPlanning(unittest.TestCase):

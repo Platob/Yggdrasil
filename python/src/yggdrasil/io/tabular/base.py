@@ -2512,6 +2512,53 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     to_records = read_records
 
     # ==================================================================
+    # Human-readable preview
+    # ==================================================================
+
+    def display(self, n: int = 10, *, max_width: int = 40) -> str:
+        """Render the first *n* rows as an aligned text table.
+
+        A clean, column-aligned preview (header + values, padded; long cells
+        truncated to *max_width*), so callers can *show* a row set without
+        serializing it. Reads only enough Arrow batches to fill *n* rows, then
+        stops — cheap even on a large source.
+
+            print(dbc.sql.execute("SELECT * FROM t").display())
+            print(IO.from_("data.parquet").display(5))
+        """
+        columns: "list[str] | None" = None
+        rows: list[tuple] = []
+        for batch in self.to_arrow_batches():
+            if columns is None:
+                columns = list(batch.schema.names)
+            for record in batch.to_pylist():
+                rows.append(tuple(record.get(c) for c in columns))
+                if len(rows) >= n:
+                    break
+            if len(rows) >= n:
+                break
+        if columns is None:  # empty source / no schema
+            return "(no rows)"
+
+        def cell(value: Any) -> str:
+            text = "" if value is None else str(value)
+            text = text.replace("\n", " ")
+            return text if len(text) <= max_width else text[: max_width - 1] + "…"
+
+        header = [str(c) for c in columns]
+        body = [[cell(v) for v in row] for row in rows]
+        widths = [
+            max([len(header[i])] + [r[i].__len__() for r in body]) if body else len(header[i])
+            for i in range(len(header))
+        ]
+        rule = "  ".join("-" * w for w in widths)
+        lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(header)), rule]
+        lines += ["  ".join(c.ljust(widths[i]) for i, c in enumerate(r)) for r in body]
+        if len(rows) >= n:
+            lines.append(f"… (first {n} rows)")
+        return "\n".join(lines)
+
+    # ==================================================================
     # Lazy execution plan
     # ==================================================================
 
