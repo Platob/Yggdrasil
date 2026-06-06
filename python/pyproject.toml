@@ -101,14 +101,6 @@ api = [
   "httpx",
 ]
 
-node = [
-  "fastapi",
-  "uvicorn",
-  "pydantic>=2.10",
-  "psutil>=5.9",
-  "httpx",
-]
-
 mongoengine = [
   "mongoengine>=0.29",
 ]
@@ -126,6 +118,7 @@ Documentation = "https://platob.github.io/Yggdrasil/"
 [project.scripts]
 ygg = "yggdrasil.cli.main:main"
 ygg-run = "yggdrasil.databricks.job.runner:main"
+ygg-loki = "yggdrasil.databricks.loki.runner:main"
 
 # ── setuptools ────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
@@ -147,6 +140,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 yggdrasil = ["py.typed"]
+"yggdrasil.databricks.assistant" = ["*.md", "skills/*.md"]
 
 [tool.uv]
 native-tls = true

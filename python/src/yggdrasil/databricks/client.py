@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from .workspaces import Workspaces, Workspace
     from .path import DatabricksPath
     from .ai import DatabricksAI
+    from .genie import Genie
     from .tags.service import EntityTags
 
 __all__ = ["DatabricksClient", "DatabricksService", "DatabricksResource"]
@@ -1947,6 +1948,22 @@ class DatabricksClient(Singleton, URLBased):
             schema_name=self.schema_name,
         )
         self.__dict__["_volumes"] = cached
+        return cached
+
+    @property
+    def genie(self) -> "Genie":
+        """Databricks AI/BI Genie service — manage spaces + ask questions by code.
+
+            dbc.genie.spaces()
+            dbc.genie["01ef…"].ask("revenue by region last month").to_polars()
+        """
+        cached = self.__dict__.get("_genie")
+        if cached is not None:
+            return cached
+        from .genie import Genie
+
+        cached = Genie(client=self)
+        self.__dict__["_genie"] = cached
         return cached
 
     @property

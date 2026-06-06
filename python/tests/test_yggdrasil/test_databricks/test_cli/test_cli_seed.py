@@ -313,6 +313,63 @@ class TestSeedProvision(unittest.TestCase):
         # Ends before the warehouse step.
         client.warehouses.find_default.assert_not_called()
 
+    def test_seed_deploys_assistant_bundle(self):
+        """Provision mode deploys the Assistant skills + guidance bundle."""
+        wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
+        client = _client_with(default_wh=wh)
+        deployed = {
+            "uploaded": ["/Workspace/Shared/.ygg/assistant/workspace_instructions.md"],
+            "missing": [], "api": "skipped (no public Assistant-settings API in this SDK)",
+        }
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]), \
+             patch("yggdrasil.databricks.assistant.deploy", return_value=deployed) as dep, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed"])
+        self.assertEqual(rc, 0)
+        dep.assert_called_once()
+        self.assertFalse(dep.call_args.kwargs.get("check", False))
+
+    def test_seed_no_assistant_skips_assistant_step(self):
+        wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
+        client = _client_with(default_wh=wh)
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]), \
+             patch("yggdrasil.databricks.assistant.deploy") as dep, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--no-assistant"])
+        self.assertEqual(rc, 0)
+        dep.assert_not_called()
+
+    def test_check_missing_assistant_returns_one(self):
+        """Everything else present, but the Assistant bundle isn't deployed → fail."""
+        wh = MagicMock(); wh.warehouse_name = "Starter"; wh.warehouse_id = "abc"
+        client = _client_with(warehouses=[wh])
+        missing = {
+            "uploaded": [],
+            "missing": ["/Workspace/Shared/.ygg/assistant/workspace_instructions.md"],
+            "api": None,
+        }
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.deployed_wheels",
+                   return_value=["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.deployed_environments",
+                   return_value=["/w/env/yellow.yml", "/w/env/yellow.requirements.txt"]), \
+             patch("yggdrasil.databricks.assistant.deploy", return_value=missing) as dep, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--check"])
+        self.assertEqual(rc, 1)
+        self.assertTrue(dep.call_args.kwargs.get("check"))
+
     def test_unreachable_workspace_returns_one_early(self):
         client = MagicMock()
         client.workspace_client.return_value.current_user.me.side_effect = RuntimeError("401")
