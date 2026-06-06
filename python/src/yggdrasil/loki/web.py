@@ -17,6 +17,8 @@ same two project abstractions the rest of yggdrasil runs on.
 from __future__ import annotations
 
 import html.parser
+import os
+import re
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -31,7 +33,17 @@ __all__ = [
     "read_table",
     "read_json",
     "read_image",
+    "scrape",
+    "discover_apis",
 ]
+
+#: A standard modern-browser User-Agent so sites serve the same content they
+#: serve a browser (override with ``YGG_LOKI_USER_AGENT``). This is normal
+#: scraping hygiene — NOT bot-detection evasion or human impersonation.
+DEFAULT_USER_AGENT = os.getenv("YGG_LOKI_USER_AGENT") or (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36 yggdrasil-loki"
+)
 
 #: URL-extension → mime name, to force the right tabular/image leaf when a
 #: server mislabels the body (``text/plain`` CSVs, octet-stream parquet, …).
@@ -58,8 +70,15 @@ def fetch(
     headers: Optional[dict[str, str]] = None,
     timeout: float = 30.0,
 ) -> "HTTPResponse":
-    """GET *url* through the yggdrasil HTTP session → an :class:`HTTPResponse`."""
-    return session().get(url, params=params, headers=headers, timeout=timeout)
+    """GET *url* through the yggdrasil HTTP session → an :class:`HTTPResponse`.
+
+    Sends a standard browser User-Agent (so pages render normally) unless the
+    caller overrides it.
+    """
+    h: dict[str, str] = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "*/*"}
+    if headers:
+        h.update(headers)
+    return session().get(url, params=params, headers=h, timeout=timeout)
 
 
 def _forced_media(url: str, resp: "HTTPResponse"):
@@ -196,3 +215,99 @@ def read_text(url: str, *, max_chars: int = 4000, **fetch_kwargs: Any) -> dict[s
     out["truncated"] = len(text) > max_chars
     out["text"] = text[:max_chars]
     return out
+
+
+def scrape(url: str, *, max_chars: int = 6000, **fetch_kwargs: Any) -> dict[str, Any]:
+    """Scrape a page into structured pieces — title, meta, text, links, tables.
+
+    A richer :func:`read_text`: pulls the ``<title>`` and meta description, the
+    readable text, the anchor links, the first HTML ``<table>`` as records (if
+    any), and any embedded JSON-LD structured data. Legitimate extraction of a
+    public page's content — it does not defeat access controls.
+    """
+    resp = fetch(url, **fetch_kwargs)
+    html = resp.text
+    out: dict[str, Any] = {"url": url, "status": resp.status_code,
+                           "content_type": str(resp.media_type.mime_type.value)}
+    title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+    out["title"] = (title.group(1).strip() if title else "")[:200]
+    desc = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+                     html, re.S | re.I)
+    out["description"] = (desc.group(1).strip() if desc else "")[:400]
+    reader = _Reader()
+    reader.feed(html)
+    out["links"] = [{"text": t, "href": h} for t, h in reader.links[:60]]
+    text = reader.text()
+    out["text"] = text[:max_chars]
+    out["json_ld"] = _json_ld(html)[:5]
+    try:
+        df = read_table(url, **fetch_kwargs)
+        out["table_preview"] = df.head(10).to_dicts()
+        out["table_shape"] = list(df.shape)
+    except Exception:
+        out["table_preview"] = None
+    return out
+
+
+def _json_ld(html: str) -> list:
+    import json as _json
+
+    blocks = []
+    for m in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, re.S | re.I,
+    ):
+        try:
+            blocks.append(_json.loads(m.group(1).strip()))
+        except Exception:
+            pass
+    return blocks
+
+
+def discover_apis(url: str, *, limit: int = 40, **fetch_kwargs: Any) -> dict[str, Any]:
+    """Discover the data APIs a page already uses — its underlying endpoints.
+
+    Inspects a public page for the data sources it embeds or calls: JSON-LD
+    structured data, ``<script type="application/json">`` payloads (e.g.
+    ``__NEXT_DATA__``), and candidate endpoint URLs referenced in markup/scripts
+    (``/api/…``, ``*.json``/``*.csv``, ``fetch(...)`` targets). This surfaces the
+    *documented/embedded* APIs to pull data from — it does not bypass auth; any
+    endpoint that needs credentials still needs them.
+    """
+    import json as _json
+
+    resp = fetch(url, **fetch_kwargs)
+    html = resp.text
+    blocks = []
+    for m in re.finditer(
+        r'<script[^>]+type=["\']application/json["\'][^>]*>(.*?)</script>',
+        html, re.S | re.I,
+    ):
+        try:
+            data = _json.loads(m.group(1).strip())
+            blocks.append({"keys": list(data.keys())[:20] if isinstance(data, dict) else "array"})
+        except Exception:
+            pass
+    endpoints: set[str] = set()
+    # data files (*.json / *.csv), and paths with a real /api/ or /v<N>/ segment.
+    for m in re.finditer(
+        r'["\']('
+        r'https?://[^"\'\s]+?\.(?:json|csv)(?:\?[^"\']*)?'
+        r'|(?:https?:)?//[^"\'\s]+?/(?:api|graphql|v\d+)/[^"\'\s]*'
+        r'|/(?:api|graphql|v\d+)/[^"\'\s]*'
+        r')["\']',
+        html,
+    ):
+        endpoints.add(m.group(1))
+    for m in re.finditer(r'fetch\(\s*["\']([^"\']+)["\']', html):
+        endpoints.add(m.group(1))
+    title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+    return {
+        "url": url,
+        "status": resp.status_code,
+        "title": (title.group(1).strip() if title else "")[:200],
+        "json_ld": _json_ld(html)[:5],
+        "json_blocks": blocks[:10],
+        "endpoints": sorted(endpoints)[:limit],
+        "note": "embedded/public endpoints only — credentials are not bypassed",
+    }

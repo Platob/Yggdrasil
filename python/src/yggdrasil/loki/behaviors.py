@@ -109,6 +109,10 @@ class WebBehavior(LokiBehavior):
             else:
                 action = "text"
 
+        if action == "scrape":
+            return {"action": "scrape", **web.scrape(url)}
+        if action == "apis":
+            return {"action": "apis", **web.discover_apis(url)}
         if action == "table":
             df = web.read_table(url, fmt=fmt)
             return {"action": "table", "url": url, "shape": list(df.shape),

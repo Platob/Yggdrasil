@@ -40,6 +40,15 @@ class TestWeb(unittest.TestCase):
                b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00"
                b"\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82")
         (d / "dot.png").write_bytes(png)
+        (d / "app.html").write_text(
+            '<html><head><title>Shop</title>'
+            '<meta name="description" content="A demo shop">'
+            '<script type="application/ld+json">{"@type":"Product","name":"Widget"}</script>'
+            '</head><body><h1>Items</h1>'
+            '<script>fetch("/api/products.json").then(r=>r.json());'
+            'const u="https://cdn.example.com/data/prices.csv";</script>'
+            '<a href="/v1/catalog">catalog</a></body></html>'
+        )
 
         handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=cls.dir)
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
@@ -78,6 +87,24 @@ class TestWeb(unittest.TestCase):
         info = web.read_image(f"{self.base}/dot.png", save_to=str(out))
         self.assertTrue(out.is_file())
         self.assertEqual(info["saved_to"], str(out))
+
+    def test_scrape_extracts_title_meta_jsonld(self):
+        s = web.scrape(f"{self.base}/app.html")
+        self.assertEqual(s["title"], "Shop")
+        self.assertEqual(s["description"], "A demo shop")
+        self.assertTrue(any(b.get("@type") == "Product" for b in s["json_ld"]))
+        self.assertIn("Items", s["text"])
+
+    def test_discover_apis_finds_endpoints(self):
+        d = web.discover_apis(f"{self.base}/app.html")
+        eps = set(d["endpoints"])
+        self.assertIn("/api/products.json", eps)            # fetch(...) target
+        self.assertIn("https://cdn.example.com/data/prices.csv", eps)  # *.csv
+        self.assertIn("/v1/catalog", eps)                   # /v1/ path
+        self.assertTrue(any(b.get("@type") == "Product" for b in d["json_ld"]))
+
+    def test_default_user_agent_is_browserish(self):
+        self.assertIn("Mozilla/5.0", web.DEFAULT_USER_AGENT)
 
     def test_web_behavior_auto_routes_by_extension(self):
         from yggdrasil.loki import Loki
