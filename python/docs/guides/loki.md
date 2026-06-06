@@ -132,6 +132,32 @@ ygg loki do "tidy the docs" --json     # full transcript as JSON
 head of the observation), then prints the files it changed and the agent's
 summary.
 
+### Use case — look up live external information
+
+With `--allow-web` (and `run_python`, on by default) the agent **browses the
+internet and computes** on its own. Ask for the EUR/USD move over two weeks:
+
+```bash
+ygg loki do "Report how EUR/USD changed over the last 2 weeks. Use web_fetch \
+on the Frankfurter API: GET /v1/latest?base=EUR&symbols=USD for the latest, \
+then GET /v1/<start>..<end>?base=EUR&symbols=USD with start = end − 14 days." \
+  --allow-web
+```
+
+Loki runs the loop unattended — `web_fetch` the latest rate, `web_fetch` the
+date-range series, `run_python` to compute — and reports, e.g.:
+
+```text
+ 1 web_fetch(https://api.frankfurter.dev/v1/latest?base=EUR&symbols=USD)   → 200 application/json
+ 2 web_fetch(https://api.frankfurter.dev/v1/2026-05-22..2026-06-05?…)       → 200 application/json
+ 3 run_python(start=1.1595; end=1.164; change=end-start; pct=change/start*100; print(...))
+ ✓ EUR/USD over the last 2 weeks: start 1.1595, end 1.164, change +0.0045 (+0.39%).
+ usage  ↑3,924 ↓479  4,403 tok  $0.0011
+```
+
+The same in code: `loki.act(task, allow_web=True)`, or one fetch at a time
+with `loki.run("web", url=…)` / `web.read_json(url)`.
+
 ## Reasoning engines (`TokenEngine`)
 
 A `TokenEngine` is the LLM contract Loki reasons on — the seam between the
