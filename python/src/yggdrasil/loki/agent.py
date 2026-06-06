@@ -278,8 +278,6 @@ class Loki:
         answer keeps the work on the cheap/local path. Returns an available
         engine, or ``None`` when nothing is reachable.
         """
-        import os
-
         available = {n: e for n, e in self._engine_instances().items() if e.available()}
         if not available:
             return None
@@ -298,20 +296,10 @@ class Loki:
         remotes = [available[n] for n in order if not available[n].local]
         base_eng = available.get(base or "")
 
-        # Can this workstation comfortably host a local model?
-        gpu = False
-        try:
-            import torch
+        # Can this workstation comfortably host a local model (and which size)?
+        from .resources import can_run_local
 
-            gpu = torch.cuda.is_available()
-        except Exception:
-            pass
-        ram_gb = 0.0
-        try:
-            ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
-        except (ValueError, OSError, AttributeError):
-            pass
-        capable = gpu or ((os.cpu_count() or 1) >= 4 and ram_gb >= 8.0)
+        capable = can_run_local()
 
         # The cheap/home choice for ordinary work: a capable local model if we
         # have one (free, private), else the session base, else the best engine.
@@ -336,12 +324,13 @@ class Loki:
     def bootstrap_local(self, *, model: "Optional[str]" = None, pull: bool = True) -> dict[str, Any]:
         """Ready a free **local** reasoning engine, lazily installing on demand.
 
-        Prefers a reachable Ollama server — ensures its lightweight bootstrap
-        model is pulled (only if missing). Falls back to the HF
-        ``transformers`` engine (weights lazy-download on first use). When
-        neither is present, returns what to install. This is the "lightweight,
-        lazily-installed, free brain" entry point — smart enough for basic
-        setup/config, and able to hand heavier work up to a remote model.
+        Prefers a reachable Ollama server — ensures the model **sized to this
+        workstation** (the more RAM/GPU, the larger the default) is pulled, only
+        if missing. Falls back to the HF ``transformers`` engine (weights
+        lazy-download on first use). When neither is present, returns what to
+        install. This is the "free local brain" entry point — sized to the box,
+        smart enough for basic setup/config, and able to hand heavier work up to
+        a remote model.
         """
         from .engines import OllamaEngine, TransformersEngine
 
@@ -362,7 +351,7 @@ class Loki:
             "engine": None, "ready": False,
             "install": [
                 "install Ollama (https://ollama.com), then it auto-pulls "
-                f"{OllamaEngine.bootstrap_model!r}",
+                f"{OllamaEngine().bootstrap_model!r} (sized to this box)",
                 "or: pip install transformers torch  (HF local engine)",
             ],
         }

@@ -65,6 +65,13 @@ class DatabricksServiceSkill(LokiSkill):
     """Base for the Databricks service skills — guards the session for all of them."""
 
     requires = "databricks"
+    preprompt = (
+        "You are a Databricks expert operating through yggdrasil's DatabricksClient "
+        "(dbc.<service> accessors). Prefer serverless compute for inner I/O, Unity "
+        "Catalog three-level names, Arrow-returning SQL (results are Tabular), and "
+        "the seeded ygg wheel environments — never %pip install per run. Be precise, "
+        "least-privilege, and safe with destructive statements."
+    )
 
     def _client(self, agent: "Loki") -> Any:
         client = agent.databricks
@@ -295,7 +302,9 @@ class DatabricksServingSkill(DatabricksServiceSkill):
             from yggdrasil.loki.engines import DatabricksServingEngine
 
             eng = DatabricksServingEngine(client=client, endpoint=endpoint)
-            return {"endpoint": eng.endpoint, "reply": eng.generate(prompt)}
+            # The domain preprompt steers the served model toward the best answer.
+            return {"endpoint": eng.endpoint,
+                    "reply": eng.generate(prompt, system=self.preprompt)}
         eps = client.workspace_client().serving_endpoints.list()
         return {"endpoints": _names(eps, attrs=("name", "id"))}
 

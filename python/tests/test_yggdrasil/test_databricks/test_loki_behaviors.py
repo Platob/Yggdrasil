@@ -126,6 +126,10 @@ class TestDatabricksBehaviors(_Base):
         out = loki.run("databricks-serving", endpoint="ep", prompt="hi")
         self.assertEqual(out["reply"], "served reply")
         self.assertEqual(out["endpoint"], "ep")
+        # The domain preprompt steers the served model (sent as the system msg).
+        sent = oai.chat.completions.create.call_args.kwargs["messages"]
+        self.assertEqual(sent[0]["role"], "system")
+        self.assertIn("Databricks expert", sent[0]["content"])
 
 
 class TestDatabricksMCP(_Base):

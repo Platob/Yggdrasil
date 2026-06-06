@@ -227,6 +227,11 @@ class GuideSkill(LokiSkill):
 
     name = "guide"
     description = "Advise the most optimized way to build something with yggdrasil's features."
+    preprompt = (
+        "You are a yggdrasil expert. Recommend the idiomatic, optimized path "
+        "using the project's own abstractions; never hand-roll what a yggdrasil "
+        "feature already does."
+    )
 
     def run(
         self,
@@ -262,8 +267,6 @@ class GuideSkill(LokiSkill):
                     f"Task: {task}\n\nUsing ONLY these yggdrasil features, give the "
                     f"most optimized implementation as concise numbered steps with the "
                     f"exact abstractions to call:\n\n{grounding}",
-                    system="You are a yggdrasil expert. Recommend the idiomatic, "
-                           "optimized path using the project's own abstractions; never "
-                           "hand-roll what a yggdrasil feature already does.",
+                    system=self.preprompt,
                 )
         return out

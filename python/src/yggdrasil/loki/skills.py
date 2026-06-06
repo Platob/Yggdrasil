@@ -119,6 +119,11 @@ class WebSkill(LokiSkill):
 
     name = "web"
     description = "Fetch + drive the internet — browse, read tables/JSON/images, fill forms, click buttons."
+    preprompt = (
+        "Answer strictly from the fetched page — quote only facts present in it, "
+        "give exact figures, and say plainly when the page does not cover the "
+        "question. Be concise."
+    )
 
     def run(
         self,
@@ -178,7 +183,7 @@ class WebSkill(LokiSkill):
             if eng is not None and eng.available():
                 out["answer"] = agent.reason(
                     f"Using only this page, {question}\n\n{page['text']}",
-                    system="Answer concisely from the page; say if it's not covered.",
+                    system=self.preprompt,
                 )
         return out
 
@@ -372,6 +377,14 @@ class PythonProjectSkill(LokiSkill):
 
     name = "python_project"
     description = "Create a Python project, write code (given or reasoned), and run it."
+    preprompt = (
+        "You are a senior Python engineer writing inside the yggdrasil project. "
+        "Reach for its abstractions before stdlib or third-party equivalents: "
+        "IO.from_(path) for tabular IO (CSV/JSON/Parquet/Arrow/XLSX/Delta), "
+        "HTTPSession for HTTP, DataType/Field for casting, dbc.<service> for "
+        "Databricks, dataproto for model-facing data. Return runnable code only — "
+        "no prose, no markdown fences."
+    )
 
     def run(
         self,
@@ -386,12 +399,17 @@ class PythonProjectSkill(LokiSkill):
         **_: Any,
     ) -> dict[str, Any]:
         # Reason the code from the task when none is supplied (needs an engine).
+        # Ground the prompt in the relevant yggdrasil recipes so the generated
+        # code uses the project's optimized path, not a hand-rolled one.
         if code is None and task:
+            from . import guides
+
+            recipes = "\n\n".join(g.as_text() for g in guides.match(task, top=2))
+            grounding = f"\n\nLeverage these yggdrasil features:\n{recipes}" if recipes else ""
             code = agent.reason(
                 f"Write a single self-contained Python script that: {task}. "
-                "Print its result to stdout. Output only the code — no prose, "
-                "no markdown fences.",
-                system="You are a senior Python engineer. Return runnable code only.",
+                f"Print its result to stdout.{grounding}",
+                system=self.preprompt,
             )
         if code is None:
             raise ValueError("provide `code=` directly or a `task=` to reason it from")

@@ -34,6 +34,12 @@ class LokiSkill(ABC):
     #: Backend this skill needs (``"databricks"``, ``"aws"``, …) or ``None``
     #: when it runs anywhere. Drives the default :meth:`available`.
     requires: ClassVar[str | None] = None
+    #: A domain **system prompt** the skill contributes whenever it reasons
+    #: through an engine — tuned to steer the model toward the best result and
+    #: to leverage yggdrasil's own features for this skill's domain. Empty for
+    #: skills that never call an engine; subclasses set it (and pass it as
+    #: ``system=``). Keep it short and concrete.
+    preprompt: ClassVar[str] = ""
 
     def available(self, agent: "Loki") -> bool:
         """True when this skill can run in *agent*'s environment.
@@ -51,11 +57,14 @@ class LokiSkill(ABC):
         """Perform the skill, using *agent* as the capability/token provider."""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "name": self.name,
             "description": self.description,
             "requires": self.requires,
         }
+        if self.preprompt:
+            d["preprompt"] = self.preprompt
+        return d
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(name={self.name!r}, requires={self.requires!r})"

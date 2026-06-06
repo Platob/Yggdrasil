@@ -310,10 +310,22 @@ class TestTransformersEngine(unittest.TestCase):
         with patch("importlib.util.find_spec", return_value=None):
             self.assertFalse(TransformersEngine().available())
 
-    def test_adaptive_tier_picks_small_then_large(self):
+    def test_model_sizes_to_resources_not_prompt_tier(self):
+        from yggdrasil.loki import resources
+
         eng = TransformersEngine()
-        self.assertEqual(eng.resolve_model(tier="fast"), "Qwen/Qwen2.5-0.5B-Instruct")
-        self.assertEqual(eng.resolve_model(tier="deep"), "Qwen/Qwen2.5-1.5B-Instruct")
+        # Local models are bounded by the box → sized to resources, not the
+        # remote fast/deep cost tier (which is ignored here).
+        with patch.object(resources, "snapshot", return_value={"cpu": 8, "ram_gb": 12, "gpu": False}):
+            self.assertEqual(eng.resolve_model(tier="deep"), "Qwen/Qwen2.5-1.5B-Instruct")
+        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": False}):
+            self.assertEqual(eng.resolve_model(tier="fast"), "Qwen/Qwen2.5-7B-Instruct")
+        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": True}):
+            self.assertEqual(eng.bootstrap_model, "Qwen/Qwen2.5-14B-Instruct")
+
+    def test_explicit_model_pin_overrides_resource_sizing(self):
+        eng = TransformersEngine(model="some/custom-model")
+        self.assertEqual(eng.resolve_model(), "some/custom-model")
 
     def test_complete_runs_pipeline_and_records_usage(self):
         from yggdrasil.loki.usage import METER
@@ -382,8 +394,16 @@ class TestOllamaEngine(unittest.TestCase):
         with patch.object(OllamaEngine, "_session", return_value=sess):
             self.assertFalse(eng.available())
 
-    def test_bootstrap_model_is_lightweight(self):
-        self.assertEqual(OllamaEngine.bootstrap_model, "qwen2.5:3b")
+    def test_bootstrap_model_scales_with_resources(self):
+        from yggdrasil.loki import resources
+
+        eng = OllamaEngine()
+        with patch.object(resources, "snapshot", return_value={"cpu": 8, "ram_gb": 12, "gpu": False}):
+            self.assertEqual(eng.bootstrap_model, "qwen2.5:3b")    # modest box → small
+        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": False}):
+            self.assertEqual(eng.bootstrap_model, "qwen2.5:14b")   # big box → larger
+        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": True}):
+            self.assertEqual(eng.bootstrap_model, "qwen2.5:32b")   # GPU → xlarge
 
     def test_installed_models_and_has_model(self):
         sess = self._fake_session(get_json={"models": [{"name": "qwen2.5:3b"},
@@ -404,11 +424,14 @@ class TestOllamaEngine(unittest.TestCase):
         self.assertTrue(receipt["was_present"])
 
     def test_ensure_pulls_when_missing(self):
+        from yggdrasil.loki import resources
+
         eng = OllamaEngine()
-        with patch.object(OllamaEngine, "has_model", return_value=False), \
+        with patch.object(resources, "snapshot", return_value={"cpu": 8, "ram_gb": 12, "gpu": False}), \
+             patch.object(OllamaEngine, "has_model", return_value=False), \
              patch.object(OllamaEngine, "pull", return_value="success") as pull:
             receipt = eng.ensure()
-        pull.assert_called_once_with("qwen2.5:3b")
+        pull.assert_called_once_with("qwen2.5:3b")    # default = resource-sized model
         self.assertEqual((receipt["was_present"], receipt["status"]), (False, "success"))
 
     def test_pull_posts_and_returns_final_status(self):

@@ -68,6 +68,16 @@ Backend-specialized skills register only when their backend is reachable —
 `genie` / `databricks-*` from `yggdrasil.databricks.loki`, `aws-*` from
 `yggdrasil.aws.loki`.
 
+**Preprompts.** A skill that reasons through an engine carries a domain
+`preprompt` — a short system prompt tuned to steer the model toward the best
+result *and* to lean on yggdrasil's own features for that domain. The
+`python_project` skill prompts for code that uses `IO`/`HTTPSession`/`DataType`
+(and grounds the request in the matching `guide` recipes); the Databricks fleet
+carries a "prefer serverless / Unity Catalog / Arrow / seeded wheel envs"
+preprompt that `databricks-serving` sends as the served model's system message;
+`web` answers strictly from the fetched page. It's `LokiSkill.preprompt` — set
+it on any skill that calls an engine.
+
 ### `guide` — the optimized yggdrasil way
 
 Loki knows the project it lives in. The **`guide`** skill is its
@@ -199,27 +209,35 @@ on the box; pick them up by `ollama pull <model>` or installing
 `transformers`+`torch`. They're chosen automatically for simple work when the
 workstation can run them — see *Resource-aware local vs remote* below.
 
-### A free, lazily-installed bootstrap brain (`ygg loki setup`)
+### A free local brain, **sized to your workstation** (`ygg loki setup`)
 
-Each local engine declares a `bootstrap_model` — a small, free, *smart-enough*
-model that loads cheaply and is good for basic install/config work (and knows
-when to hand harder tasks up to a bigger model). The default is **Qwen2.5 3B
-Instruct** on Ollama (`qwen2.5:3b` — ~2 GB, Apache-2.0, CPU-friendly), or
-Qwen2.5 1.5B for the HF engine.
+A local model is bounded by the box it runs on, so Loki sizes its `bootstrap_model`
+to the machine (`yggdrasil.loki.resources` — CPU/RAM/GPU → a size tier): the more
+muscle, the larger the default. It climbs a ladder of Qwen2.5 instruct models:
 
-`Loki.bootstrap_local()` readies one **lazily** — it pulls the model only when
-it's missing (Ollama `POST /api/pull`), or notes that HF weights download on
-first use, or tells you what to install:
+| resource tier | gate | Ollama | HF transformers |
+|---|---|---|---|
+| `small` | ≥ 8 GB CPU | `qwen2.5:3b` | Qwen2.5-1.5B |
+| `medium` | ≥ 16 GB | `qwen2.5:7b` | Qwen2.5-3B |
+| `large` | ≥ 32 GB | `qwen2.5:14b` | Qwen2.5-7B |
+| `xlarge` | CUDA GPU | `qwen2.5:32b` | Qwen2.5-14B |
+
+(`ygg loki engines` shows the pick, e.g. `qwen2.5:7b (resources: medium)`.) An
+explicit pin (`OllamaEngine(model=…)`, `YGG_LOKI_OLLAMA_MODEL`/`YGG_LOKI_HF_MODEL`)
+always wins. `Loki.bootstrap_local()` readies the sized model **lazily** — it
+pulls it only when missing (Ollama `POST /api/pull`), notes that HF weights
+download on first use, or tells you what to install:
 
 ```text
-ygg loki setup            # ready a free local model (lazy-install on demand)
+ygg loki setup            # ready the resource-sized free local model
 ygg loki setup qwen2.5:14b # ready a specific, heavier local model
 ```
 
 ```python
-loki.bootstrap_local()                 # {"engine": "ollama", "ready": True, "model": "qwen2.5:3b", ...}
+loki.bootstrap_local()                 # {"engine": "ollama", "ready": True, "model": "<sized>", ...}
 loki.run("setup")                      # same, plus "redirects" for heavier setup
-OllamaEngine().ensure("qwen2.5:3b")    # pull only if not already installed
+OllamaEngine().bootstrap_model         # the model this box gets
+OllamaEngine().ensure()                # pull the sized model only if missing
 ```
 
 The `setup` skill also surfaces **redirects** — what a lightweight model should
@@ -299,20 +317,23 @@ model.
 
 ### Adaptive model selection (the default)
 
-Each engine declares a small **tier map** — a `fast` model and a `deep`
-(more capable) one — and **by default the model is chosen adaptively**: a
-short, light request resolves to the fast model; a long or reasoning-heavy
-one (sized on the message content, plus signal words like *refactor*,
-*debug*, *design*, *optimize*) resolves to the deep model. This keeps cheap
-turns cheap without ever capping the hard ones.
+Each **remote** engine declares a small **tier map** — a `fast` model and a
+`deep` (more capable) one — and **by default the model is chosen adaptively**:
+a short, light request resolves to the fast model; a long or reasoning-heavy
+one (sized on the message content, plus signal words like *refactor*, *debug*,
+*design*, *optimize*) resolves to the deep model. This keeps cheap turns cheap
+without ever capping the hard ones.
 
 | Engine | `fast` | `deep` |
 |---|---|---|
 | `ClaudeEngine` | `claude-haiku-4-5` | `claude-opus-4-8` |
 | `OpenAIEngine` | `gpt-4o-mini` | `gpt-4o` |
 | `DatabricksServingEngine` | (pinned to one workspace endpoint — no fast/deep pair) | — |
-| `TransformersEngine` | `Qwen/Qwen2.5-0.5B-Instruct` | `Qwen/Qwen2.5-1.5B-Instruct` |
-| `OllamaEngine` | `llama3.2:1b` | `llama3.2` |
+
+**Local** engines don't use the prompt's cost tier — they're bounded by the
+machine, so they size to **resources** instead (the `bootstrap_model` ladder
+above): the box, not the prompt, picks `TransformersEngine` / `OllamaEngine`'s
+model.
 
 Adaptivity is only the **default**, never an override of an explicit
 decision:

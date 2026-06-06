@@ -75,6 +75,12 @@ class AWSServiceSkill(LokiSkill):
     """One AWS service skill, built from a :class:`_Spec`."""
 
     requires = "aws"
+    preprompt = (
+        "You are an AWS expert operating through yggdrasil's AWSClient. Prefer "
+        "least-privilege IAM, the project's S3/path abstractions (S3Path) and "
+        "Arrow/Parquet for data on S3, paginate list calls, and be explicit and "
+        "safe with anything destructive or cost-bearing."
+    )
 
     def __init__(self, spec: _Spec) -> None:
         self._spec = spec

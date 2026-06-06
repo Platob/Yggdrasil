@@ -1,10 +1,12 @@
 """Local HuggingFace -backed :class:`TokenEngine`.
 
 Runs an **open-source model on this workstation** via the ``transformers``
-text-generation pipeline — free, private, offline. Defaults to a small Qwen
-instruct model so it loads fast on CPU; override with ``YGG_LOKI_HF_MODEL``
-(any chat/instruct model id) and ``YGG_LOKI_HF_DEVICE`` (e.g. ``"cuda"``).
-Available only when ``transformers`` + ``torch`` are installed.
+text-generation pipeline — free, private, offline. The default model is **sized
+to the machine** (:class:`LocalEngine` + :mod:`yggdrasil.loki.resources`): a
+small Qwen instruct model on a modest CPU box, a larger one as RAM/GPU allow.
+Override with ``YGG_LOKI_HF_MODEL`` (any chat/instruct id) and
+``YGG_LOKI_HF_DEVICE`` (e.g. ``"cuda"``). Available only when ``transformers``
++ ``torch`` are installed.
 """
 from __future__ import annotations
 
@@ -12,26 +14,25 @@ import importlib.util
 import os
 from typing import Any, ClassVar, Optional
 
-from ..engine import DEFAULT_MAX_TOKENS, Completion, TokenEngine
+from ..engine import DEFAULT_MAX_TOKENS, Completion
+from .local import LocalEngine
 
 __all__ = ["TransformersEngine"]
 
 
-class TransformersEngine(TokenEngine):
+class TransformersEngine(LocalEngine):
     """Reason with a local HuggingFace model (``transformers`` pipeline)."""
 
     name = "transformers"
-    local = True
-    #: Small open instruct models — fast tier loads on CPU; deep is larger.
+    #: Fallback when the resource tier isn't in the ladder.
     default_model: ClassVar[str] = "Qwen/Qwen2.5-1.5B-Instruct"
-    MODELS: ClassVar[dict[str, str]] = {
-        "fast": "Qwen/Qwen2.5-0.5B-Instruct",
-        "deep": "Qwen/Qwen2.5-1.5B-Instruct",
+    #: Resource tier → open Qwen2.5 instruct model. Bigger box → bigger model.
+    RESOURCE_MODELS: ClassVar[dict[str, str]] = {
+        "small": "Qwen/Qwen2.5-1.5B-Instruct",   # ≥ 8 GB CPU
+        "medium": "Qwen/Qwen2.5-3B-Instruct",     # ≥ 16 GB
+        "large": "Qwen/Qwen2.5-7B-Instruct",      # ≥ 32 GB
+        "xlarge": "Qwen/Qwen2.5-14B-Instruct",    # CUDA GPU
     }
-    #: Lightweight, free entry model (weights lazy-download on first use):
-    #: Qwen2.5 1.5B Instruct — CPU-friendly and smart enough for basic
-    #: install/config work and for routing harder tasks up to a bigger model.
-    bootstrap_model: ClassVar[str] = "Qwen/Qwen2.5-1.5B-Instruct"
     #: One pipeline per model, shared across instances (weights load once).
     _PIPES: ClassVar[dict[str, Any]] = {}
 

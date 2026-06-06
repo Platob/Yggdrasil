@@ -17,7 +17,8 @@ from typing import Any, ClassVar, Optional
 
 from yggdrasil.dataclasses.waiting import WaitingConfig
 
-from ..engine import DEFAULT_MAX_TOKENS, Completion, TokenEngine
+from ..engine import DEFAULT_MAX_TOKENS, Completion
+from .local import LocalEngine
 
 __all__ = ["OllamaEngine"]
 
@@ -47,18 +48,20 @@ def _probe_session() -> "Any":
     return _PROBE_SESSION
 
 
-class OllamaEngine(TokenEngine):
-    """Reason with a local model served by Ollama."""
+class OllamaEngine(LocalEngine):
+    """Reason with a local model served by Ollama, sized to the workstation."""
 
     name = "ollama"
-    local = True
-    default_model: ClassVar[str] = "llama3.2"
-    MODELS: ClassVar[dict[str, str]] = {"fast": "llama3.2:1b", "deep": "llama3.2"}
-    #: Lightweight, free, broadly-capable entry model: Qwen2.5 3B Instruct —
-    #: ~2GB, Apache-2.0, strong instruction-following, runs on a modest CPU.
-    #: Smart enough for basic install/config and for routing harder work up.
-    BOOTSTRAP_MODEL: ClassVar[str] = "qwen2.5:3b"
-    bootstrap_model: ClassVar[str] = "qwen2.5:3b"
+    #: Fallback when the resource tier isn't in the ladder.
+    default_model: ClassVar[str] = "qwen2.5:3b"
+    #: Resource tier → Qwen2.5 instruct model (Apache-2.0, strong, ``ollama
+    #: pull``-able). A modest CPU box gets 3B; more RAM/GPU climbs the ladder.
+    RESOURCE_MODELS: ClassVar[dict[str, str]] = {
+        "small": "qwen2.5:3b",     # ≥ 8 GB CPU — the lightweight bootstrap
+        "medium": "qwen2.5:7b",    # ≥ 16 GB
+        "large": "qwen2.5:14b",    # ≥ 32 GB
+        "xlarge": "qwen2.5:32b",   # CUDA GPU
+    }
 
     def __init__(self, *, model: Optional[str] = None, tier: Optional[str] = None,
                  host: Optional[str] = None) -> None:
