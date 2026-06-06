@@ -8,7 +8,7 @@ from databricks.sdk.service.compute import ClusterAccessControlRequest, Library,
     DataSecurityMode, RuntimeEngine, Kind, SparkVersion, ListClustersFilterBy, ClusterSource
 
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
-from yggdrasil.version import __version_info__ as YGG_VERSION_INFO, VersionInfo
+from yggdrasil.version import VersionInfo
 from ..client import DatabricksClient
 from ..client import DatabricksService
 from ...dataclasses.expiring import ExpiringDict
@@ -104,6 +104,23 @@ class Clusters(DatabricksService):
     # ------------------------------------------------------------------ #
     # Singletons
     # ------------------------------------------------------------------ #
+    def _default_ygg_layer(self) -> str:
+        """The default ygg library for a cluster: the seeded **generic
+        environment** requirements file (zero-PyPI) for the running ygg image —
+        ``<env>/<env>.requirements.txt`` — installed via
+        ``Library(requirements=…)``. It lists the existing workspace wheels, so a
+        cluster installs from those rather than ``pip install``-ing ygg from PyPI.
+        Provisioned by ``ygg databricks seed``; an explicit ``environment`` /
+        ``libraries`` argument overrides it (and may be a PyPI spec to opt back
+        into a pip resolve)."""
+        from yggdrasil.databricks.job.wheel import (
+            WORKSPACE_ENV_DIR,
+            ygg_base_environment_name,
+        )
+
+        name = ygg_base_environment_name()
+        return f"{WORKSPACE_ENV_DIR}/{name}/{name}.requirements.txt"
+
     def all_purpose_cluster(
         self,
         name: str | None = None,
@@ -142,16 +159,13 @@ class Clusters(DatabricksService):
             None
         )
 
-        # ``environment`` points at a seeded **generic environment** — a
-        # ``…requirements.txt`` installed as ``Library(requirements=…)`` — that
-        # already carries ygg + its deps as zero-PyPI workspace wheels. Use it in
-        # place of the PyPI ``ygg[…]`` resolve; otherwise fall back to that.
-        # ``uv`` / ``dill`` (small public runtime helpers the env doesn't bundle)
-        # ride along either way.
-        ygg_layer = (
-            environment if environment
-            else f"ygg[http,data,databricks]=={YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}.*"
-        )
+        # By default the cluster installs the seeded **generic environment**
+        # (zero-PyPI workspace wheels via :meth:`_default_ygg_layer`) rather than
+        # ``pip install``-ing ygg from PyPI. An explicit ``environment`` overrides
+        # it — a ``…requirements.txt`` / ``…whl`` path, or a PyPI spec to opt back
+        # into a pip resolve. ``uv`` / ``dill`` (small public runtime helpers the
+        # env doesn't bundle) ride along either way.
+        ygg_layer = environment if environment else self._default_ygg_layer()
         libraries = (libraries or []) + [ygg_layer, "uv", "dill"]
 
         if existing is None:
@@ -362,10 +376,10 @@ class Clusters(DatabricksService):
         if found is not None:
             return found
 
-        if not libraries:
-            libraries = ["ygg[databricks]"]
-        else:
-            libraries = list(libraries) + ["ygg[databricks]"]
+        # Default to the seeded generic environment (zero-PyPI workspace wheels)
+        # instead of ``pip install``-ing ygg from PyPI.
+        ygg_layer = self._default_ygg_layer()
+        libraries = (list(libraries) if libraries else []) + [ygg_layer]
 
         return self.create(
             cluster_name=cluster_name,
@@ -420,10 +434,10 @@ class Clusters(DatabricksService):
                 **cluster_spec
             )
 
-        if not libraries:
-            libraries = ["ygg[databricks]"]
-        else:
-            libraries = list(libraries) + ["ygg[databricks]"]
+        # Default to the seeded generic environment (zero-PyPI workspace wheels)
+        # instead of ``pip install``-ing ygg from PyPI.
+        ygg_layer = self._default_ygg_layer()
+        libraries = (list(libraries) if libraries else []) + [ygg_layer]
 
         return self.create(
             cluster_name=cluster_name,

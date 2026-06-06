@@ -1,12 +1,19 @@
-"""``Clusters.all_purpose_cluster`` library composition — the ``environment``
-(generic seeded env) swap for the PyPI ``ygg[…]`` resolve."""
+"""``Clusters.all_purpose_cluster`` library composition — by default a cluster
+installs the seeded **generic environment** (zero-PyPI wheels) rather than
+``pip install``-ing ygg from PyPI; ``environment`` overrides the layer."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from yggdrasil.databricks.job.wheel import WORKSPACE_ENV_DIR, ygg_base_environment_name
 from yggdrasil.databricks.tests import DatabricksTestCase
 
 _REQS = "/Workspace/Shared/environments/ygg-1.0-py312/ygg-1.0-py312.requirements.txt"
+
+
+def _seeded_env_requirements() -> str:
+    name = ygg_base_environment_name()
+    return f"{WORKSPACE_ENV_DIR}/{name}/{name}.requirements.txt"
 
 
 class TestAllPurposeClusterEnvironment(DatabricksTestCase):
@@ -34,13 +41,23 @@ class TestAllPurposeClusterEnvironment(DatabricksTestCase):
         self.assertIn("dill", libs)
         self.assertFalse(any(str(lib).startswith("ygg[") for lib in libs))
 
-    def test_default_resolves_ygg_from_pypi(self):
+    def test_default_uses_seeded_environment_not_pypi(self):
         clusters = self._clusters()
         clusters.all_purpose_cluster(
             name="test-cluster", single_user_name="me@co.com", wait=False,
         )
         libs = clusters.create.call_args.kwargs["libraries"]
-        self.assertTrue(any(str(lib).startswith("ygg[") for lib in libs))
+        # Default installs the seeded generic-env requirements (zero-PyPI), not a
+        # PyPI ``ygg[…]`` resolve. uv/dill still ride along.
+        self.assertIn(_seeded_env_requirements(), libs)
         self.assertIn("uv", libs)
         self.assertIn("dill", libs)
-        self.assertFalse(any(str(lib).endswith("requirements.txt") for lib in libs))
+        self.assertFalse(any(str(lib).startswith("ygg[") for lib in libs))
+
+    def test_get_or_create_defaults_to_seeded_environment(self):
+        clusters = self._clusters()
+        clusters.find_cluster = MagicMock(return_value=None)
+        clusters.get_or_create(cluster_name="test-cluster", wait=False)
+        libs = clusters.create.call_args.kwargs["libraries"]
+        self.assertIn(_seeded_env_requirements(), libs)
+        self.assertFalse(any(str(lib).startswith("ygg[") for lib in libs))
