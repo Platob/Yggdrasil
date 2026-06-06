@@ -9,9 +9,17 @@ the **live** package on disk, uploads it into the workspace's PyPI-like registry
     ygg databricks deploy ygg             # get-or-build the versioned ygg wheel(s)
     ygg databricks deploy wheel <package> # build + upload any package's wheel(s)
     ygg databricks deploy environment     # print the serverless JobEnvironment(s)
+    ygg databricks deploy project [path]  # discover a pyproject.toml → wheel +
+                                          # environment + a default cluster
 
 ``--all-versions`` builds/keys a wheel + environment for every supported Python
 (3.10–3.13); without it the deploy targets the local interpreter's Python.
+
+``project`` discovers the nearest ``pyproject.toml`` (from *path* or the cwd),
+builds the **project's own wheel**, writes a serverless base environment +
+classic-cluster requirements named for the project (``<name>-<version>``), and
+get-or-creates a default single-user cluster that installs the project's
+dependencies — so a user's project runs on Databricks with one command.
 """
 from __future__ import annotations
 
@@ -72,6 +80,24 @@ class DeployCommand:
         env.add_argument("--all-versions", dest="all_versions", action="store_true",
                          help="One JobEnvironment per supported Python (3.10–3.13) plus a default.")
         env.set_defaults(handler=cls._environment)
+
+        proj = sub.add_parser(
+            "project",
+            help="Discover a pyproject.toml → build its wheel + environment + a default cluster.",
+        )
+        proj.add_argument("path", nargs="?", default=None,
+                          help="Project dir or pyproject.toml (default: discover from the cwd).")
+        proj.add_argument("--workspace-dir", dest="workspace_dir", default=None,
+                          help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
+        proj.add_argument("--extra", action="append", default=None,
+                          help="optional-dependency extra to include in the env (repeatable).")
+        proj.add_argument("--bundle", action="store_true",
+                          help="Bundle the dependency closure as wheels (zero-PyPI install).")
+        proj.add_argument("--no-cluster", dest="no_cluster", action="store_true",
+                          help="Build the wheel + environment only; don't create the default cluster.")
+        proj.add_argument("--single-user", dest="single_user_name", default=None,
+                          help="Single-user owner for the cluster (default: the current user).")
+        proj.set_defaults(handler=cls._project)
 
         parser.set_defaults(handler=cls._default)
 
@@ -138,6 +164,52 @@ class DeployCommand:
             )
             payload = env.as_dict()
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 0
+
+    @classmethod
+    def _project(cls, args: Any, build_client: Any) -> int:
+        """Discover a pyproject.toml, build its wheel + environment (named for the
+        project), and get-or-create a default cluster installing its deps."""
+        from yggdrasil.cli import style
+        from yggdrasil.databricks.job import wheel as whl
+
+        client = build_client(args)
+        pypi_dir = args.workspace_dir or whl.WORKSPACE_PYPI_DIR
+        extras = tuple(args.extra or ())
+
+        with style.Spinner("building project wheel + environment…"):
+            info = whl.ensure_project_environment(
+                client, args.path, extras=extras, bundle=args.bundle, pypi_dir=pypi_dir,
+            )
+        style.ok(f"deployed project {style.brand(info['name'])} {info['version']}")
+        style.out(f"    {style.dim('env')}        {info['env_name']}\n")
+        style.out(f"    {style.dim('serverless')} {info['serverless']}\n")
+        style.out(f"    {style.dim('cluster')}    {info['cluster']}\n")
+        style.out(f"    {style.dim('deps')}       {info['n_wheels']} entr(y/ies)\n")
+
+        if args.no_cluster:
+            return 0
+
+        # A default single-user cluster that installs the project's deps — the
+        # classic-cluster requirements file written above (project wheel +
+        # dependencies), via Library(requirements=…).
+        user = client.workspace_client().current_user.me().user_name
+        single_user = args.single_user_name or user
+        with style.Spinner(f"provisioning default cluster {info['name']!r}…"):
+            cluster = client.compute.clusters.all_purpose_cluster(
+                name=info["name"],
+                single_user_name=single_user,
+                environment=info["cluster"],
+                wait=False,
+            )
+        style.out(
+            f"    {style.dim('cluster')}    {cluster.cluster_name}  "
+            f"{style.dim(str(cluster.cluster_id))}\n"
+        )
+        style.ok(
+            f"default cluster {cluster.cluster_name!r} ready "
+            f"(project deps, single-user, autoterminating)"
+        )
         return 0
 
     @classmethod

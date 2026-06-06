@@ -717,6 +717,33 @@ ygg databricks deploy environment --key default
 ygg databricks deploy env --all-versions > environments.json
 ```
 
+### `deploy project [path]`
+
+Take **your own project** to Databricks in one command. Discovers the nearest
+`pyproject.toml` (from `path` — a project dir or the file — or the current
+working directory), then:
+
+1. builds the **project's own wheel** from its source tree (`uv build --wheel`),
+2. writes a serverless **base environment** + classic-cluster **requirements**
+   named for the project — `<name>-<version>`, where `<name>` is the
+   `[project].name` from the `pyproject.toml`,
+3. get-or-creates a **default single-user cluster** named for the project that
+   installs the project's dependencies (the requirements file from step 2).
+
+| Flag | Purpose |
+|---|---|
+| `--extra` | optional-dependency extra to fold into the environment (repeatable) |
+| `--bundle` | Bundle the dependency closure as Linux wheels (zero-PyPI install) |
+| `--no-cluster` | Build the wheel + environment only; don't create the cluster |
+| `--single-user` | Single-user owner for the cluster (default: the current user) |
+| `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`) |
+
+```bash
+ygg databricks deploy project                      # discover from the cwd
+ygg databricks deploy project ./my-app --extra databricks
+ygg databricks deploy project --bundle --no-cluster   # zero-PyPI env, no cluster
+```
+
 ---
 
 ## Seed

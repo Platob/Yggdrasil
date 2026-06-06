@@ -79,6 +79,11 @@ __all__ = [
     "ensure_cluster_requirements",
     "ensure_environment",
     "ensure_environments",
+    "find_pyproject",
+    "read_pyproject",
+    "build_project_wheel",
+    "download_dependency_wheels",
+    "ensure_project_environment",
     "ygg_base_environment_name",
     "deployed_environments",
     "ygg_runtime_dependencies",
@@ -1056,6 +1061,200 @@ def ensure_environments(
             py = futures[future]
             results[py] = future.result()
     return [results[py] for py in versions]
+
+
+# ---------------------------------------------------------------------------
+# Arbitrary on-disk projects — discover a pyproject.toml, build it, and write a
+# project-named environment (the user-project counterpart of the ygg image).
+# ---------------------------------------------------------------------------
+
+
+def find_pyproject(start: str | Path | None = None) -> Path:
+    """The nearest ``pyproject.toml`` at or above *start* (cwd by default).
+
+    *start* may point at the file itself, at its directory, or at any nested
+    directory — the search walks up to the first ``pyproject.toml``. Raises
+    :class:`FileNotFoundError` when none exists on the way up to the root."""
+    start_path = Path(start).resolve() if start else Path.cwd()
+    if start_path.is_file():
+        if start_path.name == "pyproject.toml":
+            return start_path
+        start_path = start_path.parent
+    for directory in (start_path, *start_path.parents):
+        candidate = directory / "pyproject.toml"
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"no pyproject.toml found at or above {start_path}")
+
+
+def read_pyproject(path: str | Path) -> dict[str, Any]:
+    """Parse a ``pyproject.toml``'s ``[project]`` table into what the deploy
+    needs: ``name``, ``version``, base ``dependencies``, ``optional_dependencies``
+    (keyed by extra), ``requires_python``, and the project ``dir``."""
+    try:
+        import tomllib as toml_reader
+    except ModuleNotFoundError:                       # Python 3.10 has no tomllib
+        import tomli as toml_reader
+
+    path = Path(path).resolve()
+    data = toml_reader.loads(path.read_text(encoding="utf-8"))
+    project = data.get("project") or {}
+    name = project.get("name")
+    if not name:
+        raise ValueError(f"{path} has no [project].name — not a deployable project")
+    return {
+        "name": name,
+        "version": project.get("version", "0.0.0"),
+        "dependencies": list(project.get("dependencies") or []),
+        "optional_dependencies": {
+            extra: list(reqs)
+            for extra, reqs in (project.get("optional-dependencies") or {}).items()
+        },
+        "requires_python": project.get("requires-python"),
+        "dir": path.parent,
+    }
+
+
+def build_project_wheel(
+    project_dir: str | Path,
+    *,
+    python: str | None = None,
+    dest_dir: str | Path | None = None,
+) -> list[Path]:
+    """Build the **on-disk project** at *project_dir* into a wheel (``uv build
+    --wheel``, ``--python X.Y`` when given; ``pip wheel --no-deps`` fallback).
+
+    Unlike :func:`build_wheel` — which synthesizes a project from an *installed*
+    package's metadata — this builds the real discovered project from its own
+    ``pyproject.toml``, so a user's source tree ships exactly as written."""
+    project_dir = Path(project_dir).resolve()
+    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-proj-"))
+    cmd = ["uv", "build", "--wheel"]
+    if python:
+        cmd += ["--python", python]
+    cmd += ["--out-dir", str(out), str(project_dir)]
+    try:
+        _run_build(cmd)
+    except FileNotFoundError:
+        logger.info("uv not found — building project %s with pip", project_dir)
+        _run_build(
+            [sys.executable, "-m", "pip", "wheel", str(project_dir),
+             "--no-deps", "--wheel-dir", str(out)]
+        )
+    wheels = sorted(out.glob("*.whl"))
+    if not wheels:
+        raise FileNotFoundError(f"no wheel produced for project {project_dir}")
+    return wheels
+
+
+def download_dependency_wheels(
+    dependencies: list[str] | tuple[str, ...],
+    *,
+    python: str | None = None,
+    dest_dir: str | Path | None = None,
+) -> list[Path]:
+    """Download *dependencies* as **Linux-x86_64** wheels for the serverless /
+    cluster runtime (the same platform pins :func:`build_bundle` uses), so a
+    zero-PyPI environment can install entirely from them. Runtime-provided
+    distributions (:func:`_bundle_exclude`) are dropped. Empty in → empty out."""
+    deps = [d for d in dependencies if d]
+    if not deps:
+        return []
+    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-deps-"))
+    py = _py_minor(python)
+    abi = "cp" + py.replace(".", "")                  # 3.12 → cp312
+    platform_args: list[str] = []
+    for platform_tag in _serverless_wheel_platforms():
+        platform_args += ["--platform", platform_tag]
+    logger.info("downloading %d dependency requirement(s) as linux wheels (py%s)", len(deps), py)
+    _run_build(
+        [sys.executable, "-m", "pip", "download", "--only-binary=:all:",
+         "--python-version", py, "--implementation", "cp",
+         "--abi", abi, "--abi", "abi3", "--abi", "none",
+         *platform_args, "--dest", str(out), *deps]
+    )
+    exclude = _bundle_exclude()
+    wheels: list[Path] = []
+    for whl in sorted(out.glob("*.whl")):
+        if _wheel_dist(whl.name) in exclude:
+            whl.unlink(missing_ok=True)
+            continue
+        wheels.append(whl)
+    return wheels
+
+
+def ensure_project_environment(
+    client: Any,
+    pyproject: str | Path | None = None,
+    *,
+    python: str | None = None,
+    extras: tuple[str, ...] | list[str] = (),
+    bundle: bool = False,
+    workspace_dir: str = WORKSPACE_ENV_DIR,
+    pypi_dir: str = WORKSPACE_PYPI_DIR,
+) -> dict[str, Any]:
+    """Discover a project's ``pyproject.toml``, build its wheel, and write a
+    serverless **base environment** + classic-cluster **requirements** named for
+    the project (``<name>-<version>``) — the user-project counterpart of
+    :func:`ensure_environment`.
+
+    The environment's dependency list is the **project wheel** plus the
+    project's own ``[project].dependencies`` (and any requested *extras*' deps).
+    With ``bundle=True`` those dependencies are downloaded as Linux-x86_64 wheels
+    into the env's ``binaries/`` folder and listed by workspace path, so the
+    runtime installs with zero PyPI access; otherwise they're listed as index
+    requirements resolved at install time. Returns a descriptor with the project
+    name/version, the env name, the written file paths, and the dependency list.
+    """
+    meta = read_pyproject(find_pyproject(pyproject))
+    name, version = meta["name"], meta["version"]
+    env_name = f"{_norm(name)}-{_norm_version(version)}"
+    env_dir = f"{workspace_dir.rstrip('/')}/{env_name}"
+
+    # The project's declared deps, with any requested extras flattened in.
+    deps = list(meta["dependencies"])
+    for extra in extras:
+        deps += meta["optional_dependencies"].get(extra, [])
+
+    project_wheels = build_project_wheel(meta["dir"], python=python)
+    if bundle:
+        # Zero-PyPI: project wheel + dependency closure, all under the env's own
+        # ``binaries/`` folder and listed by workspace path.
+        binaries = f"{env_dir}/binaries"
+        dependencies = [
+            registry_upload(client, w, workspace_dir=binaries, overwrite=True)
+            for w in project_wheels
+        ]
+        dependencies += [
+            registry_upload(client, w, workspace_dir=binaries)
+            for w in download_dependency_wheels(deps, python=python)
+        ]
+    else:
+        # Project wheel by path + its declared deps resolved from the index.
+        dependencies = [
+            registry_upload(client, w, workspace_dir=pypi_dir, overwrite=True)
+            for w in project_wheels
+        ] + deps
+
+    serverless = ensure_named_environment(
+        client, env_name, dependencies=dependencies,
+        environment_version=serverless_environment_version(python),
+        workspace_dir=workspace_dir, filename=f"{env_name}.yml",
+    )
+    cluster = ensure_cluster_requirements(
+        client, env_name, dependencies=dependencies, workspace_dir=workspace_dir,
+    )
+    return {
+        "name": name,
+        "version": version,
+        "env_name": env_name,
+        "env_dir": env_dir,
+        "dependencies": dependencies,
+        "n_wheels": len(dependencies),
+        "serverless": serverless,
+        "cluster": cluster,
+        "requires_python": meta["requires_python"],
+    }
 
 
 def deployed_environments(client: Any, *, workspace_dir: str = WORKSPACE_ENV_DIR) -> list[str]:
