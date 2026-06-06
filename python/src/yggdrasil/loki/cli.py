@@ -19,9 +19,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ygg loki", description="Loki — the global yggdrasil agent.")
     sub = parser.add_subparsers(dest="action")
 
-    sub.add_parser("status", help="Identity + reachable backends + behaviors (default).")
+    sub.add_parser("status", help="Identity + reachable backends + engines + behaviors (default).")
     sub.add_parser("capabilities", help="The detected backends and their signals.")
     sub.add_parser("behaviors", help="The registered behavior catalog.")
+    sub.add_parser("engines", help="The reasoning engines and which are available.")
+
+    reason = sub.add_parser("reason", help="Reason about a prompt with the best (or named) engine.")
+    reason.add_argument("prompt", help="The prompt to reason about.")
+    reason.add_argument("--system", default=None, help="Optional system instruction.")
+    reason.add_argument("--engine", default=None, help="Force an engine (claude/openai/databricks).")
 
     tok = sub.add_parser("token", help="The Databricks credentials Loki provides (non-secret).")
     tok.add_argument("--probe", action="store_true", help="Make one network call to resolve the user.")
@@ -51,6 +57,10 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         return _capabilities(loki, style)
     if action == "behaviors":
         return _behaviors(loki, style)
+    if action == "engines":
+        return _engines(loki, style)
+    if action == "reason":
+        return _reason(loki, style, args)
     if action == "token":
         return _token(loki, style, probe=args.probe)
     if action == "run":
@@ -67,6 +77,12 @@ def _status(loki: Any, style: Any) -> int:
         glyph = style.green("●") if b.available else style.dim("○")
         extra = b.detail.get("host") or b.detail.get("home") or b.detail.get("user") or ""
         style.out(f"    {glyph} {b.name.ljust(11)} {style.dim(str(extra))}\n")
+    style.out(f"\n  {style.bold('engines')}\n")
+    best = loki.engine()
+    for eng in loki.engines():
+        glyph = style.green("●") if eng.available() else style.dim("○")
+        star = style.dim(" (default)") if best is not None and eng.name == best.name else ""
+        style.out(f"    {glyph} {eng.name.ljust(11)} {style.dim(str(eng.model))}{star}\n")
     style.out(f"\n  {style.bold('behaviors')}\n")
     for beh in loki.behaviors():
         ok = beh.available(loki)
@@ -74,6 +90,27 @@ def _status(loki: Any, style: Any) -> int:
         style.out(f"    {glyph} {beh.name.ljust(11)} {style.dim(beh.description)}\n")
     if not loki.behaviors():
         style.out(f"    {style.dim('(none registered)')}\n")
+    return 0
+
+
+def _engines(loki: Any, style: Any) -> int:
+    best = loki.engine()
+    for eng in loki.engines():
+        glyph = style.green("●") if eng.available() else style.dim("○")
+        star = style.dim(" (default)") if best is not None and eng.name == best.name else ""
+        style.out(f"  {glyph} {style.bold(eng.name)}  {style.dim(str(eng.model))}{star}\n")
+    if best is None:
+        style.warn("no engine available — set ANTHROPIC_API_KEY / OPENAI_API_KEY or run with a Databricks session")
+    return 0
+
+
+def _reason(loki: Any, style: Any, args: Any) -> int:
+    try:
+        out = loki.reason(args.prompt, system=args.system, engine=args.engine)
+    except (KeyError, RuntimeError) as exc:
+        style.fail(exc.args[0] if exc.args else str(exc))
+        return 1
+    style.out(f"\n{out}\n")
     return 0
 
 

@@ -68,13 +68,61 @@ picking the first reachable space when none is named). Replication,
 inter-agent messaging, HTTP ingestion and serving land on this abstraction
 next.
 
+## Reasoning engines (`TokenEngine`)
+
+A `TokenEngine` is the LLM contract Loki reasons on — the seam between the
+agent and whatever model backs it. Three are built in:
+
+| Engine | Backend | Credentials |
+|---|---|---|
+| `ClaudeEngine` | Anthropic Messages API (`claude-opus-4-8`) | `ANTHROPIC_API_KEY` |
+| `OpenAIEngine` | OpenAI Chat Completions | `OPENAI_API_KEY` |
+| `DatabricksServingEngine` | a Databricks serving endpoint | the Databricks session (no extra key) |
+
+```python
+loki.engines()                       # all three, call .available() to filter
+loki.engine()                        # the best available (preference order)
+loki.engine("claude")                # a specific one
+loki.reason("summarize today's failed jobs", system="be terse")
+```
+
+`Loki.ENGINE_PREFERENCE` picks the engine when none is named (`claude` →
+`openai` → `databricks` for the global agent). Implement `TokenEngine` to
+add another backend.
+
+## DatabricksLoki — the specialized agent
+
+`yggdrasil.databricks.loki.DatabricksLoki` is a Loki that lives on
+Databricks at most:
+
+- **Detects its workspace only from the `ygg databricks configure` session**
+  (the remembered profile/host) — never from `DATABRICKS_*` env vars or hard
+  parameters.
+- **Reasons through a Databricks serving endpoint** by default
+  (`ENGINE_PREFERENCE = ("databricks", "claude", "openai")`; override the
+  endpoint with `serving_endpoint=` or `YGG_LOKI_SERVING_ENDPOINT`).
+- **Deploys to Databricks**: `deploy()` upserts a serverless Job that runs the
+  agent on the pre-built ygg image via the `ygg-loki` wheel entry point.
+
+```python
+from yggdrasil.databricks.loki import DatabricksLoki
+
+loki = DatabricksLoki.current()
+loki.databricks                      # client from the configure profile, or None
+loki.reason("which jobs failed in the last hour?")
+job = loki.deploy(behavior="reason", prompt="nightly health check")
+job.run()
+```
+
 ## CLI
 
 ```bash
-ygg loki                  # status: identity + reachable backends + behaviors
+ygg loki                  # status: identity + backends + engines + behaviors
 ygg loki capabilities     # the detected backends and their signals
+ygg loki engines          # the reasoning engines and which are available
 ygg loki behaviors        # the registered behavior catalog
 ygg loki token --probe    # the Databricks credentials Loki provides
+ygg loki reason "summarize failed jobs" --system "be terse"
 ygg loki run genie --kwarg question='"top customers"' --json
 ```
 

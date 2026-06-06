@@ -24,6 +24,8 @@ from .capability import Backend, detect
 if TYPE_CHECKING:
     from yggdrasil.databricks import DatabricksClient
 
+    from .engine import TokenEngine
+
 __all__ = ["Loki"]
 
 
@@ -31,6 +33,9 @@ class Loki:
     """The global yggdrasil agent — capability-aware, token-providing."""
 
     name = "loki"
+
+    #: Order in which Loki picks a reasoning engine when none is named.
+    ENGINE_PREFERENCE: tuple[str, ...] = ("claude", "openai", "databricks")
 
     _CURRENT: "Optional[Loki]" = None
 
@@ -119,6 +124,52 @@ class Loki:
         except Exception:
             return None
 
+    # -- reasoning engines -------------------------------------------------
+
+    def _engine_instances(self) -> "dict[str, TokenEngine]":
+        """One instance of every known engine (Databricks bound to our client)."""
+        from .engines import ClaudeEngine, DatabricksServingEngine, OpenAIEngine
+
+        return {
+            "claude": ClaudeEngine(),
+            "openai": OpenAIEngine(),
+            "databricks": DatabricksServingEngine(client=self.databricks),
+        }
+
+    def engines(self) -> "list[TokenEngine]":
+        """Every known reasoning engine (call ``.available()`` to filter)."""
+        return list(self._engine_instances().values())
+
+    def engine(self, name: "Optional[str]" = None) -> "Optional[TokenEngine]":
+        """Resolve a reasoning engine by name, or the best available one."""
+        insts = self._engine_instances()
+        if name is not None:
+            if name not in insts:
+                raise KeyError(f"unknown engine {name!r}; known: {', '.join(insts)}")
+            return insts[name]
+        for n in self.ENGINE_PREFERENCE:
+            eng = insts.get(n)
+            if eng is not None and eng.available():
+                return eng
+        return None
+
+    def reason(
+        self,
+        prompt: str,
+        *,
+        system: "Optional[str]" = None,
+        engine: "Optional[str]" = None,
+        **options: Any,
+    ) -> str:
+        """Reason about *prompt* with the best (or named) engine → reply text."""
+        eng = self.engine(engine)
+        if eng is None or not eng.available():
+            raise RuntimeError(
+                "no reasoning engine available — set ANTHROPIC_API_KEY / "
+                "OPENAI_API_KEY, or run with a Databricks session"
+            )
+        return eng.generate(prompt, system=system, **options)
+
     # -- behaviors ---------------------------------------------------------
 
     def behaviors(self) -> list["_behavior.LokiBehavior"]:
@@ -151,6 +202,10 @@ class Loki:
             "host": self.host,
             "backends": [b.to_dict() for b in self.backends(refresh=refresh)],
             "token": self.token_info(),
+            "engines": [
+                {"name": e.name, "model": e.model, "available": e.available()}
+                for e in self.engines()
+            ],
             "behaviors": [b.to_dict() for b in self.behaviors()],
         }
 

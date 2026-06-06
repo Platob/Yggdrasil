@@ -11,8 +11,18 @@ code via :class:`Loki` or from the terminal via ``ygg loki``.
 from .agent import Loki
 from .behavior import LokiBehavior, register, registry
 from .capability import Backend, detect
+from .engine import Completion, TokenEngine
 
 # Import the built-in behaviors so they register on package import.
 from . import behaviors as _behaviors  # noqa: F401
 
-__all__ = ["Loki", "LokiBehavior", "Backend", "detect", "register", "registry"]
+__all__ = [
+    "Loki",
+    "LokiBehavior",
+    "Backend",
+    "detect",
+    "register",
+    "registry",
+    "TokenEngine",
+    "Completion",
+]
