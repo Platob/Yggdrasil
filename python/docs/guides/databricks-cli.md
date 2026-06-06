@@ -28,7 +28,7 @@ ygg databricks <group> <action> [flags]
 | [`fs`](#filesystem-fs) | Files across Workspace / Volumes / DBFS — ls/cat/write/put/get/mkdir/rm/stat/cp/mv |
 | [`wheel`](#wheels-wheel) | Wheel registry — build/upload/deploy/list in the workspace PyPI-like index |
 | [`deploy`](#deploy) | Build + upload wheels and assemble serverless environments |
-| [`seed`](#seed) | One-shot readiness — check (and provision) wheels, environments, a default warehouse, and config |
+| [`seed`](#seed) | One-shot readiness — check (and provision) wheels, environments, a default warehouse, instance pools, a cluster, and the Assistant bundle |
 
 ---
 
@@ -722,15 +722,18 @@ ygg databricks deploy env --all-versions > environments.json
 ## Seed
 
 One command to answer *"is this workspace ready to run ygg, and if not,
-make it ready"*. `seed` walks four prerequisites and, by default,
-provisions anything missing:
+make it ready"*. `seed` walks seven areas and, by default, provisions
+anything missing:
 
 | Area | Checks | Provisions (default mode) |
 |---|---|---|
 | **config** | connectivity, host, current user, default catalog/schema, workspace id | — (read-only) |
 | **wheels** | the versioned ygg image wheel in the registry | builds + uploads it ([`deploy ygg`](#deploy)) |
-| **environments** | the serverless env version + runtime deps | assembles the `JobEnvironment` off the fresh wheel |
+| **environments** | the version-pinned base environments (serverless + cluster) | assembles + writes them off the fresh wheel (zero-PyPI) |
 | **warehouses** | a SQL warehouse to execute against | ensures a default (creates a serverless one if none) |
+| **pools** | the default Light / Medium / Heavy instance pools | provisions them (lazy — no idle nodes); skip with `--no-pools` |
+| **cluster** | a default single-user (dedicated) all-purpose cluster | provisions it (pool-backed, generic env, autoterminating); skip with `--no-cluster` |
+| **assistant** | the Databricks Assistant skills + guidance bundle | deploys it to the workspace + user folders; skip with `--no-assistant` |
 
 ```bash
 ygg databricks seed
@@ -741,7 +744,27 @@ ygg databricks seed
 | `--check` | **Read-only**: report readiness, create/upload nothing. Exits `1` if anything is missing — use it as a CI gate. |
 | `--rebuild` | Force a fresh wheel build even if the version is already deployed. |
 | `--all-versions` | Seed a wheel + environment for every supported Python (3.10–3.13). |
+| `--overwrite` | Rebuild every wheel (all Pythons + the bundle) and rewrite the environment files from scratch, then **end** (skips warehouse/pools/cluster/assistant). |
+| `--no-pools` | Skip the default Light/Medium/Heavy instance pools step. |
+| `--no-cluster` | Skip the default single-user all-purpose cluster step. |
+| `--no-assistant` | Skip deploying the Databricks Assistant skills + guidance bundle. |
 | `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`). |
+
+### Assistant bundle
+
+The **assistant** step deploys the Databricks Assistant ("Genie")
+configuration packaged in `yggdrasil.databricks.assistant` — the workspace
++ user guidance and the per-task Skills that teach the in-product Assistant
+to drive ygg **in Python on serverless, never via the CLI it can't run**.
+It uploads the bundle (and makes a best-effort attempt at any live
+Assistant-settings API):
+
+| Artifact | Lands at |
+|---|---|
+| Assistant guidance (workspace) | `/Workspace/Shared/.ygg/assistant/workspace_instructions.md` |
+| Workspace skills | `/Workspace/Shared/.ygg/assistant/skills/*.md` |
+| User guidance | `/Workspace/Users/<me>/.ygg/assistant/user_instructions.md` |
+| User skills | `/Workspace/Users/<me>/.ygg/assistant/skills/*.md` |
 
 The report is sectioned with status glyphs — `✓` ready, `▲` missing,
 `✗` errored:

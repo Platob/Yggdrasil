@@ -30,6 +30,12 @@ It walks six areas:
   zero-PyPI) so it matches the jobs' image. Lazy: created with autotermination
   and not waited on (starts on attach, self-stops when idle → no cost until
   used). Skip with ``--no-cluster``.
+- **assistant**   — the Databricks Assistant ("Genie") config bundle from
+  ``yggdrasil.databricks.assistant``: the workspace + user guidance and the
+  per-task Skills, deployed under ``/Workspace/Shared/.ygg/assistant`` and
+  ``/Workspace/Users/<me>/.ygg/assistant`` (plus a best-effort live
+  Assistant-settings push). They teach the Assistant to drive ygg in Python
+  on serverless — never via the CLI. Skip with ``--no-assistant``.
 
 In the default (seed) mode it builds/uploads the wheel, assembles and writes
 the environment files, and ensures a default warehouse exists. With ``--check``
@@ -67,6 +73,8 @@ class SeedCommand:
                             help="Skip the default Light/Medium/Heavy instance pools step.")
         parser.add_argument("--no-cluster", dest="no_cluster", action="store_true",
                             help="Skip the default single-user (dedicated) all-purpose cluster step.")
+        parser.add_argument("--no-assistant", dest="no_assistant", action="store_true",
+                            help="Skip deploying the Databricks Assistant skills + guidance bundle.")
         parser.set_defaults(handler=cls._seed)
 
     @classmethod
@@ -356,6 +364,51 @@ class SeedCommand:
                     )
             except Exception as exc:
                 style.fail(f"cluster step failed: {exc}")
+                ok = False
+
+        # -- assistant ---------------------------------------------------
+        # Deploy the Databricks Assistant ("Genie") config bundle — the
+        # workspace + user guidance and the per-task Skills — so the
+        # in-product Assistant drives ygg in Python on serverless instead of
+        # reaching for the CLI it can't run. Upload is the reliable half; the
+        # live Assistant-settings push is best-effort. ``--no-assistant`` opts
+        # out.
+        if not args.no_assistant:
+            style.info("assistant")
+            try:
+                from yggdrasil.databricks import assistant as ax
+
+                if check:
+                    res = ax.deploy(client, check=True)
+                    for path in res["uploaded"][:6]:
+                        style.out(f"    {style.dim('found')}  {path}\n")
+                    if res["missing"]:
+                        style.warn(
+                            f"{len(res['missing'])} assistant file(s) not deployed "
+                            f"(run `ygg databricks seed` to deploy)"
+                        )
+                        ok = False
+                    else:
+                        style.ok(
+                            f"assistant bundle present "
+                            f"({len(res['uploaded'])} files: skills + guidance)"
+                        )
+                else:
+                    with style.Spinner("deploying assistant skills + guidance…"):
+                        res = ax.deploy(client, check=False)
+                    for path in res["uploaded"][:8]:
+                        style.out(f"    {style.dim('file')}   {path}\n")
+                    if len(res["uploaded"]) > 8:
+                        style.out(
+                            f"    {style.dim('… +' + str(len(res['uploaded']) - 8) + ' more')}\n"
+                        )
+                    style.out(f"    {style.dim('api')}    {res['api']}\n")
+                    style.ok(
+                        f"deployed {len(res['uploaded'])} assistant file(s) "
+                        f"(workspace + user skills + guidance)"
+                    )
+            except Exception as exc:
+                style.fail(f"assistant step failed: {exc}")
                 ok = False
 
         # -- summary -----------------------------------------------------

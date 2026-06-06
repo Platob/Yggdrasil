@@ -631,9 +631,12 @@ class Tables(DatabricksService):
                 prefix of the input table names (trimmed of trailing
                 ``_ - . ``) is used.  Raises ``ValueError`` when the inputs
                 share no common prefix.
-            catalog_name, schema_name:
-                Override the view location.  Fall back to the service
-                defaults, then to the first input table's catalog/schema.
+            catalog_name:
+                Override the view catalog.  Falls back to the service
+                default, then to the first input table's catalog.
+            schema_name:
+                Override the view schema.  Falls back to the service
+                default, then to the first input table's schema.
             by_name:
                 Forwarded to :meth:`View.concat_tables`.  Only consulted
                 when ``cast`` is ``False``.

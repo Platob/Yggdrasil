@@ -1,13 +1,21 @@
 # User instructions — `ygg[databricks]`
 
-I work in Python notebooks and jobs on Databricks with
+I work in Python notebooks and jobs on Databricks **serverless** with
 [Yggdrasil](https://github.com/Platob/Yggdrasil) (`pip install "ygg[databricks]"`).
+
+## Runtime
+
+- I run on the **pre-built ygg serverless image** — `import yggdrasil`
+  works out of the box. Only `%pip install "ygg[databricks]"` (into the
+  **default environment**, then `dbutils.library.restartPython()`) if the
+  import actually fails.
+- **Never shell out.** No `%sh`, no `!command`, and **no `ygg` /
+  `databricks` CLI** — serverless can't run them. Do everything in Python
+  through `DatabricksClient` and its `dbc.<service>` accessors.
 
 ## Preferences
 
-- Install `ygg[databricks]` first; restart Python after `%pip install`.
-  Don't use `databricks-sdk` directly — go through `DatabricksClient` and
-  its `dbc.<service>` accessors.
+- Don't use `databricks-sdk` directly — go through `DatabricksClient`.
 - Read data with `dbc.sql.execute(q)` (→ `result.to_polars()` /
   `to_arrow_table()` / `to_pandas()`) or `dbc.dataset(q)` for Spark.
 - Write tables with `tbl.insert(data)`; upsert with

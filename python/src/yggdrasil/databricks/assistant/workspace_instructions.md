@@ -4,24 +4,35 @@ This workspace uses [Yggdrasil](https://github.com/Platob/Yggdrasil)
 (PyPI name: `ygg`, import: `yggdrasil`). Write notebook and job code
 against `yggdrasil.databricks`, not the raw `databricks-sdk`.
 
-## Install
+## Runtime — you are running on serverless
 
-```python
-%pip install "ygg[databricks]"
-dbutils.library.restartPython()
-```
+You (the Assistant) execute Python in a **serverless notebook on the
+pre-built ygg image**. Two hard rules follow from that:
 
-- `[databricks]` pulls `databricks-sdk`. **Don't** add `[bigdata]` on a
-  Databricks cluster — Spark is already there.
-- Add `[data]` only for local pandas/numpy/sqlglot work, `[http]` for the
-  HTTP-session ingestion helpers.
+1. **Never use a terminal.** Serverless cannot shell out — no `%sh`, no
+   `!command`, and **no `ygg` / `databricks` CLI**. Everything the CLI does
+   is also a Python call on `DatabricksClient`; use that. (When you catch
+   yourself reaching for `ygg databricks …`, stop and call the matching
+   `dbc.<service>` method instead — see the table below.)
+2. **ygg is already installed** — the workspace seeds a pre-built ygg image
+   into the default serverless environment (`ygg databricks seed`). Just
+   `import yggdrasil`. Only if the import fails, install into the **default
+   environment** once:
+
+   ```python
+   %pip install "ygg[databricks]"
+   dbutils.library.restartPython()
+   ```
+
+   Don't add `[bigdata]` on a cluster (Spark is already there); don't pin a
+   custom environment — use the default one.
 
 ## Connect
 
 ```python
 from yggdrasil.databricks import DatabricksClient
 
-dbc = DatabricksClient()   # host/token from the runtime inside a notebook
+dbc = DatabricksClient()   # host/token come from the serverless runtime
 ```
 
 - **Singleton by config** — same constructor args → the same instance.
@@ -29,15 +40,16 @@ dbc = DatabricksClient()   # host/token from the runtime inside a notebook
   re-authenticates from the runtime on the other side).
 - Reuse the process-global instance with `DatabricksClient.current()`.
 
-Auth without a notebook: set `DATABRICKS_HOST` + `DATABRICKS_TOKEN` (PAT),
-or `DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET` (OAuth M2M), or pass
-`host=`, `token=`, `profile=`, `client_id=`/`client_secret=` explicitly.
+Outside a notebook, set `DATABRICKS_HOST` + `DATABRICKS_TOKEN` (PAT) or
+`DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET` (OAuth M2M), or pass
+`host=` / `token=` / `profile=` / `client_id=` explicitly.
 
-## Services
+## Services — the CLI replacement
 
-Reach everything through `dbc.<service>` — never `import databricks.sdk`.
+Every terminal task maps to a Python call. Reach everything through
+`dbc.<service>` — never `import databricks.sdk`, never the CLI.
 
-| You want… | Use |
+| You want… | Use (Python — not the CLI) |
 | --- | --- |
 | Run SQL | `dbc.sql.execute(q)` → `StatementResult` |
 | Read/write a table | `dbc.tables["cat.sch.tbl"]` → `Table` |
@@ -50,8 +62,6 @@ Reach everything through `dbc.<service>` — never `import databricks.sdk`.
 | Users / groups | `dbc.iam` |
 | Vector Search | `dbc.ai.vector_search` |
 | Distributed Spark transforms | `dbc.dataset(...)`, `dbc.parallelize(...)` |
-
-There is **no** `dbc.genie` — Genie is not part of this library.
 
 ## SQL
 
@@ -154,10 +164,8 @@ for row in ds.to_local_iterator(): ...            # stream, bounded memory
 
 Methods: `map`, `apply`, `filter`, `explode`, `cast`, `to_table`,
 `toArrow`/`toPolars`/`toPandas`, `collect`, `count`, `to_local_iterator`,
-`infer_schema`, `persist`/`unpersist`. Constructors:
-`SparkDataset.from_sql` / `from_table` / `from_iterable` / `parallelize`
-(all take `spark_session=`). Dataset auto-ships `yggdrasil` + your
-function's imports to executors.
+`infer_schema`, `persist`/`unpersist`. Dataset auto-ships `yggdrasil` +
+your function's imports to executors.
 
 ## Jobs
 
@@ -183,22 +191,14 @@ def ingest(date: str) -> str:
 def daily(date: str = "2025-01-01"):
     ingest(date)
 
-daily.deploy(dbc)              # upsert the Databricks Job
+daily.deploy(dbc)              # upsert the Databricks Job (serverless, ygg image)
 daily(date="2026-05-23")       # run it (in-process inside Databricks, else remote)
 ```
 
-Schedules use the SDK's `CronSchedule` (quartz), passed to
-`create_or_update` or as the `@flow(trigger=...)`:
-
-```python
-from databricks.sdk.service.jobs import CronSchedule
-
-dbc.jobs.create_or_update(
-    name="hourly_ingest",
-    tasks=[...],
-    schedule=CronSchedule(quartz_cron_expression="0 0 * * * ?", timezone_id="UTC"),
-)
-```
+`@task` / `@flow` default to **serverless** and ship your live code as a
+wheel against the seeded ygg image — no cluster wiring, no CLI. Schedules
+use the SDK's `CronSchedule` (quartz), passed to `create_or_update` or as
+`@flow(trigger=...)`.
 
 ## Secrets
 
@@ -210,9 +210,12 @@ dbc.secrets["vendor/api-key"]            # dict-style access → Secret
 
 ## Rules
 
+- **No terminal / CLI.** Serverless can't run `%sh`, `!cmd`, or the
+  `ygg` / `databricks` CLI — every such task is a `dbc.<service>` call.
+- **Use the default environment.** ygg is pre-installed on the serverless
+  image; `import yggdrasil` and go. Don't build a custom environment.
 - **No row-by-row Python loops over data.** Vectorise with
-  `pyarrow.compute`, Polars expressions, or `Dataset` transforms. No
-  `to_pylist()` + comprehension for transformation.
+  `pyarrow.compute`, Polars expressions, or `Dataset` transforms.
 - **Don't pre-check then act.** `ensure_created` / `vol.create` are
   idempotent; do the op and handle errors, don't `exists()` first.
 - **Route through resource methods** — `tbl.insert()`, `vol.create()`,

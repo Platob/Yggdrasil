@@ -147,6 +147,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 yggdrasil = ["py.typed"]
+"yggdrasil.databricks.assistant" = ["*.md", "skills/*.md"]
 
 [tool.uv]
 native-tls = true

@@ -11,13 +11,17 @@ needs the client inside a notebook or job.
 ```python
 from yggdrasil.databricks import DatabricksClient
 
-dbc = DatabricksClient()   # inside a notebook: host/token from the runtime
+dbc = DatabricksClient()   # inside a serverless notebook: auth from the runtime
 ```
 
 - **Singleton by config** — same constructor args → the same instance
   (process-wide). `DatabricksClient.current()` returns the global one.
 - **Picklable** — capture it in Spark workers / job tasks; it
   re-authenticates from the runtime on the far side.
+
+> On serverless you don't install anything first — ygg is on the pre-built
+> image (see `ygg-serverless-runtime`). And you never reach for the `ygg` /
+> `databricks` CLI: every service below is a plain Python call.
 
 ### Auth patterns
 
@@ -36,7 +40,8 @@ You can also default the working catalog/schema:
 
 ## Services
 
-Reach everything through `dbc.<service>` — never `import databricks.sdk`.
+Reach everything through `dbc.<service>` — never `import databricks.sdk`,
+never the CLI.
 
 ```python
 dbc.sql            # SQL execution → StatementResult
@@ -52,15 +57,12 @@ dbc.job_runs       # Job runs
 dbc.secrets        # secret scopes + secrets
 dbc.iam            # users, groups
 dbc.ai             # dbc.ai.vector_search
-dbc.external        # external locations + storage credentials
+dbc.external       # external locations + storage credentials
 dbc.entity_tags    # UC entity tags
 ```
 
 Plus helpers: `dbc.dataset(...)`, `dbc.parallelize(...)`, `dbc.spark()`,
 `dbc.path(...)`, `dbc.tmp_path(...)`, `dbc.open(...)`.
-
-> There is **no** `dbc.genie`. Genie is not implemented in this library —
-> don't suggest it.
 
 ## Resource objects
 
@@ -105,6 +107,7 @@ See the `ygg-spark-tabular` skill for the full Dataset API.
 - Don't `import databricks.sdk` directly — go through `dbc.<service>`.
   (The raw SDK clients are reachable via `dbc.workspace_client()` if you
   truly need them, but prefer the service layer.)
+- Don't shell out to the `ygg` / `databricks` CLI — serverless can't, and
+  every CLI verb is a `dbc.<service>` method.
 - Don't build multiple clients for one workspace — the singleton handles it.
 - Don't use `dbc.dbfs_path(...)` — it's deprecated; use `dbc.path(...)`.
-- Don't reference `dbc.genie` — it doesn't exist.
