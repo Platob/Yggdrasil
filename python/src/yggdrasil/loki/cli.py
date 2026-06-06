@@ -340,7 +340,14 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
 
     streamed = False
     try:
-        if plan["action"] == "web" and plan.get("url"):
+        if plan["action"] == "tabular" and plan.get("url"):
+            cache_dir = getattr(state.get("session"), "cache_dir", None)
+            res = agent.run("tabular", url=plan["url"],
+                            cache_dir=str(cache_dir) if cache_dir else None)
+            _print_tabular(style, res)
+            reply = (f"Fetched {res['rows']}×{len(res['columns'])} from {res['source']}; "
+                     f"cached → {res['cached_to']}")
+        elif plan["action"] == "web" and plan.get("url"):
             res = agent.run("web", url=plan["url"], question=line)
             _print_web(style, res)
             reply = res.get("answer") or style.dim(f"fetched {plan['url']}")
@@ -392,6 +399,22 @@ def _confirm(style: Any, action: str) -> bool:
     except (EOFError, KeyboardInterrupt):
         return False
     return ans in ("y", "yes")
+
+
+def _print_tabular(style: Any, res: dict) -> None:
+    """Print a fetched-and-cached tabular frame + the proposed next steps."""
+    style.out(f"  {style.dim('▦ ' + str(res['source']))}\n")
+    shape = f"{res['rows']} × {len(res['columns'])}"
+    style.out(f"  {style.good('▦')} {style.bold(shape)} "
+              f"{style.dim('· ' + ', '.join(res['columns'][:8]))}\n")
+    style.out(style.dim("  " + res["preview"].replace("\n", "\n  ")) + "\n")
+    style.out(f"  {style.good('✎ cached')} {style.dim(res['cached_to'])}  "
+              f"{style.dim('(Parquet, via io)')}\n")
+    if res.get("stored"):
+        style.out(f"  {style.good('✎ stored')} {style.dim(res['stored'])}\n")
+    style.out(f"  {style.bold('next steps')} {style.dim('— reuse · store · load')}\n")
+    for step in res["next_steps"]:
+        style.out(f"    {style.brand('›')} {style.dim(step)}\n")
 
 
 def _print_web(style: Any, res: dict) -> None:

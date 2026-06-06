@@ -1,0 +1,118 @@
+"""Tests for the data/timeseries path — classifier, routing, TabularBehavior."""
+from __future__ import annotations
+
+import functools
+import http.server
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+from yggdrasil.loki import Loki
+from yggdrasil.loki.capability import Backend
+
+try:
+    import polars  # noqa: F401
+
+    from yggdrasil.loki.behaviors import _json_to_frame
+
+    _HAVE_STACK = True
+except Exception:  # pragma: no cover
+    _HAVE_STACK = False
+
+
+def _loki():
+    loki = Loki()
+    loki._backends = [Backend("local", True)]
+    return loki
+
+
+class TestClassifyAndRoute(unittest.TestCase):
+    def test_classify_data_and_timeseries(self):
+        loki = _loki()
+        self.assertTrue(loki.classify_data("EUR/USD rate over the last 2 weeks")["timeseries"])
+        self.assertTrue(loki.classify_data("show me the iris dataset csv")["data"])
+        self.assertFalse(loki.classify_data("fix the bug in app.py")["data"])
+
+    def test_data_url_routes_to_tabular(self):
+        plan = _loki().route(
+            "get https://api.x.io/v1/rates over the last 2 weeks of exchange rates")
+        self.assertEqual(plan["category"], "data")
+        self.assertEqual(plan["action"], "tabular")
+        self.assertTrue(plan["timeseries"])
+        self.assertEqual(plan["url"], "https://api.x.io/v1/rates")
+
+    def test_plain_url_still_routes_to_web(self):
+        plan = _loki().route("fetch https://example.com/about")
+        self.assertEqual(plan["action"], "web")
+
+
+@unittest.skipUnless(_HAVE_STACK, "requires the polars/io stack")
+class TestJsonToFrame(unittest.TestCase):
+    def test_list_of_records(self):
+        df = _json_to_frame([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
+        self.assertEqual(df.shape, (2, 2))
+
+    def test_nested_timeseries_becomes_long(self):
+        df = _json_to_frame({"rates": {"2026-05-22": {"USD": 1.1}, "2026-05-23": {"USD": 1.2}}})
+        self.assertEqual(set(df.columns), {"date", "symbol", "value"})
+        self.assertEqual(df.height, 2)
+
+    def test_flat_date_value_map(self):
+        df = _json_to_frame({"data": {"2026-01-01": 10, "2026-01-02": 11}})
+        self.assertEqual(set(df.columns), {"date", "value"})
+
+
+@unittest.skipUnless(_HAVE_STACK, "requires the polars/io stack")
+class TestTabularBehavior(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp(prefix="ygg-tab-")
+        d = Path(cls.dir)
+        (d / "data.csv").write_text("city,pop\nParis,2161\nTokyo,13960\n")
+        (d / "ts.json").write_text(
+            '{"rates": {"2026-05-22": {"USD": 1.1595}, "2026-05-23": {"USD": 1.1643}}}')
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=cls.dir)
+        cls.srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        self.cache = tempfile.mkdtemp(prefix="ygg-cache-")
+
+    def test_fetch_csv_caches_parquet_and_proposes(self):
+        res = _loki().run("tabular", url=f"{self.base}/data.csv",
+                          cache_dir=self.cache, key="cities")
+        self.assertEqual(res["rows"], 2)
+        self.assertEqual(res["columns"], ["city", "pop"])
+        cached = Path(res["cached_to"])
+        self.assertTrue(cached.is_file() and cached.suffix == ".parquet")
+        self.assertTrue(any("reuse" in s for s in res["next_steps"]))
+
+    def test_fetch_json_timeseries_normalized(self):
+        res = _loki().run("tabular", url=f"{self.base}/ts.json",
+                          cache_dir=self.cache, key="ts")
+        self.assertEqual(res["columns"], ["date", "symbol", "value"])
+        self.assertEqual(res["rows"], 2)
+
+    def test_reuse_cache_then_store(self):
+        first = _loki().run("tabular", url=f"{self.base}/data.csv",
+                            cache_dir=self.cache, key="cities")
+        out = Path(self.cache) / "exported.csv"
+        again = _loki().run("tabular", cache=first["cached_to"],
+                            cache_dir=self.cache, store=str(out))
+        self.assertEqual(again["rows"], 2)
+        self.assertEqual(again["stored"], str(out))
+        self.assertTrue(out.is_file())
+
+    def test_requires_url_or_cache(self):
+        with self.assertRaises(ValueError):
+            _loki().run("tabular")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -59,6 +59,19 @@ ROUTES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+#: Signals that a request is about *data* (worth fetching as a tabular frame).
+DATA_SIGNALS: tuple[str, ...] = (
+    "dataset", "data set", " csv", "parquet", "table of", "rows", "columns",
+    "records", "metrics", "statistics", "prices", "price of", "rate", "rates",
+    "exchange", "stock", "ticker", "quotes", "ohlc", "candles", "fx ",
+)
+#: Signals that a request is a *time series* (history over a period).
+TIMESERIES_SIGNALS: tuple[str, ...] = (
+    "time series", "timeseries", "over the last", "over the past", "since ",
+    "history", "historical", "trend", "daily", "weekly", "monthly", "yearly",
+    "change over", "evolution", "past two weeks", "last two weeks",
+)
+
 
 class Loki:
     """The global yggdrasil agent — capability-aware, token-providing."""
@@ -391,8 +404,15 @@ class Loki:
         low = text.lower()
         url_match = re.search(r"https?://\S+", text)
         if url_match or any(s in low for s in ROUTES["web"]):
-            return {"category": "web", "action": "web", "specialist": None,
-                    "url": url_match.group(0).rstrip(").,") if url_match else None,
+            url = url_match.group(0).rstrip(").,") if url_match else None
+            info = self.classify_data(text)
+            # A data/timeseries request with a source → fetch it as a cached
+            # tabular frame (the data path), not a plain page fetch.
+            if url and info["data"]:
+                return {"category": "data", "action": "tabular", "specialist": None,
+                        "url": url, "data": True, "timeseries": info["timeseries"],
+                        "why": "data/timeseries source → fetch as a cached tabular frame"}
+            return {"category": "web", "action": "web", "specialist": None, "url": url,
                     "why": "a URL / web-fetch request — uses the HTTP session + io handlers"}
         if any(s in low for s in ROUTES["databricks"]):
             action = "genie" if "genie" in low else "reason"
@@ -410,6 +430,23 @@ class Loki:
                     "why": "matched a file/code-change signal"}
         return {"category": "chat", "action": "reason", "specialist": None,
                 "why": "no specialized signal — plain reasoning"}
+
+    def classify_data(self, text: str) -> dict[str, Any]:
+        """Global context: is this request data- or time-series-shaped?
+
+        Drives the *data path* — a positive classification routes a sourced
+        request to tabular fetching + caching (:class:`TabularBehavior`) instead
+        of a plain page fetch. Returns ``{"data", "timeseries", "why"}``.
+        """
+        low = text.lower()
+        ts = (any(s in low for s in TIMESERIES_SIGNALS)
+              or bool(re.search(r"\b(last|past|since|over)\b.{0,20}\b(day|week|month|year)s?\b", low)))
+        data = ts or any(s in low for s in DATA_SIGNALS)
+        return {
+            "data": data,
+            "timeseries": ts,
+            "why": "time-series signal" if ts else ("data/tabular signal" if data else "no data signal"),
+        }
 
     def specialist(self, name: str) -> "Optional[Loki]":
         """A specialized agent to isolate a category of work, or ``None``.

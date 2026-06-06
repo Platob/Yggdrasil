@@ -340,6 +340,38 @@ the interactive session a URL routes itself:
   ┌──────────────┬─────────────┬─ …
 ```
 
+## Data path — detect, fetch tabular, cache, propose
+
+Loki keeps a **global read on the request**: `loki.classify_data(text)` flags
+whether it's *data*- or *time-series*-shaped (rates, prices, history, "over
+the last N weeks", a `.csv`/`.parquet`, …). When such a request carries a
+source URL, the router sends it to the **data path** (`category: "data"`,
+action `tabular`) instead of a plain page fetch — the `tabular` behavior:
+
+1. **fetches it into a polars frame** — tabular bodies through the io handlers,
+   JSON normalized into a flat/long frame (a time series → `date/symbol/value`);
+2. **caches an optimized Parquet copy** in the session `cache/` via the io
+   abstraction (`IO.from_(path).write_polars_frame(df)`);
+3. **proposes next steps** — reuse the cache, store elsewhere
+   (Parquet / Arrow / CSV / Delta), or load it into Databricks.
+
+```text
+⟢ get EUR/USD exchange rates over the last 2 weeks from https://api.frankfurter.dev/…
+  ▹ data · data/timeseries source → fetch as a cached tabular frame
+  ▦ 11 × 3 · date, symbol, value
+  …polars preview…
+  ✎ cached …/cache/frankfurter-b03cb0.parquet  (Parquet, via io)
+  next steps — reuse · store · load
+    › reuse the cache:  loki.run('tabular', cache='…/frankfurter-b03cb0.parquet')
+    › store as Parquet/Arrow/CSV/Delta:  loki.run('tabular', cache='…', store='out.parquet')
+    › read it back anywhere:  IO.from_('…').to_polars()
+```
+
+```python
+res = loki.run("tabular", url="https://…/rates.json")   # fetch → frame → cache
+loki.run("tabular", cache=res["cached_to"], store="prices.parquet")   # reuse + store
+```
+
 ## Sessions & memory
 
 Each interactive run gets an **isolated session workspace** under

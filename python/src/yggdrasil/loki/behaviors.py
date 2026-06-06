@@ -26,7 +26,8 @@ from .behavior import LokiBehavior, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentBehavior", "GenieBehavior", "PythonProjectBehavior", "WebBehavior"]
+__all__ = ["AgentBehavior", "GenieBehavior", "PythonProjectBehavior", "WebBehavior",
+           "TabularBehavior"]
 
 
 @register
@@ -127,6 +128,139 @@ class WebBehavior(LokiBehavior):
                     system="Answer concisely from the page; say if it's not covered.",
                 )
         return out
+
+
+def _tab_slug(text: str) -> str:
+    return re.sub(r"[^0-9A-Za-z]+", "-", (text or "").strip().lower()).strip("-")[:48] or "data"
+
+
+def _auto_key(source: str) -> str:
+    """A short, stable cache key from a source — ``<domain>-<xxh32>`` for URLs."""
+    import urllib.parse as _up
+
+    import xxhash
+
+    digest = xxhash.xxh32_hexdigest(source)[:6]
+    if source.startswith(("http://", "https://")):
+        host = _up.urlparse(source).netloc.split(":")[0]
+        comps = [c for c in host.split(".") if c not in ("www", "api")] or [host]
+        word = re.sub(r"[^a-z0-9]", "", max(comps, key=len).lower())[:16] or "data"
+        return f"{word}-{digest}"
+    return f"{_tab_slug(source)[:24].rstrip('-')}-{digest}"
+
+
+def _json_to_frame(data: Any):
+    """Normalize a decoded JSON payload into a polars frame.
+
+    Handles the common shapes external data APIs return: a list of records, a
+    nested ``{key: {date: {sym: val}}}`` time series (→ long ``date/symbol/value``),
+    a flat ``{date: value}`` mapping, or a single record.
+    """
+    import polars as pl
+
+    if isinstance(data, list):
+        return pl.DataFrame(data)
+    if isinstance(data, dict):
+        for key in ("rates", "data", "results", "observations", "values", "series"):
+            v = data.get(key)
+            if isinstance(v, dict) and v and all(isinstance(x, dict) for x in v.values()):
+                rows = [{"date": d, "symbol": s, "value": val}
+                        for d, m in sorted(v.items()) for s, val in m.items()]
+                return pl.DataFrame(rows)
+            if isinstance(v, dict) and v:
+                return pl.DataFrame({"date": list(v.keys()), "value": list(v.values())})
+            if isinstance(v, list) and v:
+                return pl.DataFrame(v)
+        return pl.DataFrame([data])
+    return pl.DataFrame({"value": [data]})
+
+
+def _fetch_frame(url: str, fmt: Optional[str]):
+    """Fetch *url* as a polars frame.
+
+    JSON bodies are **normalized** into a flat/long frame (a time series →
+    ``date/symbol/value``), since API JSON rarely maps 1:1 to rows. Genuinely
+    tabular bodies (CSV / Parquet / Arrow / XLSX) go through the io handlers.
+    """
+    from . import web
+
+    resp = web.fetch(url)
+    mime = str(resp.media_type.mime_type.value)
+    if not fmt and "json" in mime:
+        return _json_to_frame(resp.json())
+    try:
+        return web.read_table(url, fmt=fmt)
+    except Exception:
+        return _json_to_frame(web.read_json(url))
+
+
+@register
+class TabularBehavior(LokiBehavior):
+    """Fetch a data/timeseries source as a tabular frame, cache it, propose reuse.
+
+    Loki's data path: when a request is data- or time-series-shaped, fetch it
+    straight into a polars frame (through the io handlers for CSV/Parquet/…, or
+    a normalized JSON payload), **cache it as Parquet** in the session cache via
+    the io abstraction (an optimized columnar copy), and return the frame
+    preview plus concrete **next steps** — reuse the cache, store it elsewhere
+    (Parquet / Arrow / CSV / Delta), or load it into Databricks.
+    """
+
+    name = "tabular"
+    description = "Fetch a data/timeseries source as a cached tabular frame and propose reuse/store steps."
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        url: Optional[str] = None,
+        cache: Optional[str] = None,
+        store: Optional[str] = None,
+        fmt: Optional[str] = None,
+        key: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        from yggdrasil.io.holder import IO
+
+        if cache:                       # reuse a previously cached frame
+            df, source = IO.from_(str(cache)).to_polars(), cache
+        elif url:
+            df, source = _fetch_frame(url, fmt), url
+        else:
+            raise ValueError("provide url= to fetch, or cache= to reuse a cached frame")
+
+        cdir = pathlib.Path(cache_dir) if cache_dir else (pathlib.Path.home() / ".loki" / "cache")
+        cdir.mkdir(parents=True, exist_ok=True)
+        key = key or _auto_key(source)
+        cached_to = cdir / f"{key}.parquet"
+        IO.from_(str(cached_to)).write_polars_frame(df)   # optimized columnar copy
+
+        stored = None
+        if store:
+            IO.from_(store).write_polars_frame(df)
+            stored = store
+
+        steps = [
+            f"reuse the cache:  loki.run('tabular', cache={str(cached_to)!r})",
+            f"store as Parquet/Arrow/CSV/Delta:  loki.run('tabular', cache={str(cached_to)!r}, store='out.parquet')",
+            f"read it back anywhere:  IO.from_({str(cached_to)!r}).to_polars()",
+        ]
+        if agent.has("databricks"):
+            steps.append(
+                f"load into Databricks:  upload {cached_to.name} to a UC Volume, then "
+                f"loki.run('databricks-sql', query='CREATE TABLE <cat>.<sch>.{key} AS "
+                f"SELECT * FROM parquet.`/Volumes/.../{cached_to.name}`')"
+            )
+        return {
+            "source": source,
+            "rows": df.height,
+            "columns": list(df.columns),
+            "preview": str(df.head(10)),
+            "cached_to": str(cached_to),
+            "stored": stored,
+            "next_steps": steps,
+        }
 
 
 @register
