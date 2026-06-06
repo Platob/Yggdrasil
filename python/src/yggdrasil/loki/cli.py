@@ -171,13 +171,14 @@ def _repl(loki: Any, style: Any) -> int:
     """A modern interactive session: route → reason/act, live token KPIs, budget."""
     from yggdrasil.loki.usage import METER
 
-    METER.set_limit(METER.DEFAULT_LIMIT)
+    METER.set_limit(METER.DEFAULT_COST_LIMIT)
     state: dict[str, Any] = {"tier": None, "root": ".", "engine": None}
 
     style.out(f"  {style.bold('interactive session')}  "
               f"{style.dim('· live prompts, streamed replies · /help · /quit')}\n")
     _select_engine(loki, style, state)
-    style.out(f"  {style.dim('budget')} {style.brand(f'{METER.limit:,}')} {style.dim('tokens')}\n\n")
+    style.out(f"  {style.dim('cost budget')} {style.brand(f'${METER.cost_limit:.2f}')} "
+              f"{style.dim('· raised in $1 steps when reached')}\n\n")
 
     while True:
         try:
@@ -283,6 +284,7 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             reply = res.get("answer") or style.dim(f"fetched {plan['url']}")
         elif plan["action"] == "act":
             res = agent.act(line, root=state["root"], tier=state["tier"], allow_web=True,
+                            confirm=lambda action: _confirm(style, action),
                             on_step=lambda r: _act_step(style, r))
             reply = res["answer"]
             if res.get("files_changed"):
@@ -308,6 +310,15 @@ def _act_step(style: Any, rec: dict) -> None:
         return
     call = f"{rec['tool']}({', '.join(f'{k}={_short(v)}' for k, v in rec['args'].items())})"
     style.out(f"  {style.dim(str(rec['n']).rjust(2))} {style.brand(call)}\n")
+
+
+def _confirm(style: Any, action: str) -> bool:
+    """Ask the user to approve a destructive op on a non-temporary asset."""
+    try:
+        ans = input(f"  {style.amber('⚠ confirm')} {action}? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans in ("y", "yes")
 
 
 def _print_web(style: Any, res: dict) -> None:
@@ -351,7 +362,7 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
             f"    {style.brand('/usage')}    token KPIs (per model + global, USD)\n"
             f"    {style.brand('/tier')}     fast | deep | auto  (model tier for this session)\n"
             f"    {style.brand('/root')}     set the working tree for file tasks\n"
-            f"    {style.brand('/budget')}   show, set N, +N step, or off\n"
+            f"    {style.brand('/budget')}   cost cap — show, set $N, +$N step, or off\n"
             f"    {style.brand('/reset')}    zero the usage meter\n"
             f"    {style.brand('/quit')}     leave\n"
             f"  {style.dim('plain text is routed automatically — reason (streamed), act on files, web, or a specialist')}\n"
@@ -383,16 +394,17 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
         state["root"] = arg or "."
         style.ok(f"root → {state['root']}")
     elif cmd == "budget":
+        amt = _usd(arg.lstrip("+"))
         if arg in ("off", "none"):
-            METER.set_limit(None); style.ok("budget off (unlimited)")
-        elif arg.startswith("+") and arg[1:].isdigit():
-            METER.raise_limit(int(arg[1:])); style.ok(f"budget → {METER.limit:,}")
-        elif arg.isdigit():
-            METER.set_limit(int(arg)); style.ok(f"budget → {METER.limit:,}")
+            METER.set_limit(None); style.ok("cost budget off (unlimited)")
+        elif arg.startswith("+") and amt is not None:
+            METER.raise_limit(amt); style.ok(f"cost budget → ${METER.cost_limit:.2f}")
+        elif amt is not None:
+            METER.set_limit(amt); style.ok(f"cost budget → ${METER.cost_limit:.2f}")
         else:
-            lim = "off" if METER.limit is None else f"{METER.limit:,}"
-            style.out(f"  {style.dim('budget')} {style.brand(lim)}  "
-                      f"{style.dim('used')} {METER.total_tokens:,}\n")
+            lim = "off" if METER.cost_limit is None else f"${METER.cost_limit:.2f}"
+            style.out(f"  {style.dim('cost budget')} {style.brand(lim)}  "
+                      f"{style.dim('spent')} ${METER.total_cost:.4f}\n")
     elif cmd == "reset":
         METER.reset(); style.ok("usage meter reset")
     else:
@@ -401,23 +413,33 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
 
 
 def _budget_prompt(style: Any) -> bool:
-    """At/over budget: ask to raise step-by-step, set a custom cap, or stop."""
+    """At/over the cost cap (checked between actions): raise by a step, set a
+    custom cap, or stop. Returns whether to continue."""
     from yggdrasil.loki.usage import METER
 
-    style.warn(f"token budget reached — {METER.total_tokens:,} ≥ {METER.limit:,}")
+    style.warn(f"cost budget reached — ${METER.total_cost:.4f} ≥ ${METER.cost_limit:.2f}")
     try:
         ans = input(
-            f"  raise by {METER.step:,} [Enter] · set N · off · stop [s]: "
+            f"  raise by ${METER.cost_step:.2f} [Enter] · set $N · off · stop [s]: "
         ).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
     if ans in ("s", "stop", "n", "no"):
         return False
     if ans in ("off", "none"):
-        METER.set_limit(None); style.ok("budget off (unlimited)"); return True
-    if ans.isdigit():
-        METER.set_limit(int(ans)); style.ok(f"budget → {METER.limit:,}"); return True
-    METER.raise_limit(); style.ok(f"budget → {METER.limit:,}"); return True
+        METER.set_limit(None); style.ok("cost budget off (unlimited)"); return True
+    amt = _usd(ans)
+    if amt is not None:
+        METER.set_limit(amt); style.ok(f"cost budget → ${METER.cost_limit:.2f}"); return True
+    METER.raise_limit(); style.ok(f"cost budget → ${METER.cost_limit:.2f}"); return True
+
+
+def _usd(s: str) -> "float | None":
+    """Parse a USD amount like ``1``, ``1.50``, ``$2`` → float, else None."""
+    try:
+        return float(s.strip().lstrip("$"))
+    except (ValueError, AttributeError):
+        return None
 
 
 def _usage_line(style: Any, *, delta: int | None = None, prefix: str = "usage") -> None:
@@ -430,10 +452,10 @@ def _usage_line(style: Any, *, delta: int | None = None, prefix: str = "usage") 
         style.good(f"${METER.total_cost:.4f}"),
     ]
     if delta:
-        bits.append(style.dim(f"(+{delta:,})"))
-    if METER.limit is not None:
-        rem = METER.remaining() or 0
-        bits.append((style.good if rem > 0 else style.bad)(f"{rem:,} left"))
+        bits.append(style.dim(f"(+{delta:,} tok)"))
+    if METER.cost_limit is not None:
+        rem = METER.remaining() or 0.0
+        bits.append((style.good if rem > 0 else style.bad)(f"${rem:.4f} left"))
     style.out(f"  {style.dim(prefix)}  " + "  ".join(bits) + "\n")
 
 
@@ -462,11 +484,11 @@ def _usage_table(style: Any) -> int:
         f"{style.bold(f'{t.total_tokens:,}'.rjust(10))}"
         f"{style.good(f'${METER.total_cost:.4f}'.rjust(11))}\n"
     )
-    if METER.limit is not None:
-        rem = METER.remaining() or 0
+    if METER.cost_limit is not None:
+        rem = METER.remaining() or 0.0
         g = style.good if rem > 0 else style.bad
-        style.out(f"  {style.dim('budget')} {style.brand(f'{METER.limit:,}')}  "
-                  f"{g(f'{rem:,} left')}\n")
+        style.out(f"  {style.dim('cost budget')} {style.brand(f'${METER.cost_limit:.2f}')}  "
+                  f"{g(f'${rem:.4f} left')}\n")
     style.out(f"  {style.dim('pricing USD/1M tok — defaults in yggdrasil.loki.usage.PRICING')}\n")
     return 0
 

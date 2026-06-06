@@ -343,13 +343,13 @@ class TestReplCommands(unittest.TestCase):
 
         self.METER = METER
         self._saved = dict(METER._rows)
-        self._limit = METER.limit
+        self._limit = METER.cost_limit
         METER.reset()
 
     def tearDown(self):
         self.METER.reset()
         self.METER._rows.update(self._saved)
-        self.METER.limit = self._limit
+        self.METER.cost_limit = self._limit
 
     def test_tier_and_budget_commands(self):
         from yggdrasil.cli import style
@@ -361,27 +361,27 @@ class TestReplCommands(unittest.TestCase):
         self.assertEqual(state["tier"], "deep")
         self.assertTrue(cli._repl_command(loki, style, state, "/tier auto"))
         self.assertIsNone(state["tier"])
-        cli._repl_command(loki, style, state, "/budget 1000")
-        self.assertEqual(self.METER.limit, 1000)
-        cli._repl_command(loki, style, state, "/budget +500")
-        self.assertEqual(self.METER.limit, 1500)
+        cli._repl_command(loki, style, state, "/budget 5")
+        self.assertEqual(self.METER.cost_limit, 5.0)
+        cli._repl_command(loki, style, state, "/budget +2")
+        self.assertEqual(self.METER.cost_limit, 7.0)
         cli._repl_command(loki, style, state, "/budget off")
-        self.assertIsNone(self.METER.limit)
+        self.assertIsNone(self.METER.cost_limit)
 
     def test_budget_prompt_raises_step_on_enter(self):
         from yggdrasil.cli import style
         from yggdrasil.loki import cli
 
-        self.METER.set_limit(100)
+        self.METER.set_limit(1.0)
         with patch("builtins.input", return_value=""):
             self.assertTrue(cli._budget_prompt(style))
-        self.assertEqual(self.METER.limit, 100 + self.METER.step)
+        self.assertAlmostEqual(self.METER.cost_limit, 1.0 + self.METER.cost_step)
 
     def test_budget_prompt_stop_returns_false(self):
         from yggdrasil.cli import style
         from yggdrasil.loki import cli
 
-        self.METER.set_limit(100)
+        self.METER.set_limit(1.0)
         with patch("builtins.input", return_value="s"):
             self.assertFalse(cli._budget_prompt(style))
 

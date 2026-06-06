@@ -63,25 +63,26 @@ class TestTokenMeter(unittest.TestCase):
         self.m.record("openai", "gpt-4o", 10, 10)
         self.assertEqual([r.engine for r in self.m.rows_for("openai")], ["openai"])
 
-    def test_budget_set_raise_remaining_and_check(self):
-        self.m.record("claude", "claude-opus-4-8", 80, 0)
-        self.assertIsNone(self.m.remaining())          # no limit → unlimited
-        self.m.set_limit(100)
-        self.assertEqual(self.m.remaining(), 20)
+    def test_cost_budget_set_raise_remaining_and_check(self):
+        # haiku is $1 / 1M input tokens → 500k input = $0.50.
+        self.m.record("claude", "claude-haiku-4-5", 500_000, 0)
+        self.assertIsNone(self.m.remaining())          # no cap → unlimited
+        self.m.set_limit(1.0)                          # $1 cap
+        self.assertAlmostEqual(self.m.remaining(), 0.50)
         self.m.check_budget()                          # under → no raise
-        self.m.record("claude", "claude-opus-4-8", 30, 0)  # now 110 ≥ 100
+        self.m.record("claude", "claude-haiku-4-5", 600_000, 0)  # +$0.60 → $1.10
         self.assertTrue(self.m.over_budget())
         with self.assertRaises(TokenBudgetExceeded) as ctx:
             self.m.check_budget()
-        self.assertEqual(ctx.exception.limit, 100)
-        self.assertEqual(ctx.exception.used, 110)
-        self.m.raise_limit()                           # +step
-        self.assertGreater(self.m.limit, 110)
+        self.assertAlmostEqual(ctx.exception.limit, 1.0)
+        self.assertAlmostEqual(ctx.exception.used, 1.10)
+        self.m.raise_limit()                           # +$1 step → $2
+        self.assertAlmostEqual(self.m.cost_limit, 2.0)
         self.m.check_budget()                          # back under
 
     def test_raise_limit_by_amount(self):
-        self.m.set_limit(100)
-        self.assertEqual(self.m.raise_limit(50), 150)
+        self.m.set_limit(1.0)
+        self.assertAlmostEqual(self.m.raise_limit(0.5), 1.5)
 
     def test_reset_clears_rows(self):
         self.m.record("claude", "claude-opus-4-8", 10, 10)
@@ -95,14 +96,14 @@ class TestEngineRecordsUsage(unittest.TestCase):
 
     def setUp(self):
         self._saved = dict(METER._rows)
-        self._limit = METER.limit
+        self._limit = METER.cost_limit
         METER.reset()
         METER.set_limit(None)
 
     def tearDown(self):
         METER.reset()
         METER._rows.update(self._saved)
-        METER.limit = self._limit
+        METER.cost_limit = self._limit
 
     def test_claude_records_provider_usage(self):
         fake = types.ModuleType("anthropic")

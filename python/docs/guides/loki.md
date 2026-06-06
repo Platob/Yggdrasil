@@ -103,9 +103,19 @@ what they changed.
 | `read_file` | read a file (optional line range) | discovery |
 | `find` | find files by glob | discovery |
 | `grep` | search file contents by regex | discovery |
+| `read_table` | parse a local CSV/Parquet/Arrow/XLSX/JSON via the io handlers | discovery |
 | `write_file` | create/overwrite a file | write (skipped when `read_only`) |
 | `edit_file` | replace one unique occurrence | write (skipped when `read_only`) |
+| `run_python` | **write & run Python in `root`** (compute or apply changes) — on by default | write |
 | `run` | run a shell command in `root` | shell (only when `allow_shell`) |
+
+The agent **codes in its reasoning by default**: `run_python` lets it write
+and execute Python to compute, transform, or apply changes without a shell.
+A `confirm` callback gates **destructive ops on non-temporary assets** —
+overwriting or editing an existing file outside the system temp dir asks
+first (the interactive session prompts `⚠ confirm …? [y/N]`); new files and
+scratch/temp files don't. So Loki runs autonomously and only stops the user
+for credentials, clarifications, and destructive changes to real assets.
 
 Implement your own `Tool`s and pass a custom `Toolbox` to `act(toolbox=…)`
 to give the agent different hands.
@@ -258,16 +268,20 @@ Slash commands: `/engine` `/engines` `/status` `/usage` `/tier fast|deep|auto`
 serving engine self-heals to a deployed endpoint if its configured one is
 missing.)
 
-### Token budget
+### Cost budget
 
-Every session starts with a default **token budget** (50 000 tokens). When
-you reach it, Loki stops and asks — raise by one step (25 000), set a custom
-cap, turn it off, or stop — so a runaway session never spends without bound:
+Every session starts with a default **cost budget of $1** (USD spend, not
+tokens — a fixed cap across models of very different per-token prices).
+The cap is checked **between actions** (never mid-action), so a running
+turn always finishes; when the spend crosses it Loki stops and asks — raise
+by one **$1** step, set a custom cap, turn it off, or stop:
 
 ```text
-▲ token budget reached — 50,120 ≥ 50,000
-  raise by 25,000 [Enter] · set N · off · stop [s]:
+▲ cost budget reached — $1.0042 ≥ $1.00
+  raise by $1.00 [Enter] · set $N · off · stop [s]:
 ```
+
+`/budget $5` sets it, `/budget +$2` raises it, `/budget off` removes the cap.
 
 ## On the internet (`yggdrasil.loki.web`)
 

@@ -119,23 +119,24 @@ class ModelUsage:
 
 
 class TokenMeter:
-    """Accumulates per-model token usage and enforces a token budget.
+    """Accumulates per-model token usage and enforces a **cost** budget (USD).
 
     Recording never raises — it only counts. Enforcement is explicit:
-    :meth:`check_budget` raises :class:`TokenBudgetExceeded` when a limit is
-    set and crossed, so the caller (the REPL) can stop and offer to raise it.
+    :meth:`check_budget` raises :class:`TokenBudgetExceeded` when the USD spend
+    crosses the cap, so the caller (the REPL) can stop *between actions* and
+    offer to raise it. The cap is money, not tokens — a fixed budget across
+    models of wildly different per-token prices.
     """
 
-    #: Default budget the interactive CLI starts with (tokens). Not enforced
-    #: until a limit is actually set via :meth:`set_limit`.
-    DEFAULT_LIMIT = 50_000
-    #: How much :meth:`raise_limit` adds each step.
-    DEFAULT_STEP = 25_000
+    #: Default USD budget the interactive CLI starts with, and the raise step.
+    DEFAULT_COST_LIMIT = 1.0
+    DEFAULT_COST_STEP = 1.0
 
     def __init__(self) -> None:
         self._rows: dict[tuple[str, str], ModelUsage] = {}
-        self.limit: Optional[int] = None
-        self.step: int = self.DEFAULT_STEP
+        #: Total-spend cap in USD (``None`` → unlimited).
+        self.cost_limit: Optional[float] = None
+        self.cost_step: float = self.DEFAULT_COST_STEP
 
     # -- recording ---------------------------------------------------------
 
@@ -181,26 +182,27 @@ class TokenMeter:
 
     # -- budget ------------------------------------------------------------
 
-    def set_limit(self, limit: Optional[int]) -> None:
-        """Set (or clear, with ``None``) the total-token budget."""
-        self.limit = None if limit is None else max(0, int(limit))
+    def set_limit(self, usd: Optional[float]) -> None:
+        """Set (or clear, with ``None``) the total-spend cap in USD."""
+        self.cost_limit = None if usd is None else max(0.0, float(usd))
 
-    def raise_limit(self, by: Optional[int] = None) -> int:
-        """Bump the budget by *by* (or one :attr:`step`); returns the new limit."""
-        base = self.limit if self.limit is not None else self.total_tokens
-        self.limit = base + (by if by is not None else self.step)
-        return self.limit
+    def raise_limit(self, by: Optional[float] = None) -> float:
+        """Bump the cap by *by* USD (or one :attr:`cost_step`); returns the new cap."""
+        base = self.cost_limit if self.cost_limit is not None else self.total_cost
+        self.cost_limit = base + (by if by is not None else self.cost_step)
+        return self.cost_limit
 
-    def remaining(self) -> Optional[int]:
-        return None if self.limit is None else self.limit - self.total_tokens
+    def remaining(self) -> Optional[float]:
+        """USD left under the cap (``None`` when uncapped; may go negative)."""
+        return None if self.cost_limit is None else self.cost_limit - self.total_cost
 
     def over_budget(self) -> bool:
-        return self.limit is not None and self.total_tokens >= self.limit
+        return self.cost_limit is not None and self.total_cost >= self.cost_limit
 
     def check_budget(self) -> None:
-        """Raise :class:`TokenBudgetExceeded` if the budget is set and crossed."""
+        """Raise :class:`TokenBudgetExceeded` if the spend cap is set and crossed."""
         if self.over_budget():
-            raise TokenBudgetExceeded(self.total_tokens, self.limit)
+            raise TokenBudgetExceeded(self.total_cost, self.cost_limit)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -212,8 +214,8 @@ class TokenMeter:
             "rows": [r.to_dict() for r in self.rows()],
             "total": self.total().to_dict(),
             "total_cost_usd": round(self.total_cost, 6),
-            "limit": self.limit,
-            "remaining": self.remaining(),
+            "cost_limit_usd": self.cost_limit,
+            "remaining_usd": self.remaining(),
         }
 
 

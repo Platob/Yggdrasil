@@ -19,8 +19,10 @@ from __future__ import annotations
 import pathlib
 import re
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 __all__ = ["Tool", "Toolbox", "filesystem_toolbox"]
 
@@ -101,16 +103,21 @@ def filesystem_toolbox(
     read_only: bool = False,
     allow_shell: bool = False,
     allow_web: bool = False,
+    confirm: Optional[Callable[[str], bool]] = None,
 ) -> Toolbox:
     """Build the default toolbox rooted at *root*.
 
     The read tools (``list_dir``, ``read_file``, ``find``, ``grep``,
     ``read_table``) are always present — discovery, including parsing local
     tabular files (CSV/Parquet/Arrow/XLSX/JSON) through the io handlers. The
-    write tools (``write_file``, ``edit_file``) are added unless ``read_only``.
-    ``run`` (a shell inside the root) is added only when ``allow_shell``, and
-    the network tools (``web_fetch``, ``web_table``, ``web_image``) only when
-    ``allow_web`` — the sharpest tools, so they're opt-in.
+    write tools (``write_file``, ``edit_file``, and ``run_python`` — the agent
+    writes & runs Python by default to compute or apply changes) are added
+    unless ``read_only``. ``run`` (a *shell*) is added only with ``allow_shell``
+    and the network tools only with ``allow_web``.
+
+    ``confirm`` (``fn(action) -> bool``) gates **destructive ops on
+    non-temporary assets** — overwriting/editing an existing file outside the
+    system temp dir asks first; new files and scratch/temp files don't.
     """
     base = pathlib.Path(root).resolve()
     box = Toolbox()
@@ -127,6 +134,22 @@ def filesystem_toolbox(
             return str(p.relative_to(base)) or "."
         except ValueError:
             return str(p)
+
+    _tmp = pathlib.Path(tempfile.gettempdir()).resolve()
+    _root_is_temp = str(base).startswith(str(_tmp))
+
+    def is_temporary(p: pathlib.Path) -> bool:
+        """A scratch/temp asset (under the system temp dir or a temp root)."""
+        return _root_is_temp or str(p).startswith(str(_tmp))
+
+    def gate(target: pathlib.Path, verb: str) -> Optional[str]:
+        """Ask :func:`confirm` before a destructive op on a *non-temporary*
+        asset. Returns a refusal string when declined, else ``None``."""
+        if confirm is None or is_temporary(target):
+            return None
+        if not confirm(f"{verb} {rel(target)}"):
+            return f"REFUSED: user declined to {verb} {rel(target)}"
+        return None
 
     def list_dir(path: str = ".") -> str:
         target = resolve(path)
@@ -212,14 +235,17 @@ def filesystem_toolbox(
     if not read_only:
         def write_file(path: str, content: str) -> str:
             target = resolve(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
             existed = target.exists()
+            if existed:  # overwriting an existing asset is destructive
+                refused = gate(target, "overwrite")
+                if refused:
+                    return refused
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, "utf-8")
             r = rel(target)
             if r not in box.changed:
                 box.changed.append(r)
-            verb = "overwrote" if existed else "created"
-            return f"{verb} {r} ({len(content)} bytes)"
+            return f"{'overwrote' if existed else 'created'} {r} ({len(content)} bytes)"
 
         def edit_file(path: str, old: str, new: str) -> str:
             target = resolve(path)
@@ -232,11 +258,27 @@ def filesystem_toolbox(
             if count > 1:
                 return (f"ERROR: `old` text appears {count}× in {rel(target)} — "
                         "add surrounding context to make it unique")
+            refused = gate(target, "edit")
+            if refused:
+                return refused
             target.write_text(text.replace(old, new, 1), "utf-8")
             r = rel(target)
             if r not in box.changed:
                 box.changed.append(r)
             return f"edited {r} (1 replacement)"
+
+        def run_python(code: str, timeout: float = 60.0) -> str:
+            """Run Python source in the agent root and capture its output."""
+            proc = subprocess.run(
+                [sys.executable, "-c", code], cwd=str(base),
+                capture_output=True, text=True, timeout=timeout,
+            )
+            parts = [f"exit={proc.returncode}"]
+            if proc.stdout:
+                parts.append("stdout:\n" + proc.stdout[:MAX_READ_BYTES])
+            if proc.stderr:
+                parts.append("stderr:\n" + proc.stderr[:MAX_READ_BYTES])
+            return "\n".join(parts)
 
         box.add(Tool("write_file", "Create or overwrite a file with content.",
                      {"path": "file path", "content": "full file content"},
@@ -244,6 +286,10 @@ def filesystem_toolbox(
         box.add(Tool("edit_file", "Replace one unique occurrence of `old` with `new`.",
                      {"path": "file path", "old": "exact text to replace (must be unique)",
                       "new": "replacement text"}, edit_file, mutates=True))
+        box.add(Tool("run_python", "Write & run Python code in the agent root — "
+                     "compute, transform, or apply changes — and capture stdout/stderr.",
+                     {"code": "python source", "timeout": "seconds, default 60"},
+                     run_python, mutates=True))
 
     if allow_shell:
         def run_cmd(command: str, timeout: float = 60.0) -> str:

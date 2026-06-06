@@ -4,6 +4,7 @@ from __future__ import annotations
 import pathlib
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from yggdrasil.loki.tools import filesystem_toolbox
 
@@ -26,6 +27,45 @@ class TestFilesystemToolbox(unittest.TestCase):
     def test_shell_is_opt_in(self):
         self.assertNotIn("run", filesystem_toolbox(self.dir).names())
         self.assertIn("run", filesystem_toolbox(self.dir, allow_shell=True).names())
+
+    def test_run_python_is_a_default_write_tool(self):
+        box = filesystem_toolbox(self.dir)
+        self.assertIn("run_python", box.names())
+        out = box.call("run_python", {"code": "print(6 * 7)"})
+        self.assertIn("exit=0", out)
+        self.assertIn("42", out)
+
+    def test_run_python_absent_when_read_only(self):
+        self.assertNotIn("run_python", filesystem_toolbox(self.dir, read_only=True).names())
+
+    def test_confirm_gates_overwrite_of_existing_nontemp_file(self):
+        (self.root / "keep.txt").write_text("original")
+        calls = []
+
+        def confirm(action):
+            calls.append(action)
+            return False
+
+        # Make the temp dir look non-temporary so the gate engages.
+        with patch("yggdrasil.loki.tools.tempfile.gettempdir", return_value="/nowhere"):
+            box = filesystem_toolbox(self.dir, confirm=confirm)
+            out = box.call("write_file", {"path": "keep.txt", "content": "NEW"})
+        self.assertIn("REFUSED", out)
+        self.assertEqual((self.root / "keep.txt").read_text(), "original")
+        self.assertTrue(calls and "overwrite keep.txt" in calls[0])
+
+    def test_confirm_not_asked_for_new_file(self):
+        with patch("yggdrasil.loki.tools.tempfile.gettempdir", return_value="/nowhere"):
+            box = filesystem_toolbox(self.dir, confirm=lambda a: False)  # would refuse
+            out = box.call("write_file", {"path": "fresh.txt", "content": "x"})
+        self.assertIn("created", out)                    # new file → not gated
+
+    def test_confirm_skipped_for_temporary_root(self):
+        # The real temp root (under the system temp dir) is scratch → no confirm.
+        (self.root / "k.txt").write_text("a")
+        box = filesystem_toolbox(self.dir, confirm=lambda a: False)
+        out = box.call("write_file", {"path": "k.txt", "content": "b"})
+        self.assertIn("overwrote", out)
 
     def test_web_tools_are_opt_in(self):
         base = filesystem_toolbox(self.dir)

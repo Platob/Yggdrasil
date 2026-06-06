@@ -17,17 +17,16 @@ class LokiError(YGGException):
 
 
 class TokenBudgetExceeded(LokiError):
-    """Raised when token consumption would exceed the configured budget.
+    """Raised when USD spend would exceed the configured cost budget.
 
-    Carries the running :attr:`used` total and the :attr:`limit` it crossed
-    so a caller (the interactive CLI) can show the gap and offer to raise the
-    cap step by step.
+    Carries the running :attr:`used` spend and the :attr:`limit` it crossed
+    (both USD) so a caller (the interactive CLI) can show the gap and offer to
+    raise the cap step by step.
     """
 
-    def __init__(self, used: int, limit: int, message: str | None = None) -> None:
+    def __init__(self, used: float, limit: float, message: str | None = None) -> None:
         self.used = used
         self.limit = limit
         super().__init__(
-            message
-            or f"token budget reached: {used:,} used ≥ {limit:,} limit"
+            message or f"cost budget reached: ${used:.4f} spent ≥ ${limit:.2f} cap"
         )

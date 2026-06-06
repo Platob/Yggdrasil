@@ -276,6 +276,7 @@ class Loki:
         read_only: bool = False,
         allow_shell: bool = False,
         allow_web: bool = False,
+        confirm: "Optional[Callable[[str], bool]]" = None,
         toolbox: "Optional[Toolbox]" = None,
         on_step: "Optional[Callable[[dict[str, Any]], None]]" = None,
     ) -> dict[str, Any]:
@@ -307,7 +308,8 @@ class Loki:
                 "Databricks session"
             )
         box = toolbox or filesystem_toolbox(
-            root, read_only=read_only, allow_shell=allow_shell, allow_web=allow_web
+            root, read_only=read_only, allow_shell=allow_shell, allow_web=allow_web,
+            confirm=confirm,
         )
         system = (
             "You are Loki, an autonomous engineering agent working inside a "
