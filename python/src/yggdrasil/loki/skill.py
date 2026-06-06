@@ -7,8 +7,7 @@ Databricks-only skill stays dark on a bare shell) and implement :meth:`run`.
 They register into a global table so the CLI and the agent can discover and
 dispatch them by name.
 
-This is the **abstraction**; concrete skills land on top of it. (Formerly
-``LokiBehavior`` — that name remains as an alias for back-compat.)
+This is the **abstraction**; concrete skills land on top of it.
 """
 from __future__ import annotations
 
@@ -18,7 +17,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["LokiSkill", "LokiBehavior", "register", "registry", "get", "REGISTRY"]
+__all__ = ["LokiSkill", "register", "registry", "get", "REGISTRY"]
 
 #: Global name → skill-instance registry. Skills are stateless dispatch
 #: objects, so a single shared instance per name is the right granularity.
@@ -60,10 +59,6 @@ class LokiSkill(ABC):
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(name={self.name!r}, requires={self.requires!r})"
-
-
-#: Back-compat alias — skills used to be called behaviors.
-LokiBehavior = LokiSkill
 
 
 def register(skill: "type[LokiSkill] | LokiSkill") -> "type[LokiSkill] | LokiSkill":

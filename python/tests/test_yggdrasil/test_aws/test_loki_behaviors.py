@@ -39,11 +39,11 @@ class TestAWSFleet(unittest.TestCase):
         return loki
 
     def test_fleet_registered_and_requires_aws(self):
-        names = {b.name for b in Loki().behaviors()}
+        names = {b.name for b in Loki().skills()}
         for n in ("aws-identity", "aws-s3", "aws-ec2", "aws-lambda", "aws-dynamodb",
                   "aws-iam-users", "aws-sqs", "aws-rds", "aws-secrets"):
             self.assertIn(n, names)
-        beh = next(b for b in Loki().behaviors() if b.name == "aws-s3")
+        beh = next(b for b in Loki().skills() if b.name == "aws-s3")
         self.assertEqual(beh.requires, "aws")
 
     def test_unavailable_without_session(self):

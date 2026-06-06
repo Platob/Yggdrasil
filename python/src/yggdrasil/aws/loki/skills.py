@@ -1,7 +1,7 @@
 """Specialized AWS Loki behaviors — one agent skill per AWS service.
 
 A data-driven fleet: each :class:`_Spec` becomes an
-:class:`AWSServiceBehavior` instance that ``requires="aws"`` and drives one
+:class:`AWSServiceSkill` instance that ``requires="aws"`` and drives one
 boto3 service call through the project's :class:`~yggdrasil.aws.AWSClient`
 (``agent.aws.client(service)``), summarizing the response to the identifying
 field(s). All operations are **read/list/describe** — safe to run; nothing
@@ -16,12 +16,12 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Any, Optional
 
-from yggdrasil.loki.behavior import LokiBehavior, register
+from yggdrasil.loki.skill import LokiSkill, register
 
 if TYPE_CHECKING:
     from yggdrasil.loki import Loki
 
-__all__ = ["AWSServiceBehavior", "SPECS"]
+__all__ = ["AWSServiceSkill", "SPECS"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,7 +71,7 @@ def _extract(resp: Any, spec: _Spec) -> list[Any]:
     return [_pick(values, spec.item)] if values is not None else []
 
 
-class AWSServiceBehavior(LokiBehavior):
+class AWSServiceSkill(LokiSkill):
     """One AWS service skill, built from a :class:`_Spec`."""
 
     requires = "aws"
@@ -138,4 +138,4 @@ SPECS: tuple[_Spec, ...] = (
 )
 
 for _spec in SPECS:
-    register(AWSServiceBehavior(_spec))
+    register(AWSServiceSkill(_spec))

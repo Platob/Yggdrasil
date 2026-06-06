@@ -1,6 +1,6 @@
 """Specialized Databricks Loki behaviors — one agent skill per dbc service.
 
-Each behavior is a :class:`~yggdrasil.loki.behavior.LokiBehavior` that
+Each behavior is a :class:`~yggdrasil.loki.behavior.LokiSkill` that
 ``requires="databricks"`` and drives one ``dbc.<service>`` accessor through
 the agent's token provider (``agent.databricks``). They register into the
 global Loki catalog on import, so ``ygg loki behaviors`` lists them and
@@ -17,23 +17,23 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from yggdrasil.loki.behavior import LokiBehavior, register
+from yggdrasil.loki.skill import LokiSkill, register
 
 if TYPE_CHECKING:
     from yggdrasil.loki import Loki
 
 __all__ = [
-    "DatabricksServiceBehavior",
-    "DatabricksMCPBehavior",
-    "DatabricksSQLBehavior",
-    "DatabricksTablesBehavior",
-    "DatabricksWarehousesBehavior",
-    "DatabricksJobsBehavior",
-    "DatabricksClustersBehavior",
-    "DatabricksVolumesBehavior",
-    "DatabricksSecretsBehavior",
-    "DatabricksIAMBehavior",
-    "DatabricksServingBehavior",
+    "DatabricksServiceSkill",
+    "DatabricksMCPSkill",
+    "DatabricksSQLSkill",
+    "DatabricksTablesSkill",
+    "DatabricksWarehousesSkill",
+    "DatabricksJobsSkill",
+    "DatabricksClustersSkill",
+    "DatabricksVolumesSkill",
+    "DatabricksSecretsSkill",
+    "DatabricksIAMSkill",
+    "DatabricksServingSkill",
 ]
 
 
@@ -60,7 +60,7 @@ def _frame(result: Any) -> Any:
     return result
 
 
-class DatabricksServiceBehavior(LokiBehavior):
+class DatabricksServiceSkill(LokiSkill):
     """Base for the Databricks service skills — guards the session for all of them."""
 
     requires = "databricks"
@@ -73,7 +73,7 @@ class DatabricksServiceBehavior(LokiBehavior):
 
 
 @register
-class DatabricksSQLBehavior(DatabricksServiceBehavior):
+class DatabricksSQLSkill(DatabricksServiceSkill):
     """Run SQL on a Databricks warehouse and return the rows."""
 
     name = "databricks-sql"
@@ -91,7 +91,7 @@ class DatabricksSQLBehavior(DatabricksServiceBehavior):
 
 
 @register
-class DatabricksTablesBehavior(DatabricksServiceBehavior):
+class DatabricksTablesSkill(DatabricksServiceSkill):
     """List tables (or describe one) in a catalog.schema — via SHOW/DESCRIBE."""
 
     name = "databricks-tables"
@@ -116,7 +116,7 @@ class DatabricksTablesBehavior(DatabricksServiceBehavior):
 
 
 @register
-class DatabricksWarehousesBehavior(DatabricksServiceBehavior):
+class DatabricksWarehousesSkill(DatabricksServiceSkill):
     """List the SQL warehouses reachable to the agent."""
 
     name = "databricks-warehouses"
@@ -128,7 +128,7 @@ class DatabricksWarehousesBehavior(DatabricksServiceBehavior):
 
 
 @register
-class DatabricksJobsBehavior(DatabricksServiceBehavior):
+class DatabricksJobsSkill(DatabricksServiceSkill):
     """List jobs, or run one by name/id."""
 
     name = "databricks-jobs"
@@ -143,7 +143,7 @@ class DatabricksJobsBehavior(DatabricksServiceBehavior):
 
 
 @register
-class DatabricksClustersBehavior(DatabricksServiceBehavior):
+class DatabricksClustersSkill(DatabricksServiceSkill):
     """List the compute clusters."""
 
     name = "databricks-clusters"
@@ -154,7 +154,7 @@ class DatabricksClustersBehavior(DatabricksServiceBehavior):
 
 
 @register
-class DatabricksVolumesBehavior(DatabricksServiceBehavior):
+class DatabricksVolumesSkill(DatabricksServiceSkill):
     """List Unity Catalog volumes (optionally within a catalog.schema)."""
 
     name = "databricks-volumes"
@@ -168,7 +168,7 @@ class DatabricksVolumesBehavior(DatabricksServiceBehavior):
 
 
 @register
-class DatabricksSecretsBehavior(DatabricksServiceBehavior):
+class DatabricksSecretsSkill(DatabricksServiceSkill):
     """List secret scopes (and a scope's secret keys — names only, never values)."""
 
     name = "databricks-secrets"
@@ -183,7 +183,7 @@ class DatabricksSecretsBehavior(DatabricksServiceBehavior):
 
 
 @register
-class DatabricksIAMBehavior(DatabricksServiceBehavior):
+class DatabricksIAMSkill(DatabricksServiceSkill):
     """Who am I, and list workspace users/groups."""
 
     name = "databricks-iam"
@@ -241,7 +241,7 @@ async def _mcp_call(url: str, headers: dict, tool: str, args: dict) -> Any:
 
 
 @register
-class DatabricksMCPBehavior(DatabricksServiceBehavior):
+class DatabricksMCPSkill(DatabricksServiceSkill):
     """Connect to a Databricks-hosted MCP server and list (or call) its tools.
 
     Reaches the workspace's **managed MCP servers** — Unity Catalog functions
@@ -281,7 +281,7 @@ class DatabricksMCPBehavior(DatabricksServiceBehavior):
 
 
 @register
-class DatabricksServingBehavior(DatabricksServiceBehavior):
+class DatabricksServingSkill(DatabricksServiceSkill):
     """List model-serving endpoints, or query one with a prompt."""
 
     name = "databricks-serving"

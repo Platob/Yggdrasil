@@ -7,6 +7,6 @@ credentials / region / role).
 """
 from __future__ import annotations
 
-from . import behaviors as _behaviors  # noqa: F401
+from . import skills as _skills  # noqa: F401
 
 __all__: list[str] = []

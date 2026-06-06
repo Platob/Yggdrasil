@@ -5,11 +5,11 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from yggdrasil.loki import Loki
-from yggdrasil.loki.behavior import REGISTRY, LokiBehavior, register
+from yggdrasil.loki.skill import REGISTRY, LokiSkill, register
 from yggdrasil.loki.capability import Backend
 
 
-class _Dummy(LokiBehavior):
+class _Dummy(LokiSkill):
     name = "dummy-test"
     description = "echo kwargs"
 
@@ -17,7 +17,7 @@ class _Dummy(LokiBehavior):
         return {"agent": agent.name, **kwargs}
 
 
-class _NeedsDatabricks(LokiBehavior):
+class _NeedsDatabricks(LokiSkill):
     name = "needs-dbx-test"
     requires = "databricks"
 
@@ -36,7 +36,7 @@ class TestBehaviorRegistry(unittest.TestCase):
     def test_register_and_dispatch(self):
         register(_Dummy)
         loki = Loki()
-        self.assertIn("dummy-test", [b.name for b in loki.behaviors()])
+        self.assertIn("dummy-test", [b.name for b in loki.skills()])
         self.assertEqual(loki.run("dummy-test", x=1), {"agent": "loki", "x": 1})
 
     def test_unknown_behavior_raises(self):
@@ -95,15 +95,15 @@ class TestAgent(unittest.TestCase):
         card = loki.card()
         self.assertEqual(card["agent"], "loki")
         self.assertIn("backends", card)
-        self.assertIn("behaviors", card)
+        self.assertIn("skills", card)
         self.assertIn("token", card)
 
 
 class TestGenieBehavior(unittest.TestCase):
     def test_genie_requires_databricks_and_asks_first_space(self):
-        from yggdrasil.loki.behaviors import GenieBehavior
+        from yggdrasil.loki.skills import GenieSkill
 
-        beh = GenieBehavior()
+        beh = GenieSkill()
         self.assertEqual(beh.requires, "databricks")
 
         loki = Loki()

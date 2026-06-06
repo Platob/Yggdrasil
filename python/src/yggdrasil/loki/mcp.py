@@ -53,18 +53,18 @@ def build_server(loki: "Optional[Loki]" = None) -> "FastMCP":
         return agent.reason(prompt, engine=engine or None, tier=tier or None)
 
     @server.tool()
-    def behaviors() -> list[dict]:
-        """List Loki's available behaviors (name, description, required backend)."""
-        return [b.to_dict() for b in agent.behaviors()]
+    def skills() -> list[dict]:
+        """List Loki's available skills (name, description, required backend)."""
+        return [b.to_dict() for b in agent.skills()]
 
     @server.tool()
-    def run(behavior: str, kwargs: Optional[dict] = None) -> Any:
-        """Run a Loki behavior by name with keyword args.
+    def run(skill: str, kwargs: Optional[dict] = None) -> Any:
+        """Run a Loki skill by name with keyword args.
 
         Examples: behavior="databricks-sql" kwargs={"query": "SELECT 1"};
         behavior="aws-s3"; behavior="web" kwargs={"url": "https://…"}.
         """
-        return _sanitize(agent.run(behavior, **(kwargs or {})))
+        return _sanitize(agent.run(skill, **(kwargs or {})))
 
     @server.tool()
     def web(url: str, question: str = "") -> Any:

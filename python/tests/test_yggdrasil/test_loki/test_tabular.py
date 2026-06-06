@@ -1,4 +1,4 @@
-"""Tests for the data/timeseries path — classifier, routing, TabularBehavior."""
+"""Tests for the data/timeseries path — classifier, routing, TabularSkill."""
 from __future__ import annotations
 
 import functools
@@ -14,7 +14,7 @@ from yggdrasil.loki.capability import Backend
 try:
     import polars  # noqa: F401
 
-    from yggdrasil.loki.behaviors import _json_to_frame
+    from yggdrasil.loki.skills import _json_to_frame
 
     _HAVE_STACK = True
 except Exception:  # pragma: no cover

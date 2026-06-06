@@ -2,7 +2,7 @@
 
 ```text
 ygg loki                 # interactive session (modern REPL) on a terminal
-ygg loki status          # identity + reachable backends + engines + behaviors
+ygg loki status          # identity + reachable backends + engines + skills
 ygg loki capabilities    # the detected backends and why
 ygg loki engines         # the reasoning engines and which are available
 ygg loki usage           # live token usage + USD KPIs, per model and global
@@ -25,9 +25,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="action")
 
     sub.add_parser("chat", aliases=["repl"], help="Interactive session (the default on a terminal).")
-    sub.add_parser("status", help="Identity + reachable backends + engines + behaviors.")
+    sub.add_parser("status", help="Identity + reachable backends + engines + skills.")
     sub.add_parser("capabilities", help="The detected backends and their signals.")
-    sub.add_parser("skills", aliases=["behaviors"], help="The registered skill catalog.")
+    sub.add_parser("skills", help="The registered skill catalog.")
     sub.add_parser("engines", help="The reasoning engines and which are available.")
     sub.add_parser("usage", help="Live token usage + USD KPIs, per model and global.")
     sub.add_parser("mcp", help="Run Loki as an MCP server (stdio) — expose it to MCP clients.")
@@ -119,7 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _status(loki, style)
     if action == "capabilities":
         return _capabilities(loki, style)
-    if action in ("skills", "behaviors"):
+    if action == "skills":
         return _skills(loki, style)
     if action == "engines":
         return _engines(loki, style)
@@ -278,7 +278,7 @@ def _select_engine(loki: Any, style: Any, state: dict) -> None:
     if not available:
         style.warn("no engine configured — set ANTHROPIC_API_KEY, log into Claude Code, "
                    "or run with a Databricks session")
-        style.out(f"  {style.dim('(web fetches and `run` behaviors still work without one)')}\n")
+        style.out(f"  {style.dim('(web fetches and `run` skills still work without one)')}\n")
         state["engine"] = None
         return
 
@@ -458,7 +458,7 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
             f"  {style.bold('commands')}\n"
             f"    {style.brand('/engine')}   pick the session engine (claude/databricks/openai/auto)\n"
             f"    {style.brand('/engines')}  reasoning engines and adaptive models\n"
-            f"    {style.brand('/status')}   identity + backends + engines + behaviors\n"
+            f"    {style.brand('/status')}   identity + backends + engines + skills\n"
             f"    {style.brand('/usage')}    token KPIs (per model + global, USD)\n"
             f"    {style.brand('/tier')}     fast | deep | auto  (model tier for this session)\n"
             f"    {style.brand('/root')}     set the working tree for file tasks\n"

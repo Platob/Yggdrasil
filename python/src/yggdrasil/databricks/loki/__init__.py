@@ -7,6 +7,6 @@ endpoint, and can deploy itself to run on Databricks compute.
 from .agent import DatabricksLoki
 
 # Import the specialized service behaviors so they register on package import.
-from . import behaviors as _behaviors  # noqa: F401
+from . import skills as _skills  # noqa: F401
 
 __all__ = ["DatabricksLoki"]

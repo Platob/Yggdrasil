@@ -4,7 +4,7 @@ Loki is one agent that adapts to wherever it runs. It detects the backends
 it can reach (:mod:`yggdrasil.loki.capability`), acts as a **token /
 credential provider** for them (chiefly Databricks — when a session is
 present Loki hands its authenticated client to whatever it drives), and
-dispatches :class:`~yggdrasil.loki.behavior.LokiBehavior` actions. The CLI
+dispatches :class:`~yggdrasil.loki.skill.LokiSkill` actions. The CLI
 (`ygg loki`) is a thin shell over this object.
 
     from yggdrasil.loki import Loki
@@ -20,7 +20,7 @@ import json
 import re
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
-from . import behavior as _behavior
+from . import skill as _skill
 from .capability import Backend, detect
 
 if TYPE_CHECKING:
@@ -441,7 +441,7 @@ class Loki:
         """Global context: is this request data- or time-series-shaped?
 
         Drives the *data path* — a positive classification routes a sourced
-        request to tabular fetching + caching (:class:`TabularBehavior`) instead
+        request to tabular fetching + caching (:class:`TabularSkill`) instead
         of a plain page fetch. Returns ``{"data", "timeseries", "why"}``.
         """
         low = text.lower()
@@ -473,15 +473,12 @@ class Loki:
 
     # -- skills ------------------------------------------------------------
 
-    def skills(self) -> list["_behavior.LokiSkill"]:
-        return _behavior.registry()
+    def skills(self) -> list["_skill.LokiSkill"]:
+        return _skill.registry()
 
-    def skill(self, name: str) -> "Optional[_behavior.LokiSkill]":
-        return _behavior.get(name)
+    def skill(self, name: str) -> "Optional[_skill.LokiSkill]":
+        return _skill.get(name)
 
-    #: Back-compat aliases (skills were called behaviors).
-    behaviors = skills
-    behavior = skill
 
     def run(self, name: str, **kwargs: Any) -> Any:
         """Dispatch skill *name* with *kwargs*, using self as the provider."""
@@ -512,7 +509,6 @@ class Loki:
                 for e in self.engines()
             ],
             "skills": [s.to_dict() for s in self.skills()],
-            "behaviors": [s.to_dict() for s in self.skills()],  # back-compat
         }
 
     def __repr__(self) -> str:

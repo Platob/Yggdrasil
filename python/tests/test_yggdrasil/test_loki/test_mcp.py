@@ -12,7 +12,7 @@ except Exception:  # pragma: no cover
     _HAVE_MCP = False
 
 from yggdrasil.loki import Loki
-from yggdrasil.loki.behavior import REGISTRY, LokiBehavior, register
+from yggdrasil.loki.skill import REGISTRY, LokiSkill, register
 from yggdrasil.loki.capability import Backend
 from yggdrasil.loki.mcp import _sanitize
 
@@ -46,13 +46,13 @@ class TestLokiMCPServer(unittest.TestCase):
 
         server = build_server(self._loki())
         names = {t.name for t in asyncio.run(server.list_tools())}
-        self.assertEqual(names, {"reason", "behaviors", "run", "web", "capabilities"})
+        self.assertEqual(names, {"reason", "skills", "run", "web", "capabilities"})
 
     def test_run_tool_dispatches_a_behavior(self):
         from yggdrasil.loki.mcp import build_server
 
         @register
-        class _Echo(LokiBehavior):
+        class _Echo(LokiSkill):
             name = "mcp-echo"
             description = "echo"
 
@@ -60,7 +60,7 @@ class TestLokiMCPServer(unittest.TestCase):
                 return {"echoed": kw}
 
         server = build_server(self._loki())
-        result = asyncio.run(server.call_tool("run", {"behavior": "mcp-echo",
+        result = asyncio.run(server.call_tool("run", {"skill": "mcp-echo",
                                                       "kwargs": {"x": 1}}))
         # call_tool returns (content, structured) — assert the dispatch happened.
         self.assertIn("echoed", str(result))
@@ -70,7 +70,7 @@ class TestLokiMCPServer(unittest.TestCase):
         from yggdrasil.loki.mcp import build_server
 
         server = build_server(self._loki())
-        result = asyncio.run(server.call_tool("behaviors", {}))
+        result = asyncio.run(server.call_tool("skills", {}))
         self.assertIn("python_project", str(result))
 
 

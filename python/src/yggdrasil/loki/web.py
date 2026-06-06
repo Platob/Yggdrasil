@@ -37,13 +37,23 @@ __all__ = [
     "discover_apis",
 ]
 
-#: A standard modern-browser User-Agent so sites serve the same content they
-#: serve a browser (override with ``YGG_LOKI_USER_AGENT``). This is normal
-#: scraping hygiene — NOT bot-detection evasion or human impersonation.
-DEFAULT_USER_AGENT = os.getenv("YGG_LOKI_USER_AGENT") or (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36 yggdrasil-loki"
-)
+#: One realistic browser header profile for this process, from the http_
+#: user-agent utilities — so sites serve the content they serve a browser.
+#: Stable per run (a session shouldn't flip identity mid-scrape); override the
+#: UA with ``YGG_LOKI_USER_AGENT``. Normal scraping hygiene, not evasion.
+_BROWSER_HEADERS: "Optional[dict[str, str]]" = None
+
+
+def _browser_headers() -> dict[str, str]:
+    global _BROWSER_HEADERS
+    if _BROWSER_HEADERS is None:
+        from yggdrasil.http_.user_agents import random_browser_headers
+
+        _BROWSER_HEADERS = dict(random_browser_headers())
+        ua = os.getenv("YGG_LOKI_USER_AGENT")
+        if ua:
+            _BROWSER_HEADERS["User-Agent"] = ua
+    return _BROWSER_HEADERS
 
 #: URL-extension → mime name, to force the right tabular/image leaf when a
 #: server mislabels the body (``text/plain`` CSVs, octet-stream parquet, …).
@@ -72,10 +82,10 @@ def fetch(
 ) -> "HTTPResponse":
     """GET *url* through the yggdrasil HTTP session → an :class:`HTTPResponse`.
 
-    Sends a standard browser User-Agent (so pages render normally) unless the
-    caller overrides it.
+    Sends a realistic browser header profile (from the http_ user-agent utils)
+    so pages render normally, unless the caller overrides specific headers.
     """
-    h: dict[str, str] = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "*/*"}
+    h = dict(_browser_headers())
     if headers:
         h.update(headers)
     return session().get(url, params=params, headers=h, timeout=timeout)

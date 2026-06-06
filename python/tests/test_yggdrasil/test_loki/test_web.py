@@ -103,8 +103,10 @@ class TestWeb(unittest.TestCase):
         self.assertIn("/v1/catalog", eps)                   # /v1/ path
         self.assertTrue(any(b.get("@type") == "Product" for b in d["json_ld"]))
 
-    def test_default_user_agent_is_browserish(self):
-        self.assertIn("Mozilla/5.0", web.DEFAULT_USER_AGENT)
+    def test_browser_headers_from_http_utils(self):
+        h = web._browser_headers()
+        self.assertIn("Mozilla/5.0", h["User-Agent"])
+        self.assertIn("Accept", h)
 
     def test_web_behavior_auto_routes_by_extension(self):
         from yggdrasil.loki import Loki

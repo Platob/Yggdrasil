@@ -22,18 +22,18 @@ class _Base(unittest.TestCase):
 
 class TestDatabricksBehaviors(_Base):
     def test_fleet_is_registered_and_requires_databricks(self):
-        names = {b.name for b in Loki().behaviors()}
+        names = {b.name for b in Loki().skills()}
         for n in ("databricks-sql", "databricks-tables", "databricks-warehouses",
                   "databricks-jobs", "databricks-clusters", "databricks-volumes",
                   "databricks-secrets", "databricks-iam", "databricks-serving"):
             self.assertIn(n, names)
-        beh = next(b for b in Loki().behaviors() if b.name == "databricks-sql")
+        beh = next(b for b in Loki().skills() if b.name == "databricks-sql")
         self.assertEqual(beh.requires, "databricks")
 
     def test_unavailable_when_no_session(self):
         loki = Loki()
         loki._backends = [Backend("databricks", available=False)]
-        beh = next(b for b in loki.behaviors() if b.name == "databricks-sql")
+        beh = next(b for b in loki.skills() if b.name == "databricks-sql")
         self.assertFalse(beh.available(loki))
         with self.assertRaises(RuntimeError):
             loki.run("databricks-sql", query="select 1")
@@ -111,7 +111,7 @@ class TestDatabricksBehaviors(_Base):
 
 class TestDatabricksMCP(_Base):
     def test_mcp_url_templates(self):
-        from yggdrasil.databricks.loki.behaviors import _mcp_url
+        from yggdrasil.databricks.loki.skills import _mcp_url
 
         self.assertEqual(
             _mcp_url("https://w/", "functions", catalog="main", schema="sales"),
@@ -124,7 +124,7 @@ class TestDatabricksMCP(_Base):
             "https://w/api/2.0/mcp/vector-search/c/s")
 
     def test_mcp_url_validates(self):
-        from yggdrasil.databricks.loki.behaviors import _mcp_url
+        from yggdrasil.databricks.loki.skills import _mcp_url
 
         with self.assertRaises(ValueError):
             _mcp_url("https://w", "nope")
@@ -142,7 +142,7 @@ class TestDatabricksMCP(_Base):
             self.assertEqual(headers, {"Authorization": "Bearer tok"})
             return ["uc.fn_a", "uc.fn_b"]
 
-        with patch("yggdrasil.databricks.loki.behaviors._mcp_tools", fake_tools):
+        with patch("yggdrasil.databricks.loki.skills._mcp_tools", fake_tools):
             out = loki.run("databricks-mcp", kind="functions", catalog="main", schema="sales")
         self.assertEqual(out["server"], "https://w/api/2.0/mcp/functions/main/sales")
         self.assertEqual(out["tools"], ["uc.fn_a", "uc.fn_b"])
