@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import FastAPI, Request
@@ -26,6 +27,7 @@ from .routers import (
     workbook_router,
     user_router,
     saga_router,
+    ai_router,
 )
 from .services.audit import AuditLog
 from .services.backend import BackendService
@@ -130,20 +132,31 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     # -- Aggregate cluster stats (one call instead of N) --------------------
     prefix = f"{settings.api_prefix}/v2"
 
+    # 1s in-process TTL cache: the dashboard polls /stats every 5s, so a burst
+    # of viewers collapses to one fan-out per second. Single-threaded asyncio →
+    # no lock needed.
+    _stats_cache: dict = {}
+
     @app.get(f"{prefix}/stats")
     async def get_stats(request: Request):
         """Aggregate cluster-wide statistics in one call."""
+        cached = _stats_cache.get("stats")
+        if cached is not None and time.monotonic() - cached[0] <= 1.0:
+            return cached[1]
         state = request.app.state
         snap = state.backend_service.snapshot()
-        envs = await state.pyenv_service.list()
-        funcs = await state.pyfunc_service.list()
-        dags = await state.dag_service.list()
-        peers = await state.network_service.get_peers()
+        # Independent reads — fan out concurrently instead of awaiting in series.
+        envs, funcs, dags, peers = await asyncio.gather(
+            state.pyenv_service.list(),
+            state.pyfunc_service.list(),
+            state.dag_service.list(),
+            state.network_service.get_peers(),
+        )
         mem_pct = (
             round(snap.memory_used_mb / snap.memory_total_mb * 100, 1)
             if snap.memory_total_mb else 0
         )
-        return {
+        payload = {
             "node_id": settings.node_id,
             "uptime": snap.uptime_seconds,
             "cpu_percent": snap.cpu_percent,
@@ -157,6 +170,8 @@ def create_api(settings: Settings | None = None) -> FastAPI:
             "peer_count": len(peers.peers),
             "gpu_count": len(snap.gpus),
         }
+        _stats_cache["stats"] = (time.monotonic(), payload)
+        return payload
 
     @app.get(f"{prefix}/metrics")
     async def get_metrics(request: Request):
@@ -245,23 +260,26 @@ def create_api(settings: Settings | None = None) -> FastAPI:
         except Exception as e:
             checks["backend"] = {"status": "error", "error": str(e)}
 
-        try:
-            envs = await state.pyenv_service.list()
-            checks["pyenv"] = {"status": "ok", "count": len(envs.envs)}
-        except Exception as e:
-            checks["pyenv"] = {"status": "error", "error": str(e)}
-
-        try:
-            funcs = await state.pyfunc_service.list()
-            checks["pyfunc"] = {"status": "ok", "count": len(funcs.funcs)}
-        except Exception as e:
-            checks["pyfunc"] = {"status": "error", "error": str(e)}
-
-        try:
-            peers = await state.network_service.get_peers()
-            checks["network"] = {"status": "ok", "peers": len(peers.peers)}
-        except Exception as e:
-            checks["network"] = {"status": "error", "error": str(e)}
+        # The three subsystem reads are independent — fan out, then map results
+        # back. return_exceptions keeps one failing check from sinking the rest.
+        envs, funcs, peers = await asyncio.gather(
+            state.pyenv_service.list(),
+            state.pyfunc_service.list(),
+            state.network_service.get_peers(),
+            return_exceptions=True,
+        )
+        checks["pyenv"] = (
+            {"status": "error", "error": str(envs)} if isinstance(envs, Exception)
+            else {"status": "ok", "count": len(envs.envs)}
+        )
+        checks["pyfunc"] = (
+            {"status": "error", "error": str(funcs)} if isinstance(funcs, Exception)
+            else {"status": "ok", "count": len(funcs.funcs)}
+        )
+        checks["network"] = (
+            {"status": "error", "error": str(peers)} if isinstance(peers, Exception)
+            else {"status": "ok", "peers": len(peers.peers)}
+        )
 
         all_ok = all(c["status"] == "ok" for c in checks.values())
         return {
@@ -287,6 +305,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     app.include_router(messenger_router, prefix=f"{prefix}/messenger")
     app.include_router(excel_router, prefix=f"{prefix}/excel")
     app.include_router(saga_router, prefix=f"{prefix}/saga")
+    app.include_router(ai_router, prefix=f"{prefix}/ai")
 
     @app.get(f"{prefix}/audit")
     async def get_audit(limit: int = 100):

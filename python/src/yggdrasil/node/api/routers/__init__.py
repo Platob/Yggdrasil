@@ -14,8 +14,10 @@ from .user import router as user_router
 from .messenger import router as messenger_router
 from .excel import router as excel_router
 from .saga import router as saga_router
+from .ai import router as ai_router
 
 __all__ = [
+    "ai_router",
     "backend_router",
     "card_router",
     "dag_router",
