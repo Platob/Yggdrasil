@@ -85,6 +85,67 @@ class TestDatabricksBehaviors(_Base):
         client.catalogs.catalog.assert_called_once_with("main")
         self.assertEqual(out["schemas"], ["sales"])
 
+    def test_catalogs_create_and_drop(self):
+        client = MagicMock()
+        loki = self._loki_with_client(client)
+        self.assertEqual(loki.run("databricks-catalogs", op="create", catalog="cat")["created"], "cat")
+        client.sql.execute.assert_called_with("CREATE CATALOG IF NOT EXISTS cat")
+        loki.run("databricks-catalogs", op="drop", catalog="cat")
+        client.sql.execute.assert_called_with("DROP CATALOG IF EXISTS cat")
+
+    def test_schemas_create_drop_cascade(self):
+        client = MagicMock()
+        loki = self._loki_with_client(client)
+        loki.run("databricks-schemas", op="create", catalog="c", schema="s")
+        client.sql.execute.assert_called_with("CREATE SCHEMA IF NOT EXISTS c.s")
+        loki.run("databricks-schemas", op="drop", catalog="c", schema="s", cascade=True)
+        client.sql.execute.assert_called_with("DROP SCHEMA IF EXISTS c.s CASCADE")
+
+    def test_tables_preview_create_drop(self):
+        client = MagicMock()
+        client.sql.execute.return_value = "RESULT"
+        loki = self._loki_with_client(client)
+        prev = loki.run("databricks-tables", catalog="c", schema="s", table="t",
+                        op="preview", limit=5)
+        client.sql.execute.assert_called_with("SELECT * FROM c.s.t LIMIT 5")
+        self.assertEqual(prev["rows"], "RESULT")
+        loki.run("databricks-tables", catalog="c", schema="s", table="t",
+                 op="create", as_select="SELECT 1 AS x")
+        client.sql.execute.assert_called_with("CREATE TABLE c.s.t AS SELECT 1 AS x")
+        loki.run("databricks-tables", catalog="c", schema="s", table="t", op="drop")
+        client.sql.execute.assert_called_with("DROP TABLE IF EXISTS c.s.t")
+
+    def test_clusters_start_stop_restart(self):
+        client = MagicMock()
+        target = MagicMock()
+        client.compute.clusters.find_cluster.return_value = target
+        loki = self._loki_with_client(client)
+        self.assertEqual(loki.run("databricks-clusters", op="start", cluster="cl")["started"], "cl")
+        target.start.assert_called_once()
+        loki.run("databricks-clusters", op="stop", cluster="cl")
+        target.delete.assert_called_once()
+        loki.run("databricks-clusters", op="restart", cluster="cl")
+        target.restart.assert_called_once()
+
+    def test_warehouses_start_stop(self):
+        client = MagicMock()
+        target = MagicMock()
+        client.warehouses.find_warehouse.return_value = target
+        loki = self._loki_with_client(client)
+        self.assertEqual(loki.run("databricks-warehouses", op="start", warehouse="wh")["started"], "wh")
+        target.start.assert_called_once()
+        loki.run("databricks-warehouses", op="stop", warehouse="wh")
+        target.stop.assert_called_once()
+
+    def test_secrets_put_and_delete(self):
+        client = MagicMock()
+        loki = self._loki_with_client(client)
+        out = loki.run("databricks-secrets", op="put", scope="sc", key="k", value="v")
+        client.secrets.create_secret.assert_called_once_with("k", "v", scope="sc")
+        self.assertEqual(out, {"scope": "sc", "put": "k"})   # value never echoed
+        loki.run("databricks-secrets", op="delete", scope="sc", key="k")
+        client.secrets.delete_secret.assert_called_once_with("k", scope="sc")
+
     def test_tables_list_via_uc_api(self):
         client = MagicMock()
         t1 = MagicMock(); t1.name = "orders"

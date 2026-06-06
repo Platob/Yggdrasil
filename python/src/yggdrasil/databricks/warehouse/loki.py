@@ -6,7 +6,7 @@ agent can reach (their names / ids / state).
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from yggdrasil.loki.skill import register
 
@@ -20,15 +20,30 @@ __all__ = ["DatabricksWarehousesSkill"]
 
 @register
 class DatabricksWarehousesSkill(DatabricksServiceSkill):
-    """List the SQL warehouses reachable to the agent."""
+    """List SQL warehouses, or start / stop one by name or id."""
 
     name = "databricks-warehouses"
-    description = "List the Databricks SQL warehouses (the compute behind dbc.sql)."
+    description = "List Databricks SQL warehouses, or start/stop one (the compute behind dbc.sql)."
     preprompt = (
-        "You list SQL warehouses via dbc.warehouses — the compute behind "
-        "dbc.sql. Prefer a serverless warehouse for inner I/O; surface name, "
-        "id, and state so the user can pick one."
+        "You manage SQL warehouses via dbc.warehouses — the compute behind "
+        "dbc.sql: list them, or start/stop one by name or id. Prefer a "
+        "serverless warehouse for inner I/O; starting one is billable."
     )
 
-    def run(self, agent: "Loki", **_: Any) -> dict[str, Any]:
-        return {"warehouses": names(self._client(agent).warehouses.list_warehouses())}
+    def run(self, agent: "Loki", *, op: str = "list",
+            warehouse: Optional[str] = None, **_: Any) -> dict[str, Any]:
+        whs = self._client(agent).warehouses
+        if op == "list":
+            return {"warehouses": names(whs.list_warehouses())}
+        if not warehouse:
+            raise ValueError(f"{op} needs warehouse= (a name or id)")
+        target = whs.find_warehouse(warehouse)
+        if target is None:
+            return {"warehouse": warehouse, "found": False}
+        if op == "start":
+            target.start()
+            return {"started": warehouse}
+        if op in ("stop", "terminate"):
+            target.stop()
+            return {"stopped": warehouse}
+        raise ValueError(f"unknown op {op!r}; use list/start/stop")
