@@ -139,14 +139,17 @@ class TestDatabricksBehaviors(_Base):
 
     def test_secrets_lists_scopes(self):
         client = MagicMock()
-        s = MagicMock(); s.name = "prod"
+        # A UC secret Scope identifies by ``.key`` (no ``.name``).
+        s = MagicMock(spec=["key"]); s.key = "prod"
         client.secrets.list_scopes.return_value = [s]
         loki = self._loki_with_client(client)
         self.assertEqual(loki.run("databricks-secrets")["scopes"], ["prod"])
 
     def test_iam_me(self):
         client = MagicMock()
-        client.iam.current_user = MagicMock(user_name="me@x.io")
+        # "who am I" resolves through the workspace client's /Me call.
+        client.workspace_client.return_value.current_user.me.return_value = MagicMock(
+            user_name="me@x.io", id="42")
         loki = self._loki_with_client(client)
         self.assertEqual(loki.run("databricks-iam")["me"], "me@x.io")
 

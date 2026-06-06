@@ -233,7 +233,8 @@ class DatabricksSecretsSkill(DatabricksServiceSkill):
         if scope:
             sc = client.secrets.scope(scope)
             return {"scope": scope, "keys": _names(sc.list_secrets(), attrs=("key", "name"))}
-        return {"scopes": _names(client.secrets.list_scopes(), attrs=("name",))}
+        # A UC secret Scope identifies by ``.key`` (not ``.name``).
+        return {"scopes": _names(client.secrets.list_scopes(), attrs=("key", "name"))}
 
 
 @register
@@ -244,13 +245,15 @@ class DatabricksIAMSkill(DatabricksServiceSkill):
     description = "Resolve the current user; list workspace users or groups."
 
     def run(self, agent: "Loki", *, what: str = "me", **_: Any) -> dict[str, Any]:
-        iam = self._client(agent).iam
+        client = self._client(agent)
         if what == "users":
-            return {"users": _names(iam.users(), attrs=("user_name", "name", "id"))}
+            return {"users": _names(client.iam.users(), attrs=("user_name", "name", "id"))}
         if what == "groups":
-            return {"groups": _names(iam.groups(), attrs=("display_name", "name", "id"))}
-        user = iam.current_user
-        return {"me": getattr(user, "user_name", str(user))}
+            return {"groups": _names(client.iam.groups(), attrs=("display_name", "name", "id"))}
+        # "who am I" — resolve through the workspace client (the SCIM /Me call),
+        # the same path Loki.whoami uses.
+        me = client.workspace_client().current_user.me()
+        return {"me": getattr(me, "user_name", str(me)), "id": getattr(me, "id", None)}
 
 
 #: Databricks-hosted managed MCP server URL templates, keyed by kind.

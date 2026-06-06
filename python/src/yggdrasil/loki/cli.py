@@ -842,7 +842,7 @@ def _run(loki: Any, style: Any, args: Any) -> int:
         style.fail(exc.args[0] if exc.args else str(exc))
         return 1
     if args.json:
-        style.out(_json(result) if isinstance(result, (dict, list)) else str(result))
+        style.out(_json(result))
         style.out("\n")
     else:
         style.ok(f"skill {args.name!r} completed")
@@ -863,11 +863,41 @@ def _short(v: Any) -> str:
     return s if len(s) <= 200 else s[:197] + "…"
 
 
+def _jsonable(obj: Any) -> Any:
+    """Coerce a skill result into JSON-serializable shapes.
+
+    Skill results carry rich objects — chiefly polars/pandas frames (a SQL or
+    Genie row set) — that orjson can't encode. Frames become records (capped),
+    dicts/lists recurse, models/SDK objects fall back to ``to_dict()`` or a
+    string. Keeps ``ygg loki run … --json`` working whatever a skill returns.
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    to_dicts = getattr(obj, "to_dicts", None)        # polars DataFrame → records
+    if callable(to_dicts):
+        try:
+            rows = to_dicts()
+            return _jsonable(rows[:1000] if len(rows) > 1000 else rows)
+        except Exception:
+            return str(obj)
+    to_dict = getattr(obj, "to_dict", None)          # pandas / Pydantic models
+    if callable(to_dict):
+        try:
+            return _jsonable(to_dict())
+        except Exception:
+            pass
+    return str(obj)
+
+
 def _json(result: Any) -> str:
     """JSON-encode a result for the CLI (orjson emits bytes → decode to str)."""
     from yggdrasil.pickle import json as yjson
 
-    out = yjson.dumps(result, indent=2)
+    out = yjson.dumps(_jsonable(result), indent=2)
     return out.decode() if isinstance(out, (bytes, bytearray)) else out
 
 
