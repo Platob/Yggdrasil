@@ -666,6 +666,90 @@ export function analysisOhlc(
   return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
 }
 
+// ── Technical indicators + trading signals ─────────────────────────────────
+
+export interface IndicatorResult {
+  column: string; x: (string | number)[]; close: (number | null)[];
+  rsi: (number | null)[] | null; macd: (number | null)[] | null;
+  macd_signal: (number | null)[] | null; macd_hist: (number | null)[] | null;
+  bb_upper: (number | null)[] | null; bb_mid: (number | null)[] | null; bb_lower: (number | null)[] | null;
+  sma: (number | null)[] | null; ema: (number | null)[] | null;
+  atr: (number | null)[] | null;
+  source_rows: number; truncated: boolean;
+}
+
+// POST /analysis/indicators — RSI/MACD/Bollinger/SMA/EMA/ATR over a price
+// column in one streaming polars pass. Cached client-side so re-opening a panel
+// doesn't recompute.
+export function analysisIndicators(
+  path: string, column: string,
+  opts: {
+    x?: string; volume?: string; indicators?: string[]; window?: number;
+    macd_fast?: number; macd_slow?: number; macd_signal?: number;
+    bb_window?: number; bb_std?: number; filters?: FilterSpec[]; node?: string;
+  } = {},
+): Promise<IndicatorResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/indicators${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
+export interface TradingSignal {
+  signal: string; direction: string; x: string | number;
+  value: number | null; strength: number; label: string;
+}
+
+export interface SignalResult {
+  column: string; signals: TradingSignal[];
+  current_rsi: number | null; current_macd: number | null; current_bb_pct: number | null;
+  bias: string; source_rows: number;
+}
+
+// POST /analysis/signals — detect RSI thresholds, MACD/MA crossings and BB
+// breakouts over the recent tail, with an overall bullish/bearish bias.
+export function analysisTradingSignals(
+  path: string, column: string,
+  opts: {
+    x?: string; window?: number; macd_fast?: number; macd_slow?: number;
+    macd_signal_period?: number; bb_window?: number; bb_std?: number;
+    last_n?: number; filters?: FilterSpec[]; node?: string;
+  } = {},
+): Promise<SignalResult> {
+  const { node, ...body } = opts;
+  const url = `/api/v2/analysis/signals${node ? `?node=${encodeURIComponent(node)}` : ""}`;
+  const payload = { path, column, ...body };
+  return cachedPost(url, payload, TTL.VITAL, () => jsonFetch(url, { method: "POST", body: JSON.stringify(payload) }));
+}
+
+// POST /ai/analyze — stream an LLM analysis of a trading-data summary as SSE.
+// Yields text chunks as they arrive; the backend falls back to a static message
+// when ANTHROPIC_API_KEY is absent, so this always produces something.
+export async function* streamAiAnalyze(summary: string, question: string): AsyncGenerator<string> {
+  const res = await fetch("/api/v2/ai/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ summary, question }),
+  });
+  if (!res.ok || !res.body) throw new Error(`AI analyze failed: HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep: number;
+    while ((sep = buf.indexOf("\n\n")) !== -1) {
+      const event = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      const line = event.startsWith("data: ") ? event.slice(6) : event;
+      if (line === "[DONE]") return;
+      if (line) yield line;
+    }
+  }
+}
+
 // ── Forecasting ─────────────────────────────────────────────────────────
 export interface ForecastSeriesData {
   key: string;
