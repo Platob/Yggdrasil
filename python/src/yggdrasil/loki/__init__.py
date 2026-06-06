@@ -9,7 +9,7 @@ code via :class:`Loki` or from the terminal via ``ygg loki``.
     Loki.current().card()
 """
 from .agent import Loki
-from .behavior import LokiBehavior, register, registry
+from .skill import LokiSkill, LokiBehavior, register, registry
 from .capability import Backend, detect
 from .engine import Completion, TokenEngine
 from .tools import Tool, Toolbox, filesystem_toolbox
@@ -23,6 +23,7 @@ from . import web
 
 __all__ = [
     "Loki",
+    "LokiSkill",
     "LokiBehavior",
     "Backend",
     "detect",

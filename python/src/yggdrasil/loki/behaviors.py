@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from .agent import Loki
 
 __all__ = ["AgentBehavior", "GenieBehavior", "PythonProjectBehavior", "WebBehavior",
-           "TabularBehavior"]
+           "TabularBehavior", "TransformBehavior"]
 
 
 @register
@@ -243,6 +243,8 @@ class TabularBehavior(LokiBehavior):
 
         steps = [
             f"reuse the cache:  loki.run('tabular', cache={str(cached_to)!r})",
+            f"transform (cast types / timezone / select):  loki.run('transform', "
+            f"cache={str(cached_to)!r}, cast={{'date':'date','value':'float64'}}, tz={{'date':'UTC'}})",
             f"store as Parquet/Arrow/CSV/Delta:  loki.run('tabular', cache={str(cached_to)!r}, store='out.parquet')",
             f"read it back anywhere:  IO.from_({str(cached_to)!r}).to_polars()",
         ]
@@ -260,6 +262,86 @@ class TabularBehavior(LokiBehavior):
             "cached_to": str(cached_to),
             "stored": stored,
             "next_steps": steps,
+        }
+
+
+@register
+class TransformBehavior(LokiBehavior):
+    """Transform a cached/fetched frame before reuse — cast types, tz, rename, select.
+
+    Closes the data loop: take a cached (or freshly fetched) tabular frame and
+    reshape it using the **yggdrasil field-type casting** — cast columns to
+    target types (``date``, ``float64``, ``datetime``, …, including
+    **timezone**), rename, or select — then re-cache the optimized Parquet copy.
+    So a fetched series can be made analysis-ready (typed dates, numeric values,
+    a target timezone) and reused cleanly.
+    """
+
+    name = "transform"
+    description = "Cast field types (incl. timezone), rename, or select columns of a cached frame; re-cache."
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        cache: Optional[str] = None,
+        url: Optional[str] = None,
+        cast: Optional[dict] = None,
+        tz: Optional[dict] = None,
+        rename: Optional[dict] = None,
+        select: Optional[list] = None,
+        fmt: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        key: Optional[str] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        import polars as pl
+
+        from yggdrasil.data import DataType, Field
+        from yggdrasil.io.holder import IO
+
+        if cache:
+            df, source = IO.from_(str(cache)).to_polars(), cache
+        elif url:
+            df, source = _fetch_frame(url, fmt), url
+        else:
+            raise ValueError("provide cache= (or url=) to transform")
+
+        if cast:  # field-type casting via the data layer (DataType/Field)
+            cols = [
+                Field(name=c, dtype=DataType.from_(t)).cast_polars_series(df[c]).alias(c)
+                for c, t in cast.items() if c in df.columns
+            ]
+            if cols:
+                df = df.with_columns(cols)
+        if tz:  # timezone cast on temporal columns
+            for c, target in tz.items():
+                if c in df.columns and df[c].dtype == pl.Datetime:
+                    try:
+                        df = df.with_columns(pl.col(c).dt.convert_time_zone(target).alias(c))
+                    except Exception:
+                        df = df.with_columns(pl.col(c).dt.replace_time_zone(target).alias(c))
+        if rename:
+            df = df.rename({k: v for k, v in rename.items() if k in df.columns})
+        if select:
+            df = df.select([c for c in select if c in df.columns])
+
+        cdir = pathlib.Path(cache_dir) if cache_dir else (pathlib.Path.home() / ".loki" / "cache")
+        cdir.mkdir(parents=True, exist_ok=True)
+        key = key or f"{_auto_key(source)}-t"
+        cached_to = cdir / f"{key}.parquet"
+        IO.from_(str(cached_to)).write_polars_frame(df)
+        return {
+            "source": source,
+            "rows": df.height,
+            "columns": list(df.columns),
+            "schema": {c: str(t) for c, t in zip(df.columns, df.dtypes)},
+            "preview": str(df.head(10)),
+            "cached_to": str(cached_to),
+            "next_steps": [
+                f"reuse:  loki.run('tabular', cache={str(cached_to)!r})",
+                f"store:  loki.run('tabular', cache={str(cached_to)!r}, store='out.parquet')",
+            ],
         }
 
 

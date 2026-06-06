@@ -113,6 +113,48 @@ class TestTabularBehavior(unittest.TestCase):
         with self.assertRaises(ValueError):
             _loki().run("tabular")
 
+    def test_transform_casts_field_types(self):
+        first = _loki().run("tabular", url=f"{self.base}/data.csv",
+                            cache_dir=self.cache, key="cities")
+        t = _loki().run("transform", cache=first["cached_to"], cache_dir=self.cache,
+                        cast={"pop": "float64"}, key="cities-typed")
+        self.assertEqual(t["schema"]["pop"], "Float64")
+        self.assertTrue(Path(t["cached_to"]).is_file())
+
+    def test_transform_select_and_rename(self):
+        first = _loki().run("tabular", url=f"{self.base}/ts.json",
+                            cache_dir=self.cache, key="ts")
+        t = _loki().run("transform", cache=first["cached_to"], cache_dir=self.cache,
+                        cast={"value": "float64", "date": "date"},
+                        rename={"value": "usd"}, select=["date", "usd"], key="ts2")
+        self.assertEqual(t["columns"], ["date", "usd"])
+        self.assertEqual(t["schema"]["date"], "Date")
+        self.assertEqual(t["schema"]["usd"], "Float64")
+
+
+class TestPlanning(unittest.TestCase):
+    def test_agentplan_is_mapping_compatible_and_typed(self):
+        from yggdrasil.loki.planning import AgentPlan
+
+        p = _loki().plan("analyze the iris dataset csv trends")
+        self.assertIsInstance(p, AgentPlan)
+        self.assertEqual(p["category"], p.category)          # mapping + attr
+        self.assertEqual(p.get("nope", "x"), "x")
+        self.assertIn("category", p.to_dict())
+
+    def test_persona_classification(self):
+        loki = _loki()
+        self.assertEqual(loki.plan("refactor the bug in this function").persona, "software-engineer")
+        self.assertEqual(loki.plan("quote the stock market price, spread and volatility").persona, "trader")
+        self.assertEqual(loki.plan("build an ETL pipeline into a delta warehouse").persona, "data-engineer")
+        self.assertEqual(loki.plan("I need to confess something I feel guilty about").persona, "confessor")
+        self.assertEqual(loki.plan("what's the weather like").persona, "assistant")
+
+    def test_required_skills_filled(self):
+        p = _loki().plan("fetch https://x/rates.csv over the last 2 weeks")
+        self.assertIn("tabular", p.required_skills)
+        self.assertTrue(p.persona_prompt())  # data-analyst persona has a prompt
+
 
 if __name__ == "__main__":
     unittest.main()

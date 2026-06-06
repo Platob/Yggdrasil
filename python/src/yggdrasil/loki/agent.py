@@ -385,51 +385,57 @@ class Loki:
             "files_changed": list(box.changed),
         }
 
-    # -- reasoning router --------------------------------------------------
+    # -- reasoning planner -------------------------------------------------
 
-    def route(self, text: str) -> dict[str, Any]:
-        """Categorize a request and decide how to solve it.
+    def plan(self, text: str) -> "AgentPlan":
+        """Classify a request into a structured :class:`AgentPlan`.
 
         Loki reasoning, optimized: rather than throwing every prompt at one
-        engine, it first *categorizes the problem* (data-driven, see
-        :data:`ROUTES`) and picks a *solution path* — answer (``reason``),
-        act on files (``act``), or ask Genie (``genie``) — and whether to
-        **isolate** the work to a specialized agent. Databricks problems are
-        handed to :class:`~yggdrasil.databricks.loki.DatabricksLoki` (the
-        "databricks on databricks" scheme: a workspace-resident brain answers
-        workspace questions) when one is reachable.
-
-        Returns ``{"category", "action", "specialist", "why"}``.
+        engine, it *classifies the problem* — a **category** and solution
+        **action** (answer / act on files / fetch tabular / ask Genie), the
+        **persona** to embody (data engineer, analyst, software engineer,
+        trader, confessor, companion, …), the **skills** likely required, and
+        whether to **isolate** the work to a specialist (the "databricks on
+        databricks" scheme). Returns an :class:`AgentPlan` (mapping-compatible).
         """
+        from .planning import DEFAULT_PERSONA, AgentPlan, classify_persona, skills_for
+
         low = text.lower()
+        signalled = classify_persona(text)
+        dataf = self.classify_data(text)
+
+        def made(category, action, *, specialist=None, url=None, why=""):
+            # A signalled persona wins; otherwise fall back to the category's
+            # default (data → analyst, databricks → engineer, …).
+            persona = signalled if signalled != "assistant" else DEFAULT_PERSONA.get(category, "assistant")
+            return AgentPlan(
+                text=text, category=category, action=action, specialist=specialist,
+                url=url, persona=persona, data=dataf["data"], timeseries=dataf["timeseries"],
+                required_skills=skills_for(category, data=dataf["data"]), why=why)
+
         url_match = re.search(r"https?://\S+", text)
         if url_match or any(s in low for s in ROUTES["web"]):
             url = url_match.group(0).rstrip(").,") if url_match else None
-            info = self.classify_data(text)
-            # A data/timeseries request with a source → fetch it as a cached
-            # tabular frame (the data path), not a plain page fetch.
-            if url and info["data"]:
-                return {"category": "data", "action": "tabular", "specialist": None,
-                        "url": url, "data": True, "timeseries": info["timeseries"],
-                        "why": "data/timeseries source → fetch as a cached tabular frame"}
-            return {"category": "web", "action": "web", "specialist": None, "url": url,
-                    "why": "a URL / web-fetch request — uses the HTTP session + io handlers"}
+            if url and dataf["data"]:
+                return made("data", "tabular", url=url,
+                            why="data/timeseries source → fetch as a cached tabular frame")
+            return made("web", "web", url=url,
+                        why="a URL / web-fetch request — uses the HTTP session + io handlers")
         if any(s in low for s in ROUTES["databricks"]):
-            action = "genie" if "genie" in low else "reason"
-            return {"category": "databricks", "action": action,
-                    "specialist": "databricks",
-                    "why": "matched a Databricks/Unity/warehouse signal"}
+            return made("databricks", "genie" if "genie" in low else "reason",
+                        specialist="databricks",
+                        why="matched a Databricks/Unity/warehouse signal")
         if any(s in low for s in ROUTES["aws"]):
-            return {"category": "aws", "action": "reason", "specialist": None,
-                    "why": "matched an AWS service signal — see the aws-* behaviors"}
+            return made("aws", "reason", why="matched an AWS service signal — see the aws-* skills")
         if self.has("databricks") and any(s in low for s in ROUTES["sql"]):
-            return {"category": "databricks", "action": "reason",
-                    "specialist": "databricks", "why": "SQL with a live workspace"}
+            return made("databricks", "reason", specialist="databricks",
+                        why="SQL with a live workspace")
         if any(s in low for s in ROUTES["files"]):
-            return {"category": "files", "action": "act", "specialist": None,
-                    "why": "matched a file/code-change signal"}
-        return {"category": "chat", "action": "reason", "specialist": None,
-                "why": "no specialized signal — plain reasoning"}
+            return made("files", "act", why="matched a file/code-change signal")
+        return made("chat", "reason", why=f"no specialized signal — plain reasoning ({signalled})")
+
+    #: Back-compat alias — ``route`` returns the (mapping-compatible) plan.
+    route = plan
 
     def classify_data(self, text: str) -> dict[str, Any]:
         """Global context: is this request data- or time-series-shaped?
@@ -465,26 +471,30 @@ class Loki:
             return agent if agent.has("databricks") else None
         return None
 
-    # -- behaviors ---------------------------------------------------------
+    # -- skills ------------------------------------------------------------
 
-    def behaviors(self) -> list["_behavior.LokiBehavior"]:
+    def skills(self) -> list["_behavior.LokiSkill"]:
         return _behavior.registry()
 
-    def behavior(self, name: str) -> "Optional[_behavior.LokiBehavior]":
+    def skill(self, name: str) -> "Optional[_behavior.LokiSkill]":
         return _behavior.get(name)
 
+    #: Back-compat aliases (skills were called behaviors).
+    behaviors = skills
+    behavior = skill
+
     def run(self, name: str, **kwargs: Any) -> Any:
-        """Dispatch behavior *name* with *kwargs*, using self as the provider."""
-        b = self.behavior(name)
-        if b is None:
-            known = ", ".join(x.name for x in self.behaviors()) or "(none)"
-            raise KeyError(f"unknown behavior {name!r}; registered: {known}")
-        if not b.available(self):
+        """Dispatch skill *name* with *kwargs*, using self as the provider."""
+        s = self.skill(name)
+        if s is None:
+            known = ", ".join(x.name for x in self.skills()) or "(none)"
+            raise KeyError(f"unknown skill {name!r}; registered: {known}")
+        if not s.available(self):
             raise RuntimeError(
-                f"behavior {name!r} needs backend {b.requires!r}, "
+                f"skill {name!r} needs backend {s.requires!r}, "
                 f"which is not available here"
             )
-        return b.run(self, **kwargs)
+        return s.run(self, **kwargs)
 
     # -- self-description --------------------------------------------------
 
@@ -501,7 +511,8 @@ class Loki:
                 {"name": e.name, "model": e.model_label, "available": e.available()}
                 for e in self.engines()
             ],
-            "behaviors": [b.to_dict() for b in self.behaviors()],
+            "skills": [s.to_dict() for s in self.skills()],
+            "behaviors": [s.to_dict() for s in self.skills()],  # back-compat
         }
 
     def __repr__(self) -> str:

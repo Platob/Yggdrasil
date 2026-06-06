@@ -27,7 +27,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("chat", aliases=["repl"], help="Interactive session (the default on a terminal).")
     sub.add_parser("status", help="Identity + reachable backends + engines + behaviors.")
     sub.add_parser("capabilities", help="The detected backends and their signals.")
-    sub.add_parser("behaviors", help="The registered behavior catalog.")
+    sub.add_parser("skills", aliases=["behaviors"], help="The registered skill catalog.")
     sub.add_parser("engines", help="The reasoning engines and which are available.")
     sub.add_parser("usage", help="Live token usage + USD KPIs, per model and global.")
     sub.add_parser("mcp", help="Run Loki as an MCP server (stdio) — expose it to MCP clients.")
@@ -59,7 +59,7 @@ def _build_parser() -> argparse.ArgumentParser:
     tok.add_argument("--probe", action="store_true", help="Make one network call to resolve the user.")
 
     run = sub.add_parser("run", help="Run a behavior by name.")
-    run.add_argument("name", help="Behavior name (see `ygg loki behaviors`).")
+    run.add_argument("name", help="Skill name (see `ygg loki skills`).")
     run.add_argument("--kwarg", action="append", default=[], metavar="KEY=VALUE",
                      help="Keyword argument (JSON-decoded; repeatable).")
     run.add_argument("--json", action="store_true", help="Print the raw result as JSON.")
@@ -119,8 +119,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _status(loki, style)
     if action == "capabilities":
         return _capabilities(loki, style)
-    if action == "behaviors":
-        return _behaviors(loki, style)
+    if action in ("skills", "behaviors"):
+        return _skills(loki, style)
     if action == "engines":
         return _engines(loki, style)
     if action == "reason":
@@ -151,12 +151,12 @@ def _status(loki: Any, style: Any) -> int:
         glyph = style.green("●") if eng.available() else style.dim("○")
         star = style.dim(" (default)") if best is not None and eng.name == best.name else ""
         style.out(f"    {glyph} {eng.name.ljust(11)} {style.dim(str(eng.model_label))}{star}\n")
-    style.out(f"\n  {style.bold('behaviors')}\n")
-    for beh in loki.behaviors():
+    style.out(f"\n  {style.bold('skills')}\n")
+    for beh in loki.skills():
         ok = beh.available(loki)
         glyph = style.green("●") if ok else style.dim("○")
         style.out(f"    {glyph} {beh.name.ljust(11)} {style.dim(beh.description)}\n")
-    if not loki.behaviors():
+    if not loki.skills():
         style.out(f"    {style.dim('(none registered)')}\n")
     return 0
 
@@ -329,14 +329,16 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
     from yggdrasil.loki.usage import METER
 
     before = METER.total_tokens
-    plan = loki.route(line)
+    plan = loki.plan(line)
 
     agent, tail = loki, ""
     if plan["specialist"]:
         spec = loki.specialist(plan["specialist"])
         if spec is not None:
             agent, tail = spec, f"  →  {style.brand(spec.name)} {style.dim('(isolated)')}"
-    style.out(f"  {style.dim('▹ ' + plan['category'] + ' · ' + plan['why'])}{tail}\n")
+    persona = plan.get("persona", "assistant")
+    badge = f"{plan['category']} · {style.brand(persona)}" if persona != "assistant" else plan["category"]
+    style.out(f"  {style.dim('▹ ')}{style.dim(badge)}{style.dim(' · ' + plan['why'])}{tail}\n")
 
     streamed = False
     try:
@@ -363,9 +365,11 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             reply = res.get("text", "") if isinstance(res, dict) else str(res)
         else:
             # chat (or a web verb with no URL) → stream the reply live, with
-            # the session memory as context for continuity.
+            # the persona system prompt + session memory as context.
             memory = state.get("memory")
-            system = memory.system_context() if memory is not None else None
+            parts = [p for p in (plan.persona_prompt(),
+                                 memory.system_context() if memory is not None else None) if p]
+            system = "\n\n".join(parts) or None
             reply = _stream_reply(agent, style, line, state, system=system)
             streamed = True
     except Exception as exc:  # never let one turn kill the session
@@ -692,12 +696,12 @@ def _capabilities(loki: Any, style: Any) -> int:
     return 0
 
 
-def _behaviors(loki: Any, style: Any) -> int:
-    behaviors = loki.behaviors()
-    if not behaviors:
-        style.out(f"  {style.dim('no behaviors registered')}\n")
+def _skills(loki: Any, style: Any) -> int:
+    skills = loki.skills()
+    if not skills:
+        style.out(f"  {style.dim('no skills registered')}\n")
         return 0
-    for beh in behaviors:
+    for beh in skills:
         glyph = style.green("●") if beh.available(loki) else style.dim("○")
         req = f" {style.dim('requires=' + beh.requires)}" if beh.requires else ""
         style.out(f"  {glyph} {style.bold(beh.name)}{req}\n")
