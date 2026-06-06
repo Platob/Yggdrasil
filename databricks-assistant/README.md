@@ -57,6 +57,7 @@ into the workspace + user instruction slots (Settings → Assistant).
 | `ygg-databricks-client` | `DatabricksClient`, auth, the `dbc.<service>` map, secrets |
 | `ygg-databricks-sql` | `dbc.sql.execute` → `StatementResult`, `Table` create/insert/upsert |
 | `ygg-databricks-files` | `DatabricksPath`, Volumes, DBFS, Workspace files |
+| `ygg-databricks-genie` | `dbc.genie` — list/create spaces, `space.ask(q)`, answer → Polars/Arrow |
 | `ygg-spark-tabular` | `Dataset` / `SparkDataset` — map, apply, filter, parallelize, to_table |
 | `ygg-databricks-jobs` | Jobs & runs, `@task` / `@flow`, schedules, secrets |
 

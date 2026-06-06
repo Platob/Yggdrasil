@@ -179,6 +179,28 @@ list(iam.groups.list(name="data-engineering", limit=5))
 iam.groups.delete(grp)
 ```
 
+## Genie (AI/BI)
+
+`c.genie` is code-oriented access to Databricks AI/BI **Genie** spaces:
+list / find / create spaces, ask a space a question, and read the rows it
+computed — all through the same `StatementResult` surface as `c.sql`.
+
+```python
+space = c.genie.find("Sales analytics")     # or c.genie["01ef…space_id"]
+answer = space.ask("top 10 customers by revenue last quarter")
+
+answer.text            # Genie's narrative reply
+answer.query           # the SQL it generated
+answer.to_polars()     # the rows, re-read from the executed statement (no re-run)
+
+follow = space.follow_up(answer.conversation_id, "now split by product")
+```
+
+Genie runs its SQL on the space's own warehouse; `answer.result()`
+re-attaches to that finished statement (falling back to the engine's
+default warehouse when the space has none), so reading the rows never
+re-runs the query.
+
 ## Troubleshooting
 
 - **401 / 403** — verify host + token, and whether you need workspace vs account scope.

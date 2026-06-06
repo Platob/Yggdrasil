@@ -61,6 +61,7 @@ Every terminal task maps to a Python call. Reach everything through
 | Secrets | `dbc.secrets` |
 | Users / groups | `dbc.iam` |
 | Vector Search | `dbc.ai.vector_search` |
+| AI/BI Genie spaces | `dbc.genie` (`dbc.genie["space"].ask(q).to_polars()`) |
 | Distributed Spark transforms | `dbc.dataset(...)`, `dbc.parallelize(...)` |
 
 ## SQL

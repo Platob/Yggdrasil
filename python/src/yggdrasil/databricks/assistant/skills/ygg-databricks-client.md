@@ -57,6 +57,7 @@ dbc.job_runs       # Job runs
 dbc.secrets        # secret scopes + secrets
 dbc.iam            # users, groups
 dbc.ai             # dbc.ai.vector_search
+dbc.genie          # AI/BI Genie spaces (ask questions, manage spaces)
 dbc.external       # external locations + storage credentials
 dbc.entity_tags    # UC entity tags
 ```
