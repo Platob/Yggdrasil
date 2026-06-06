@@ -30,6 +30,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("behaviors", help="The registered behavior catalog.")
     sub.add_parser("engines", help="The reasoning engines and which are available.")
     sub.add_parser("usage", help="Live token usage + USD KPIs, per model and global.")
+    sub.add_parser("mcp", help="Run Loki as an MCP server (stdio) — expose it to MCP clients.")
 
     reason = sub.add_parser("reason", help="Reason about a prompt with the best (or named) engine.")
     reason.add_argument("prompt", help="The prompt to reason about.")
@@ -101,6 +102,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Register the specialized behavior fleets for every reachable backend
     # (databricks-* / aws-*), so they show up and dispatch here.
     loki.load_specialists()
+
+    # The MCP server speaks JSON-RPC on stdio — no logo / chatter on stdout.
+    if action == "mcp":
+        from yggdrasil.loki import mcp as loki_mcp
+
+        return loki_mcp.main()
 
     style.print_logo("YGGLOKI")
 

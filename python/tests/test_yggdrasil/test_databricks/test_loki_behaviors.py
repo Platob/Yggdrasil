@@ -109,5 +109,45 @@ class TestDatabricksBehaviors(_Base):
         self.assertEqual(out["endpoint"], "ep")
 
 
+class TestDatabricksMCP(_Base):
+    def test_mcp_url_templates(self):
+        from yggdrasil.databricks.loki.behaviors import _mcp_url
+
+        self.assertEqual(
+            _mcp_url("https://w/", "functions", catalog="main", schema="sales"),
+            "https://w/api/2.0/mcp/functions/main/sales")
+        self.assertEqual(
+            _mcp_url("https://w", "genie", space="01ef"),
+            "https://w/api/2.0/mcp/genie/01ef")
+        self.assertEqual(
+            _mcp_url("https://w", "vector_search", catalog="c", schema="s"),
+            "https://w/api/2.0/mcp/vector-search/c/s")
+
+    def test_mcp_url_validates(self):
+        from yggdrasil.databricks.loki.behaviors import _mcp_url
+
+        with self.assertRaises(ValueError):
+            _mcp_url("https://w", "nope")
+        with self.assertRaises(ValueError):
+            _mcp_url("https://w", "functions", catalog="main")  # missing schema
+
+    def test_mcp_behavior_lists_tools(self):
+        client = MagicMock()
+        w = client.workspace_client.return_value
+        w.config.authenticate.return_value = {"Authorization": "Bearer tok"}
+        w.config.host = "https://w"
+        loki = self._loki_with_client(client)
+
+        async def fake_tools(url, headers):
+            self.assertEqual(headers, {"Authorization": "Bearer tok"})
+            return ["uc.fn_a", "uc.fn_b"]
+
+        with patch("yggdrasil.databricks.loki.behaviors._mcp_tools", fake_tools):
+            out = loki.run("databricks-mcp", kind="functions", catalog="main", schema="sales")
+        self.assertEqual(out["server"], "https://w/api/2.0/mcp/functions/main/sales")
+        self.assertEqual(out["tools"], ["uc.fn_a", "uc.fn_b"])
+        w.config.authenticate.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -107,7 +107,7 @@ what they changed.
 | `write_file` | create/overwrite a file | write (skipped when `read_only`) |
 | `edit_file` | replace one unique occurrence | write (skipped when `read_only`) |
 | `run_python` | **write & run Python in `root`** (compute or apply changes) — on by default | write |
-| `run` | run a shell command in `root` | shell (only when `allow_shell`) |
+| `run` | **run a shell command in `root`** — on by default | write |
 
 The agent **codes in its reasoning by default**: `run_python` lets it write
 and execute Python to compute, transform, or apply changes without a shell.
@@ -314,6 +314,47 @@ the interactive session a URL routes itself:
   ┌──────────────┬─────────────┬─ …
 ```
 
+## Sessions & memory
+
+Each interactive run gets an **isolated session workspace** under
+`~/.loki/session/<id>/` (`workspace/` + `memory/` + `cache/`). The agent is
+rooted at `workspace/`, so files it writes land there — out of your cwd and
+safe to wipe. On start, Loki **auto-purges** old sessions (keep the 20 newest,
+drop anything older than 14 days) so the tree never grows without bound.
+Session trees count as scratch, so the destructive-confirm gate stays quiet
+inside them.
+
+A session carries **self-compressing working memory** (`yggdrasil.loki.LokiMemory`):
+recent turns stay verbatim, and when context grows past a threshold the older
+turns are folded into a compact **synthesis** (summarized by the fast engine,
+for clean LLM reuse) and the raw turns dropped. This keeps a long, continuous
+development session token-efficient and precise. `/memory` shows the
+synthesis; `/sessions` lists the workspaces.
+
+## MCP — Loki as a server, and Databricks MCP
+
+`ygg loki mcp` runs Loki as a **Model Context Protocol** server over stdio, so
+any MCP client (Claude Desktop, an editor) can drive the whole agent — tools
+`reason`, `behaviors`, `run` (dispatch any behavior: `databricks-sql`,
+`aws-s3`, `genie`, …), `web`, and `capabilities`. Requires the optional `mcp`
+package.
+
+```jsonc
+// an MCP client config entry
+{ "loki": { "command": "ygg", "args": ["loki", "mcp"] } }
+```
+
+The other direction: the **`databricks-mcp`** behavior connects *out* to a
+workspace's managed MCP servers — Unity Catalog functions, Genie, or vector
+search — authenticating with the agent's Databricks credentials:
+
+```bash
+ygg loki run databricks-mcp --kwarg kind='"functions"' \
+  --kwarg catalog='"main"' --kwarg schema='"sales"'       # list UC-function tools
+ygg loki run databricks-mcp --kwarg kind='"genie"' --kwarg space='"01ef…"' \
+  --kwarg tool='"ask"' --kwarg args='{"question":"top customers"}'
+```
+
 ## Token monitoring (`ygg loki usage`)
 
 Every engine records its spend into a process-global meter
@@ -338,6 +379,7 @@ ygg loki                  # interactive session on a terminal (else status)
 ygg loki status           # identity + backends + engines + behaviors
 ygg loki engines          # the reasoning engines and which are available
 ygg loki usage            # live token + USD KPIs, per model and global
+ygg loki mcp              # run Loki as an MCP server (stdio) for MCP clients
 ygg loki capabilities     # the detected backends and their signals
 ygg loki behaviors        # the registered behavior catalog
 ygg loki tools            # the tools the autonomous agent acts through
