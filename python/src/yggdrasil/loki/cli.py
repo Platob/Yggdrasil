@@ -447,9 +447,7 @@ def _do(loki: Any, style: Any, args: Any) -> int:
         return 1
 
     if args.json:
-        from yggdrasil.pickle import json as yjson
-
-        style.out(yjson.dumps(result, indent=2) + "\n")
+        style.out(_json(result) + "\n")
         return 0
 
     style.out("\n")
@@ -536,9 +534,7 @@ def _run(loki: Any, style: Any, args: Any) -> int:
         style.fail(exc.args[0] if exc.args else str(exc))
         return 1
     if args.json:
-        from yggdrasil.pickle import json as yjson
-
-        style.out(yjson.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result))
+        style.out(_json(result) if isinstance(result, (dict, list)) else str(result))
         style.out("\n")
     else:
         style.ok(f"behavior {args.name!r} completed")
@@ -557,6 +553,14 @@ def _print_result(result: Any, style: Any) -> None:
 def _short(v: Any) -> str:
     s = str(v)
     return s if len(s) <= 200 else s[:197] + "…"
+
+
+def _json(result: Any) -> str:
+    """JSON-encode a result for the CLI (orjson emits bytes → decode to str)."""
+    from yggdrasil.pickle import json as yjson
+
+    out = yjson.dumps(result, indent=2)
+    return out.decode() if isinstance(out, (bytes, bytearray)) else out
 
 
 if __name__ == "__main__":

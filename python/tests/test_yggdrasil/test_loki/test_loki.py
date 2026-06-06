@@ -369,6 +369,14 @@ class TestReplCommands(unittest.TestCase):
         with patch("builtins.input", return_value="s"):
             self.assertFalse(cli._budget_prompt(style))
 
+    def test_json_helper_returns_str_not_bytes(self):
+        # Regression: orjson emits bytes; the CLI --json path must decode.
+        from yggdrasil.loki import cli
+
+        out = cli._json({"a": 1, "b": ["x", "y"]})
+        self.assertIsInstance(out, str)
+        self.assertIn('"a"', out)
+
 
 if __name__ == "__main__":
     unittest.main()
