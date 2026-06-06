@@ -36,12 +36,17 @@ from ..schemas.analysis import (
     ForecastRequest,
     ForecastResult,
     ForecastSeries,
+    IndicatorRequest,
+    IndicatorResult,
     OhlcRequest,
     OhlcResult,
     PivotRequest,
     PivotResult,
     SeriesRequest,
     SeriesResult,
+    SignalRequest,
+    SignalResult,
+    TradingSignal,
     Transform,
 )
 from .fs import FsService
@@ -95,6 +100,12 @@ class AnalysisService:
 
     async def forecast(self, req: "ForecastRequest") -> "ForecastResult":
         return await run_in_threadpool(partial(self._forecast, req))
+
+    async def indicators(self, req: IndicatorRequest) -> IndicatorResult:
+        return await run_in_threadpool(partial(self._indicators, req))
+
+    async def signals(self, req: SignalRequest) -> SignalResult:
+        return await run_in_threadpool(partial(self._signals, req))
 
     def _forecast(self, req: "ForecastRequest") -> "ForecastResult":
         """Forecast a value column over time (optionally per group key).
@@ -667,4 +678,181 @@ class AnalysisService:
             low=_safe_list(out["low"]), close=_safe_list(out["close"]),
             volume=_safe_list(out["volume"]) if has_vol else None,
             bars=out.height, source_rows=source_rows,
+        )
+
+    # -- technical indicators -----------------------------------------------
+
+    def _indicators_df(
+        self,
+        path: str,
+        column: str,
+        *,
+        x: str | None,
+        filters: list[FilterSpec],
+        window: int,
+        macd_fast: int,
+        macd_slow: int,
+        macd_signal: int,
+        bb_window: int,
+        bb_std: float,
+    ) -> tuple[pl.DataFrame, int, bool]:
+        """Compute every indicator over the price series in one streaming pass.
+
+        Returns the (bounded, ordered) frame carrying x/close + rsi/macd/bb/
+        sma/ema/atr columns, the full source row count, and whether it was
+        truncated to the byte budget. Shared by ``_indicators`` and
+        ``_signals`` so both read one identical computation."""
+        lf = self._apply_filters(self._frame(path), filters)
+        cols = set(lf.collect_schema().names())
+        if column not in cols:
+            raise BadRequestError(f"column {column!r} not found")
+        has_x = bool(x and x in cols)
+        keep = list(dict.fromkeys([column] + ([x] if has_x else [])))
+        plan = lf.select(keep)
+        if has_x:
+            plan = plan.sort(x)
+        cap = self._row_cap_for_bytes(plan)
+        source_rows = plan.select(pl.len()).collect(engine="streaming").item()
+        truncated = source_rows > cap
+        df = plan.tail(cap).collect(engine="streaming") if truncated else plan.collect(engine="streaming")
+
+        win = max(2, window)
+        bbw = max(2, bb_window)
+        close = pl.col(column).cast(pl.Float64, strict=False)
+        ret = close - close.shift(1)
+        gain = pl.when(ret > 0).then(ret).otherwise(0.0)
+        loss = pl.when(ret < 0).then(-ret).otherwise(0.0)
+        avg_gain = gain.rolling_mean(window_size=win)
+        avg_loss = loss.rolling_mean(window_size=win)
+        rs = avg_gain / avg_loss
+        rsi = pl.when(avg_loss == 0).then(100.0).otherwise(100.0 - 100.0 / (1.0 + rs))
+        ema_fast = close.ewm_mean(span=macd_fast, ignore_nulls=True)
+        ema_slow = close.ewm_mean(span=macd_slow, ignore_nulls=True)
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm_mean(span=macd_signal, ignore_nulls=True)
+        bb_mid = close.rolling_mean(window_size=bbw)
+        bb_sd = close.rolling_std(window_size=bbw)
+        # ATR proxy when no high/low: rolling mean of |pct change| scaled to price.
+        pct = (close / close.shift(1) - 1.0).abs()
+        atr_proxy = pct.rolling_mean(window_size=win) * close
+
+        out = df.with_columns([
+            close.alias("__close"),
+            rsi.alias("__rsi"),
+            macd_line.alias("__macd"),
+            signal_line.alias("__macd_signal"),
+            (macd_line - signal_line).alias("__macd_hist"),
+            (bb_mid + bb_std * bb_sd).alias("__bb_upper"),
+            bb_mid.alias("__bb_mid"),
+            (bb_mid - bb_std * bb_sd).alias("__bb_lower"),
+            close.rolling_mean(window_size=win).alias("__sma"),
+            close.ewm_mean(span=win, ignore_nulls=True).alias("__ema"),
+            atr_proxy.alias("__atr"),
+        ])
+        if has_x:
+            out = out.with_columns(pl.col(x).alias("__x"))
+        else:
+            out = out.with_row_index("__x")
+        return out, source_rows, truncated
+
+    def _indicators(self, req: IndicatorRequest) -> IndicatorResult:
+        df, source_rows, truncated = self._indicators_df(
+            req.path, req.column, x=req.x, filters=req.filters,
+            window=req.window, macd_fast=req.macd_fast, macd_slow=req.macd_slow,
+            macd_signal=req.macd_signal, bb_window=req.bb_window, bb_std=req.bb_std,
+        )
+        want = set(req.indicators)
+        result = IndicatorResult(
+            node_id=self.settings.node_id, path=req.path, column=req.column,
+            x=[_safe(v) for v in df["__x"].to_list()],
+            close=_safe_list(df["__close"]),
+            source_rows=source_rows, truncated=truncated,
+        )
+        if "rsi" in want:
+            result.rsi = _safe_list(df["__rsi"])
+        if "macd" in want:
+            result.macd = _safe_list(df["__macd"])
+            result.macd_signal = _safe_list(df["__macd_signal"])
+            result.macd_hist = _safe_list(df["__macd_hist"])
+        if "bb" in want:
+            result.bb_upper = _safe_list(df["__bb_upper"])
+            result.bb_mid = _safe_list(df["__bb_mid"])
+            result.bb_lower = _safe_list(df["__bb_lower"])
+        if "sma" in want:
+            result.sma = _safe_list(df["__sma"])
+        if "ema" in want:
+            result.ema = _safe_list(df["__ema"])
+        if "atr" in want:
+            result.atr = _safe_list(df["__atr"])
+        return result
+
+    # -- trading signals ----------------------------------------------------
+
+    def _signals(self, req: SignalRequest) -> SignalResult:
+        df, source_rows, _ = self._indicators_df(
+            req.path, req.column, x=req.x, filters=req.filters,
+            window=req.window, macd_fast=req.macd_fast, macd_slow=req.macd_slow,
+            macd_signal=req.macd_signal_period, bb_window=req.bb_window, bb_std=req.bb_std,
+        )
+        last_n = max(2, req.last_n)
+        if df.height > last_n:
+            df = df.tail(last_n)
+
+        # Materialise the indicator arrays once; signal detection is a small
+        # scan over the bounded tail (last_n rows), not over the source file.
+        xs = df["__x"].to_list()
+        close = df["__close"].to_list()
+        rsi = df["__rsi"].to_list()
+        macd = df["__macd"].to_list()
+        macd_sig = df["__macd_signal"].to_list()
+        bb_up = df["__bb_upper"].to_list()
+        bb_lo = df["__bb_lower"].to_list()
+        sma = df["__sma"].to_list()
+
+        def _f(v):
+            return v if isinstance(v, (int, float)) and v == v else None
+
+        signals: list[TradingSignal] = []
+        for i in range(1, df.height):
+            xv = _safe(xs[i])
+            r, rp = _f(rsi[i]), _f(rsi[i - 1])
+            if r is not None and rp is not None:
+                if rp >= 30 > r:
+                    signals.append(TradingSignal(signal="rsi_oversold", direction="bullish", x=xv, value=r, strength=min(1.0, (30 - r) / 30 + 0.4), label=f"RSI crossed below 30 (oversold) at {r:.1f}"))
+                if rp <= 70 < r:
+                    signals.append(TradingSignal(signal="rsi_overbought", direction="bearish", x=xv, value=r, strength=min(1.0, (r - 70) / 30 + 0.4), label=f"RSI crossed above 70 (overbought) at {r:.1f}"))
+            m, mp, s, sp = _f(macd[i]), _f(macd[i - 1]), _f(macd_sig[i]), _f(macd_sig[i - 1])
+            if None not in (m, mp, s, sp):
+                if mp <= sp and m > s:
+                    signals.append(TradingSignal(signal="macd_cross_up", direction="bullish", x=xv, value=m, strength=0.6, label="MACD crossed above signal line"))
+                if mp >= sp and m < s:
+                    signals.append(TradingSignal(signal="macd_cross_down", direction="bearish", x=xv, value=m, strength=0.6, label="MACD crossed below signal line"))
+            c, cp = _f(close[i]), _f(close[i - 1])
+            bu, bl = _f(bb_up[i]), _f(bb_lo[i])
+            if c is not None:
+                if bu is not None and c > bu:
+                    signals.append(TradingSignal(signal="bb_breakout_up", direction="bearish", x=xv, value=c, strength=0.5, label="Close broke above upper Bollinger band (overextended)"))
+                if bl is not None and c < bl:
+                    signals.append(TradingSignal(signal="bb_breakout_down", direction="bullish", x=xv, value=c, strength=0.5, label="Close broke below lower Bollinger band (oversold)"))
+            sm, smp = _f(sma[i]), _f(sma[i - 1])
+            if None not in (c, cp, sm, smp):
+                if cp <= smp and c > sm:
+                    signals.append(TradingSignal(signal="price_ma_cross_up", direction="bullish", x=xv, value=c, strength=0.55, label="Price crossed above moving average"))
+                if cp >= smp and c < sm:
+                    signals.append(TradingSignal(signal="price_ma_cross_down", direction="bearish", x=xv, value=c, strength=0.55, label="Price crossed below moving average"))
+
+        cur_rsi = _f(rsi[-1]) if rsi else None
+        cur_macd = _f(macd[-1]) if macd else None
+        cur_close = _f(close[-1]) if close else None
+        cu, cl = (_f(bb_up[-1]) if bb_up else None), (_f(bb_lo[-1]) if bb_lo else None)
+        cur_bb_pct = ((cur_close - cl) / (cu - cl)) if (None not in (cur_close, cu, cl) and cu != cl) else None
+
+        recent = signals[-10:]
+        score = sum(1 if s.direction == "bullish" else -1 for s in recent)
+        bias = "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
+
+        return SignalResult(
+            node_id=self.settings.node_id, path=req.path, column=req.column,
+            signals=signals, current_rsi=_safe(cur_rsi), current_macd=_safe(cur_macd),
+            current_bb_pct=_safe(cur_bb_pct), bias=bias, source_rows=source_rows,
         )

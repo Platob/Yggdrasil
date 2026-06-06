@@ -221,3 +221,90 @@ class ForecastResult(StrictModel):
     series: list[ForecastSeries]
     source_rows: int
     sampled: bool = False
+
+
+# -- technical indicators ---------------------------------------------------
+
+class IndicatorRequest(StrictModel):
+    path: str
+    column: str              # price column
+    x: str | None = None     # time/order column
+    volume: str | None = None
+    indicators: list[str] = ["rsi", "macd", "bb"]  # which to compute
+    window: int = 14         # base period (RSI, ATR)
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    bb_window: int = 20
+    bb_std: float = 2.0
+    filters: list[FilterSpec] = []
+
+
+class IndicatorResult(StrictModel):
+    node_id: str
+    path: str
+    column: str
+    x: list[Any]
+    close: list[float | None]
+    # RSI
+    rsi: list[float | None] | None = None
+    # MACD
+    macd: list[float | None] | None = None
+    macd_signal: list[float | None] | None = None
+    macd_hist: list[float | None] | None = None
+    # Bollinger Bands
+    bb_upper: list[float | None] | None = None
+    bb_mid: list[float | None] | None = None
+    bb_lower: list[float | None] | None = None
+    # SMA/EMA
+    sma: list[float | None] | None = None
+    ema: list[float | None] | None = None
+    # ATR (needs high/low — uses rolling std of pct_change as proxy when unavailable)
+    atr: list[float | None] | None = None
+    source_rows: int
+    truncated: bool = False
+
+
+# -- trading signals --------------------------------------------------------
+
+class SignalRequest(StrictModel):
+    path: str
+    column: str
+    x: str | None = None
+    window: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal_period: int = 9
+    bb_window: int = 20
+    bb_std: float = 2.0
+    filters: list[FilterSpec] = []
+    last_n: int = 500  # only look at last N rows for signals
+
+
+class TradingSignal(StrictModel):
+    signal: str           # e.g. "rsi_oversold"
+    direction: str        # "bullish" | "bearish" | "neutral"
+    x: Any                # x value at signal
+    value: float | None   # indicator value
+    strength: float       # 0-1 score
+    label: str            # human-readable description
+
+
+class SignalResult(StrictModel):
+    node_id: str
+    path: str
+    column: str
+    signals: list[TradingSignal]
+    current_rsi: float | None
+    current_macd: float | None
+    current_bb_pct: float | None  # (close - bb_lower) / (bb_upper - bb_lower)
+    bias: str  # "bullish" | "bearish" | "neutral" — overall signal bias
+    source_rows: int
+
+
+# -- AI analysis ------------------------------------------------------------
+
+class AiAnalyzeRequest(StrictModel):
+    summary: str          # JSON/text summary of indicators
+    question: str = "Analyze this trading data and identify key signals and risks."
+    model: str = "claude-haiku-4-5-20251001"

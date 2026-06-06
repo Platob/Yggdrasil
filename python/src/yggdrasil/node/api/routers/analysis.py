@@ -13,12 +13,16 @@ from ..schemas.analysis import (
     FinanceResult,
     ForecastRequest,
     ForecastResult,
+    IndicatorRequest,
+    IndicatorResult,
     OhlcRequest,
     OhlcResult,
     PivotRequest,
     PivotResult,
     SeriesRequest,
     SeriesResult,
+    SignalRequest,
+    SignalResult,
 )
 from ..services.analysis import AnalysisService
 from ..services.network import NetworkService
@@ -127,6 +131,34 @@ async def ohlc(
     if node and node != service.settings.node_id:
         return await network.proxy_json(node, "POST", "/api/v2/analysis/ohlc", json_body=req.model_dump())
     return await service.ohlc(req)
+
+
+@router.post("/indicators", response_model=IndicatorResult)
+async def indicators(
+    req: IndicatorRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> IndicatorResult:
+    """Technical indicators (RSI, MACD, Bollinger bands, SMA/EMA, ATR proxy)
+    over a price column — computed in one streaming polars pass."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/indicators", json_body=req.model_dump())
+    return await service.indicators(req)
+
+
+@router.post("/signals", response_model=SignalResult)
+async def signals(
+    req: SignalRequest,
+    node: str | None = None,
+    service: AnalysisService = Depends(get_analysis_service),
+    network: NetworkService = Depends(get_network_service),
+) -> SignalResult:
+    """Detect trading signals (RSI thresholds, MACD/MA crossings, BB breakouts)
+    over the recent tail of a price series, with an overall bullish/bearish bias."""
+    if node and node != service.settings.node_id:
+        return await network.proxy_json(node, "POST", "/api/v2/analysis/signals", json_body=req.model_dump())
+    return await service.signals(req)
 
 
 @router.post("/export")
