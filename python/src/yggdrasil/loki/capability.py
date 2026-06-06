@@ -9,10 +9,12 @@ capabilities before it acts.
 """
 from __future__ import annotations
 
+import json
 import os
 import pathlib
+import socket
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 __all__ = ["Backend", "detect", "detect_databricks", "detect_aws", "detect_local"]
 
@@ -55,6 +57,18 @@ def detect_databricks() -> Backend:
         return Backend("databricks", available=False, detail={"signals": signals})
 
     detail: dict[str, Any] = {"signals": signals}
+    # Resolve host/catalog/schema cheaply — env, the `ygg databricks configure`
+    # session snapshot, or ~/.databrickscfg — so the common case never pays the
+    # ~0.85s ``import databricks.sdk`` just to *detect* the workspace. The heavy
+    # client (and SDK) load is deferred to when Databricks is actually used.
+    cheap = _cheap_databricks_detail(home)
+    if cheap.get("host"):
+        detail.update(cheap)
+        return Backend("databricks", available=True, detail=detail)
+
+    # Signalled but host not resolvable cheaply (exotic auth — Azure MSI, an
+    # OAuth flow with no cached host, …): fall back to the full SDK client to
+    # resolve it precisely, paying the heavier import only in this rare case.
     try:
         from yggdrasil.databricks import DatabricksClient
 
@@ -68,6 +82,61 @@ def detect_databricks() -> Backend:
         detail["error"] = f"{type(exc).__name__}: {exc}"
         available = False
     return Backend("databricks", available=available, detail=detail)
+
+
+def _cheap_databricks_detail(home: pathlib.Path) -> dict[str, Any]:
+    """Best-effort host/catalog/schema/auth **without** importing the SDK.
+
+    Reads the same sources the client would, cheaply: the remembered
+    ``ygg databricks configure`` session snapshot, the ``DATABRICKS_*``
+    environment, then ``~/.databrickscfg``. Returns ``{}`` when none yields a
+    host (the caller then falls back to the full client)."""
+    sess = _databricks_session_snapshot(home)
+    if sess and sess.get("host"):
+        return {"host": sess.get("host"), "auth_type": sess.get("auth_type"),
+                "catalog": sess.get("catalog"), "schema": sess.get("schema")}
+    host = os.getenv("DATABRICKS_HOST")
+    if host:
+        auth = ("pat" if os.getenv("DATABRICKS_TOKEN")
+                else "oauth-m2m" if os.getenv("DATABRICKS_CLIENT_ID") else None)
+        return {"host": host, "auth_type": auth,
+                "catalog": os.getenv("DATABRICKS_CATALOG"),
+                "schema": os.getenv("DATABRICKS_SCHEMA")}
+    cfg = home / ".databrickscfg"
+    if cfg.is_file():
+        import configparser
+
+        cp = configparser.ConfigParser()
+        try:
+            cp.read(cfg)
+            for sec in ("DEFAULT", *cp.sections()):
+                if cp.has_option(sec, "host"):
+                    return {"host": cp.get(sec, "host"),
+                            "auth_type": "pat" if cp.has_option(sec, "token") else None,
+                            "catalog": None, "schema": None}
+        except configparser.Error:
+            pass
+    return {}
+
+
+def _databricks_session_snapshot(home: pathlib.Path) -> Optional[dict[str, Any]]:
+    """The newest ``ygg databricks configure`` session snapshot, read directly
+    (this host's, else the most recent) — no SDK / ``yggdrasil.databricks``
+    import. Mirrors :mod:`yggdrasil.databricks.loki.session`."""
+    d = home / ".config" / "databricks-sdk-py" / "sessions"
+    if not d.is_dir():
+        return None
+    host = "".join(c if (c.isalnum() or c in "-_.") else "-"
+                   for c in (socket.gethostname() or "default"))
+    preferred = d / f"{host}.json"
+    files = [preferred] if preferred.is_file() else sorted(
+        d.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files:
+        try:
+            return json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def _has_remembered_session(home: pathlib.Path) -> bool:

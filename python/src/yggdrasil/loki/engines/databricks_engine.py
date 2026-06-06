@@ -31,6 +31,7 @@ class DatabricksServingEngine(TokenEngine):
         client: Any = None,
         endpoint: Optional[str] = None,
         model: Optional[str] = None,
+        available: Optional[bool] = None,
     ) -> None:
         # The endpoint name *is* the model selector here.
         super().__init__(model=model or endpoint or DEFAULT_ENDPOINT)
@@ -39,6 +40,10 @@ class DatabricksServingEngine(TokenEngine):
         # than adapting; ``tier`` is accepted for contract parity and ignored.
         self.endpoint = endpoint or model or DEFAULT_ENDPOINT
         self._client = client
+        # A cheap availability signal from the detected backend, set by Loki so
+        # ``available()`` doesn't import the SDK / build a client just to answer
+        # (the import is deferred to an actual completion). ``None`` → probe.
+        self._available = available
 
     @property
     def client(self):
@@ -49,22 +54,53 @@ class DatabricksServingEngine(TokenEngine):
         return self._client
 
     def available(self) -> bool:
+        if self._available is not None:
+            return self._available
         try:
             return bool(self.client and self.client.base_url)
         except Exception:
             return False
+
+    def warm(self) -> None:
+        """Best-effort: build + cache the OpenAI-compatible client ahead of the
+        first completion so the first submit isn't slowed by client setup.
+
+        A no-op when the ``openai`` dep isn't present yet (the first real call
+        installs it) — the warmer must never trigger a background pip install.
+        """
+        import importlib.util
+
+        if importlib.util.find_spec("openai") is None:
+            return
+        try:
+            self._oai_client()
+        except Exception:
+            pass
+
+    #: base_url → OpenAI-compatible client, cached per workspace. Building it
+    #: resolves the workspace client + auth and stands up a fresh connection
+    #: pool; rebuilding on every completion is the bulk of serving latency, so
+    #: reuse one client (and its keep-alive pool) across turns.
+    _OAI: "dict[str, Any]" = {}
 
     def _oai_client(self):
         """The OpenAI-compatible client for the workspace's serving endpoints.
 
         `serving_endpoints.get_open_ai_client()` needs the ``openai`` package
         (shipped as the ``databricks-sdk[openai]`` extra) — auto-install it on
-        first use so reasoning just works.
+        first use so reasoning just works. Cached per workspace so the client
+        and its connection pool are reused across completions.
         """
+        key = getattr(self.client, "base_url", "") or ""
+        cached = type(self)._OAI.get(key)
+        if cached is not None:
+            return cached
         from ..runtime import load
 
         load("openai", "databricks-sdk[openai]")
-        return self.client.workspace_client().serving_endpoints.get_open_ai_client()
+        client = self.client.workspace_client().serving_endpoints.get_open_ai_client()
+        type(self)._OAI[key] = client
+        return client
 
     def complete(
         self,

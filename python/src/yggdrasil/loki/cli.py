@@ -107,8 +107,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         loki = Loki.current()
 
     # Register the specialized skill fleets for every reachable backend
-    # (databricks-* / aws-*), so they show up and dispatch here.
-    loki.load_specialists()
+    # (databricks-* / aws-*) only for the actions that surface or run them right
+    # away — the import is heavy (pulls the Databricks SDK). Lightweight reads
+    # (engines/usage/capabilities/token) and pure-reasoning actions stay fast.
+    # The REPL warms the fleet *asynchronously* (see _repl) so the logo is
+    # instant. On the Databricks runtime ``ygg loki`` *is* the specialist.
+    if action in ("status", "skills", "run") or os.getenv("DATABRICKS_RUNTIME_VERSION"):
+        loki.load_specialists()
 
     # The MCP server speaks JSON-RPC on stdio — no logo / chatter on stdout.
     if action == "mcp":
@@ -117,6 +122,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return loki_mcp.main()
 
     style.print_logo("YGGLOKI")
+
+    # Surface local-model progress in the terminal: the transformers engine
+    # logs its (otherwise silent) weight download + model load through the
+    # `yggdrasil.loki` logger, so a long first run on a CPU box isn't a black
+    # box. Stderr-bound + styled — never tangles with streamed output on stdout.
+    import logging
+
+    style.install_logging(logger=logging.getLogger("yggdrasil.loki"), show_name=False)
 
     if action == "chat":
         return _repl(loki, style)
@@ -221,6 +234,28 @@ def _repl(loki: Any, style: Any) -> int:
     from yggdrasil.loki.usage import METER
 
     METER.set_limit(METER.DEFAULT_COST_LIMIT)
+
+    # Warm in the background while the user picks a session and types the first
+    # prompt: register the specialist skill fleets (heavy Databricks import) and
+    # build the chosen engine's client. Overlapping this with the input wait
+    # keeps the logo instant and the first turn's submit fast.
+    import threading
+
+    def _warm() -> None:
+        try:
+            loki.load_specialists()
+        except Exception:
+            pass
+        try:
+            eng = loki.engine()
+            warm = getattr(eng, "warm", None)
+            if callable(warm):
+                warm()
+        except Exception:
+            pass
+
+    threading.Thread(target=_warm, daemon=True).start()
+
     session = _choose_session(style)  # resume a prior session for this user, or start new
     state: dict[str, Any] = {
         "tier": None, "engine": None, "session": session,
@@ -233,6 +268,12 @@ def _repl(loki: Any, style: Any) -> int:
               f"{style.dim('· ' + session.user)}\n")
     style.out(f"  {style.dim('workspace ' + str(session.workspace))}\n")
     _select_engine(loki, style, state)
+    # Warm the local-capability probe now (it imports torch the first time —
+    # slow on a box that has it) so the first turn's engine selection doesn't
+    # stall silently. Only matters when a local engine is actually reachable.
+    if any(e.local and e.available() for e in loki.engines()):
+        with style.Spinner("checking local model capacity…"):
+            loki.can_run_local()
     style.out(f"  {style.dim('cost budget')} {style.brand(f'${METER.cost_limit:.2f}')} "
               f"{style.dim('· raised in $1 steps when reached')}\n\n")
 
@@ -348,15 +389,68 @@ def _select_engine(loki: Any, style: Any, state: dict) -> None:
     style.ok(f"engine → {state['engine']}")
 
 
+def _local_load_notice(agent: Any, style: Any, engine: "str | None") -> None:
+    """Warn that a local transformers model is about to load (slow + silent).
+
+    The first turn on a fresh box downloads weights and builds the pipeline
+    before a single token streams; say so up front so the wait isn't a black
+    box (the engine then logs the load itself via the routed loki logger)."""
+    if engine != "transformers":
+        return
+    eng = agent.engine("transformers")
+    model = eng.resolve_model()
+    if not eng.ready(model):
+        style.out(f"  {style.dim('▹ loading local model')} {style.brand(model)} "
+                  f"{style.dim('· first run downloads weights, then runs on CPU — this can take a while')}\n")
+
+
 def _stream_reply(agent: Any, style: Any, line: str, state: dict,
                   *, engine: "str | None" = None, system: "str | None" = None) -> str:
-    """Stream a reasoned reply to the terminal token-by-token; return the full text."""
-    style.out("\n  ")
+    """Submit the reply asynchronously and yield it to the terminal as it lands.
+
+    The reasoning stream runs on a worker thread that feeds a queue; the main
+    thread shows a spinner until the first token, then drains the queue,
+    printing tokens the instant they arrive. Decoupling production from the UI
+    keeps the spinner smooth across token gaps and the terminal responsive,
+    and surfaces a stream error back on the main thread."""
+    import queue
+    import threading
+
+    _local_load_notice(agent, style, engine)
+    q: "queue.Queue[Any]" = queue.Queue()
+    done = object()
+    error: list[BaseException] = []
+
+    def produce() -> None:
+        try:
+            for chunk in agent.reason_stream(line, engine=engine,
+                                             tier=state["tier"], system=system):
+                q.put(chunk)
+        except BaseException as exc:           # surfaced + re-raised on the main thread
+            error.append(exc)
+        finally:
+            q.put(done)
+
+    threading.Thread(target=produce, daemon=True).start()   # submit
+
     parts: list[str] = []
-    for chunk in agent.reason_stream(line, engine=engine,
-                                     tier=state["tier"], system=system):
-        style.out(chunk)
-        parts.append(chunk)
+    spin = style.Spinner("thinking…").start()
+    try:
+        while True:
+            chunk = q.get()                    # yield as tokens land
+            if chunk is done:
+                break
+            if spin is not None:               # first token — drop the spinner, open output
+                spin.stop()
+                spin = None
+                style.out("  ")
+            style.out(chunk)
+            parts.append(chunk)
+    finally:
+        if spin is not None:                   # nothing streamed (empty or error)
+            spin.stop()
+    if error:
+        raise error[0]
     style.out("\n\n")
     return "".join(parts)
 
@@ -417,13 +511,15 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
     try:
         if plan["action"] == "tabular" and plan.get("url"):
             cache_dir = getattr(state.get("session"), "cache_dir", None)
-            res = agent.run("tabular", url=plan["url"],
-                            cache_dir=str(cache_dir) if cache_dir else None)
+            with style.Spinner(f"fetching {_short_text(plan['url'], 52)}…"):
+                res = agent.run("tabular", url=plan["url"],
+                                cache_dir=str(cache_dir) if cache_dir else None)
             _print_tabular(style, res)
             reply = (f"Fetched {res['rows']}×{len(res['columns'])} from {res['source']}; "
                      f"cached → {res['cached_to']}")
         elif plan["action"] == "web" and plan.get("url"):
-            res = agent.run("web", url=plan["url"], question=line)
+            with style.Spinner(f"fetching {_short_text(plan['url'], 52)}…"):
+                res = agent.run("web", url=plan["url"], question=line)
             _print_web(style, res)
             reply = res.get("answer") or style.dim(f"fetched {plan['url']}")
         elif plan["action"] == "act":
@@ -436,7 +532,8 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             if res.get("files_changed"):
                 style.out(f"  {style.good('✎')} {', '.join(res['files_changed'])}\n")
         elif plan["action"] == "genie":
-            res = agent.run("genie", question=line)
+            with style.Spinner("asking Genie…"):
+                res = agent.run("genie", question=line)
             reply = res.get("text", "") if isinstance(res, dict) else str(res)
         elif plan["action"] == "skill" and plan.get("skill"):
             # A precise databricks request → dispatch the specialized skill
@@ -444,7 +541,8 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             reply = _dispatch_skill(agent, style, plan["skill"], plan.get("skill_kwargs") or {})
             streamed = True
         elif plan["action"] == "guide":
-            res = agent.run("guide", task=line, plan=True)
+            with style.Spinner("composing the yggdrasil recipe…"):
+                res = agent.run("guide", task=line, plan=True)
             _print_guide(style, res)
             reply = res.get("plan") or style.dim("see the yggdrasil recipes above")
             if res.get("plan"):
@@ -471,9 +569,13 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
     if memory is not None:
         memory.add("user", line)
         memory.add("assistant", _short_text(reply, 1200))
-        if memory.maybe_compress(loki, engine=state.get("engine")):
-            note = f"· memory compressed → {memory.chars()} chars"
-            style.out(f"  {style.dim(note)}\n")
+        # Compression is a real (slow) model call — spin only when it'll run.
+        if memory.should_compress():
+            with style.Spinner("compressing session memory…"):
+                compressed = memory.maybe_compress(loki, engine=state.get("engine"))
+            if compressed:
+                note = f"· memory compressed → {memory.chars()} chars"
+                style.out(f"  {style.dim(note)}\n")
     _usage_line(style, delta=METER.total_tokens - before)
 
 
@@ -538,7 +640,8 @@ def _dispatch_skill(agent: Any, style: Any, skill: str, kwargs: dict) -> str:
     shown = f" {style.dim(str(kwargs))}" if kwargs else ""
     style.out(f"  {style.dim('▹ dispatched')} {style.brand(skill)}{shown}\n")
     try:
-        res = agent.run(skill, **kwargs)
+        with style.Spinner(f"running {skill}…"):
+            res = agent.run(skill, **kwargs)
     except Exception as exc:
         style.fail(f"{skill}: {exc.args[0] if exc.args else exc}")
         return f"{skill} failed: {exc}"
@@ -623,7 +726,8 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
         else:
             style.warn(f"unknown engine {arg!r} — see /engines")
     elif cmd == "status":
-        _status(loki, style)
+        loki.load_specialists()   # ensure the specialist fleet is listed even
+        _status(loki, style)      # if the background warmer hasn't finished yet
     elif cmd == "engines":
         _engines(loki, style)
     elif cmd == "setup":
@@ -759,7 +863,8 @@ def _usage_table(style: Any) -> int:
 
 def _reason(loki: Any, style: Any, args: Any) -> int:
     try:
-        out = loki.reason(args.prompt, system=args.system, engine=args.engine, tier=args.tier)
+        with style.Spinner("reasoning…"):
+            out = loki.reason(args.prompt, system=args.system, engine=args.engine, tier=args.tier)
     except (KeyError, RuntimeError) as exc:
         style.fail(exc.args[0] if exc.args else str(exc))
         return 1

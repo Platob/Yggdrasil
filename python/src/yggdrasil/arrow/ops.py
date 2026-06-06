@@ -24,9 +24,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
 
-import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
+try:
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+except ImportError:
+    # numpy / pyarrow are heavy optional deps this module needs — auto-install
+    # them into the running interpreter on first import (the project's standard
+    # import-or-install guard) so Arrow ops just work out of the box.
+    from yggdrasil.lazy_imports import _lazy_import
+
+    np = _lazy_import("numpy", install=True)
+    pa = _lazy_import("pyarrow", install=True)
+    pc = _lazy_import("pyarrow.compute", "pyarrow", install=True)
 
 
 def _row_index_array(n: int) -> pa.Array:

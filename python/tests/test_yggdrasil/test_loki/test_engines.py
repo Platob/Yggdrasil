@@ -350,6 +350,40 @@ class TestTransformersEngine(unittest.TestCase):
         self.assertEqual(METER.rows_for("transformers")[0].calls, 1)
         self.assertEqual(METER.total_cost, 0.0)  # local is free
 
+    def test_ready_tracks_loaded_pipeline(self):
+        eng = TransformersEngine(model="m")
+        self.assertFalse(eng.ready())          # nothing loaded yet
+        TransformersEngine._PIPES["m"] = object()
+        self.assertTrue(eng.ready())
+        self.assertTrue(eng.ready("m"))
+        self.assertFalse(eng.ready("other"))
+
+    def test_stream_yields_tokens_live_and_records_usage(self):
+        from yggdrasil.loki.usage import METER
+
+        class _FakeStreamer:
+            def __init__(self, tokenizer, **kw):
+                self.kw = kw
+
+            def __iter__(self):
+                return iter(["Hel", "lo!"])
+
+        pipe = MagicMock()
+        pipe.tokenizer = object()
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(return_value=pipe)
+        fake.TextIteratorStreamer = _FakeStreamer
+        fake_torch = types.ModuleType("torch")
+        METER.reset()
+        with patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch}):
+            chunks = list(TransformersEngine(model="m").generate_stream("hi"))
+        # Tokens arrive incrementally (live), not as one final blob.
+        self.assertEqual(chunks, ["Hel", "lo!"])
+        # The generation ran on a worker thread the streamer drained.
+        pipe.assert_called_once()
+        self.assertEqual(pipe.call_args.kwargs["streamer"].__class__.__name__, "_FakeStreamer")
+        self.assertEqual(METER.rows_for("transformers")[0].calls, 1)
+
     @unittest.skipUnless(
         os.getenv("YGG_LOKI_TEST_LOCAL") == "1",
         "set YGG_LOKI_TEST_LOCAL=1 to run the real (downloads a small model) test",
@@ -387,12 +421,24 @@ class TestOllamaEngine(unittest.TestCase):
         return sess
 
     def test_available_pings_tags_via_httpsession(self):
-        eng = OllamaEngine()
+        # Fresh instances: a 200 from /api/tags is up, a refused connection down.
         with patch.object(OllamaEngine, "_session", return_value=self._fake_session(get_status=200)):
-            self.assertTrue(eng.available())
+            self.assertTrue(OllamaEngine().available())
         sess = MagicMock(); sess.get.side_effect = OSError("refused")
         with patch.object(OllamaEngine, "_session", return_value=sess):
-            self.assertFalse(eng.available())
+            self.assertFalse(OllamaEngine().available())
+
+    def test_available_probe_is_memoized(self):
+        # The liveness probe is a network round-trip asked several times per
+        # `ygg loki` command (engine() + engines() + select()), so it's cached
+        # for a short TTL — repeated checks hit the cache, not the network.
+        eng = OllamaEngine()
+        sess = self._fake_session(get_status=200)
+        with patch.object(OllamaEngine, "_session", return_value=sess):
+            self.assertTrue(eng.available())
+            self.assertTrue(eng.available())
+            self.assertTrue(eng.available())
+        self.assertEqual(sess.get.call_count, 1)  # one probe, then cached
 
     def test_bootstrap_model_scales_with_resources(self):
         from yggdrasil.loki import resources

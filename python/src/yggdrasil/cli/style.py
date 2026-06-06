@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import time
+from typing import Callable
 
 _CSI = "\033["
 _RESET = f"{_CSI}0m"
@@ -53,10 +54,19 @@ def force_color(enabled: bool = True) -> None:
 
 # -- colors ----------------------------------------------------------------
 
+#: Escape prefix per SGR code (``"2"`` → ``"\033[2m"``), built once and reused.
+#: The colour helpers run several times per rendered line, so each concatenates
+#: a cached prefix + text + reset rather than re-formatting the CSI every call.
+_PREFIX: dict[str, str] = {}
+
+
 def _esc(code: str, text: str) -> str:
     if not _COLOR:
         return text
-    return f"{_CSI}{code}m{text}{_RESET}"
+    prefix = _PREFIX.get(code)
+    if prefix is None:
+        prefix = _PREFIX[code] = f"{_CSI}{code}m"
+    return prefix + text + _RESET
 
 # One coral-forward theme for every ygg CLI. Coral orange is the brand /
 # primary accent; green means good, red means bad, amber means caution, and
@@ -69,15 +79,29 @@ _RED   = "38;5;203"   # bad (a coral-red that sits beside the brand)
 _AMBER = "38;5;214"   # caution
 _MUTED = "38;5;245"   # secondary — labels, paths, hints
 
-def bold(text: str) -> str:  return _esc("1", text)
-def dim(text: str) -> str:   return _esc("2", text)
+def _painter(code: str) -> Callable[[str], str]:
+    """A colour helper bound to *code* with its escape prefix precomputed.
+
+    One call that concatenates ``prefix + text + reset`` — no per-call CSI
+    formatting and no delegation through :func:`_esc`. The colour gate
+    (:func:`force_color` / ``NO_COLOR`` / TTY) is still read live per call."""
+    prefix = _PREFIX.setdefault(code, f"{_CSI}{code}m")
+
+    def paint(text: str) -> str:
+        return prefix + text + _RESET if _COLOR else text
+
+    return paint
+
+
+bold = _painter("1")
+dim = _painter("2")
 
 # -- semantic palette (prefer these) --------------------------------------
-def brand(text: str) -> str: return _esc(_CORAL, text)   # coral orange
-def good(text: str) -> str:  return _esc(_GREEN, text)
-def bad(text: str) -> str:   return _esc(_RED, text)
-def amber(text: str) -> str: return _esc(_AMBER, text)
-def muted(text: str) -> str: return _esc(_MUTED, text)
+brand = _painter(_CORAL)   # coral orange
+good = _painter(_GREEN)
+bad = _painter(_RED)
+amber = _painter(_AMBER)
+muted = _painter(_MUTED)
 
 # -- back-compat aliases — existing call sites map onto the theme ----------
 coral = orange = brand           # brand / primary accent

@@ -16,9 +16,22 @@ from typing import (
     Union,
 )
 
-from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
-from databricks.sdk.client_types import ClientType
-from databricks.sdk.config import Config
+try:
+    from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
+    from databricks.sdk.client_types import ClientType
+    from databricks.sdk.config import Config
+except ImportError:
+    # The Databricks SDK is an optional heavy dependency, but it underpins the
+    # whole ``yggdrasil.databricks`` package — and ``client.py`` is the first
+    # module its ``__init__`` imports, so auto-installing it here (into the
+    # running interpreter, via the project's import-or-install guard) makes
+    # every ``databricks.sdk.*`` import across the package resolve.
+    from yggdrasil.lazy_imports import _lazy_import
+
+    _lazy_import("databricks.sdk", "databricks-sdk", install=True)
+    from databricks.sdk import AccountClient as DAC, WorkspaceClient as DWC
+    from databricks.sdk.client_types import ClientType
+    from databricks.sdk.config import Config
 
 from yggdrasil.concurrent.threading import Job
 from yggdrasil.dataclasses import (

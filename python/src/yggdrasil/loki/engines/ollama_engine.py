@@ -13,6 +13,7 @@ shared pool.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, ClassVar, Optional
 
 from yggdrasil.dataclasses.waiting import WaitingConfig
@@ -24,6 +25,14 @@ __all__ = ["OllamaEngine"]
 
 #: Quick, single-shot waiting profile for liveness probes — short timeout.
 _PROBE = WaitingConfig(timeout=2.0, retries=0, max_attempts=1)
+
+#: Seconds an ``available()`` probe result is trusted before re-checking. A
+#: single ``ygg loki`` command asks ``available()`` several times (engine()
+#: + engines() + per-turn select()); the probe is a network round-trip to the
+#: Ollama server, so caching it collapses that burst into one call — the bulk
+#: of ``ygg loki`` startup latency when a local model server is configured.
+#: Short enough that a server started later in a long REPL is still detected.
+_PROBE_TTL = 30.0
 
 #: A no-retry HTTPSession for liveness probes (cached). The shared session
 #: retries a refused connection ~8× with backoff — right for real calls, but it
@@ -67,6 +76,8 @@ class OllamaEngine(LocalEngine):
                  host: Optional[str] = None) -> None:
         super().__init__(model=model or os.getenv("YGG_LOKI_OLLAMA_MODEL"), tier=tier)
         self.host = (host or os.getenv("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
+        #: Memoized liveness probe — (monotonic timestamp, result), TTL-bounded.
+        self._probe: "Optional[tuple[float, bool]]" = None
 
     def _session(self, *, probe: bool = False):
         """The HTTPSession to use — pooling, retry, and parsing in one place.
@@ -81,12 +92,17 @@ class OllamaEngine(LocalEngine):
         return HTTPSession()
 
     def available(self) -> bool:
+        now = time.monotonic()
+        if self._probe is not None and now - self._probe[0] < _PROBE_TTL:
+            return self._probe[1]
         try:
             resp = self._session(probe=True).get(f"{self.host}/api/tags",
                                                  raise_error=False, wait=_PROBE)
-            return resp.status_code == 200
+            ok = resp.status_code == 200
         except Exception:
-            return False
+            ok = False
+        self._probe = (now, ok)
+        return ok
 
     # -- lazy model install ------------------------------------------------
 

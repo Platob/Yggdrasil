@@ -138,9 +138,54 @@ def read_json(url: str, **fetch_kwargs: Any) -> Any:
     return fetch(url, **fetch_kwargs).json()
 
 
+def _image_size(data: bytes) -> "tuple[int, int] | None":
+    """``(width, height)`` from an image's header for common web formats — PNG,
+    GIF, BMP, WEBP, JPEG — with no image library. ``None`` if undetermined.
+
+    Cheap, dependency-free metadata so :func:`read_image` reports dimensions
+    even when Pillow isn't installed (Pillow, when present, is authoritative)."""
+    import struct
+
+    if len(data) < 24:
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        w, h = struct.unpack(">II", data[16:24])
+        return int(w), int(h)
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        w, h = struct.unpack("<HH", data[6:10])
+        return int(w), int(h)
+    if data[:2] == b"BM":
+        w, h = struct.unpack("<ii", data[18:26])
+        return int(w), abs(int(h))
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        fmt = data[12:16]
+        if fmt == b"VP8 ":
+            w, h = struct.unpack("<HH", data[26:30])
+            return w & 0x3FFF, h & 0x3FFF
+        if fmt == b"VP8L" and data[20] == 0x2F:
+            bits = int.from_bytes(data[21:25], "little")
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if fmt == b"VP8X":
+            w = 1 + int.from_bytes(data[24:27], "little")
+            h = 1 + int.from_bytes(data[27:30], "little")
+            return w, h
+    if data[:2] == b"\xff\xd8":  # JPEG — walk segments to the start-of-frame marker
+        i, n = 2, len(data)
+        while i + 9 < n:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return int(w), int(h)
+            i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+    return None
+
+
 def read_image(url: str, *, save_to: Optional[str] = None, **fetch_kwargs: Any) -> dict[str, Any]:
-    """Fetch an image; report its content type, byte size, and (if Pillow is
-    present) pixel dimensions. Optionally save the bytes to *save_to*."""
+    """Fetch an image; report its content type, byte size, and pixel dimensions.
+    Optionally save the bytes to *save_to*."""
     import pathlib
 
     resp = fetch(url, **fetch_kwargs)
@@ -151,15 +196,17 @@ def read_image(url: str, *, save_to: Optional[str] = None, **fetch_kwargs: Any) 
         "content_type": str(resp.media_type.mime_type.value),
         "bytes": len(data),
     }
-    try:  # dimensions are a nicety, not a requirement
+    try:  # Pillow, when present, is authoritative (and carries the colour mode)
         import io as _io
 
         from PIL import Image
 
         with Image.open(_io.BytesIO(data)) as im:
             info["width"], info["height"], info["mode"] = im.width, im.height, im.mode
-    except Exception:
-        pass
+    except Exception:  # no Pillow → read dimensions from the header, dependency-free
+        size = _image_size(data)
+        if size is not None:
+            info["width"], info["height"] = size
     if save_to:
         path = pathlib.Path(save_to)
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -17,11 +17,16 @@ dispatches :class:`~yggdrasil.loki.skill.LokiSkill` actions. The CLI
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 from . import skill as _skill
 from .capability import Backend, detect
+
+#: Engine fallback / skip notices ride this logger; ``ygg loki`` routes it to
+#: the terminal (``style.install_logging``) so a skipped engine is visible.
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from yggdrasil.databricks import DatabricksClient
@@ -30,6 +35,12 @@ if TYPE_CHECKING:
     from .tools import Toolbox
 
 __all__ = ["Loki", "ROUTES"]
+
+#: Raised when no reasoning engine is reachable (or every one failed in turn).
+_NO_ENGINE = (
+    "no reasoning engine available — log into Claude Code, or set "
+    "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a Databricks session"
+)
 
 #: Problem-category signals for :meth:`Loki.route`. Data over code — extend the
 #: keyword lists, not the routing branches.
@@ -102,6 +113,10 @@ class Loki:
         self.user = _safe(getpass.getuser)
         self.host = _safe(socket.gethostname)
         self._backends: "Optional[list[Backend]]" = None
+        self._engines: "Optional[dict[str, TokenEngine]]" = None
+        self._capable: "Optional[bool]" = None
+        self._agent_id: "Optional[int]" = None
+        self._specialists: "dict[str, Optional[Loki]]" = {}
 
     # -- singleton ---------------------------------------------------------
 
@@ -116,10 +131,12 @@ class Loki:
 
     @property
     def agent_id(self) -> int:
-        """Stable int64 id derived from ``user@host`` (xxhash, not crypto)."""
-        import xxhash
+        """Stable int64 id derived from ``user@host`` (xxhash, not crypto); cached."""
+        if self._agent_id is None:
+            import xxhash
 
-        return xxhash.xxh64_intdigest(f"{self.user}@{self.host}") & 0x7FFFFFFFFFFFFFFF
+            self._agent_id = xxhash.xxh64_intdigest(f"{self.user}@{self.host}") & 0x7FFFFFFFFFFFFFFF
+        return self._agent_id
 
     # -- backends / capabilities ------------------------------------------
 
@@ -215,24 +232,37 @@ class Loki:
 
     # -- reasoning engines -------------------------------------------------
 
-    def _engine_instances(self) -> "dict[str, TokenEngine]":
+    def _engine_instances(self, *, refresh: bool = False) -> "dict[str, TokenEngine]":
         """One instance of every known engine — remote APIs plus the free
-        local ones (Databricks bound to our client)."""
-        from .engines import (
-            ClaudeEngine,
-            DatabricksServingEngine,
-            OllamaEngine,
-            OpenAIEngine,
-            TransformersEngine,
-        )
+        local ones (Databricks bound to our client).
 
-        return {
-            "claude": ClaudeEngine(),
-            "openai": OpenAIEngine(),
-            "databricks": DatabricksServingEngine(client=self.databricks),
-            "ollama": OllamaEngine(),
-            "transformers": TransformersEngine(),
-        }
+        Cached for the process: ``engine()``, ``engines()``, and ``select()``
+        all resolve engines, and rebuilding them each time would re-run every
+        ``available()`` check — including the Ollama liveness *network* probe —
+        several times per ``ygg loki`` command. Reusing the instances keeps the
+        startup path to a single probe (each engine memoizes its own check).
+        ``refresh=True`` re-detects (e.g. after a Databricks session appears).
+        """
+        if self._engines is None or refresh:
+            from .engines import (
+                ClaudeEngine,
+                DatabricksServingEngine,
+                OllamaEngine,
+                OpenAIEngine,
+                TransformersEngine,
+            )
+
+            self._engines = {
+                "claude": ClaudeEngine(),
+                "openai": OpenAIEngine(),
+                # Lazy client + a cheap availability signal from the detected
+                # backend — so listing/selecting engines never imports the SDK;
+                # the heavy load is deferred to an actual serving completion.
+                "databricks": DatabricksServingEngine(available=self.has("databricks")),
+                "ollama": OllamaEngine(),
+                "transformers": TransformersEngine(),
+            }
+        return self._engines
 
     def engines(self) -> "list[TokenEngine]":
         """Every known reasoning engine (call ``.available()`` to filter)."""
@@ -303,10 +333,10 @@ class Loki:
         remotes = [available[n] for n in order if not available[n].local]
         base_eng = available.get(base or "")
 
-        # Can this workstation comfortably host a local model (and which size)?
-        from .resources import can_run_local
-
-        capable = can_run_local()
+        # Can this workstation comfortably host a local model? Only worth asking
+        # when a local engine is actually reachable — the probe imports torch
+        # (slow first call), so skip it entirely on a remote-only box.
+        capable = bool(locals_) and self.can_run_local()
 
         # The cheap/home choice for ordinary work: a capable local model if we
         # have one (free, private), else the session base, else the best engine.
@@ -327,6 +357,48 @@ class Loki:
             if not confirm(target, model):
                 return home
         return target
+
+    def can_run_local(self) -> bool:
+        """Whether this box can comfortably host a local model — cached.
+
+        Wraps :func:`yggdrasil.loki.resources.can_run_local` but memoizes the
+        result for the process: the probe imports ``torch`` to check for a CUDA
+        GPU (slow on the first call, on a box that has it), and engine selection
+        asks this on every turn. Hardware doesn't change within a session.
+        """
+        if self._capable is None:
+            from .resources import can_run_local
+
+            self._capable = can_run_local()
+        return self._capable
+
+    def _engine_chain(
+        self,
+        text: "Optional[str]" = None,
+        *,
+        engine: "Optional[str]" = None,
+        tier: "Optional[str]" = None,
+        base: "Optional[str]" = None,
+        confirm: "Optional[Callable[[TokenEngine, Optional[str]], bool]]" = None,
+    ) -> "list[TokenEngine]":
+        """Ordered, available engines to try for a request — the chosen one
+        first, then the rest in preference order.
+
+        Powers log-and-skip fallback: a pinned/selected engine that errors
+        (bad token, 403, missing dep) is logged and the next available engine
+        is tried instead of failing the whole request.
+        """
+        available = {n: e for n, e in self._engine_instances().items() if e.available()}
+        chain: "list[TokenEngine]" = []
+        first = (self.engine(engine) if engine
+                 else self.select(text, tier=tier, base=base, confirm=confirm))
+        if first is not None and first.available():
+            chain.append(first)
+        for n in self.ENGINE_PREFERENCE:
+            eng = available.get(n)
+            if eng is not None and all(eng is not c for c in chain):
+                chain.append(eng)
+        return chain
 
     def bootstrap_local(self, *, model: "Optional[str]" = None, pull: bool = True) -> dict[str, Any]:
         """Ready a free **local** reasoning engine, lazily installing on demand.
@@ -382,15 +454,16 @@ class Loki:
         (:meth:`select`), sticking to the session ``base`` and asking
         ``confirm`` before escalating to a paid remote model.
         """
-        eng = (self.engine(engine) if engine
-               else self.select(prompt, tier=tier, base=base, confirm=confirm))
-        if eng is None or not eng.available():
-            raise RuntimeError(
-                "no reasoning engine available — log into Claude Code, or set "
-                "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a "
-                "Databricks session"
-            )
-        return eng.generate(prompt, system=system, tier=tier, **options)
+        chain = self._engine_chain(prompt, engine=engine, tier=tier, base=base, confirm=confirm)
+        last: "Optional[Exception]" = None
+        for eng in chain:
+            try:
+                return eng.generate(prompt, system=system, tier=tier, **options)
+            except Exception as exc:
+                last = exc
+                _log.warning("engine '%s' failed: %s — skipping to next",
+                             eng.name, _short_err(exc))
+        raise last if last is not None else RuntimeError(_NO_ENGINE)
 
     def reason_stream(
         self,
@@ -408,15 +481,22 @@ class Loki:
         Same engine/tier resolution as :meth:`reason`, but live: the chosen
         engine streams token deltas so the terminal prints them as they come.
         """
-        eng = (self.engine(engine) if engine
-               else self.select(prompt, tier=tier, base=base, confirm=confirm))
-        if eng is None or not eng.available():
-            raise RuntimeError(
-                "no reasoning engine available — log into Claude Code, or set "
-                "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a "
-                "Databricks session"
-            )
-        yield from eng.generate_stream(prompt, system=system, tier=tier, **options)
+        chain = self._engine_chain(prompt, engine=engine, tier=tier, base=base, confirm=confirm)
+        last: "Optional[Exception]" = None
+        for eng in chain:
+            started = False
+            try:
+                for chunk in eng.generate_stream(prompt, system=system, tier=tier, **options):
+                    started = True
+                    yield chunk
+                return
+            except Exception as exc:
+                if started:
+                    raise            # already emitted output — can't silently switch
+                last = exc
+                _log.warning("engine '%s' failed: %s — skipping to next",
+                             eng.name, _short_err(exc))
+        raise last if last is not None else RuntimeError(_NO_ENGINE)
 
     # -- autonomous action loop -------------------------------------------
 
@@ -634,16 +714,24 @@ class Loki:
         ``"databricks"`` resolves the workspace-bound
         :class:`~yggdrasil.databricks.loki.DatabricksLoki` when the SDK and a
         session are present; otherwise falls back to ``self``.
+
+        Cached per name: the REPL asks for the same specialist on every
+        databricks turn, and the resolution (import + singleton lookup +
+        backend check) is stable for the process.
         """
+        if name in self._specialists:
+            return self._specialists[name]
+        resolved: "Optional[Loki]" = None
         if name == "databricks":
             try:
                 from yggdrasil.databricks.loki import DatabricksLoki
 
                 agent = DatabricksLoki.current()
+                resolved = agent if agent.has("databricks") else None
             except Exception:
-                return None
-            return agent if agent.has("databricks") else None
-        return None
+                resolved = None
+        self._specialists[name] = resolved
+        return resolved
 
     # -- skills ------------------------------------------------------------
 
@@ -719,3 +807,10 @@ def _safe(fn) -> str:
         return fn()
     except Exception:
         return "unknown"
+
+
+def _short_err(exc: Exception) -> str:
+    """A one-line, truncated rendering of an engine error for a log line."""
+    msg = (exc.args[0] if exc.args else str(exc)) if exc.args else str(exc)
+    msg = " ".join(str(msg).split())
+    return msg if len(msg) <= 200 else msg[:199] + "…"

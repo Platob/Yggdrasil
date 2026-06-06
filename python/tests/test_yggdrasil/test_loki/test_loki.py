@@ -98,6 +98,28 @@ class TestAgent(unittest.TestCase):
         self.assertIn("skills", card)
         self.assertIn("token", card)
 
+    def test_can_run_local_probe_is_cached(self):
+        # The hardware probe imports torch (slow first call) and is asked on
+        # every turn by select() — resolve it once per process.
+        loki = Loki()
+        with patch("yggdrasil.loki.resources.can_run_local", return_value=True) as crl:
+            self.assertTrue(loki.can_run_local())
+            self.assertTrue(loki.can_run_local())
+        crl.assert_called_once()
+
+    def test_specialist_resolution_is_cached(self):
+        # The REPL asks for the databricks specialist every databricks turn;
+        # the import + singleton lookup + backend check resolves once (here,
+        # with no databricks SDK/session, to None) and is then memoized.
+        loki = Loki()
+        first = loki.specialist("databricks")
+        self.assertIn("databricks", loki._specialists)
+        self.assertIs(loki.specialist("databricks"), first)
+        # The cache is authoritative — a seeded value short-circuits resolution.
+        sentinel = object()
+        loki._specialists["databricks"] = sentinel
+        self.assertIs(loki.specialist("databricks"), sentinel)
+
 
 class TestPythonProjectBehavior(unittest.TestCase):
     def test_runs_anywhere_and_executes_supplied_code(self):
@@ -396,6 +418,71 @@ class TestReplCommands(unittest.TestCase):
         out = cli._json({"a": 1, "b": ["x", "y"]})
         self.assertIsInstance(out, str)
         self.assertIn('"a"', out)
+
+
+class _BoomEngine:
+    """An available engine whose generation always errors."""
+    def __init__(self, name="claude"):
+        self.name = name; self.local = False
+    def available(self): return True
+    def generate(self, *a, **k): raise RuntimeError("403 invalid access token")
+    def generate_stream(self, *a, **k):
+        raise RuntimeError("403 invalid access token")
+        yield  # pragma: no cover
+
+
+class _OkEngine:
+    """An available engine that answers."""
+    def __init__(self, name="openai", text="fallback reply"):
+        self.name = name; self.local = False; self._text = text
+    def available(self): return True
+    def generate(self, *a, **k): return self._text
+    def generate_stream(self, *a, **k):
+        for w in self._text.split(" "):
+            yield w + " "
+
+
+class TestEngineFallback(unittest.TestCase):
+    """A failing engine is logged and skipped to the next available one."""
+
+    def _loki(self, engines):
+        loki = Loki(); loki._backends = []
+        self._p1 = patch.object(Loki, "_engine_instances", return_value=engines)
+        self._p2 = patch.object(Loki, "can_run_local", return_value=False)
+        self._p1.start(); self._p2.start()
+        self.addCleanup(self._p1.stop); self.addCleanup(self._p2.stop)
+        return loki
+
+    def test_reason_skips_failing_engine(self):
+        loki = self._loki({"claude": _BoomEngine(), "openai": _OkEngine()})
+        with self.assertLogs("yggdrasil.loki.agent", level="WARNING") as logs:
+            self.assertEqual(loki.reason("hi"), "fallback reply")
+        self.assertTrue(any("claude" in m and "skipping" in m for m in logs.output))
+
+    def test_reason_stream_skips_failing_engine_before_first_token(self):
+        loki = self._loki({"claude": _BoomEngine(), "openai": _OkEngine()})
+        with self.assertLogs("yggdrasil.loki.agent", level="WARNING"):
+            self.assertEqual("".join(loki.reason_stream("hi")).strip(), "fallback reply")
+
+    def test_stream_does_not_switch_after_output_started(self):
+        # An engine that yields then errors must not silently fail over — the
+        # partial output is already on screen.
+        class _PartialThenBoom(_OkEngine):
+            def generate_stream(self, *a, **k):
+                yield "half "
+                raise RuntimeError("mid-stream drop")
+        loki = self._loki({"claude": _PartialThenBoom(name="claude"), "openai": _OkEngine()})
+        out = []
+        with self.assertRaises(RuntimeError):
+            for chunk in loki.reason_stream("hi"):
+                out.append(chunk)
+        self.assertEqual(out, ["half "])
+
+    def test_all_engines_failing_raises(self):
+        loki = self._loki({"claude": _BoomEngine("claude"), "openai": _BoomEngine("openai")})
+        with self.assertRaises(RuntimeError), \
+             self.assertLogs("yggdrasil.loki.agent", level="WARNING"):
+            loki.reason("hi")
 
 
 if __name__ == "__main__":
