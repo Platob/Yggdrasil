@@ -244,7 +244,10 @@ class Loki:
             self._engines = {
                 "claude": ClaudeEngine(),
                 "openai": OpenAIEngine(),
-                "databricks": DatabricksServingEngine(client=self.databricks),
+                # Lazy client + a cheap availability signal from the detected
+                # backend — so listing/selecting engines never imports the SDK;
+                # the heavy load is deferred to an actual serving completion.
+                "databricks": DatabricksServingEngine(available=self.has("databricks")),
                 "ollama": OllamaEngine(),
                 "transformers": TransformersEngine(),
             }

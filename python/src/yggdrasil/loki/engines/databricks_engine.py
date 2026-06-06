@@ -31,6 +31,7 @@ class DatabricksServingEngine(TokenEngine):
         client: Any = None,
         endpoint: Optional[str] = None,
         model: Optional[str] = None,
+        available: Optional[bool] = None,
     ) -> None:
         # The endpoint name *is* the model selector here.
         super().__init__(model=model or endpoint or DEFAULT_ENDPOINT)
@@ -39,6 +40,10 @@ class DatabricksServingEngine(TokenEngine):
         # than adapting; ``tier`` is accepted for contract parity and ignored.
         self.endpoint = endpoint or model or DEFAULT_ENDPOINT
         self._client = client
+        # A cheap availability signal from the detected backend, set by Loki so
+        # ``available()`` doesn't import the SDK / build a client just to answer
+        # (the import is deferred to an actual completion). ``None`` → probe.
+        self._available = available
 
     @property
     def client(self):
@@ -49,6 +54,8 @@ class DatabricksServingEngine(TokenEngine):
         return self._client
 
     def available(self) -> bool:
+        if self._available is not None:
+            return self._available
         try:
             return bool(self.client and self.client.base_url)
         except Exception:

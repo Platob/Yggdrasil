@@ -107,8 +107,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         loki = Loki.current()
 
     # Register the specialized skill fleets for every reachable backend
-    # (databricks-* / aws-*), so they show up and dispatch here.
-    loki.load_specialists()
+    # (databricks-* / aws-*) only for the actions that actually surface or run
+    # them — the import is heavy (pulls the Databricks SDK). Lightweight reads
+    # (engines/usage/capabilities/token) and pure-reasoning actions stay fast;
+    # the REPL routes to specialist skills, so it loads them up front. On the
+    # Databricks runtime ``ygg loki`` *is* the specialist, so always load.
+    if action in ("chat", "status", "skills", "run") or os.getenv("DATABRICKS_RUNTIME_VERSION"):
+        loki.load_specialists()
 
     # The MCP server speaks JSON-RPC on stdio — no logo / chatter on stdout.
     if action == "mcp":
