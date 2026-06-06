@@ -732,15 +732,26 @@ working directory), then:
 
 | Flag | Purpose |
 |---|---|
+| `--mode` | Idempotency policy — `overwrite` / `append` / `auto` (default `auto`) |
 | `--extra` | optional-dependency extra to fold into the environment (repeatable) |
 | `--bundle` | Bundle the dependency closure as Linux wheels (zero-PyPI install) |
 | `--no-cluster` | Build the wheel + environment only; don't create the cluster |
 | `--single-user` | Single-user owner for the cluster (default: the current user) |
 | `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`) |
 
+`--mode` controls what gets rebuilt vs. reused:
+
+| Mode | Wheel(s) | Env config files | Cluster |
+|---|---|---|---|
+| `overwrite` | rebuilt + overwritten | overwritten | created **or updated** |
+| `append` | reused if present, else built | written only if **missing** | created if missing |
+| `auto` (default) | get-or-create (reused if present) | **always overwritten** | get-or-create |
+
 ```bash
-ygg databricks deploy project                      # discover from the cwd
+ygg databricks deploy project                      # discover from the cwd (auto)
 ygg databricks deploy project ./my-app --extra databricks
+ygg databricks deploy project --mode overwrite        # rebuild + update everything
+ygg databricks deploy project --mode append           # only add what's missing
 ygg databricks deploy project --bundle --no-cluster   # zero-PyPI env, no cluster
 ```
 

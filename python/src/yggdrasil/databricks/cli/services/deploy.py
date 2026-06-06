@@ -20,6 +20,9 @@ builds the **project's own wheel**, writes a serverless base environment +
 classic-cluster requirements named for the project (``<name>-<version>``), and
 get-or-creates a default single-user cluster that installs the project's
 dependencies — so a user's project runs on Databricks with one command.
+``--mode`` sets the idempotency policy: ``overwrite`` (rebuild + update all),
+``append`` (add only what's missing), or ``auto`` (get-or-create wheels but
+overwrite the env config files; the default).
 """
 from __future__ import annotations
 
@@ -93,6 +96,10 @@ class DeployCommand:
                           help="optional-dependency extra to include in the env (repeatable).")
         proj.add_argument("--bundle", action="store_true",
                           help="Bundle the dependency closure as wheels (zero-PyPI install).")
+        proj.add_argument("--mode", default="auto", choices=["auto", "append", "overwrite"],
+                          help="Idempotency policy: overwrite (rebuild + update all), "
+                               "append (add only what's missing), auto (get-or-create wheels, "
+                               "overwrite env config files). Default: auto.")
         proj.add_argument("--no-cluster", dest="no_cluster", action="store_true",
                           help="Build the wheel + environment only; don't create the default cluster.")
         proj.add_argument("--single-user", dest="single_user_name", default=None,
@@ -172,16 +179,20 @@ class DeployCommand:
         project), and get-or-create a default cluster installing its deps."""
         from yggdrasil.cli import style
         from yggdrasil.databricks.job import wheel as whl
+        from yggdrasil.enums.mode import Mode
 
         client = build_client(args)
         pypi_dir = args.workspace_dir or whl.WORKSPACE_PYPI_DIR
         extras = tuple(args.extra or ())
+        mode = Mode.from_(args.mode)
 
         with style.Spinner("building project wheel + environment…"):
             info = whl.ensure_project_environment(
-                client, args.path, extras=extras, bundle=args.bundle, pypi_dir=pypi_dir,
+                client, args.path, extras=extras, bundle=args.bundle,
+                mode=mode, pypi_dir=pypi_dir,
             )
         style.ok(f"deployed project {style.brand(info['name'])} {info['version']}")
+        style.out(f"    {style.dim('mode')}       {mode.name.lower()}\n")
         style.out(f"    {style.dim('env')}        {info['env_name']}\n")
         style.out(f"    {style.dim('serverless')} {info['serverless']}\n")
         style.out(f"    {style.dim('cluster')}    {info['cluster']}\n")
@@ -192,16 +203,26 @@ class DeployCommand:
 
         # A default single-user cluster that installs the project's deps — the
         # classic-cluster requirements file written above (project wheel +
-        # dependencies), via Library(requirements=…).
+        # dependencies), via Library(requirements=…). OVERWRITE updates an
+        # existing cluster's libraries; AUTO/APPEND get-or-create it.
         user = client.workspace_client().current_user.me().user_name
         single_user = args.single_user_name or user
+        clusters = client.compute.clusters
+        libraries = [info["cluster"], "uv", "dill"]
         with style.Spinner(f"provisioning default cluster {info['name']!r}…"):
-            cluster = client.compute.clusters.all_purpose_cluster(
-                name=info["name"],
-                single_user_name=single_user,
-                environment=info["cluster"],
-                wait=False,
+            existing = (
+                clusters.find_cluster(cluster_name=info["name"], raise_error=False)
+                if mode is Mode.OVERWRITE else None
             )
+            if existing is not None:
+                cluster = existing.update(
+                    libraries=libraries, single_user_name=single_user, wait=False,
+                )
+            else:
+                cluster = clusters.all_purpose_cluster(
+                    name=info["name"], single_user_name=single_user,
+                    environment=info["cluster"], wait=False,
+                )
         style.out(
             f"    {style.dim('cluster')}    {cluster.cluster_name}  "
             f"{style.dim(str(cluster.cluster_id))}\n"

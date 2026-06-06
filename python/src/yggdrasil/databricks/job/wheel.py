@@ -27,6 +27,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from yggdrasil.enums.mode import Mode
+
 logger = logging.getLogger(__name__)
 
 
@@ -1190,6 +1192,7 @@ def ensure_project_environment(
     python: str | None = None,
     extras: tuple[str, ...] | list[str] = (),
     bundle: bool = False,
+    mode: Mode = Mode.AUTO,
     workspace_dir: str = WORKSPACE_ENV_DIR,
     pypi_dir: str = WORKSPACE_PYPI_DIR,
 ) -> dict[str, Any]:
@@ -1203,12 +1206,31 @@ def ensure_project_environment(
     With ``bundle=True`` those dependencies are downloaded as Linux-x86_64 wheels
     into the env's ``binaries/`` folder and listed by workspace path, so the
     runtime installs with zero PyPI access; otherwise they're listed as index
-    requirements resolved at install time. Returns a descriptor with the project
-    name/version, the env name, the written file paths, and the dependency list.
+    requirements resolved at install time.
+
+    *mode* (a :class:`~yggdrasil.enums.Mode`) sets the idempotency policy:
+
+    - :data:`Mode.OVERWRITE` — rebuild the wheel(s) and **overwrite** everything
+      (the deployed wheel and the env config files).
+    - :data:`Mode.APPEND` — **add only what's missing**: reuse an already-deployed
+      wheel, and write the env config files only when they don't exist yet.
+    - :data:`Mode.AUTO` (default) — **get-or-create** the wheel(s) (reuse when
+      already deployed, build when not) but always **overwrite** the env config
+      files so they track the current dependency set.
+
+    Returns a descriptor with the project name/version, the env name, the written
+    file paths, the dependency list, and the resolved *mode*.
     """
+    from yggdrasil.databricks.path import DatabricksPath
+
+    mode = Mode.from_(mode)
+    rebuild = mode is Mode.OVERWRITE           # OVERWRITE rebuilds wheels
+    overwrite_env = mode is not Mode.APPEND    # OVERWRITE + AUTO rewrite env files
+
     meta = read_pyproject(find_pyproject(pyproject))
     name, version = meta["name"], meta["version"]
-    env_name = f"{_norm(name)}-{_norm_version(version)}"
+    proj = _norm(name)
+    env_name = f"{proj}-{_norm_version(version)}"
     env_dir = f"{workspace_dir.rstrip('/')}/{env_name}"
 
     # The project's declared deps, with any requested extras flattened in.
@@ -1216,34 +1238,66 @@ def ensure_project_environment(
     for extra in extras:
         deps += meta["optional_dependencies"].get(extra, [])
 
-    project_wheels = build_project_wheel(meta["dir"], python=python)
     if bundle:
         # Zero-PyPI: project wheel + dependency closure, all under the env's own
-        # ``binaries/`` folder and listed by workspace path.
+        # ``binaries/`` folder and listed by workspace path. A ``.manifest``
+        # beside the project wheel records the full path set so a get-or-create
+        # (non-OVERWRITE) deploy can reuse the closure without rebuilding.
         binaries = f"{env_dir}/binaries"
-        dependencies = [
-            registry_upload(client, w, workspace_dir=binaries, overwrite=True)
-            for w in project_wheels
-        ]
-        dependencies += [
-            registry_upload(client, w, workspace_dir=binaries)
-            for w in download_dependency_wheels(deps, python=python)
-        ]
+        manifest = DatabricksPath.from_(f"{binaries}/{proj}/{env_name}.manifest", client=client)
+        reused = (
+            [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip()]
+            if (not rebuild and manifest.exists()) else []
+        )
+        if reused and DatabricksPath.from_(reused[0], client=client).exists():
+            logger.info("reusing %d-wheel project bundle for %s", len(reused), env_name)
+            dependencies = reused
+        else:
+            dependencies = [
+                registry_upload(client, w, workspace_dir=binaries, overwrite=True)
+                for w in build_project_wheel(meta["dir"], python=python)
+            ]
+            dependencies += [
+                registry_upload(client, w, workspace_dir=binaries)
+                for w in download_dependency_wheels(deps, python=python)
+            ]
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text("\n".join(dependencies) + "\n")
     else:
         # Project wheel by path + its declared deps resolved from the index.
-        dependencies = [
-            registry_upload(client, w, workspace_dir=pypi_dir, overwrite=True)
-            for w in project_wheels
-        ] + deps
+        proj_dir = f"{pypi_dir.rstrip('/')}/{proj}"
+        existing = (
+            [] if rebuild
+            else deployed_wheels(client, name, version, workspace_dir=proj_dir, dist_only=True)
+        )
+        if existing:
+            logger.info("reusing deployed project wheel(s) for %s", env_name)
+            wheel_paths = existing
+        else:
+            wheel_paths = [
+                registry_upload(client, w, workspace_dir=pypi_dir, overwrite=True)
+                for w in build_project_wheel(meta["dir"], python=python)
+            ]
+        dependencies = wheel_paths + deps
 
-    serverless = ensure_named_environment(
-        client, env_name, dependencies=dependencies,
-        environment_version=serverless_environment_version(python),
-        workspace_dir=workspace_dir, filename=f"{env_name}.yml",
-    )
-    cluster = ensure_cluster_requirements(
-        client, env_name, dependencies=dependencies, workspace_dir=workspace_dir,
-    )
+    # Env config files: OVERWRITE/AUTO always rewrite; APPEND writes only the
+    # ones that don't exist yet ("add missing").
+    serverless_dest = f"{env_dir}/{env_name}.yml"
+    cluster_dest = f"{env_dir}/{env_name}.requirements.txt"
+    if overwrite_env or not DatabricksPath.from_(serverless_dest, client=client).exists():
+        serverless = ensure_named_environment(
+            client, env_name, dependencies=dependencies,
+            environment_version=serverless_environment_version(python),
+            workspace_dir=workspace_dir, filename=f"{env_name}.yml",
+        )
+    else:
+        serverless = serverless_dest
+    if overwrite_env or not DatabricksPath.from_(cluster_dest, client=client).exists():
+        cluster = ensure_cluster_requirements(
+            client, env_name, dependencies=dependencies, workspace_dir=workspace_dir,
+        )
+    else:
+        cluster = cluster_dest
     return {
         "name": name,
         "version": version,
@@ -1254,6 +1308,7 @@ def ensure_project_environment(
         "serverless": serverless,
         "cluster": cluster,
         "requires_python": meta["requires_python"],
+        "mode": mode.name,
     }
 
 
