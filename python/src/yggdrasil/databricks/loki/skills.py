@@ -216,9 +216,10 @@ class DatabricksVolumesSkill(DatabricksServiceSkill):
 
     def run(self, agent: "Loki", *, catalog: Optional[str] = None,
             schema: Optional[str] = None, **_: Any) -> dict[str, Any]:
-        vols = self._client(agent).volumes.list(catalog, schema) if catalog else \
-            self._client(agent).volumes.list()
-        return {"volumes": _names(vols)}
+        # ``catalog_name`` / ``schema_name`` are keyword-only and default to the
+        # service scope when ``None``.
+        vols = self._client(agent).volumes.list(catalog_name=catalog, schema_name=schema)
+        return {"catalog": catalog, "schema": schema, "volumes": _names(vols)}
 
 
 @register

@@ -137,6 +137,16 @@ class TestDatabricksBehaviors(_Base):
         self.assertEqual((out["job_id"], out["run_id"]), (7, 99))
         self.assertEqual(out["url"], "https://w/jobs/7/runs/99")
 
+    def test_volumes_list_uses_keyword_scope(self):
+        client = MagicMock()
+        v = MagicMock(); v.name = "contracts"
+        client.volumes.list.return_value = [v]
+        loki = self._loki_with_client(client)
+        out = loki.run("databricks-volumes", catalog="samples")
+        # catalog_name / schema_name are keyword-only on Volumes.list.
+        client.volumes.list.assert_called_once_with(catalog_name="samples", schema_name=None)
+        self.assertEqual(out["volumes"], ["contracts"])
+
     def test_secrets_lists_scopes(self):
         client = MagicMock()
         # A UC secret Scope identifies by ``.key`` (no ``.name``).
