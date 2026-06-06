@@ -14,6 +14,8 @@ from .capability import Backend, detect
 from .engine import Completion, TokenEngine
 from .tools import Tool, Toolbox, filesystem_toolbox
 from .usage import METER, ModelPricing, ModelUsage, TokenMeter, price_for
+from .session import LokiSession
+from .memory import LokiMemory
 
 # Import the built-in behaviors so they register on package import.
 from . import behaviors as _behaviors  # noqa: F401
@@ -37,4 +39,6 @@ __all__ = [
     "ModelPricing",
     "price_for",
     "web",
+    "LokiSession",
+    "LokiMemory",
 ]

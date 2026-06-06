@@ -169,13 +169,21 @@ def _engines(loki: Any, style: Any) -> int:
 
 def _repl(loki: Any, style: Any) -> int:
     """A modern interactive session: route → reason/act, live token KPIs, budget."""
+    from yggdrasil.loki.memory import LokiMemory
+    from yggdrasil.loki.session import LokiSession
     from yggdrasil.loki.usage import METER
 
     METER.set_limit(METER.DEFAULT_COST_LIMIT)
-    state: dict[str, Any] = {"tier": None, "root": ".", "engine": None}
+    session = LokiSession.start()  # isolated ~/.loki/session/<id>/ (auto-purges old)
+    state: dict[str, Any] = {
+        "tier": None, "engine": None,
+        "root": str(session.workspace),
+        "memory": LokiMemory(session.memory_file),
+    }
 
-    style.out(f"  {style.bold('interactive session')}  "
-              f"{style.dim('· live prompts, streamed replies · /help · /quit')}\n")
+    style.out(f"  {style.bold('interactive session')} {style.dim('#' + session.id)} "
+              f"{style.dim('· streamed · self-purging · /help · /quit')}\n")
+    style.out(f"  {style.dim('workspace')} {style.dim(str(session.workspace))}\n")
     _select_engine(loki, style, state)
     style.out(f"  {style.dim('cost budget')} {style.brand(f'${METER.cost_limit:.2f}')} "
               f"{style.dim('· raised in $1 steps when reached')}\n\n")
@@ -252,15 +260,21 @@ def _select_engine(loki: Any, style: Any, state: dict) -> None:
     style.ok(f"engine → {state['engine']}")
 
 
-def _stream_reply(agent: Any, style: Any, line: str, state: dict) -> str:
+def _stream_reply(agent: Any, style: Any, line: str, state: dict,
+                  *, system: "str | None" = None) -> str:
     """Stream a reasoned reply to the terminal token-by-token; return the full text."""
     style.out("\n  ")
     parts: list[str] = []
-    for chunk in agent.reason_stream(line, engine=state.get("engine"), tier=state["tier"]):
+    for chunk in agent.reason_stream(line, engine=state.get("engine"),
+                                     tier=state["tier"], system=system):
         style.out(chunk)
         parts.append(chunk)
     style.out("\n\n")
     return "".join(parts)
+
+
+def _short_text(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
@@ -293,8 +307,11 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             res = agent.run("genie", question=line)
             reply = res.get("text", "") if isinstance(res, dict) else str(res)
         else:
-            # chat (or a web verb with no URL) → stream the reply live
-            reply = _stream_reply(agent, style, line, state)
+            # chat (or a web verb with no URL) → stream the reply live, with
+            # the session memory as context for continuity.
+            memory = state.get("memory")
+            system = memory.system_context() if memory is not None else None
+            reply = _stream_reply(agent, style, line, state, system=system)
             streamed = True
     except Exception as exc:  # never let one turn kill the session
         style.out("\n")
@@ -302,6 +319,14 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
         return
     if not streamed:
         style.out(f"\n  {reply}\n\n")
+    # Record the turn in memory and auto-compress when it grows.
+    memory = state.get("memory")
+    if memory is not None:
+        memory.add("user", line)
+        memory.add("assistant", _short_text(reply, 1200))
+        if memory.maybe_compress(loki, engine=state.get("engine")):
+            note = f"· memory compressed → {memory.chars()} chars"
+            style.out(f"  {style.dim(note)}\n")
     _usage_line(style, delta=METER.total_tokens - before)
 
 
@@ -363,6 +388,8 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
             f"    {style.brand('/tier')}     fast | deep | auto  (model tier for this session)\n"
             f"    {style.brand('/root')}     set the working tree for file tasks\n"
             f"    {style.brand('/budget')}   cost cap — show, set $N, +$N step, or off\n"
+            f"    {style.brand('/memory')}   show the session's synthesized memory\n"
+            f"    {style.brand('/sessions')} list session workspaces (under ~/.loki)\n"
             f"    {style.brand('/reset')}    zero the usage meter\n"
             f"    {style.brand('/quit')}     leave\n"
             f"  {style.dim('plain text is routed automatically — reason (streamed), act on files, web, or a specialist')}\n"
@@ -405,6 +432,21 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
             lim = "off" if METER.cost_limit is None else f"${METER.cost_limit:.2f}"
             style.out(f"  {style.dim('cost budget')} {style.brand(lim)}  "
                       f"{style.dim('spent')} ${METER.total_cost:.4f}\n")
+    elif cmd == "memory":
+        memory = state.get("memory")
+        if memory is None or (not memory.synthesis and not memory.turns):
+            style.out(f"  {style.dim('(memory is empty)')}\n")
+        else:
+            if memory.synthesis:
+                style.out(f"  {style.bold('synthesis')}\n  {style.dim(memory.synthesis)}\n")
+            stat = f"{len(memory.turns)} recent turns · {memory.chars()} chars"
+            style.out(f"  {style.dim(stat)}\n")
+    elif cmd == "sessions":
+        from yggdrasil.loki.session import LokiSession
+
+        for p in LokiSession.list()[:20]:
+            style.out(f"  {style.brand(p.name)}\n")
+        style.out(f"  {style.dim('auto-purged: keep 20 newest, drop >14 days old')}\n")
     elif cmd == "reset":
         METER.reset(); style.ok("usage meter reset")
     else:

@@ -110,10 +110,11 @@ def filesystem_toolbox(
     The read tools (``list_dir``, ``read_file``, ``find``, ``grep``,
     ``read_table``) are always present — discovery, including parsing local
     tabular files (CSV/Parquet/Arrow/XLSX/JSON) through the io handlers. The
-    write tools (``write_file``, ``edit_file``, and ``run_python`` — the agent
-    writes & runs Python by default to compute or apply changes) are added
-    unless ``read_only``. ``run`` (a *shell*) is added only with ``allow_shell``
-    and the network tools only with ``allow_web``.
+    write tools — ``write_file``, ``edit_file``, ``run_python`` (write & run
+    Python), and ``run`` (a shell command) — are added unless ``read_only``;
+    the agent can code and shell out by default. ``allow_shell`` is kept for
+    back-compat but no longer gates ``run``. Network tools (``web_*``) are
+    added only with ``allow_web``.
 
     ``confirm`` (``fn(action) -> bool``) gates **destructive ops on
     non-temporary assets** — overwriting/editing an existing file outside the
@@ -135,12 +136,15 @@ def filesystem_toolbox(
         except ValueError:
             return str(p)
 
-    _tmp = pathlib.Path(tempfile.gettempdir()).resolve()
-    _root_is_temp = str(base).startswith(str(_tmp))
+    # Scratch roots that don't need a destructive-confirm: the system temp dir
+    # and Loki's own session trees (~/.loki).
+    _scratch = [str(pathlib.Path(tempfile.gettempdir()).resolve()),
+                str((pathlib.Path.home() / ".loki").resolve())]
+    _root_is_temp = any(str(base).startswith(s) for s in _scratch)
 
     def is_temporary(p: pathlib.Path) -> bool:
-        """A scratch/temp asset (under the system temp dir or a temp root)."""
-        return _root_is_temp or str(p).startswith(str(_tmp))
+        """A scratch/temp asset (under the system temp dir or a session tree)."""
+        return _root_is_temp or any(str(p).startswith(s) for s in _scratch)
 
     def gate(target: pathlib.Path, verb: str) -> Optional[str]:
         """Ask :func:`confirm` before a destructive op on a *non-temporary*
@@ -267,10 +271,9 @@ def filesystem_toolbox(
                 box.changed.append(r)
             return f"edited {r} (1 replacement)"
 
-        def run_python(code: str, timeout: float = 60.0) -> str:
-            """Run Python source in the agent root and capture its output."""
+        def _run(argv, *, timeout, shell):
             proc = subprocess.run(
-                [sys.executable, "-c", code], cwd=str(base),
+                argv, shell=shell, cwd=str(base),
                 capture_output=True, text=True, timeout=timeout,
             )
             parts = [f"exit={proc.returncode}"]
@@ -279,6 +282,12 @@ def filesystem_toolbox(
             if proc.stderr:
                 parts.append("stderr:\n" + proc.stderr[:MAX_READ_BYTES])
             return "\n".join(parts)
+
+        def run_python(code: str, timeout: float = 60.0) -> str:
+            return _run([sys.executable, "-c", code], timeout=timeout, shell=False)
+
+        def run_cmd(command: str, timeout: float = 60.0) -> str:
+            return _run(command, timeout=timeout, shell=True)
 
         box.add(Tool("write_file", "Create or overwrite a file with content.",
                      {"path": "file path", "content": "full file content"},
@@ -290,20 +299,6 @@ def filesystem_toolbox(
                      "compute, transform, or apply changes — and capture stdout/stderr.",
                      {"code": "python source", "timeout": "seconds, default 60"},
                      run_python, mutates=True))
-
-    if allow_shell:
-        def run_cmd(command: str, timeout: float = 60.0) -> str:
-            proc = subprocess.run(
-                command, shell=True, cwd=str(base),
-                capture_output=True, text=True, timeout=timeout,
-            )
-            parts = [f"exit={proc.returncode}"]
-            if proc.stdout:
-                parts.append("stdout:\n" + proc.stdout[:MAX_READ_BYTES])
-            if proc.stderr:
-                parts.append("stderr:\n" + proc.stderr[:MAX_READ_BYTES])
-            return "\n".join(parts)
-
         box.add(Tool("run", "Run a shell command in the agent root and capture output.",
                      {"command": "shell command", "timeout": "seconds, default 60"},
                      run_cmd, mutates=True))

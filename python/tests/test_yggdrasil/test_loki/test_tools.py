@@ -24,9 +24,16 @@ class TestFilesystemToolbox(unittest.TestCase):
         self.assertNotIn("edit_file", box.names())
         self.assertNotIn("run", box.names())
 
-    def test_shell_is_opt_in(self):
-        self.assertNotIn("run", filesystem_toolbox(self.dir).names())
-        self.assertIn("run", filesystem_toolbox(self.dir, allow_shell=True).names())
+    def test_shell_and_python_are_default_write_tools(self):
+        names = filesystem_toolbox(self.dir).names()
+        self.assertIn("run", names)         # shell on by default now
+        self.assertIn("run_python", names)
+        self.assertNotIn("run", filesystem_toolbox(self.dir, read_only=True).names())
+
+    def test_shell_runs_a_command(self):
+        out = filesystem_toolbox(self.dir).call("run", {"command": "echo hi && pwd"})
+        self.assertIn("exit=0", out)
+        self.assertIn("hi", out)
 
     def test_run_python_is_a_default_write_tool(self):
         box = filesystem_toolbox(self.dir)
