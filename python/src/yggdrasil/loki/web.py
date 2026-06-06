@@ -35,6 +35,10 @@ __all__ = [
     "read_image",
     "scrape",
     "discover_apis",
+    "Browser",
+    "browser_available",
+    "fill_form",
+    "interact",
 ]
 
 #: One realistic browser header profile for this process, from the http_
@@ -272,6 +276,223 @@ def _json_ld(html: str) -> list:
         except Exception:
             pass
     return blocks
+
+
+# -- interactive browser automation ----------------------------------------
+#
+# Reading a page (above) is a plain HTTP fetch; *interacting* with one — typing
+# into fields, ticking boxes, clicking buttons, submitting forms and reading
+# what the page becomes — needs a real browser. That's a headless Playwright
+# session, imported lazily so everything above keeps working without it.
+
+
+def browser_available() -> bool:
+    """True when Playwright (and a browser binary) is installed for automation."""
+    import importlib.util
+
+    if importlib.util.find_spec("playwright") is None:
+        return False
+    try:  # the package can be present without the browser binaries downloaded
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as pw:
+            return bool(pw.chromium.executable_path)
+    except Exception:
+        return False
+
+
+class Browser:
+    """A headless browser session for interacting with a live page.
+
+    Drive a page the way a person would — :meth:`goto`, :meth:`fill` a field,
+    :meth:`type`, :meth:`check` a box, :meth:`select_option`, :meth:`click` a
+    button, :meth:`submit`, then read the result (:meth:`text`, :attr:`url`,
+    :meth:`title`). Backed by Playwright (Chromium by default), imported only
+    when you open one. Use as a context manager so the browser always closes::
+
+        with web.Browser() as b:
+            b.goto("https://example.com/login")
+            b.fill("#user", "me").fill("#pass", "secret").submit("button[type=submit]")
+            print(b.url, b.text())
+
+    The action methods return ``self`` so calls chain.
+    """
+
+    def __init__(self, *, headless: bool = True, browser: str = "chromium",
+                 timeout: float = 30000) -> None:
+        self._kind = browser
+        self._headless = headless
+        self._timeout = timeout
+        self._pw = None
+        self._browser = None
+        self.page: Any = None
+
+    def __enter__(self) -> "Browser":
+        from playwright.sync_api import sync_playwright
+
+        self._pw = sync_playwright().start()
+        self._browser = getattr(self._pw, self._kind).launch(headless=self._headless)
+        ctx = self._browser.new_context(user_agent=_browser_headers().get("User-Agent"))
+        self.page = ctx.new_page()
+        self.page.set_default_timeout(self._timeout)
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        finally:
+            if self._pw is not None:
+                self._pw.stop()
+        return False
+
+    def goto(self, url: str) -> "Browser":
+        self.page.goto(url)
+        return self
+
+    def fill(self, selector: str, value: str) -> "Browser":
+        """Set an input/textarea's value (clears it first)."""
+        self.page.fill(selector, value)
+        return self
+
+    def type(self, selector: str, text: str, *, delay: float = 0) -> "Browser":
+        """Type *text* key by key (fires keypress handlers, unlike :meth:`fill`)."""
+        self.page.type(selector, text, delay=delay)
+        return self
+
+    def click(self, selector: str) -> "Browser":
+        self.page.click(selector)
+        return self
+
+    def check(self, selector: str, value: bool = True) -> "Browser":
+        (self.page.check if value else self.page.uncheck)(selector)
+        return self
+
+    def select_option(self, selector: str, value: str) -> "Browser":
+        self.page.select_option(selector, value)
+        return self
+
+    def press(self, selector: str, key: str) -> "Browser":
+        self.page.press(selector, key)
+        return self
+
+    def submit(self, selector: Optional[str] = None) -> "Browser":
+        """Submit a form — click *selector* if given, else press Enter."""
+        if selector:
+            self.page.click(selector)
+        else:
+            self.page.keyboard.press("Enter")
+        return self
+
+    def wait_for(self, selector: str) -> "Browser":
+        self.page.wait_for_selector(selector)
+        return self
+
+    @property
+    def url(self) -> str:
+        return self.page.url
+
+    def title(self) -> str:
+        return self.page.title()
+
+    def value(self, selector: str) -> str:
+        return self.page.input_value(selector)
+
+    def text(self, max_chars: int = 4000) -> str:
+        return self.page.inner_text("body")[:max_chars]
+
+    def screenshot(self, path: str) -> str:
+        self.page.screenshot(path=path)
+        return path
+
+
+def fill_form(
+    url: str,
+    fields: dict[str, str],
+    *,
+    submit: Optional[str] = None,
+    headless: bool = True,
+    browser: str = "chromium",
+    wait_for: Optional[str] = None,
+    screenshot: Optional[str] = None,
+    max_chars: int = 4000,
+) -> dict[str, Any]:
+    """Open *url*, fill *fields* (CSS selector → value), optionally submit, and
+    return the resulting page state — the high-level "fill in this form".
+
+    ``submit`` is the selector of the submit button (omit to skip submitting);
+    ``wait_for`` waits for a selector to appear after submit (e.g. a results
+    panel); ``screenshot`` saves a PNG of the final page.
+    """
+    with Browser(headless=headless, browser=browser) as b:
+        b.goto(url)
+        for selector, value in fields.items():
+            b.fill(selector, str(value))
+        if submit:
+            b.submit(submit)
+        if wait_for:
+            b.wait_for(wait_for)
+        out: dict[str, Any] = {"url": b.url, "title": b.title(),
+                               "filled": list(fields), "text": b.text(max_chars)}
+        if screenshot:
+            out["screenshot"] = b.screenshot(screenshot)
+        return out
+
+
+def interact(
+    url: str,
+    steps: list[dict[str, Any]],
+    *,
+    headless: bool = True,
+    browser: str = "chromium",
+    screenshot: Optional[str] = None,
+    max_chars: int = 4000,
+) -> dict[str, Any]:
+    """Drive a page through a sequence of interaction *steps*, return its final
+    state. Each step is one action dict — the page is a thing you operate::
+
+        web.interact("https://shop.example/search", [
+            {"type": ["#q", "wireless headphones"]},
+            {"press": ["#q", "Enter"]},
+            {"wait_for": ".results"},
+            {"click": ".results a:first-child"},
+        ])
+
+    Actions: ``goto`` (url), ``fill``/``type``/``select``/``press`` (``[selector,
+    value]``), ``click``/``check``/``wait_for`` (selector), ``submit`` (button
+    selector or ``null`` for Enter).
+    """
+    log: list[dict[str, Any]] = []
+    with Browser(headless=headless, browser=browser) as b:
+        b.goto(url)
+        for step in steps:
+            for action, arg in step.items():
+                if action == "goto":
+                    b.goto(arg)
+                elif action == "fill":
+                    b.fill(*arg)
+                elif action == "type":
+                    b.type(*arg)
+                elif action == "select":
+                    b.select_option(*arg)
+                elif action == "press":
+                    b.press(*arg)
+                elif action == "click":
+                    b.click(arg)
+                elif action == "check":
+                    b.check(arg) if isinstance(arg, str) else b.check(*arg)
+                elif action == "wait_for":
+                    b.wait_for(arg)
+                elif action == "submit":
+                    b.submit(arg if isinstance(arg, str) else None)
+                else:
+                    raise ValueError(f"unknown interaction step {action!r}")
+                log.append({action: arg})
+        out: dict[str, Any] = {"url": b.url, "title": b.title(),
+                               "steps": log, "text": b.text(max_chars)}
+        if screenshot:
+            out["screenshot"] = b.screenshot(screenshot)
+        return out
 
 
 def discover_apis(url: str, *, limit: int = 40, **fetch_kwargs: Any) -> dict[str, Any]:

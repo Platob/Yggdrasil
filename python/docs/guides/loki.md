@@ -179,6 +179,34 @@ on the box; pick them up by `ollama pull <model>` or installing
 `transformers`+`torch`. They're chosen automatically for simple work when the
 workstation can run them — see *Resource-aware local vs remote* below.
 
+### A free, lazily-installed bootstrap brain (`ygg loki setup`)
+
+Each local engine declares a `bootstrap_model` — a small, free, *smart-enough*
+model that loads cheaply and is good for basic install/config work (and knows
+when to hand harder tasks up to a bigger model). The default is **Qwen2.5 3B
+Instruct** on Ollama (`qwen2.5:3b` — ~2 GB, Apache-2.0, CPU-friendly), or
+Qwen2.5 1.5B for the HF engine.
+
+`Loki.bootstrap_local()` readies one **lazily** — it pulls the model only when
+it's missing (Ollama `POST /api/pull`), or notes that HF weights download on
+first use, or tells you what to install:
+
+```text
+ygg loki setup            # ready a free local model (lazy-install on demand)
+ygg loki setup qwen2.5:14b # ready a specific, heavier local model
+```
+
+```python
+loki.bootstrap_local()                 # {"engine": "ollama", "ready": True, "model": "qwen2.5:3b", ...}
+loki.run("setup")                      # same, plus "redirects" for heavier setup
+OllamaEngine().ensure("qwen2.5:3b")    # pull only if not already installed
+```
+
+The `setup` skill also surfaces **redirects** — what a lightweight model should
+hand heavier work to: `ygg databricks configure` to set up Databricks, a larger
+model id for more capability, or an API key so heavy reasoning escalates to a
+remote engine automatically.
+
 ### Reasoning with Claude **without an API key**
 
 `ClaudeEngine` can authenticate with the same OAuth / subscription token
@@ -227,11 +255,27 @@ or a thin machine, goes to the best available **remote** API. Either way it
 falls back when one side is unreachable — local-only when no API is
 configured, remote-only when no local engine is installed.
 
+**Session-sticky base, with a confirm before escalating.** An interactive
+session starts on a **base** provider (chosen at startup, e.g. Claude) and
+sticks with it. Ordinary work runs on the cheapest capable option — a local
+model when the box can host one — and only **heavy** work escalates up to the
+capable remote. When that escalation means switching *from a free local model
+up to a paid remote one* (e.g. Claude Opus), `select` asks first via a
+`confirm(engine, model)` callback; decline and the work stays local. So the
+small free model handles the light/setup tasks and you're only ever billed for
+the big model when you say yes.
+
 ```python
-loki.select("hi there")                  # simple + capable box → ollama (local)
-loki.select("refactor the planner")      # reasoning-heavy → claude (remote)
-loki.select("anything", tier="deep")     # forced complex → remote
+loki.select("hi there", base="claude")             # light + capable box → ollama (local, free)
+loki.select("refactor the planner", base="claude", # heavy → asks, then claude (remote)
+            confirm=lambda eng, model: True)
+loki.select("anything", tier="deep")               # forced complex → remote
 ```
+
+In the REPL this is automatic: light prompts run free/local, and a heavy one
+prints `⤴ escalate … switch up to claude … (remote, paid)? [Y/n]` before
+spending. `/engine` sets the session base; `/setup` readies the free local
+model.
 
 ### Adaptive model selection (the default)
 
@@ -363,11 +407,46 @@ web.read_json("https://api.example.com/x")     # → decoded JSON
 web.read_image("https://…/logo.png")           # → bytes + dims + content-type
 ```
 
-The **`web` behavior** wraps these (`loki.run("web", url=…, question=…)`);
-the autonomous loop gets `web_fetch` / `web_table` / `web_image` tools with
-`act(..., allow_web=True)` (or `ygg loki do --allow-web`), and local tabular
-files parse through the same io layer via the always-on `read_table` tool. In
-the interactive session a URL routes itself:
+### Interacting with a page — fill forms, click, type
+
+Reading a page is a plain HTTP fetch; *operating* one — typing into fields,
+ticking boxes, clicking buttons, submitting a form and reading what the page
+becomes — drives a real **headless browser** (`web.Browser`, Playwright /
+Chromium, imported lazily). Available when `pip install playwright && playwright
+install chromium` has been run (`web.browser_available()`):
+
+```python
+from yggdrasil.loki import web
+
+# Fill a form and submit it, then read the resulting page.
+web.fill_form("https://site/login",
+              {"#user": "me", "#pass": "secret"},
+              submit="button[type=submit]", wait_for="#dashboard")
+
+# Or drive a page through an explicit sequence of interactions.
+web.interact("https://shop/search", [
+    {"type": ["#q", "wireless headphones"]},
+    {"press": ["#q", "Enter"]},
+    {"wait_for": ".results"},
+    {"check": "#in-stock"},
+    {"click": ".results a:first-child"},
+])
+
+# Low-level: a chainable browser session.
+with web.Browser() as b:
+    b.goto("https://site").fill("#email", "a@b.com").click("#go")
+    print(b.url, b.title(), b.text())
+```
+
+The **`web` skill** exposes these too — `loki.run("web", url=…, action="form",
+fields={…}, submit="#go")` and `action="interact", steps=[…]`. When the browser
+isn't installed the skill returns an install hint rather than failing.
+
+The **`web` behavior** also wraps the read paths (`loki.run("web", url=…,
+question=…)`); the autonomous loop gets `web_fetch` / `web_table` / `web_image`
+tools with `act(..., allow_web=True)` (or `ygg loki do --allow-web`), and local
+tabular files parse through the same io layer via the always-on `read_table`
+tool. In the interactive session a URL routes itself:
 
 ```text
 ⟢ auto ›  fetch https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv

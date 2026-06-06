@@ -26,8 +26,8 @@ from .skill import LokiSkill, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentSkill", "GenieSkill", "PythonProjectSkill", "WebSkill",
-           "TabularSkill", "TransformSkill"]
+__all__ = ["AgentSkill", "GenieSkill", "PythonProjectSkill", "SetupSkill",
+           "WebSkill", "TabularSkill", "TransformSkill"]
 
 
 @register
@@ -72,8 +72,34 @@ class AgentSkill(LokiSkill):
 
 
 @register
+class SetupSkill(LokiSkill):
+    """Bootstrap a free local model, and redirect heavier setup elsewhere.
+
+    Loki's self-setup path: ready a lightweight, lazily-installed local brain
+    (:meth:`Loki.bootstrap_local`) — smart enough for basic install/config —
+    and surface the **redirects** for the heavier work a small model should
+    hand off: configuring Databricks, pulling a bigger/smarter model, or
+    escalating reasoning to a remote engine. Runs anywhere.
+    """
+
+    name = "setup"
+    description = "Bootstrap a free local model (lazy-install) and point heavier setup to the right tool."
+
+    def run(self, agent: Loki, *, model: Optional[str] = None, pull: bool = True,
+            **_: Any) -> dict[str, Any]:
+        res = agent.bootstrap_local(model=model, pull=pull)
+        # What a lightweight model should hand heavier setup off to.
+        res["redirects"] = {
+            "configure databricks": "ygg databricks configure   (host + token, then `ygg databricks seed`)",
+            "heavier local model": "loki.run('setup', model='qwen2.5:14b')   (or any larger ollama/HF id)",
+            "stronger reasoning": "set ANTHROPIC_API_KEY / log into Claude Code, then heavy tasks escalate automatically",
+        }
+        return res
+
+
+@register
 class WebSkill(LokiSkill):
-    """Reach the internet — browse a page, read a table, JSON, or image.
+    """Reach the internet — browse, read tables/JSON/images, or drive a page.
 
     Runs anywhere (no backend). Fetches through
     :class:`~yggdrasil.http_.HTTPSession` and parses tabular bodies through the
@@ -81,10 +107,16 @@ class WebSkill(LokiSkill):
     URL (a ``.csv``/``.parquet``/… → table, an image extension → image, else
     browse as text); pass ``question=`` to have the agent reason over a
     fetched page.
+
+    For *interactive* pages it drives a real headless browser (Playwright):
+    ``action="form"`` fills ``fields`` (selector → value) and optionally clicks
+    ``submit``; ``action="interact"`` runs a list of ``steps`` (type, click,
+    select, check, press, submit, wait_for) — filling forms, clicking buttons,
+    and reading what the page becomes.
     """
 
     name = "web"
-    description = "Fetch the internet — browse pages, read tables/JSON, or images."
+    description = "Fetch + drive the internet — browse, read tables/JSON/images, fill forms, click buttons."
 
     def run(
         self,
@@ -95,6 +127,10 @@ class WebSkill(LokiSkill):
         fmt: Optional[str] = None,
         save: Optional[str] = None,
         question: Optional[str] = None,
+        fields: Optional[dict] = None,
+        steps: Optional[list] = None,
+        submit: Optional[str] = None,
+        headless: bool = True,
         **_: Any,
     ) -> dict[str, Any]:
         from . import web
@@ -108,6 +144,17 @@ class WebSkill(LokiSkill):
                 action = "image"
             else:
                 action = "text"
+
+        if action in ("form", "interact"):
+            if not web.browser_available():
+                return {"action": action, "url": url, "error": "browser automation unavailable",
+                        "install": "pip install playwright && playwright install chromium"}
+            if action == "form":
+                return {"action": "form",
+                        **web.fill_form(url, fields or {}, submit=submit,
+                                        headless=headless, screenshot=save)}
+            return {"action": "interact",
+                    **web.interact(url, steps or [], headless=headless, screenshot=save)}
 
         if action == "scrape":
             return {"action": "scrape", **web.scrape(url)}

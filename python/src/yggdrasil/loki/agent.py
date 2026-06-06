@@ -244,17 +244,30 @@ class Loki:
         return None
 
     def select(
-        self, text: "Optional[str]" = None, *, tier: "Optional[str]" = None,
+        self,
+        text: "Optional[str]" = None,
+        *,
+        tier: "Optional[str]" = None,
+        base: "Optional[str]" = None,
+        confirm: "Optional[Callable[[TokenEngine, Optional[str]], bool]]" = None,
     ) -> "Optional[TokenEngine]":
-        """Resource-aware engine choice: a local model for simple work this
-        workstation can run, a remote API for complex work or a thin box.
+        """Resource-aware engine choice: keep light work cheap, escalate heavy
+        work to a capable remote — asking first.
 
-        Complexity comes from an explicit ``tier`` or, failing that, the
-        prompt itself (long or reasoning-heavy → complex). Local engines (HF
-        ``transformers``, a local Ollama server) are free and private but
-        bounded by this machine, so they're chosen for *simple* work only when
-        the box has the muscle — a CUDA GPU, or enough CPU + RAM. Everything
-        else routes to the best available remote API. Returns an available
+        Two axes drive the pick:
+
+        - **Complexity** — an explicit ``tier`` (``deep`` → heavy), else the
+          prompt itself (long or reasoning-heavy text → heavy).
+        - **Resources** — a CUDA GPU, or enough CPU + RAM (≥ 4 cores, ≥ 8 GB),
+          decides whether this box can comfortably run a local model.
+
+        A session pins a **base** provider and sticks with it. Ordinary/light
+        work runs on the cheapest capable option — a local model when the box
+        can host one (free, private), otherwise the base. Heavy work escalates
+        to the most capable remote (the base remote if it is one). When that
+        escalation means **switching from a free local model up to a paid
+        remote** model, ``confirm(engine, model)`` is asked first; a falsy
+        answer keeps the work on the cheap/local path. Returns an available
         engine, or ``None`` when nothing is reachable.
         """
         import os
@@ -275,6 +288,7 @@ class Loki:
         order = [n for n in self.ENGINE_PREFERENCE if n in available]
         locals_ = [available[n] for n in order if available[n].local]
         remotes = [available[n] for n in order if not available[n].local]
+        base_eng = available.get(base or "")
 
         # Can this workstation comfortably host a local model?
         gpu = False
@@ -291,9 +305,59 @@ class Loki:
             pass
         capable = gpu or ((os.cpu_count() or 1) >= 4 and ram_gb >= 8.0)
 
-        if not heavy and locals_ and capable:
-            return locals_[0]
-        return remotes[0] if remotes else locals_[0]
+        # The cheap/home choice for ordinary work: a capable local model if we
+        # have one (free, private), else the session base, else the best engine.
+        home = (locals_[0] if (locals_ and capable)
+                else base_eng or (remotes[0] if remotes else locals_[0]))
+        if not heavy:
+            return home
+
+        # Heavy work wants the most capable remote — the base if it's remote,
+        # otherwise the preferred remote. No remote reachable → stay on home.
+        target = (base_eng if (base_eng and not base_eng.local)
+                  else (remotes[0] if remotes else home))
+        # Escalating from a free local home up to a paid remote → confirm first.
+        if confirm is not None and target is not home and not target.local and home.local:
+            model = target.resolve_model(
+                messages=[{"role": "user", "content": text or ""}], tier="deep"
+            )
+            if not confirm(target, model):
+                return home
+        return target
+
+    def bootstrap_local(self, *, model: "Optional[str]" = None, pull: bool = True) -> dict[str, Any]:
+        """Ready a free **local** reasoning engine, lazily installing on demand.
+
+        Prefers a reachable Ollama server — ensures its lightweight bootstrap
+        model is pulled (only if missing). Falls back to the HF
+        ``transformers`` engine (weights lazy-download on first use). When
+        neither is present, returns what to install. This is the "lightweight,
+        lazily-installed, free brain" entry point — smart enough for basic
+        setup/config, and able to hand heavier work up to a remote model.
+        """
+        from .engines import OllamaEngine, TransformersEngine
+
+        oll = OllamaEngine()
+        if oll.available():
+            target = model or oll.bootstrap_model
+            receipt = oll.ensure(target) if pull else {
+                "model": target, "was_present": oll.has_model(target),
+                "status": "skipped (pull=False)",
+            }
+            return {"engine": "ollama", "ready": True, **receipt}
+        tf = TransformersEngine()
+        if tf.available():
+            return {"engine": "transformers", "ready": True,
+                    "model": model or tf.bootstrap_model, "was_present": False,
+                    "status": "ready (weights lazy-download on first use)"}
+        return {
+            "engine": None, "ready": False,
+            "install": [
+                "install Ollama (https://ollama.com), then it auto-pulls "
+                f"{OllamaEngine.bootstrap_model!r}",
+                "or: pip install transformers torch  (HF local engine)",
+            ],
+        }
 
     def reason(
         self,
@@ -302,15 +366,20 @@ class Loki:
         system: "Optional[str]" = None,
         engine: "Optional[str]" = None,
         tier: "Optional[str]" = None,
+        base: "Optional[str]" = None,
+        confirm: "Optional[Callable[[TokenEngine, Optional[str]], bool]]" = None,
         **options: Any,
     ) -> str:
         """Reason about *prompt* with the best (or named) engine → reply text.
 
         ``tier`` (``"fast"`` / ``"deep"``) forces the model tier; the default
-        (``None``) lets the engine pick adaptively from the prompt. With no
-        ``engine`` named, the choice is resource-aware (:meth:`select`).
+        (``None``) lets the engine pick adaptively from the prompt. A pinned
+        ``engine`` is used as-is; otherwise the choice is resource-aware
+        (:meth:`select`), sticking to the session ``base`` and asking
+        ``confirm`` before escalating to a paid remote model.
         """
-        eng = self.engine(engine) if engine else self.select(prompt, tier=tier)
+        eng = (self.engine(engine) if engine
+               else self.select(prompt, tier=tier, base=base, confirm=confirm))
         if eng is None or not eng.available():
             raise RuntimeError(
                 "no reasoning engine available — log into Claude Code, or set "
@@ -326,6 +395,8 @@ class Loki:
         system: "Optional[str]" = None,
         engine: "Optional[str]" = None,
         tier: "Optional[str]" = None,
+        base: "Optional[str]" = None,
+        confirm: "Optional[Callable[[TokenEngine, Optional[str]], bool]]" = None,
         **options: Any,
     ) -> "Iterator[str]":
         """Stream a reply to *prompt* — yields text chunks as they arrive.
@@ -333,7 +404,8 @@ class Loki:
         Same engine/tier resolution as :meth:`reason`, but live: the chosen
         engine streams token deltas so the terminal prints them as they come.
         """
-        eng = self.engine(engine) if engine else self.select(prompt, tier=tier)
+        eng = (self.engine(engine) if engine
+               else self.select(prompt, tier=tier, base=base, confirm=confirm))
         if eng is None or not eng.available():
             raise RuntimeError(
                 "no reasoning engine available — log into Claude Code, or set "

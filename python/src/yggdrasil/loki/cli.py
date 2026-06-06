@@ -29,6 +29,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("capabilities", help="The detected backends and their signals.")
     sub.add_parser("skills", help="The registered skill catalog.")
     sub.add_parser("engines", help="The reasoning engines and which are available.")
+    setup = sub.add_parser("setup", help="Bootstrap a free local model (lazy-install on demand).")
+    setup.add_argument("model", nargs="?", default=None, help="A specific local model to ready.")
     sub.add_parser("usage", help="Live token usage + USD KPIs, per model and global.")
     sub.add_parser("mcp", help="Run Loki as an MCP server (stdio) — expose it to MCP clients.")
 
@@ -123,6 +125,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _skills(loki, style)
     if action == "engines":
         return _engines(loki, style)
+    if action == "setup":
+        return _setup(loki, style, args.model or "")
     if action == "reason":
         return _reason(loki, style, args)
     if action == "do":
@@ -171,6 +175,29 @@ def _engines(loki: Any, style: Any) -> int:
         style.out(f"  {glyph} {style.bold(eng.name.ljust(12))} {kind}  {style.dim(str(eng.model_label))}{star}\n")
     if best is None:
         style.warn("no engine available — log into Claude Code, or set ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a Databricks session")
+    return 0
+
+
+def _setup(loki: Any, style: Any, arg: str) -> int:
+    """Bootstrap a free local model — lazily install it on demand.
+
+    A lightweight, smart-enough brain for basic setup/config that knows when
+    to hand harder work up to a remote model. ``/setup <model>`` targets a
+    specific local model.
+    """
+    model = arg.strip() or None
+    style.out(f"  {style.dim('readying a free local model — this may download on first run…')}\n")
+    res = loki.bootstrap_local(model=model)
+    if res.get("ready"):
+        was = res.get("was_present")
+        verb = "already installed" if was else "installed"
+        style.ok(f"local engine {style.brand(res['engine'])} ready "
+                 f"· {res['model']} ({verb})")
+        style.out(f"  {style.dim('light work now runs locally for free; heavy tasks escalate to a remote model (you are asked first)')}\n")
+    else:
+        style.warn("no local engine yet — install one of:")
+        for hint in res.get("install", []):
+            style.out(f"    {style.brand('›')} {style.dim(hint)}\n")
     return 0
 
 
@@ -311,16 +338,42 @@ def _select_engine(loki: Any, style: Any, state: dict) -> None:
 
 
 def _stream_reply(agent: Any, style: Any, line: str, state: dict,
-                  *, system: "str | None" = None) -> str:
+                  *, engine: "str | None" = None, system: "str | None" = None) -> str:
     """Stream a reasoned reply to the terminal token-by-token; return the full text."""
     style.out("\n  ")
     parts: list[str] = []
-    for chunk in agent.reason_stream(line, engine=state.get("engine"),
+    for chunk in agent.reason_stream(line, engine=engine,
                                      tier=state["tier"], system=system):
         style.out(chunk)
         parts.append(chunk)
     style.out("\n\n")
     return "".join(parts)
+
+
+def _escalation_confirm(style: Any):
+    """A confirm callback for :meth:`Loki.select` — asks before auto-switching
+    from a free local model up to a paid remote one for a heavy task."""
+    def ask(engine: Any, model: "str | None") -> bool:
+        label = f"{engine.name} {model}" if model else engine.name
+        try:
+            ans = input(f"  {style.amber('⤴ escalate')} this looks heavy — switch up to "
+                        f"{style.brand(label)} {style.dim('(remote, paid)')}? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans in ("", "y", "yes")
+    return ask
+
+
+def _turn_engine(loki: Any, style: Any, state: dict, line: str) -> "str | None":
+    """The engine to use for this turn: keep light work on the session base /
+    a free local model, escalate heavy work to a remote — asking first.
+
+    Resolves once, up front (so any escalation prompt fires before output),
+    and returns the engine name to pin for the turn.
+    """
+    chosen = loki.select(line, tier=state["tier"], base=state.get("engine"),
+                         confirm=_escalation_confirm(style))
+    return chosen.name if chosen is not None else state.get("engine")
 
 
 def _short_text(s: str, n: int) -> str:
@@ -356,7 +409,9 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             _print_web(style, res)
             reply = res.get("answer") or style.dim(f"fetched {plan['url']}")
         elif plan["action"] == "act":
-            res = agent.act(line, root=state["root"], tier=state["tier"], allow_web=True,
+            eng_name = _turn_engine(agent, style, state, line)
+            res = agent.act(line, root=state["root"], engine=eng_name, tier=state["tier"],
+                            allow_web=True,
                             confirm=lambda action: _confirm(style, action),
                             on_step=lambda r: _act_step(style, r))
             reply = res["answer"]
@@ -367,12 +422,14 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             reply = res.get("text", "") if isinstance(res, dict) else str(res)
         else:
             # chat (or a web verb with no URL) → stream the reply live, with
-            # the persona system prompt + session memory as context.
+            # the persona system prompt + session memory as context. The engine
+            # is resolved up front: light → base/local, heavy → remote (asked).
             memory = state.get("memory")
             parts = [p for p in (plan.persona_prompt(),
                                  memory.system_context() if memory is not None else None) if p]
             system = "\n\n".join(parts) or None
-            reply = _stream_reply(agent, style, line, state, system=system)
+            eng_name = _turn_engine(agent, style, state, line)
+            reply = _stream_reply(agent, style, line, state, engine=eng_name, system=system)
             streamed = True
     except Exception as exc:  # never let one turn kill the session
         style.out("\n")
@@ -458,8 +515,9 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
     if cmd in ("help", "h", "?"):
         style.out(
             f"  {style.bold('commands')}\n"
-            f"    {style.brand('/engine')}   pick the session engine (claude/databricks/openai/auto)\n"
+            f"    {style.brand('/engine')}   pick the session base engine (claude/databricks/openai/ollama/auto)\n"
             f"    {style.brand('/engines')}  reasoning engines and adaptive models\n"
+            f"    {style.brand('/setup')}    bootstrap a free local model (lazy-install on demand)\n"
             f"    {style.brand('/status')}   identity + backends + engines + skills\n"
             f"    {style.brand('/usage')}    token KPIs (per model + global, USD)\n"
             f"    {style.brand('/tier')}     fast | deep | auto  (model tier for this session)\n"
@@ -489,6 +547,8 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
         _status(loki, style)
     elif cmd == "engines":
         _engines(loki, style)
+    elif cmd == "setup":
+        _setup(loki, style, arg)
     elif cmd == "usage":
         _usage_table(style)
     elif cmd == "tier":

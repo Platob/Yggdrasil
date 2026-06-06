@@ -66,6 +66,11 @@ class TokenEngine(ABC):
     local: ClassVar[bool] = False
     #: The model shown / used when nothing adapts — the engine's capable tier.
     default_model: ClassVar[Optional[str]] = None
+    #: A small, free, *smart-enough* model this engine can run cheaply as a
+    #: bootstrap brain — capable of basic install/config work and of deciding
+    #: when to hand a harder task up to a bigger model. ``None`` means the
+    #: engine has no lightweight entry point. Local engines set this.
+    bootstrap_model: ClassVar[Optional[str]] = None
     #: Tier → model id, fast → capable. Adaptive selection picks among these
     #: when the caller pins no model/tier. Engines override.
     MODELS: ClassVar[dict[str, str]] = {}

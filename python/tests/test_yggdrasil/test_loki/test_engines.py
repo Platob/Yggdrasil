@@ -363,6 +363,49 @@ class TestOllamaEngine(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=OSError("refused")):
             self.assertFalse(eng.available())
 
+    def test_bootstrap_model_is_lightweight(self):
+        self.assertEqual(OllamaEngine.bootstrap_model, "qwen2.5:3b")
+
+    def test_installed_models_and_has_model(self):
+        tags = json.dumps({"models": [{"name": "qwen2.5:3b"}, {"name": "llama3.2:latest"}]}).encode()
+        resp = MagicMock()
+        resp.read.return_value = tags
+        resp.__enter__ = lambda s: s; resp.__exit__ = lambda s, *a: False
+        with patch("urllib.request.urlopen", return_value=resp):
+            eng = OllamaEngine()
+            self.assertEqual(eng.installed_models(), ["qwen2.5:3b", "llama3.2:latest"])
+            self.assertTrue(eng.has_model("qwen2.5:3b"))
+            self.assertTrue(eng.has_model("llama3.2"))      # matches :latest by base
+            self.assertFalse(eng.has_model("mistral"))
+
+    def test_ensure_skips_pull_when_present(self):
+        eng = OllamaEngine()
+        with patch.object(OllamaEngine, "has_model", return_value=True), \
+             patch.object(OllamaEngine, "pull") as pull:
+            receipt = eng.ensure("qwen2.5:3b")
+        pull.assert_not_called()
+        self.assertTrue(receipt["was_present"])
+
+    def test_ensure_pulls_when_missing(self):
+        eng = OllamaEngine()
+        with patch.object(OllamaEngine, "has_model", return_value=False), \
+             patch.object(OllamaEngine, "pull", return_value="success") as pull:
+            receipt = eng.ensure()
+        pull.assert_called_once_with("qwen2.5:3b")
+        self.assertEqual((receipt["was_present"], receipt["status"]), (False, "success"))
+
+    def test_pull_streams_progress_and_returns_final_status(self):
+        lines = [json.dumps({"status": "pulling manifest"}).encode(),
+                 b"", json.dumps({"status": "success"}).encode()]
+        resp = MagicMock()
+        resp.__iter__ = lambda s: iter(lines)
+        resp.__enter__ = lambda s: s; resp.__exit__ = lambda s, *a: False
+        with patch("urllib.request.urlopen", return_value=resp) as urlopen:
+            status = OllamaEngine().pull("qwen2.5:3b")
+        self.assertEqual(status, "success")
+        body = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(body["name"], "qwen2.5:3b")
+
     def test_complete_posts_chat_and_records_provider_tokens(self):
         from yggdrasil.loki.usage import METER
 
@@ -400,10 +443,11 @@ class TestResourceAwareSelection(unittest.TestCase):
 
     @staticmethod
     def _eng(name, local, available=True):
-        e = MagicMock(spec=["name", "local", "available"])
+        e = MagicMock(spec=["name", "local", "available", "resolve_model"])
         e.name = name
         e.local = local
         e.available.return_value = available
+        e.resolve_model.return_value = f"{name}-deep"
         return e
 
     def _select(self, engines, *, cpu, ram_gb, gpu=False, **kw):
@@ -450,6 +494,80 @@ class TestResourceAwareSelection(unittest.TestCase):
     def test_nothing_available_returns_none(self):
         engines = {"claude": self._eng("claude", False, available=False)}
         self.assertIsNone(self._select(engines, cpu=8, ram_gb=16, text="hi"))
+
+    def test_heavy_escalation_to_remote_asks_confirm(self):
+        engines = {"claude": self._eng("claude", False),
+                   "ollama": self._eng("ollama", True)}
+        asked = {}
+
+        def confirm(engine, model):
+            asked["engine"] = engine.name
+            asked["model"] = model
+            return True
+
+        chosen = self._select(engines, cpu=8, ram_gb=16,
+                              text="refactor the planner", base="claude", confirm=confirm)
+        self.assertEqual(chosen.name, "claude")          # escalated, with consent
+        self.assertEqual(asked["engine"], "claude")
+
+    def test_declined_escalation_stays_local(self):
+        engines = {"claude": self._eng("claude", False),
+                   "ollama": self._eng("ollama", True)}
+        chosen = self._select(engines, cpu=8, ram_gb=16,
+                              text="refactor the planner", base="claude",
+                              confirm=lambda e, m: False)
+        self.assertEqual(chosen.name, "ollama")          # declined → kept free/local
+
+    def test_no_confirm_prompt_when_base_is_already_remote_only(self):
+        # No local engine at all → no "switch to remote" to confirm.
+        engines = {"claude": self._eng("claude", False)}
+        confirm = MagicMock()
+        chosen = self._select(engines, cpu=2, ram_gb=2,
+                              text="refactor everything", base="claude", confirm=confirm)
+        self.assertEqual(chosen.name, "claude")
+        confirm.assert_not_called()
+
+    def test_base_sticks_for_light_work_without_local(self):
+        engines = {"claude": self._eng("claude", False),
+                   "openai": self._eng("openai", False)}
+        chosen = self._select(engines, cpu=2, ram_gb=2, text="hi", base="openai")
+        self.assertEqual(chosen.name, "openai")          # honored the session base
+
+
+class TestBootstrapLocal(unittest.TestCase):
+    """`Loki.bootstrap_local` readies a free local engine, lazily installing."""
+
+    def test_uses_ollama_and_ensures_bootstrap_model(self):
+        loki = Loki()
+        fake = MagicMock()
+        fake.available.return_value = True
+        fake.bootstrap_model = "qwen2.5:3b"
+        fake.ensure.return_value = {"model": "qwen2.5:3b", "was_present": False,
+                                    "status": "success"}
+        with patch("yggdrasil.loki.engines.OllamaEngine", return_value=fake):
+            res = loki.bootstrap_local()
+        self.assertEqual((res["engine"], res["ready"], res["model"]),
+                         ("ollama", True, "qwen2.5:3b"))
+        fake.ensure.assert_called_once_with("qwen2.5:3b")
+
+    def test_falls_back_to_transformers(self):
+        loki = Loki()
+        oll = MagicMock(); oll.available.return_value = False
+        tf = MagicMock(); tf.available.return_value = True; tf.bootstrap_model = "Qwen/Qwen2.5-1.5B-Instruct"
+        with patch("yggdrasil.loki.engines.OllamaEngine", return_value=oll), \
+             patch("yggdrasil.loki.engines.TransformersEngine", return_value=tf):
+            res = loki.bootstrap_local()
+        self.assertEqual((res["engine"], res["ready"]), ("transformers", True))
+
+    def test_reports_install_when_no_local_engine(self):
+        loki = Loki()
+        oll = MagicMock(); oll.available.return_value = False
+        tf = MagicMock(); tf.available.return_value = False
+        with patch("yggdrasil.loki.engines.OllamaEngine", return_value=oll), \
+             patch("yggdrasil.loki.engines.TransformersEngine", return_value=tf):
+            res = loki.bootstrap_local()
+        self.assertFalse(res["ready"])
+        self.assertTrue(res["install"])
 
 
 class TestEngineSelection(unittest.TestCase):

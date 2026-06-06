@@ -28,6 +28,10 @@ class TransformersEngine(TokenEngine):
         "fast": "Qwen/Qwen2.5-0.5B-Instruct",
         "deep": "Qwen/Qwen2.5-1.5B-Instruct",
     }
+    #: Lightweight, free entry model (weights lazy-download on first use):
+    #: Qwen2.5 1.5B Instruct — CPU-friendly and smart enough for basic
+    #: install/config work and for routing harder tasks up to a bigger model.
+    bootstrap_model: ClassVar[str] = "Qwen/Qwen2.5-1.5B-Instruct"
     #: One pipeline per model, shared across instances (weights load once).
     _PIPES: ClassVar[dict[str, Any]] = {}
 
