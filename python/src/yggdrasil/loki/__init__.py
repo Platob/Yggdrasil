@@ -17,6 +17,7 @@ from .usage import METER, ModelPricing, ModelUsage, TokenMeter, price_for
 
 # Import the built-in behaviors so they register on package import.
 from . import behaviors as _behaviors  # noqa: F401
+from . import web
 
 __all__ = [
     "Loki",
@@ -35,4 +36,5 @@ __all__ = [
     "ModelUsage",
     "ModelPricing",
     "price_for",
+    "web",
 ]

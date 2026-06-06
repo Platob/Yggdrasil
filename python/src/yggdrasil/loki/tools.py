@@ -100,14 +100,17 @@ def filesystem_toolbox(
     *,
     read_only: bool = False,
     allow_shell: bool = False,
+    allow_web: bool = False,
 ) -> Toolbox:
     """Build the default toolbox rooted at *root*.
 
-    The read tools (``list_dir``, ``read_file``, ``find``, ``grep``) are
-    always present — discovery. The write tools (``write_file``,
-    ``edit_file``) are added unless ``read_only``. ``run`` (a shell command
-    inside the root) is added only when ``allow_shell`` — it's the sharpest
-    tool, so it's opt-in.
+    The read tools (``list_dir``, ``read_file``, ``find``, ``grep``,
+    ``read_table``) are always present — discovery, including parsing local
+    tabular files (CSV/Parquet/Arrow/XLSX/JSON) through the io handlers. The
+    write tools (``write_file``, ``edit_file``) are added unless ``read_only``.
+    ``run`` (a shell inside the root) is added only when ``allow_shell``, and
+    the network tools (``web_fetch``, ``web_table``, ``web_image``) only when
+    ``allow_web`` — the sharpest tools, so they're opt-in.
     """
     base = pathlib.Path(root).resolve()
     box = Toolbox()
@@ -189,9 +192,22 @@ def filesystem_toolbox(
                   "end": "last line (optional)"}, read_file))
     box.add(Tool("find", "Find files by glob pattern under a directory.",
                  {"pattern": "glob, e.g. '*.py'", "path": "root, default '.'"}, find))
+    def read_table(path: str, rows: int = 10) -> str:
+        target = resolve(path)
+        if not target.is_file():
+            return f"ERROR: not a file: {path}"
+        from yggdrasil.io.holder import IO
+
+        df = IO.from_(str(target)).to_polars()
+        return (f"{rel(target)}  shape={df.shape}  columns={list(df.columns)}\n"
+                + str(df.head(rows)))
+
     box.add(Tool("grep", "Search file contents for a regex.",
                  {"pattern": "regex", "path": "root, default '.'",
                   "glob": "file glob, default '*'"}, grep))
+    box.add(Tool("read_table", "Parse a local tabular file (CSV/Parquet/Arrow/XLSX/JSON) "
+                 "to a DataFrame preview via the io handlers.",
+                 {"path": "file path", "rows": "preview rows, default 10"}, read_table))
 
     if not read_only:
         def write_file(path: str, content: str) -> str:
@@ -245,5 +261,54 @@ def filesystem_toolbox(
         box.add(Tool("run", "Run a shell command in the agent root and capture output.",
                      {"command": "shell command", "timeout": "seconds, default 60"},
                      run_cmd, mutates=True))
+
+    if allow_web:
+        def web_fetch(url: str) -> str:
+            from . import web
+
+            page = web.read_text(url)
+            head = f"{page['status']} {page['content_type']}\n{page['text']}"
+            if page.get("links"):
+                head += "\n\nlinks:\n" + "\n".join(
+                    f"  {l['text'][:50]} → {l['href']}" for l in page["links"][:15]
+                )
+            return head[:MAX_READ_BYTES]
+
+        def web_table(url: str, fmt: str = "", save: str = "") -> str:
+            from . import web
+
+            df = web.read_table(url, fmt=fmt or None)
+            out = f"{url}  shape={df.shape}  columns={list(df.columns)}\n{df.head(10)}"
+            if save:
+                target = resolve(save)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                df.write_csv(str(target)) if save.endswith(".csv") else df.write_parquet(str(target))
+                r = rel(target)
+                if r not in box.changed:
+                    box.changed.append(r)
+                out += f"\nsaved → {r} ({df.height} rows)"
+            return out
+
+        def web_image(url: str, save: str = "") -> str:
+            from . import web
+
+            dest = str(resolve(save)) if save else None
+            info = web.read_image(url, save_to=dest)
+            if save:
+                r = rel(resolve(save))
+                if r not in box.changed:
+                    box.changed.append(r)
+                info["saved_to"] = r
+            return "  ".join(f"{k}={v}" for k, v in info.items())
+
+        box.add(Tool("web_fetch", "Browse a web page — readable text + links.",
+                     {"url": "http(s) URL"}, web_fetch))
+        box.add(Tool("web_table", "Fetch a remote table (CSV/Parquet/JSON/XLSX) as a DataFrame.",
+                     {"url": "http(s) URL", "fmt": "format hint if unlabelled",
+                      "save": "path under root to save (.csv/.parquet)"},
+                     web_table, mutates=True))
+        box.add(Tool("web_image", "Fetch an image — content type, size, dimensions.",
+                     {"url": "http(s) URL", "save": "path under root to save"},
+                     web_image, mutates=True))
 
     return box

@@ -17,6 +17,7 @@ dispatches :class:`~yggdrasil.loki.behavior.LokiBehavior` actions. The CLI
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from . import behavior as _behavior
@@ -33,6 +34,10 @@ __all__ = ["Loki", "ROUTES"]
 #: Problem-category signals for :meth:`Loki.route`. Data over code — extend the
 #: keyword lists, not the routing branches.
 ROUTES: dict[str, tuple[str, ...]] = {
+    "web": (
+        "http://", "https://", "www.", "fetch ", "download ", "browse",
+        "look up", "on the internet", "search the web", "scrape", "this url",
+    ),
     "databricks": (
         "databricks", "genie", "unity catalog", "warehouse", "cluster",
         "dbfs", "delta", "spark", "serving endpoint", "notebook", "job run",
@@ -209,6 +214,7 @@ class Loki:
         max_steps: int = 12,
         read_only: bool = False,
         allow_shell: bool = False,
+        allow_web: bool = False,
         toolbox: "Optional[Toolbox]" = None,
         on_step: "Optional[Callable[[dict[str, Any]], None]]" = None,
     ) -> dict[str, Any]:
@@ -240,7 +246,7 @@ class Loki:
                 "Databricks session"
             )
         box = toolbox or filesystem_toolbox(
-            root, read_only=read_only, allow_shell=allow_shell
+            root, read_only=read_only, allow_shell=allow_shell, allow_web=allow_web
         )
         system = (
             "You are Loki, an autonomous engineering agent working inside a "
@@ -320,6 +326,11 @@ class Loki:
         Returns ``{"category", "action", "specialist", "why"}``.
         """
         low = text.lower()
+        url_match = re.search(r"https?://\S+", text)
+        if url_match or any(s in low for s in ROUTES["web"]):
+            return {"category": "web", "action": "web", "specialist": None,
+                    "url": url_match.group(0).rstrip(").,") if url_match else None,
+                    "why": "a URL / web-fetch request — uses the HTTP session + io handlers"}
         if any(s in low for s in ROUTES["databricks"]):
             action = "genie" if "genie" in low else "reason"
             return {"category": "databricks", "action": action,

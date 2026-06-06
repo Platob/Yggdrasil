@@ -27,6 +27,24 @@ class TestFilesystemToolbox(unittest.TestCase):
         self.assertNotIn("run", filesystem_toolbox(self.dir).names())
         self.assertIn("run", filesystem_toolbox(self.dir, allow_shell=True).names())
 
+    def test_web_tools_are_opt_in(self):
+        base = filesystem_toolbox(self.dir)
+        self.assertNotIn("web_fetch", base.names())
+        web = filesystem_toolbox(self.dir, allow_web=True)
+        self.assertIn("web_fetch", web.names())
+        self.assertIn("web_table", web.names())
+        self.assertIn("web_image", web.names())
+
+    def test_read_table_tool_parses_local_csv(self):
+        try:
+            import polars  # noqa: F401
+        except Exception:
+            self.skipTest("requires the polars/io data stack")
+        (self.root / "t.csv").write_text("a,b\n1,2\n3,4\n")
+        out = filesystem_toolbox(self.dir).call("read_table", {"path": "t.csv"})
+        self.assertIn("shape=(2, 2)", out)
+        self.assertIn("a", out)
+
     def test_list_dir_and_read_file(self):
         box = filesystem_toolbox(self.dir)
         listing = box.call("list_dir", {"path": "."})

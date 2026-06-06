@@ -45,12 +45,14 @@ def _build_parser() -> argparse.ArgumentParser:
     do.add_argument("--max-steps", type=int, default=12, help="Tool-call budget (default 12).")
     do.add_argument("--read-only", action="store_true", help="Discovery only — no file writes.")
     do.add_argument("--allow-shell", action="store_true", help="Also give the agent a shell tool.")
+    do.add_argument("--allow-web", action="store_true", help="Also give the agent web fetch/table/image tools.")
     do.add_argument("--json", action="store_true", help="Print the full transcript as JSON.")
 
     tools = sub.add_parser("tools", help="The tools the autonomous agent can act through.")
     tools.add_argument("--root", default=".", help="Working tree to root the tools at (default '.').")
     tools.add_argument("--read-only", action="store_true", help="Show the read-only toolbox.")
     tools.add_argument("--allow-shell", action="store_true", help="Include the shell tool.")
+    tools.add_argument("--allow-web", action="store_true", help="Include the web tools.")
 
     tok = sub.add_parser("token", help="The Databricks credentials Loki provides (non-secret).")
     tok.add_argument("--probe", action="store_true", help="Make one network call to resolve the user.")
@@ -219,8 +221,17 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
     style.out(f"  {style.dim('▹ ' + plan['category'] + ' · ' + plan['why'])}{tail}\n")
 
     try:
-        if plan["action"] == "act":
-            res = agent.act(line, root=state["root"], tier=state["tier"],
+        if plan["action"] == "web":
+            url = plan.get("url")
+            if not url:
+                with style.Spinner("thinking…"):
+                    reply = agent.reason(line, tier=state["tier"])
+            else:
+                res = agent.run("web", url=url, question=line)
+                _print_web(style, res)
+                reply = res.get("answer") or style.dim(f"fetched {url}")
+        elif plan["action"] == "act":
+            res = agent.act(line, root=state["root"], tier=state["tier"], allow_web=True,
                             on_step=lambda r: _act_step(style, r))
             reply = res["answer"]
             if res.get("files_changed"):
@@ -243,6 +254,30 @@ def _act_step(style: Any, rec: dict) -> None:
         return
     call = f"{rec['tool']}({', '.join(f'{k}={_short(v)}' for k, v in rec['args'].items())})"
     style.out(f"  {style.dim(str(rec['n']).rjust(2))} {style.brand(call)}\n")
+
+
+def _print_web(style: Any, res: dict) -> None:
+    """Pretty-print a `web` behavior result by kind: table / image / json / page."""
+    kind = res.get("action")
+    style.out(f"  {style.dim('🌐 ' + str(res.get('url', '')))}\n")
+    if kind == "table":
+        style.out(f"  {style.good('▦')} {style.bold(str(tuple(res['shape'])))} "
+                  f"{style.dim('· ' + ', '.join(res['columns']))}\n")
+        style.out(style.dim("  " + res["preview"].replace("\n", "\n  ")) + "\n")
+    elif kind == "image":
+        dims = (f"{res.get('width')}×{res.get('height')}"
+                if res.get("width") else "?")
+        style.out(f"  {style.good('🖼')} {res.get('content_type')}  "
+                  f"{res.get('bytes'):,} bytes  {dims}"
+                  + (f"  → {res['saved_to']}" if res.get("saved_to") else "") + "\n")
+    elif kind == "json":
+        style.out(style.dim("  " + _short(res.get("data"))) + "\n")
+    else:
+        for link in res.get("links", [])[:8]:
+            style.out(f"  {style.dim('↪')} {style.dim(link['text'][:48])} {style.dim(link['href'])}\n")
+        body = (res.get("text") or "").strip()
+        if body:
+            style.out(style.dim("  " + body[:600].replace("\n", "\n  ")) + "\n")
 
 
 def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
@@ -383,6 +418,8 @@ def _do(loki: Any, style: Any, args: Any) -> int:
     mode = "read-only" if args.read_only else "read-write"
     if args.allow_shell:
         mode += "+shell"
+    if args.allow_web:
+        mode += "+web"
     style.out(f"  {style.dim('root ' + args.root + '  ·  ' + mode)}\n\n")
 
     def on_step(rec: dict) -> None:
@@ -398,7 +435,7 @@ def _do(loki: Any, style: Any, args: Any) -> int:
     try:
         result = loki.act(
             args.task, root=args.root, engine=args.engine, tier=args.tier, max_steps=args.max_steps,
-            read_only=args.read_only, allow_shell=args.allow_shell,
+            read_only=args.read_only, allow_shell=args.allow_shell, allow_web=args.allow_web,
             on_step=None if args.json else on_step,
         )
     except (KeyError, RuntimeError) as exc:
@@ -429,7 +466,7 @@ def _do(loki: Any, style: Any, args: Any) -> int:
 def _tools(style: Any, args: Any) -> int:
     from yggdrasil.loki.tools import filesystem_toolbox
 
-    box = filesystem_toolbox(args.root, read_only=args.read_only, allow_shell=args.allow_shell)
+    box = filesystem_toolbox(args.root, read_only=args.read_only, allow_shell=args.allow_shell, allow_web=args.allow_web)
     for t in box.tools.values():
         mark = style.brand("✎") if t.mutates else style.dim("○")
         style.out(f"  {mark} {style.bold(t.name)}  {style.dim(t.description)}\n")

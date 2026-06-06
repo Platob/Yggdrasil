@@ -252,6 +252,37 @@ cap, turn it off, or stop — so a runaway session never spends without bound:
   raise by 25,000 [Enter] · set N · off · stop [s]:
 ```
 
+## On the internet (`yggdrasil.loki.web`)
+
+Loki reaches the web through yggdrasil's own stack — every request rides
+`HTTPSession` (pooling, retry, response cache) and every tabular body is
+parsed by the **io handlers** (`HTTPResponse.to_polars()` auto-detects CSV /
+JSON / Parquet / Arrow / XLSX). So "look it up" and "parse that table" are
+the same abstractions the rest of yggdrasil runs on.
+
+```python
+from yggdrasil.loki import web
+
+web.read_text("https://example.com")        # browse → readable text + links
+web.read_table("https://…/iris.csv")          # → polars DataFrame (any format)
+web.read_json("https://api.example.com/x")     # → decoded JSON
+web.read_image("https://…/logo.png")           # → bytes + dims + content-type
+```
+
+The **`web` behavior** wraps these (`loki.run("web", url=…, question=…)`);
+the autonomous loop gets `web_fetch` / `web_table` / `web_image` tools with
+`act(..., allow_web=True)` (or `ygg loki do --allow-web`), and local tabular
+files parse through the same io layer via the always-on `read_table` tool. In
+the interactive session a URL routes itself:
+
+```text
+⟢ auto ›  fetch https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv
+  ▹ web · a URL / web-fetch request — uses the HTTP session + io handlers
+  🌐 https://…/iris.csv
+  ▦ (150, 5) · sepal_length, sepal_width, petal_length, petal_width, species
+  ┌──────────────┬─────────────┬─ …
+```
+
 ## Token monitoring (`ygg loki usage`)
 
 Every engine records its spend into a process-global meter

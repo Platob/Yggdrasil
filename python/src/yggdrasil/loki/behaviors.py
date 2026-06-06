@@ -26,7 +26,7 @@ from .behavior import LokiBehavior, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentBehavior", "GenieBehavior", "PythonProjectBehavior"]
+__all__ = ["AgentBehavior", "GenieBehavior", "PythonProjectBehavior", "WebBehavior"]
 
 
 @register
@@ -55,6 +55,7 @@ class AgentBehavior(LokiBehavior):
         max_steps: int = 12,
         read_only: bool = False,
         allow_shell: bool = False,
+        allow_web: bool = False,
         **_: Any,
     ) -> dict[str, Any]:
         return agent.act(
@@ -65,7 +66,67 @@ class AgentBehavior(LokiBehavior):
             max_steps=max_steps,
             read_only=read_only,
             allow_shell=allow_shell,
+            allow_web=allow_web,
         )
+
+
+@register
+class WebBehavior(LokiBehavior):
+    """Reach the internet — browse a page, read a table, JSON, or image.
+
+    Runs anywhere (no backend). Fetches through
+    :class:`~yggdrasil.http_.HTTPSession` and parses tabular bodies through the
+    io handlers (:mod:`yggdrasil.loki.web`). ``action="auto"`` infers from the
+    URL (a ``.csv``/``.parquet``/… → table, an image extension → image, else
+    browse as text); pass ``question=`` to have the agent reason over a
+    fetched page.
+    """
+
+    name = "web"
+    description = "Fetch the internet — browse pages, read tables/JSON, or images."
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        url: str,
+        action: str = "auto",
+        fmt: Optional[str] = None,
+        save: Optional[str] = None,
+        question: Optional[str] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        from . import web
+
+        if action == "auto":
+            ext = url.rsplit("?", 1)[0].rsplit(".", 1)[-1].lower()
+            if ext in ("csv", "tsv", "json", "ndjson", "jsonl", "parquet", "pq",
+                       "arrow", "feather", "xlsx", "xls"):
+                action = "json" if ext in ("json",) else "table"
+            elif ext in ("png", "jpg", "jpeg", "gif", "webp"):
+                action = "image"
+            else:
+                action = "text"
+
+        if action == "table":
+            df = web.read_table(url, fmt=fmt)
+            return {"action": "table", "url": url, "shape": list(df.shape),
+                    "columns": list(df.columns), "preview": str(df.head(10))}
+        if action == "json":
+            return {"action": "json", "url": url, "data": web.read_json(url)}
+        if action == "image":
+            return {"action": "image", **web.read_image(url, save_to=save)}
+
+        page = web.read_text(url)
+        out: dict[str, Any] = {"action": "text", **page}
+        if question:
+            eng = agent.engine()
+            if eng is not None and eng.available():
+                out["answer"] = agent.reason(
+                    f"Using only this page, {question}\n\n{page['text']}",
+                    system="Answer concisely from the page; say if it's not covered.",
+                )
+        return out
 
 
 @register

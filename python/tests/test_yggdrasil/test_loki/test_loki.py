@@ -285,6 +285,17 @@ class TestAgentAct(unittest.TestCase):
 class TestReasoningRouter(unittest.TestCase):
     """Loki categorizes a request and picks a solution path / specialist."""
 
+    def test_url_routes_to_web_with_extracted_url(self):
+        plan = Loki().route("fetch https://example.com/data.csv please")
+        self.assertEqual(plan["category"], "web")
+        self.assertEqual(plan["action"], "web")
+        self.assertEqual(plan["url"], "https://example.com/data.csv")
+
+    def test_web_verb_without_url_still_routes_web(self):
+        plan = Loki().route("browse the latest news")
+        self.assertEqual(plan["category"], "web")
+        self.assertIsNone(plan["url"])
+
     def test_databricks_signal_routes_to_specialist(self):
         plan = Loki().route("how do I size a Databricks SQL warehouse?")
         self.assertEqual(plan["category"], "databricks")
