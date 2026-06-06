@@ -77,9 +77,9 @@ if __name__ == "__main__":
 
 
 class TestTabularDisplay(unittest.TestCase):
-    """Tabular.display() renders an aligned first-n-rows preview."""
+    """Tabular.display() renders a typed, aligned, delimited first-n-rows preview."""
 
-    def test_aligned_preview(self):
+    def test_typed_header_aligned_columns(self):
         try:
             import polars  # noqa: F401
         except Exception:
@@ -91,16 +91,37 @@ class TestTabularDisplay(unittest.TestCase):
 
         p = Path(tempfile.mkdtemp()) / "d.csv"
         p.write_text("city,pop\nParis,2161\nTokyo,13960\n")
-        out = IO.from_(str(p)).display()
-        lines = out.splitlines()
-        self.assertIn("city", lines[0])
-        self.assertIn("pop", lines[0])
-        self.assertTrue(set(lines[1]) <= {"-", " "})   # the rule row
-        self.assertIn("Paris", out)
-        # Columns are aligned: the 'pop' header sits at a fixed offset on rows.
-        self.assertEqual(lines[0].index("pop"), lines[2].index("2161"))
+        lines = IO.from_(str(p)).display().splitlines()
+        # Header carries short data types and a │ column delimiter.
+        self.assertIn("city:str", lines[0])
+        self.assertIn("pop:i64", lines[0])
+        self.assertIn("│", lines[0])
+        # The rule row uses the box-drawing rule, aligned to the columns.
+        self.assertTrue(set(lines[1]) <= {"─", "┼"})
+        # Columns align: the 2nd column header and its values share an offset.
+        self.assertEqual(lines[0].index("pop:i64"), lines[2].index("2161"))
 
-    def test_limit_and_empty(self):
+    def test_nested_values_are_compacted(self):
+        try:
+            import polars as pl
+        except Exception:
+            self.skipTest("polars not installed")
+        import tempfile
+        from pathlib import Path
+
+        from yggdrasil.io.holder import IO
+
+        p = Path(tempfile.mkdtemp()) / "n.parquet"
+        pl.DataFrame({"id": [1], "tags": [["a", "b"]], "meta": [{"x": 1}]}).write_parquet(p)
+        lines = IO.from_(str(p)).display().splitlines()
+        # Nested columns get a flat type tag (not the whole inner schema) …
+        self.assertIn("tags:list", lines[0])
+        self.assertIn("meta:struct", lines[0])
+        # … and nested values render compactly on one line.
+        self.assertIn('["a","b"]', lines[2])
+        self.assertIn('{"x":1}', lines[2])
+
+    def test_limit_marker(self):
         try:
             import polars  # noqa: F401
         except Exception:

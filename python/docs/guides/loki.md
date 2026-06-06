@@ -548,11 +548,15 @@ print(dbc.sql.execute("SELECT * FROM samples.nyctaxi.trips").display())
 print(IO.from_("data.parquet").display(5))
 ```
 
+Headers carry a **short data type** (`col:i64` / `:str` / `:ts` / `:list` …),
+columns are separated by `│`, and nested values (lists / structs) are compacted
+so the output never balloons:
+
 ```text
-tpep_pickup_datetime       trip_distance  fare_amount  pickup_zip
--------------------------  -------------  -----------  ----------
-2016-02-14 16:52:13+00:00  4.94           19.0         10282
-2016-02-04 18:44:19+00:00  0.28           3.5          10110
+tpep_pickup_datetime:ts   │ trip_distance:f64 │ fare_amount:f64 │ pickup_zip:i32
+──────────────────────────┼───────────────────┼─────────────────┼───────────────
+2016-02-14 16:52:13+00:00 │ 4.94              │ 19.0            │ 10282
+2016-02-04 18:44:19+00:00 │ 0.28              │ 3.5             │ 10110
 … (first 10 rows)
 ```
 

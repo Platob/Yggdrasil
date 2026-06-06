@@ -87,6 +87,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _short_arrow_dtype(t: "pa.DataType") -> str:
+    """A short type tag for a column header in :meth:`Tabular.display`.
+
+    Compact and stable — ``i64`` / ``f64`` / ``str`` / ``bool`` / ``date`` /
+    ``ts`` / ``list`` / ``struct`` / ``map`` / ``dec`` / ``bin`` — and crucially
+    *flat* for nested types (a struct shows ``struct``, not its whole inner
+    schema), so the header never balloons.
+    """
+    if pa.types.is_integer(t):
+        return f"i{t.bit_width}"
+    if pa.types.is_floating(t):
+        return f"f{t.bit_width}"
+    if pa.types.is_string(t) or pa.types.is_large_string(t):
+        return "str"
+    if pa.types.is_boolean(t):
+        return "bool"
+    if pa.types.is_date(t):
+        return "date"
+    if pa.types.is_timestamp(t):
+        return "ts"
+    if pa.types.is_time(t):
+        return "time"
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return "list"
+    if pa.types.is_struct(t):
+        return "struct"
+    if pa.types.is_map(t):
+        return "map"
+    if pa.types.is_decimal(t):
+        return "dec"
+    if pa.types.is_binary(t) or pa.types.is_large_binary(t):
+        return "bin"
+    if pa.types.is_null(t):
+        return "null"
+    return str(t)[:8]
+
+
+def _compact_nested(value: Any) -> str:
+    """Render a nested cell (list / dict / tuple) compactly on one line."""
+    import json
+
+    try:
+        return json.dumps(value, separators=(",", ":"), default=str, ensure_ascii=False)
+    except Exception:
+        return str(value).replace("\n", " ")
+
+
 #: Placeholder column-name prefix pyarrow uses for pandas index levels
 #: that had no ``name`` on the source DataFrame (``__index_level_0__``
 #: for an unnamed top level, ``__index_level_1__`` for the second level
@@ -2515,24 +2562,28 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     # Human-readable preview
     # ==================================================================
 
-    def display(self, n: int = 10, *, max_width: int = 40) -> str:
-        """Render the first *n* rows as an aligned text table.
+    def display(self, n: int = 10, *, max_width: int = 32) -> str:
+        """Render the first *n* rows as an aligned, typed text table.
 
-        A clean, column-aligned preview (header + values, padded; long cells
-        truncated to *max_width*), so callers can *show* a row set without
-        serializing it. Reads only enough Arrow batches to fill *n* rows, then
-        stops — cheap even on a large source.
+        Each header carries a **short data type** (``col:i64`` / ``:str`` /
+        ``:ts`` …); columns are separated by ``│`` with a ``─┼─`` rule; nested
+        values (lists / structs / maps) are compacted (and their column type is
+        just ``list`` / ``struct``) so the output never balloons. Long cells are
+        truncated to *max_width*. Reads only enough Arrow batches to fill *n*
+        rows, then stops — cheap even on a large source.
 
             print(dbc.sql.execute("SELECT * FROM t").display())
             print(IO.from_("data.parquet").display(5))
         """
         columns: "list[str] | None" = None
-        rows: list[tuple] = []
+        types: "list[str]" = []
+        rows: list[list] = []
         for batch in self.to_arrow_batches():
             if columns is None:
                 columns = list(batch.schema.names)
+                types = [_short_arrow_dtype(batch.schema.field(c).type) for c in columns]
             for record in batch.to_pylist():
-                rows.append(tuple(record.get(c) for c in columns))
+                rows.append([record.get(c) for c in columns])
                 if len(rows) >= n:
                     break
             if len(rows) >= n:
@@ -2541,19 +2592,27 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             return "(no rows)"
 
         def cell(value: Any) -> str:
-            text = "" if value is None else str(value)
-            text = text.replace("\n", " ")
+            if value is None:
+                text = ""
+            elif isinstance(value, (dict, list, tuple)):     # nested → compact
+                text = _compact_nested(value)
+            else:
+                text = str(value).replace("\n", " ")
             return text if len(text) <= max_width else text[: max_width - 1] + "…"
 
-        header = [str(c) for c in columns]
+        header = [f"{columns[i]}:{types[i]}" for i in range(len(columns))]
         body = [[cell(v) for v in row] for row in rows]
         widths = [
-            max([len(header[i])] + [r[i].__len__() for r in body]) if body else len(header[i])
+            max([len(header[i])] + [len(r[i]) for r in body]) if body else len(header[i])
             for i in range(len(header))
         ]
-        rule = "  ".join("-" * w for w in widths)
-        lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(header)), rule]
-        lines += ["  ".join(c.ljust(widths[i]) for i, c in enumerate(r)) for r in body]
+        sep, rule_sep = " │ ", "─┼─"
+
+        def line(cells: "list[str]") -> str:
+            return sep.join(c.ljust(widths[i]) for i, c in enumerate(cells))
+
+        lines = [line(header), rule_sep.join("─" * w for w in widths)]
+        lines += [line(r) for r in body]
         if len(rows) >= n:
             lines.append(f"… (first {n} rows)")
         return "\n".join(lines)
