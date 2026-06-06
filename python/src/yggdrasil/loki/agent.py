@@ -17,11 +17,16 @@ dispatches :class:`~yggdrasil.loki.skill.LokiSkill` actions. The CLI
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 from . import skill as _skill
 from .capability import Backend, detect
+
+#: Engine fallback / skip notices ride this logger; ``ygg loki`` routes it to
+#: the terminal (``style.install_logging``) so a skipped engine is visible.
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from yggdrasil.databricks import DatabricksClient
@@ -30,6 +35,12 @@ if TYPE_CHECKING:
     from .tools import Toolbox
 
 __all__ = ["Loki", "ROUTES"]
+
+#: Raised when no reasoning engine is reachable (or every one failed in turn).
+_NO_ENGINE = (
+    "no reasoning engine available — log into Claude Code, or set "
+    "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a Databricks session"
+)
 
 #: Problem-category signals for :meth:`Loki.route`. Data over code — extend the
 #: keyword lists, not the routing branches.
@@ -361,6 +372,34 @@ class Loki:
             self._capable = can_run_local()
         return self._capable
 
+    def _engine_chain(
+        self,
+        text: "Optional[str]" = None,
+        *,
+        engine: "Optional[str]" = None,
+        tier: "Optional[str]" = None,
+        base: "Optional[str]" = None,
+        confirm: "Optional[Callable[[TokenEngine, Optional[str]], bool]]" = None,
+    ) -> "list[TokenEngine]":
+        """Ordered, available engines to try for a request — the chosen one
+        first, then the rest in preference order.
+
+        Powers log-and-skip fallback: a pinned/selected engine that errors
+        (bad token, 403, missing dep) is logged and the next available engine
+        is tried instead of failing the whole request.
+        """
+        available = {n: e for n, e in self._engine_instances().items() if e.available()}
+        chain: "list[TokenEngine]" = []
+        first = (self.engine(engine) if engine
+                 else self.select(text, tier=tier, base=base, confirm=confirm))
+        if first is not None and first.available():
+            chain.append(first)
+        for n in self.ENGINE_PREFERENCE:
+            eng = available.get(n)
+            if eng is not None and all(eng is not c for c in chain):
+                chain.append(eng)
+        return chain
+
     def bootstrap_local(self, *, model: "Optional[str]" = None, pull: bool = True) -> dict[str, Any]:
         """Ready a free **local** reasoning engine, lazily installing on demand.
 
@@ -415,15 +454,16 @@ class Loki:
         (:meth:`select`), sticking to the session ``base`` and asking
         ``confirm`` before escalating to a paid remote model.
         """
-        eng = (self.engine(engine) if engine
-               else self.select(prompt, tier=tier, base=base, confirm=confirm))
-        if eng is None or not eng.available():
-            raise RuntimeError(
-                "no reasoning engine available — log into Claude Code, or set "
-                "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a "
-                "Databricks session"
-            )
-        return eng.generate(prompt, system=system, tier=tier, **options)
+        chain = self._engine_chain(prompt, engine=engine, tier=tier, base=base, confirm=confirm)
+        last: "Optional[Exception]" = None
+        for eng in chain:
+            try:
+                return eng.generate(prompt, system=system, tier=tier, **options)
+            except Exception as exc:
+                last = exc
+                _log.warning("engine '%s' failed: %s — skipping to next",
+                             eng.name, _short_err(exc))
+        raise last if last is not None else RuntimeError(_NO_ENGINE)
 
     def reason_stream(
         self,
@@ -441,15 +481,22 @@ class Loki:
         Same engine/tier resolution as :meth:`reason`, but live: the chosen
         engine streams token deltas so the terminal prints them as they come.
         """
-        eng = (self.engine(engine) if engine
-               else self.select(prompt, tier=tier, base=base, confirm=confirm))
-        if eng is None or not eng.available():
-            raise RuntimeError(
-                "no reasoning engine available — log into Claude Code, or set "
-                "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a "
-                "Databricks session"
-            )
-        yield from eng.generate_stream(prompt, system=system, tier=tier, **options)
+        chain = self._engine_chain(prompt, engine=engine, tier=tier, base=base, confirm=confirm)
+        last: "Optional[Exception]" = None
+        for eng in chain:
+            started = False
+            try:
+                for chunk in eng.generate_stream(prompt, system=system, tier=tier, **options):
+                    started = True
+                    yield chunk
+                return
+            except Exception as exc:
+                if started:
+                    raise            # already emitted output — can't silently switch
+                last = exc
+                _log.warning("engine '%s' failed: %s — skipping to next",
+                             eng.name, _short_err(exc))
+        raise last if last is not None else RuntimeError(_NO_ENGINE)
 
     # -- autonomous action loop -------------------------------------------
 
@@ -760,3 +807,10 @@ def _safe(fn) -> str:
         return fn()
     except Exception:
         return "unknown"
+
+
+def _short_err(exc: Exception) -> str:
+    """A one-line, truncated rendering of an engine error for a log line."""
+    msg = (exc.args[0] if exc.args else str(exc)) if exc.args else str(exc)
+    msg = " ".join(str(msg).split())
+    return msg if len(msg) <= 200 else msg[:199] + "…"
