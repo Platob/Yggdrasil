@@ -27,6 +27,7 @@ def _client_with(*, user="me@co.com", warehouses=None, default_wh=...):
     pool = MagicMock()
     pool.instance_pool_name = "Yggdrasil Light"
     pool.node_type_id = "r5d.xlarge"
+    pool.instance_pool_id = "pool-light"
     client.compute.instance_pools.seed_default_pools.return_value = [pool]
     client.compute.instance_pools.find.return_value = pool
     return client
@@ -174,9 +175,28 @@ class TestSeedProvision(unittest.TestCase):
             rc = main(["seed"])
         self.assertEqual(rc, 0)
         # A default all-purpose cluster is provisioned in single-user (dedicated)
-        # mode for the current user, without blocking on start-up.
+        # mode for the current user, attached to the Light pool, without blocking.
+        client.compute.instance_pools.find.assert_any_call(name="Yggdrasil Light")
         client.compute.clusters.all_purpose_cluster.assert_called_once_with(
-            single_user_name="alice@co.com", wait=False,
+            single_user_name="alice@co.com", instance_pool_id="pool-light", wait=False,
+        )
+
+    def test_seed_cluster_without_light_pool_uses_standalone(self):
+        wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
+        client = _client_with(user="bob@co.com", default_wh=wh)
+        client.compute.instance_pools.find.return_value = None   # Light pool absent
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed"])
+        self.assertEqual(rc, 0)
+        # No pool to attach to → cluster created standalone (instance_pool_id=None).
+        client.compute.clusters.all_purpose_cluster.assert_called_once_with(
+            single_user_name="bob@co.com", instance_pool_id=None, wait=False,
         )
 
     def test_seed_no_cluster_skips_cluster_step(self):

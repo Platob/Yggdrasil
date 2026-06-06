@@ -25,9 +25,10 @@ It walks six areas:
   bundle. Lazy by default (no idle nodes → no cost until attached). Skip with
   ``--no-pools``.
 - **cluster**     — a default **single-user (dedicated)** all-purpose cluster
-  owned by the current user, so interactive ygg work has compute on hand. Lazy:
-  created with autotermination and not waited on (starts on attach, self-stops
-  when idle → no cost until used). Skip with ``--no-cluster``.
+  owned by the current user, **attached to the Light instance pool** so it
+  starts warm against the seeded zero-PyPI bundle. Lazy: created with
+  autotermination and not waited on (starts on attach, self-stops when idle →
+  no cost until used). Skip with ``--no-cluster``.
 
 In the default (seed) mode it builds/uploads the wheel, assembles and writes
 the environment files, and ensures a default warehouse exists. With ``--check``
@@ -290,12 +291,31 @@ class SeedCommand:
                         )
                         style.ok("default single-user cluster present")
                 else:
+                    # Attach to the default Light pool so the cluster starts warm
+                    # against the seeded zero-PyPI bundle (and inherits the pool's
+                    # node type). Falls back to a standalone node type if the pool
+                    # isn't present (e.g. seeded with ``--no-pools``).
+                    from yggdrasil.databricks.compute.instance_pool import (
+                        DEFAULT_POOL_TIERS,
+                    )
+
+                    light_name = DEFAULT_POOL_TIERS[0].pool_name()
+                    pool = client.compute.instance_pools.find(name=light_name)
+                    pool_id = getattr(pool, "instance_pool_id", None) if pool else None
+                    if pool_id is None:
+                        style.warn(
+                            f"pool {light_name!r} not found — cluster will use a "
+                            f"standalone node type"
+                        )
                     with style.Spinner("provisioning default single-user cluster…"):
                         # ``single_user_name`` flips the cluster to dedicated
                         # (single-user) access mode for the current user;
+                        # ``instance_pool_id`` attaches it to the Light pool;
                         # ``wait=False`` returns without blocking on start-up.
                         cluster = clusters_svc.all_purpose_cluster(
-                            single_user_name=user, wait=False,
+                            single_user_name=user,
+                            instance_pool_id=pool_id,
+                            wait=False,
                         )
                     details = None
                     try:
@@ -314,7 +334,14 @@ class SeedCommand:
                         f"{mode or 'dedicated (single user)'}  "
                         f"{style.dim('single_user=' + str(user))}\n"
                     )
-                    style.ok("default single-user cluster ready (dedicated, autoterminating)")
+                    style.out(
+                        f"    {style.dim('pool')}    "
+                        f"{light_name if pool_id else style.dim('(standalone)')}\n"
+                    )
+                    style.ok(
+                        "default single-user cluster ready "
+                        "(dedicated, pool-backed, autoterminating)"
+                    )
             except Exception as exc:
                 style.fail(f"cluster step failed: {exc}")
                 ok = False
