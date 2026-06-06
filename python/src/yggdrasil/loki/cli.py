@@ -150,7 +150,8 @@ def _status(loki: Any, style: Any) -> int:
     for eng in loki.engines():
         glyph = style.green("●") if eng.available() else style.dim("○")
         star = style.dim(" (default)") if best is not None and eng.name == best.name else ""
-        style.out(f"    {glyph} {eng.name.ljust(11)} {style.dim(str(eng.model_label))}{star}\n")
+        kind = style.dim("local" if eng.local else "remote")
+        style.out(f"    {glyph} {eng.name.ljust(11)} {kind}  {style.dim(str(eng.model_label))}{star}\n")
     style.out(f"\n  {style.bold('skills')}\n")
     for beh in loki.skills():
         ok = beh.available(loki)
@@ -166,7 +167,8 @@ def _engines(loki: Any, style: Any) -> int:
     for eng in loki.engines():
         glyph = style.green("●") if eng.available() else style.dim("○")
         star = style.dim(" (default)") if best is not None and eng.name == best.name else ""
-        style.out(f"  {glyph} {style.bold(eng.name)}  {style.dim(str(eng.model_label))}{star}\n")
+        kind = style.dim("local " if eng.local else "remote")
+        style.out(f"  {glyph} {style.bold(eng.name.ljust(12))} {kind}  {style.dim(str(eng.model_label))}{star}\n")
     if best is None:
         style.warn("no engine available — log into Claude Code, or set ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a Databricks session")
     return 0

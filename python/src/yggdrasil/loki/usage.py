@@ -65,6 +65,9 @@ PRICING: dict[tuple[str, str], ModelPricing] = {
     ("openai", "*"): ModelPricing(2.5, 10.0),
     # Databricks serving — nominal placeholder until wired to workspace DBU.
     ("databricks", "*"): ModelPricing(0.20, 0.60),
+    # Local engines run on this workstation — free, no per-token cost.
+    ("transformers", "*"): ModelPricing(0.0, 0.0),
+    ("ollama", "*"): ModelPricing(0.0, 0.0),
 }
 
 #: Last-resort price when neither the exact model nor the engine is known.

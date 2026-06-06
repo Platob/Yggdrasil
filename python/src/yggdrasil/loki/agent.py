@@ -78,8 +78,12 @@ class Loki:
 
     name = "loki"
 
-    #: Order in which Loki picks a reasoning engine when none is named.
-    ENGINE_PREFERENCE: tuple[str, ...] = ("claude", "openai", "databricks")
+    #: Order in which Loki picks a reasoning engine when none is named —
+    #: capable remote APIs first, then free local engines as a fallback.
+    #: :meth:`select` overrides this for simple work on a capable workstation.
+    ENGINE_PREFERENCE: tuple[str, ...] = (
+        "claude", "openai", "databricks", "ollama", "transformers",
+    )
 
     _CURRENT: "Optional[Loki]" = None
 
@@ -204,13 +208,22 @@ class Loki:
     # -- reasoning engines -------------------------------------------------
 
     def _engine_instances(self) -> "dict[str, TokenEngine]":
-        """One instance of every known engine (Databricks bound to our client)."""
-        from .engines import ClaudeEngine, DatabricksServingEngine, OpenAIEngine
+        """One instance of every known engine — remote APIs plus the free
+        local ones (Databricks bound to our client)."""
+        from .engines import (
+            ClaudeEngine,
+            DatabricksServingEngine,
+            OllamaEngine,
+            OpenAIEngine,
+            TransformersEngine,
+        )
 
         return {
             "claude": ClaudeEngine(),
             "openai": OpenAIEngine(),
             "databricks": DatabricksServingEngine(client=self.databricks),
+            "ollama": OllamaEngine(),
+            "transformers": TransformersEngine(),
         }
 
     def engines(self) -> "list[TokenEngine]":
@@ -230,6 +243,58 @@ class Loki:
                 return eng
         return None
 
+    def select(
+        self, text: "Optional[str]" = None, *, tier: "Optional[str]" = None,
+    ) -> "Optional[TokenEngine]":
+        """Resource-aware engine choice: a local model for simple work this
+        workstation can run, a remote API for complex work or a thin box.
+
+        Complexity comes from an explicit ``tier`` or, failing that, the
+        prompt itself (long or reasoning-heavy → complex). Local engines (HF
+        ``transformers``, a local Ollama server) are free and private but
+        bounded by this machine, so they're chosen for *simple* work only when
+        the box has the muscle — a CUDA GPU, or enough CPU + RAM. Everything
+        else routes to the best available remote API. Returns an available
+        engine, or ``None`` when nothing is reachable.
+        """
+        import os
+
+        available = {n: e for n, e in self._engine_instances().items() if e.available()}
+        if not available:
+            return None
+
+        if tier in ("fast", "deep"):
+            heavy = tier == "deep"
+        else:
+            from .engine import ADAPTIVE_DEEP_CHARS, ADAPTIVE_DEEP_SIGNALS
+
+            blob = (text or "").lower()
+            heavy = (len(blob) >= ADAPTIVE_DEEP_CHARS
+                     or any(s in blob for s in ADAPTIVE_DEEP_SIGNALS))
+
+        order = [n for n in self.ENGINE_PREFERENCE if n in available]
+        locals_ = [available[n] for n in order if available[n].local]
+        remotes = [available[n] for n in order if not available[n].local]
+
+        # Can this workstation comfortably host a local model?
+        gpu = False
+        try:
+            import torch
+
+            gpu = torch.cuda.is_available()
+        except Exception:
+            pass
+        ram_gb = 0.0
+        try:
+            ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+        except (ValueError, OSError, AttributeError):
+            pass
+        capable = gpu or ((os.cpu_count() or 1) >= 4 and ram_gb >= 8.0)
+
+        if not heavy and locals_ and capable:
+            return locals_[0]
+        return remotes[0] if remotes else locals_[0]
+
     def reason(
         self,
         prompt: str,
@@ -242,9 +307,10 @@ class Loki:
         """Reason about *prompt* with the best (or named) engine → reply text.
 
         ``tier`` (``"fast"`` / ``"deep"``) forces the model tier; the default
-        (``None``) lets the engine pick adaptively from the prompt.
+        (``None``) lets the engine pick adaptively from the prompt. With no
+        ``engine`` named, the choice is resource-aware (:meth:`select`).
         """
-        eng = self.engine(engine)
+        eng = self.engine(engine) if engine else self.select(prompt, tier=tier)
         if eng is None or not eng.available():
             raise RuntimeError(
                 "no reasoning engine available — log into Claude Code, or set "
@@ -267,7 +333,7 @@ class Loki:
         Same engine/tier resolution as :meth:`reason`, but live: the chosen
         engine streams token deltas so the terminal prints them as they come.
         """
-        eng = self.engine(engine)
+        eng = self.engine(engine) if engine else self.select(prompt, tier=tier)
         if eng is None or not eng.available():
             raise RuntimeError(
                 "no reasoning engine available — log into Claude Code, or set "
@@ -313,7 +379,7 @@ class Loki:
         """
         from .tools import filesystem_toolbox
 
-        eng = self.engine(engine)
+        eng = self.engine(engine) if engine else self.select(task, tier=tier)
         if eng is None or not eng.available():
             raise RuntimeError(
                 "no reasoning engine available — log into Claude Code, or set "
@@ -505,7 +571,8 @@ class Loki:
             "backends": [b.to_dict() for b in self.backends(refresh=refresh)],
             "token": self.token_info(),
             "engines": [
-                {"name": e.name, "model": e.model_label, "available": e.available()}
+                {"name": e.name, "model": e.model_label,
+                 "local": e.local, "available": e.available()}
                 for e in self.engines()
             ],
             "skills": [s.to_dict() for s in self.skills()],

@@ -1,6 +1,8 @@
 """Tests for Loki reasoning engines and engine selection."""
 from __future__ import annotations
 
+import json
+import os
 import sys
 import types
 import unittest
@@ -9,7 +11,13 @@ from unittest.mock import MagicMock, patch
 from yggdrasil.loki import Loki
 from yggdrasil.loki.capability import Backend
 from yggdrasil.loki.engine import Completion, TokenEngine
-from yggdrasil.loki.engines import ClaudeEngine, DatabricksServingEngine, OpenAIEngine
+from yggdrasil.loki.engines import (
+    ClaudeEngine,
+    DatabricksServingEngine,
+    OllamaEngine,
+    OpenAIEngine,
+    TransformersEngine,
+)
 
 
 class TestEngineContract(unittest.TestCase):
@@ -271,6 +279,177 @@ class TestDatabricksServingEngine(unittest.TestCase):
         eng = DatabricksServingEngine(client=client, endpoint="ep")
         self.assertEqual(eng.generate("hi"), "served")
         self.assertEqual(oai.chat.completions.create.call_args.kwargs["model"], "ep")
+
+
+class TestTransformersEngine(unittest.TestCase):
+    """The local HuggingFace engine — open models on this workstation, free."""
+
+    def setUp(self):
+        TransformersEngine._PIPES.clear()  # don't leak a pipeline across tests
+
+    def test_is_local_and_free(self):
+        self.assertTrue(TransformersEngine.local)
+        from yggdrasil.loki.usage import price_for
+
+        p = price_for("transformers", "Qwen/Qwen2.5-0.5B-Instruct")
+        self.assertEqual((p.input_usd_per_mtok, p.output_usd_per_mtok), (0.0, 0.0))
+
+    def test_available_requires_transformers_and_torch(self):
+        with patch("importlib.util.find_spec", return_value=object()):
+            self.assertTrue(TransformersEngine().available())
+        with patch("importlib.util.find_spec", return_value=None):
+            self.assertFalse(TransformersEngine().available())
+
+    def test_adaptive_tier_picks_small_then_large(self):
+        eng = TransformersEngine()
+        self.assertEqual(eng.resolve_model(tier="fast"), "Qwen/Qwen2.5-0.5B-Instruct")
+        self.assertEqual(eng.resolve_model(tier="deep"), "Qwen/Qwen2.5-1.5B-Instruct")
+
+    def test_complete_runs_pipeline_and_records_usage(self):
+        from yggdrasil.loki.usage import METER
+
+        calls = {}
+
+        def pipe(chat, **kw):
+            calls["chat"] = chat
+            calls["kw"] = kw
+            return [{"generated_text": [{"role": "assistant", "content": "local reply"}]}]
+
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(return_value=pipe)
+        METER.reset()
+        with patch.dict(sys.modules, {"transformers": fake}):
+            out = TransformersEngine(model="m").generate("hi", system="sys")
+        self.assertEqual(out, "local reply")
+        # System prompt leads the chat; new-token cap kept small for CPU.
+        self.assertEqual(calls["chat"][0], {"role": "system", "content": "sys"})
+        self.assertEqual(calls["kw"]["max_new_tokens"], 512)
+        self.assertEqual(METER.rows_for("transformers")[0].calls, 1)
+        self.assertEqual(METER.total_cost, 0.0)  # local is free
+
+    @unittest.skipUnless(
+        os.getenv("YGG_LOKI_TEST_LOCAL") == "1",
+        "set YGG_LOKI_TEST_LOCAL=1 to run the real (downloads a small model) test",
+    )
+    def test_real_small_model_replies(self):
+        eng = TransformersEngine(tier="fast")
+        if not eng.available():
+            self.skipTest("transformers/torch not installed")
+        out = eng.generate("Reply with the single word: ping", system="Be terse.")
+        self.assertIsInstance(out, str)
+        self.assertTrue(out.strip())
+
+
+class TestOllamaEngine(unittest.TestCase):
+    """The local Ollama engine — a model served on this machine, free."""
+
+    def test_is_local_and_free(self):
+        self.assertTrue(OllamaEngine.local)
+        from yggdrasil.loki.usage import price_for
+
+        p = price_for("ollama", "llama3.2")
+        self.assertEqual((p.input_usd_per_mtok, p.output_usd_per_mtok), (0.0, 0.0))
+
+    def test_host_from_env(self):
+        with patch.dict(os.environ, {"OLLAMA_HOST": "http://box:1234/"}):
+            self.assertEqual(OllamaEngine().host, "http://box:1234")
+
+    def test_available_pings_tags(self):
+        eng = OllamaEngine()
+        ok = MagicMock(); ok.status = 200
+        ok.__enter__ = lambda s: s; ok.__exit__ = lambda s, *a: False
+        with patch("urllib.request.urlopen", return_value=ok):
+            self.assertTrue(eng.available())
+        with patch("urllib.request.urlopen", side_effect=OSError("refused")):
+            self.assertFalse(eng.available())
+
+    def test_complete_posts_chat_and_records_provider_tokens(self):
+        from yggdrasil.loki.usage import METER
+
+        payload = json.dumps({
+            "message": {"role": "assistant", "content": "ollama reply"},
+            "prompt_eval_count": 11, "eval_count": 4,
+        }).encode()
+        resp = MagicMock()
+        resp.read.return_value = payload
+        resp.__enter__ = lambda s: s; resp.__exit__ = lambda s, *a: False
+        METER.reset()
+        with patch("urllib.request.urlopen", return_value=resp) as urlopen:
+            out = OllamaEngine(model="llama3.2").generate("hi", system="sys")
+        self.assertEqual(out, "ollama reply")
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(sent["messages"][0], {"role": "system", "content": "sys"})
+        self.assertFalse(sent["stream"])
+        row = METER.rows_for("ollama")[0]
+        self.assertEqual((row.input_tokens, row.output_tokens), (11, 4))
+        self.assertEqual(METER.total_cost, 0.0)  # local is free
+
+    @unittest.skipUnless(
+        os.getenv("YGG_LOKI_TEST_LOCAL") == "1",
+        "set YGG_LOKI_TEST_LOCAL=1 (and run a local ollama) for the real test",
+    )
+    def test_real_local_server(self):
+        eng = OllamaEngine()
+        if not eng.available():
+            self.skipTest("no local ollama server reachable")
+        self.assertTrue(eng.generate("Reply with one word: ping").strip())
+
+
+class TestResourceAwareSelection(unittest.TestCase):
+    """``Loki.select`` weighs task complexity against workstation resources."""
+
+    @staticmethod
+    def _eng(name, local, available=True):
+        e = MagicMock(spec=["name", "local", "available"])
+        e.name = name
+        e.local = local
+        e.available.return_value = available
+        return e
+
+    def _select(self, engines, *, cpu, ram_gb, gpu=False, **kw):
+        loki = Loki()
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(is_available=lambda: gpu)
+        sysconf = {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": int(ram_gb * 1e9 / 4096)}
+        with patch.object(Loki, "_engine_instances", return_value=engines), \
+             patch.dict(sys.modules, {"torch": fake_torch}), \
+             patch("os.cpu_count", return_value=cpu), \
+             patch("os.sysconf", side_effect=lambda n: sysconf[n]):
+            return loki.select(**kw)
+
+    def test_simple_on_capable_box_goes_local(self):
+        engines = {"claude": self._eng("claude", False),
+                   "ollama": self._eng("ollama", True)}
+        chosen = self._select(engines, cpu=8, ram_gb=16, text="hi there")
+        self.assertEqual(chosen.name, "ollama")
+
+    def test_complex_goes_remote_even_on_capable_box(self):
+        engines = {"claude": self._eng("claude", False),
+                   "ollama": self._eng("ollama", True)}
+        chosen = self._select(engines, cpu=8, ram_gb=16, text="refactor the planner")
+        self.assertEqual(chosen.name, "claude")
+
+    def test_forced_deep_tier_goes_remote(self):
+        engines = {"claude": self._eng("claude", False),
+                   "ollama": self._eng("ollama", True)}
+        chosen = self._select(engines, cpu=8, ram_gb=16, text="hi", tier="deep")
+        self.assertEqual(chosen.name, "claude")
+
+    def test_thin_box_goes_remote_for_simple_work(self):
+        engines = {"claude": self._eng("claude", False),
+                   "ollama": self._eng("ollama", True)}
+        chosen = self._select(engines, cpu=2, ram_gb=2, text="hi")
+        self.assertEqual(chosen.name, "claude")
+
+    def test_no_remote_falls_back_to_local(self):
+        engines = {"claude": self._eng("claude", False, available=False),
+                   "ollama": self._eng("ollama", True)}
+        chosen = self._select(engines, cpu=2, ram_gb=2, text="refactor everything")
+        self.assertEqual(chosen.name, "ollama")
+
+    def test_nothing_available_returns_none(self):
+        engines = {"claude": self._eng("claude", False, available=False)}
+        self.assertIsNone(self._select(engines, cpu=8, ram_gb=16, text="hi"))
 
 
 class TestEngineSelection(unittest.TestCase):

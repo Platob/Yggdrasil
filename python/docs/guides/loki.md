@@ -161,13 +161,23 @@ with `loki.run("web", url=…)` / `web.read_json(url)`.
 ## Reasoning engines (`TokenEngine`)
 
 A `TokenEngine` is the LLM contract Loki reasons on — the seam between the
-agent and whatever model backs it. Three are built in:
+agent and whatever model backs it. Engines are either **remote** (hosted
+APIs — capable and metered) or **local** (run on this workstation — free,
+private, but bounded by the machine; `TokenEngine.local` says which). Five
+are built in:
 
-| Engine | Backend | Credentials |
-|---|---|---|
-| `ClaudeEngine` | Anthropic Messages API (Haiku ↔ Opus, adaptive) | `ANTHROPIC_API_KEY`, **or** a Claude Code OAuth login (no key) |
-| `OpenAIEngine` | OpenAI Chat Completions (mini ↔ 4o, adaptive) | `OPENAI_API_KEY` |
-| `DatabricksServingEngine` | a Databricks serving endpoint | the Databricks session (no extra key) |
+| Engine | Local? | Backend | Credentials / requirements |
+|---|---|---|---|
+| `ClaudeEngine` | remote | Anthropic Messages API (Haiku ↔ Opus, adaptive) | `ANTHROPIC_API_KEY`, **or** a Claude Code OAuth login (no key) |
+| `OpenAIEngine` | remote | OpenAI Chat Completions (mini ↔ 4o, adaptive) | `OPENAI_API_KEY` |
+| `DatabricksServingEngine` | remote | a Databricks serving endpoint | the Databricks session (no extra key) |
+| `TransformersEngine` | **local** | an open HuggingFace model via the `transformers` text-generation pipeline (Qwen2.5 0.5B ↔ 1.5B by default) | `transformers` + `torch` installed; `YGG_LOKI_HF_MODEL` / `YGG_LOKI_HF_DEVICE` override |
+| `OllamaEngine` | **local** | a model served by a local [Ollama](https://ollama.com) server (`llama3.2:1b` ↔ `llama3.2`) | a running Ollama server (`OLLAMA_HOST`, default `localhost:11434`); `YGG_LOKI_OLLAMA_MODEL` override |
+
+Local engines are **free** (priced at `$0` in the token meter) and keep data
+on the box; pick them up by `ollama pull <model>` or installing
+`transformers`+`torch`. They're chosen automatically for simple work when the
+workstation can run them — see *Resource-aware local vs remote* below.
 
 ### Reasoning with Claude **without an API key**
 
@@ -188,15 +198,40 @@ loki.act("refactor utils.py", root=".")   # the agent loop, reasoning keyless
 ```
 
 ```python
-loki.engines()                       # all three, call .available() to filter
+loki.engines()                       # all five, call .available() to filter
 loki.engine()                        # the best available (preference order)
 loki.engine("claude")                # a specific one
+loki.select("classify this ticket")  # resource-aware local-vs-remote choice
 loki.reason("summarize today's failed jobs", system="be terse")
 ```
 
-`Loki.ENGINE_PREFERENCE` picks the engine when none is named (`claude` →
-`openai` → `databricks` for the global agent). Implement `TokenEngine` to
-add another backend.
+`Loki.ENGINE_PREFERENCE` picks the engine when one is named or as the
+fallback order — capable remote APIs first, then the free local engines
+(`claude` → `openai` → `databricks` → `ollama` → `transformers` for the
+global agent). Implement `TokenEngine` to add another backend.
+
+### Resource-aware local vs remote
+
+When no engine is named, `reason` / `reason_stream` / `act` route through
+`Loki.select`, which weighs **task complexity** against **workstation
+resources**:
+
+- *Complexity* comes from an explicit `tier` (`deep` → complex) or, failing
+  that, the prompt itself — long or reasoning-heavy text (the same signals
+  that drive adaptive tiers) counts as complex.
+- *Resources* are probed inline: a CUDA GPU (`torch.cuda.is_available()`), or
+  enough CPU + RAM (≥ 4 cores and ≥ 8 GB).
+
+Simple work on a capable box stays **local** (free, private); complex work,
+or a thin machine, goes to the best available **remote** API. Either way it
+falls back when one side is unreachable — local-only when no API is
+configured, remote-only when no local engine is installed.
+
+```python
+loki.select("hi there")                  # simple + capable box → ollama (local)
+loki.select("refactor the planner")      # reasoning-heavy → claude (remote)
+loki.select("anything", tier="deep")     # forced complex → remote
+```
 
 ### Adaptive model selection (the default)
 
@@ -212,6 +247,8 @@ turns cheap without ever capping the hard ones.
 | `ClaudeEngine` | `claude-haiku-4-5` | `claude-opus-4-8` |
 | `OpenAIEngine` | `gpt-4o-mini` | `gpt-4o` |
 | `DatabricksServingEngine` | (pinned to one workspace endpoint — no fast/deep pair) | — |
+| `TransformersEngine` | `Qwen/Qwen2.5-0.5B-Instruct` | `Qwen/Qwen2.5-1.5B-Instruct` |
+| `OllamaEngine` | `llama3.2:1b` | `llama3.2` |
 
 Adaptivity is only the **default**, never an override of an explicit
 decision:

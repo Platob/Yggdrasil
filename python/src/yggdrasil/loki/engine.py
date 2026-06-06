@@ -58,8 +58,12 @@ class Completion:
 class TokenEngine(ABC):
     """A pluggable LLM backend Loki reasons with."""
 
-    #: Engine name (``"openai"`` / ``"claude"`` / ``"databricks"``).
+    #: Engine name (``"openai"`` / ``"claude"`` / ``"databricks"`` / …).
     name: ClassVar[str]
+    #: True when the model runs **on this workstation** (HF transformers, a
+    #: local Ollama server) — free and private, but bounded by local resources.
+    #: False for hosted/remote APIs (Claude, OpenAI, Databricks serving).
+    local: ClassVar[bool] = False
     #: The model shown / used when nothing adapts — the engine's capable tier.
     default_model: ClassVar[Optional[str]] = None
     #: Tier → model id, fast → capable. Adaptive selection picks among these

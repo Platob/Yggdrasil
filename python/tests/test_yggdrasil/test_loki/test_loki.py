@@ -195,6 +195,7 @@ class TestAgentAct(unittest.TestCase):
         loki._backends = [Backend("local", True)]
         eng = _ScriptedEngine(replies)
         loki.engine = lambda name=None: eng  # force our scripted brain
+        loki.select = lambda text=None, *, tier=None: eng  # …on the auto path too
         return loki, eng
 
     def test_act_writes_a_file_and_reports_change(self):
@@ -277,7 +278,7 @@ class TestAgentAct(unittest.TestCase):
     def test_act_without_engine_raises(self):
         loki = Loki()
         loki._backends = [Backend("local", True)]
-        loki.engine = lambda name=None: None
+        loki.select = lambda text=None, *, tier=None: None
         with self.assertRaises(RuntimeError):
             loki.act("anything", root=self.dir)
 
@@ -287,13 +288,13 @@ class TestAgentAct(unittest.TestCase):
         eng = _ScriptedEngine([""])
         eng.stream = lambda messages, **k: iter(["A", "B", "C"])
         eng.generate_stream = lambda prompt, **k: eng.stream([], **k)
-        loki.engine = lambda name=None: eng
+        loki.select = lambda text=None, *, tier=None: eng
         self.assertEqual("".join(loki.reason_stream("hi")), "ABC")
 
     def test_reason_stream_without_engine_raises(self):
         loki = Loki()
         loki._backends = [Backend("local", True)]
-        loki.engine = lambda name=None: None
+        loki.select = lambda text=None, *, tier=None: None
         with self.assertRaises(RuntimeError):
             list(loki.reason_stream("x"))
 
