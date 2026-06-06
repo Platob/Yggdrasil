@@ -841,5 +841,5 @@ There are two surfaces in the tree:
 ## See also
 
 - [Databricks (Python API)](databricks.md) — the service layer this CLI drives.
-- [`ygg` node CLI](node.md) — node lifecycle and execution.
+- [Loki agent](loki.md) — the global yggdrasil agent.
 - [databricks/job](../modules/databricks/job/README.md), [databricks/fs](../modules/databricks/fs/README.md), [databricks/compute](../modules/databricks/compute/README.md), [databricks/warehouse](../modules/databricks/warehouse/README.md).

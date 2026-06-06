@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from yggdrasil.loki import Loki
 from yggdrasil.loki.behavior import REGISTRY, LokiBehavior, register
-from yggdrasil.loki.capability import Backend, detect_node
+from yggdrasil.loki.capability import Backend
 
 
 class _Dummy(LokiBehavior):
@@ -97,17 +97,6 @@ class TestAgent(unittest.TestCase):
         self.assertIn("backends", card)
         self.assertIn("behaviors", card)
         self.assertIn("token", card)
-
-
-class TestCapabilityDetection(unittest.TestCase):
-    def test_detect_node_unset_env_does_not_pick_cwd(self):
-        # An empty/unset YGG_NODE_HOME must not resolve to the current dir.
-        with patch.dict("os.environ", {}, clear=False):
-            import os
-            os.environ.pop("YGG_NODE_HOME", None)
-            backend = detect_node()
-        self.assertEqual(backend.name, "node")
-        self.assertNotEqual(backend.detail["home"], ".")
 
 
 class TestGenieBehavior(unittest.TestCase):

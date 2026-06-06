@@ -101,14 +101,6 @@ api = [
   "httpx",
 ]
 
-node = [
-  "fastapi",
-  "uvicorn",
-  "pydantic>=2.10",
-  "psutil>=5.9",
-  "httpx",
-]
-
 mongoengine = [
   "mongoengine>=0.29",
 ]

@@ -315,7 +315,7 @@ _LEVEL_STYLE: "dict[int, tuple[str, str]]" = {
 class LogFormatter(logging.Formatter):
     """Format log records in the ygg CLI look::
 
-        12:34:56  ●  yggdrasil.node.server  starting on :8100
+        12:34:56  ●  yggdrasil.databricks.cli  seeding workspace
 
     A dim clock, a level-colored glyph, the muted logger name, then the
     message — mirroring :func:`event`. Honors the module's color gate

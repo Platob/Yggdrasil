@@ -14,7 +14,7 @@ import pathlib
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["Backend", "detect", "detect_databricks", "detect_node", "detect_local"]
+__all__ = ["Backend", "detect", "detect_databricks", "detect_local"]
 
 
 @dataclass
@@ -78,14 +78,6 @@ def _has_remembered_session(home: pathlib.Path) -> bool:
         return False
 
 
-def detect_node() -> Backend:
-    """Detect a configured yggdrasil node home (offline)."""
-    env = os.getenv("YGG_NODE_HOME")
-    node_home = pathlib.Path(env) if env else (pathlib.Path.home() / ".node")
-    configured = node_home.is_dir()
-    return Backend("node", available=configured, detail={"home": str(node_home)})
-
-
 def detect_local() -> Backend:
     """The local machine — always available."""
     import getpass
@@ -107,4 +99,4 @@ def _safe(fn) -> str:
 
 def detect() -> list[Backend]:
     """Every backend Loki can see from here, in priority order."""
-    return [detect_databricks(), detect_node(), detect_local()]
+    return [detect_databricks(), detect_local()]
