@@ -129,9 +129,27 @@ agent and whatever model backs it. Three are built in:
 
 | Engine | Backend | Credentials |
 |---|---|---|
-| `ClaudeEngine` | Anthropic Messages API (`claude-opus-4-8`) | `ANTHROPIC_API_KEY` |
+| `ClaudeEngine` | Anthropic Messages API (`claude-opus-4-8`) | `ANTHROPIC_API_KEY`, **or** a Claude Code OAuth login (no key) |
 | `OpenAIEngine` | OpenAI Chat Completions | `OPENAI_API_KEY` |
 | `DatabricksServingEngine` | a Databricks serving endpoint | the Databricks session (no extra key) |
+
+### Reasoning with Claude **without an API key**
+
+`ClaudeEngine` can authenticate with the same OAuth / subscription token
+Claude Code itself logs in with — so on a machine where you're signed into
+Claude Code, Loki reasons through Claude with **no separate billed API
+key**, which is the cheap path for local testing. It resolves the token, in
+order, from `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, or the Claude
+Code credentials file (`~/.claude/.credentials.json` → `claudeAiOauth`). A
+real `ANTHROPIC_API_KEY` still wins when both are present. The OAuth request
+carries the `oauth-2025-04-20` beta header and leads its system prompt with
+the Claude Code identity the grant is scoped to.
+
+```python
+ClaudeEngine().available()    # True on a logged-in Claude Code box, no key set
+ClaudeEngine().uses_oauth     # True when it will use the subscription token
+loki.act("refactor utils.py", root=".")   # the agent loop, reasoning keyless
+```
 
 ```python
 loki.engines()                       # all three, call .available() to filter

@@ -46,24 +46,101 @@ class TestOpenAIEngine(unittest.TestCase):
         self.assertEqual(sent[0], {"role": "system", "content": "sys"})
 
 
+def _fake_anthropic(text: str = "claude says hi"):
+    """A stand-in ``anthropic`` module whose client returns *text*."""
+    fake = types.ModuleType("anthropic")
+    client = MagicMock()
+    block = MagicMock(); block.type = "text"; block.text = text
+    client.messages.create.return_value = MagicMock(
+        content=[block], model="claude-opus-4-8", usage=None,
+    )
+    fake.Anthropic = MagicMock(return_value=client)
+    return fake, client
+
+
 class TestClaudeEngine(unittest.TestCase):
+    _CRED_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+
+    def setUp(self):
+        import os
+
+        # Isolate credential resolution from the host environment / creds file.
+        self._saved = {k: os.environ.pop(k, None) for k in self._CRED_VARS}
+        self._nofile = patch(
+            "yggdrasil.loki.engines.claude_engine._oauth_token_from_file",
+            return_value=None,
+        )
+        self._nofile.start()
+
+    def tearDown(self):
+        import os
+
+        self._nofile.stop()
+        for k, v in self._saved.items():
+            if v is not None:
+                os.environ[k] = v
+
     def test_default_model_is_current_opus(self):
         self.assertEqual(ClaudeEngine().default_model, "claude-opus-4-8")
 
     def test_complete_passes_system_separately(self):
-        fake = types.ModuleType("anthropic")
-        client = MagicMock()
-        block = MagicMock(); block.type = "text"; block.text = "claude says hi"
-        client.messages.create.return_value = MagicMock(
-            content=[block], model="claude-opus-4-8", usage=None,
-        )
-        fake.Anthropic = MagicMock(return_value=client)
+        fake, client = _fake_anthropic()
         with patch.dict(sys.modules, {"anthropic": fake}):
             out = ClaudeEngine(api_key="k").generate("q", system="be terse")
         self.assertEqual(out, "claude says hi")
         kwargs = client.messages.create.call_args.kwargs
         self.assertEqual(kwargs["system"], "be terse")
         self.assertNotIn("system", [m["role"] for m in kwargs["messages"]])
+        # API-key path uses x-api-key, not bearer/OAuth.
+        self.assertEqual(fake.Anthropic.call_args.kwargs.get("api_key"), "k")
+        self.assertNotIn("auth_token", fake.Anthropic.call_args.kwargs)
+
+    # -- keyless OAuth / subscription auth ---------------------------------
+
+    def test_unavailable_without_any_credential(self):
+        self.assertFalse(ClaudeEngine().available())
+
+    def test_available_with_only_oauth_token(self):
+        eng = ClaudeEngine(auth_token="sk-ant-oat01-x")
+        self.assertTrue(eng.available())
+        self.assertTrue(eng.uses_oauth)
+
+    def test_api_key_takes_precedence_over_oauth(self):
+        eng = ClaudeEngine(api_key="k", auth_token="oat")
+        self.assertFalse(eng.uses_oauth)
+
+    def test_oauth_token_resolved_from_env(self):
+        import os
+
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "sk-ant-oat01-env"
+        try:
+            self.assertEqual(ClaudeEngine().auth_token, "sk-ant-oat01-env")
+        finally:
+            os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+
+    def test_oauth_token_resolved_from_credentials_file(self):
+        with patch(
+            "yggdrasil.loki.engines.claude_engine._oauth_token_from_file",
+            return_value="sk-ant-oat01-file",
+        ):
+            self.assertEqual(ClaudeEngine().auth_token, "sk-ant-oat01-file")
+
+    def test_oauth_complete_sends_bearer_and_identity(self):
+        fake, client = _fake_anthropic("via subscription")
+        with patch.dict(sys.modules, {"anthropic": fake}):
+            out = ClaudeEngine(auth_token="sk-ant-oat01-x").generate(
+                "q", system="be terse"
+            )
+        self.assertEqual(out, "via subscription")
+        # Bearer token (no api_key) + the OAuth beta header.
+        ctor = fake.Anthropic.call_args.kwargs
+        self.assertEqual(ctor.get("auth_token"), "sk-ant-oat01-x")
+        self.assertNotIn("api_key", ctor)
+        self.assertEqual(ctor["default_headers"]["anthropic-beta"], "oauth-2025-04-20")
+        # System prompt leads with the Claude Code identity, caller's follows.
+        system = client.messages.create.call_args.kwargs["system"]
+        self.assertEqual(system[0]["text"], "You are Claude Code, Anthropic's official CLI for Claude.")
+        self.assertEqual(system[1]["text"], "be terse")
 
 
 class TestDatabricksServingEngine(unittest.TestCase):

@@ -133,7 +133,7 @@ def _engines(loki: Any, style: Any) -> int:
         star = style.dim(" (default)") if best is not None and eng.name == best.name else ""
         style.out(f"  {glyph} {style.bold(eng.name)}  {style.dim(str(eng.model))}{star}\n")
     if best is None:
-        style.warn("no engine available — set ANTHROPIC_API_KEY / OPENAI_API_KEY or run with a Databricks session")
+        style.warn("no engine available — log into Claude Code, or set ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a Databricks session")
     return 0
 
 

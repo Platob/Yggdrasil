@@ -1,12 +1,48 @@
-"""Anthropic (Claude) -backed :class:`TokenEngine`."""
+"""Anthropic (Claude) -backed :class:`TokenEngine`.
+
+Two ways to authenticate, resolved in this order:
+
+1. **API key** — ``ANTHROPIC_API_KEY`` (or ``api_key=``). Billed per token.
+2. **OAuth / subscription token** — the credential Claude Code itself logs in
+   with, so Loki can reason **without a separate billed API key** when run on
+   a machine where you're signed into Claude Code. Taken from
+   ``ANTHROPIC_AUTH_TOKEN`` / ``CLAUDE_CODE_OAUTH_TOKEN``, or the Claude Code
+   credentials file (``~/.claude/.credentials.json`` → ``claudeAiOauth``).
+   The SDK sends it as a bearer token; the request carries the OAuth beta
+   header and the Claude Code system identity the grant is scoped to.
+
+An API key wins when both are present. ``available()`` is true when *either*
+is resolvable, so ``ygg loki`` lights up Claude on a logged-in Claude Code
+box with no extra configuration.
+"""
 from __future__ import annotations
 
+import json
 import os
+import pathlib
 from typing import Any, ClassVar, Optional
 
 from ..engine import DEFAULT_MAX_TOKENS, Completion, TokenEngine
 
 __all__ = ["ClaudeEngine"]
+
+#: Beta header that opts a request into OAuth (subscription) authentication.
+OAUTH_BETA = "oauth-2025-04-20"
+#: The system identity a Claude Code OAuth grant is scoped to — required as the
+#: first system block when authenticating with a subscription token.
+CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def _oauth_token_from_file() -> Optional[str]:
+    """The Claude Code OAuth access token from its credentials file, if any."""
+    path = pathlib.Path.home() / ".claude" / ".credentials.json"
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    return token or None
 
 
 class ClaudeEngine(TokenEngine):
@@ -16,12 +52,30 @@ class ClaudeEngine(TokenEngine):
     #: The most capable current Claude model (see the claude-api reference).
     default_model: ClassVar[str] = "claude-opus-4-8"
 
-    def __init__(self, *, model: Optional[str] = None, api_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        *,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        auth_token: Optional[str] = None,
+    ) -> None:
         super().__init__(model=model)
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        # OAuth / subscription token: explicit arg → env → Claude Code creds file.
+        self.auth_token = (
+            auth_token
+            or os.getenv("ANTHROPIC_AUTH_TOKEN")
+            or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
+            or _oauth_token_from_file()
+        )
+
+    @property
+    def uses_oauth(self) -> bool:
+        """True when this engine will authenticate with a subscription token."""
+        return not self.api_key and bool(self.auth_token)
 
     def available(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.api_key or self.auth_token)
 
     def complete(
         self,
@@ -39,10 +93,25 @@ class ClaudeEngine(TokenEngine):
             "max_tokens": max_tokens,
             "messages": list(messages),
         }
-        if system:
-            kwargs["system"] = system
+        if self.api_key:
+            client = anthropic.Anthropic(api_key=self.api_key)
+            if system:
+                kwargs["system"] = system
+        else:
+            # Subscription auth: bearer token + the OAuth beta header. The
+            # grant is scoped to Claude Code, so its identity must lead the
+            # system prompt; the caller's own system instruction follows it.
+            client = anthropic.Anthropic(
+                auth_token=self.auth_token,
+                default_headers={"anthropic-beta": OAUTH_BETA},
+            )
+            system_blocks = [{"type": "text", "text": CLAUDE_CODE_IDENTITY}]
+            if system:
+                system_blocks.append({"type": "text", "text": system})
+            kwargs["system"] = system_blocks
         kwargs.update(options)
-        resp = anthropic.Anthropic(api_key=self.api_key).messages.create(**kwargs)
+
+        resp = client.messages.create(**kwargs)
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
         usage = getattr(resp, "usage", None)
         return Completion(

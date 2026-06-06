@@ -167,8 +167,9 @@ class Loki:
         eng = self.engine(engine)
         if eng is None or not eng.available():
             raise RuntimeError(
-                "no reasoning engine available — set ANTHROPIC_API_KEY / "
-                "OPENAI_API_KEY, or run with a Databricks session"
+                "no reasoning engine available — log into Claude Code, or set "
+                "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a "
+                "Databricks session"
             )
         return eng.generate(prompt, system=system, **options)
 
@@ -205,8 +206,9 @@ class Loki:
         eng = self.engine(engine)
         if eng is None or not eng.available():
             raise RuntimeError(
-                "no reasoning engine available — set ANTHROPIC_API_KEY / "
-                "OPENAI_API_KEY, or run with a Databricks session"
+                "no reasoning engine available — log into Claude Code, or set "
+                "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a "
+                "Databricks session"
             )
         box = toolbox or filesystem_toolbox(
             root, read_only=read_only, allow_shell=allow_shell
