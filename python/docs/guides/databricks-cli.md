@@ -725,8 +725,10 @@ working directory), then:
 
 1. builds the **project's own wheel** from its source tree (`uv build --wheel`),
 2. writes a serverless **base environment** + classic-cluster **requirements**
-   named for the project — `<name>-<version>`, where `<name>` is the
-   `[project].name` from the `pyproject.toml`,
+   named for the project — `<name>`, the `[project].name` from the
+   `pyproject.toml` (version-free, so redeploys upsert one stable environment
+   rather than orphaning a version-suffixed copy each bump; the version stays in
+   the wheel filename and the dependency list),
 3. get-or-creates a **default single-user cluster** named for the project that
    installs the project's dependencies (the requirements file from step 2).
 

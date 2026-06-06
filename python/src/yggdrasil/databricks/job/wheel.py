@@ -1218,8 +1218,8 @@ def ensure_project_environment(
 ) -> dict[str, Any]:
     """Discover a project's ``pyproject.toml``, build its wheel, and write a
     serverless **base environment** + classic-cluster **requirements** named for
-    the project (``<name>-<version>``) — the user-project counterpart of
-    :func:`ensure_environment`.
+    the project (``<name>`` — version-free, so redeploys upsert one stable
+    environment) — the user-project counterpart of :func:`ensure_environment`.
 
     The environment's dependency list is the **project wheel** plus the
     project's own ``[project].dependencies`` (and any requested *extras*' deps).
@@ -1250,7 +1250,12 @@ def ensure_project_environment(
     meta = read_pyproject(find_pyproject(pyproject))
     name, version = meta["name"], meta["version"]
     proj = _norm(name)
-    env_name = f"{proj}-{_norm_version(version)}"
+    # The environment is named for the project alone — not the version. The
+    # version lives in the wheel filename and the dependency list; baking it into
+    # the env name would spawn a fresh env dir + config files on every version
+    # bump (and orphan the old ones), breaking the upsert-by-default contract and
+    # diverging from the cluster, which is already named for the project alone.
+    env_name = proj
     env_dir = f"{workspace_dir.rstrip('/')}/{env_name}"
 
     # The project's declared deps, with any requested extras flattened in.

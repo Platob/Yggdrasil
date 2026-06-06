@@ -95,7 +95,7 @@ def test_non_bundle_lists_wheel_then_index_deps(tmp_path):
         info = W.ensure_project_environment(client, tmp_path, extras=("extra",))
 
     assert info["name"] == "demo"
-    assert info["env_name"] == "demo-0-1-0"
+    assert info["env_name"] == "demo"          # version-free: named for the project alone
     assert info["mode"] == "AUTO"
     assert info["dependencies"] == [
         "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl", "polars", "httpx",
@@ -113,8 +113,8 @@ def test_bundle_downloads_and_lists_wheels(tmp_path):
     )
     client = MagicMock()
     uploads = iter([
-        "/env/demo-0-1-0/binaries/demo/demo-0.1.0-py3-none-any.whl",
-        "/env/demo-0-1-0/binaries/polars/polars-1.0-cp312.whl",
+        "/env/demo/binaries/demo/demo-0.1.0-py3-none-any.whl",
+        "/env/demo/binaries/polars/polars-1.0-cp312.whl",
     ])
     with patch("yggdrasil.databricks.path.DatabricksPath", _fake_dbpath(exists=False)), \
          patch.object(W, "build_project_wheel",
@@ -128,8 +128,8 @@ def test_bundle_downloads_and_lists_wheels(tmp_path):
 
     dl.assert_called_once()
     assert info["dependencies"] == [
-        "/env/demo-0-1-0/binaries/demo/demo-0.1.0-py3-none-any.whl",
-        "/env/demo-0-1-0/binaries/polars/polars-1.0-cp312.whl",
+        "/env/demo/binaries/demo/demo-0.1.0-py3-none-any.whl",
+        "/env/demo/binaries/polars/polars-1.0-cp312.whl",
     ]
 
 
@@ -191,5 +191,5 @@ def test_append_writes_env_files_only_when_missing(tmp_path):
         info = W.ensure_project_environment(client, tmp_path, mode=Mode.APPEND)
     named.assert_not_called()                         # yml exists → left alone
     req.assert_called_once()                          # requirements missing → written
-    assert info["serverless"].endswith("demo-0-1-0.yml")   # reported existing path
+    assert info["serverless"].endswith("demo.yml")   # reported existing path
     assert info["mode"] == "APPEND"

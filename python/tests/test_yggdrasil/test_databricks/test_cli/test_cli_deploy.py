@@ -94,11 +94,11 @@ class TestDeployProject(unittest.TestCase):
     def _info(self):
         return {
             "name": "myproj", "version": "0.1.0",
-            "env_name": "myproj-0-1-0", "env_dir": "/Workspace/Shared/environments/myproj-0-1-0",
+            "env_name": "myproj", "env_dir": "/Workspace/Shared/environments/myproj",
             "dependencies": ["/Workspace/Shared/pypi/myproj/myproj-0.1.0-py3-none-any.whl", "polars"],
             "n_wheels": 2,
-            "serverless": "/Workspace/Shared/environments/myproj-0-1-0/myproj-0-1-0.yml",
-            "cluster": "/Workspace/Shared/environments/myproj-0-1-0/myproj-0-1-0.requirements.txt",
+            "serverless": "/Workspace/Shared/environments/myproj/myproj.yml",
+            "cluster": "/Workspace/Shared/environments/myproj/myproj.requirements.txt",
             "requires_python": ">=3.10",
         }
 
@@ -122,7 +122,7 @@ class TestDeployProject(unittest.TestCase):
         self.assertEqual(create.call_args.kwargs["single_user_name"], "me@co.com")
         self.assertEqual(
             create.call_args.kwargs["environment"],
-            "/Workspace/Shared/environments/myproj-0-1-0/myproj-0-1-0.requirements.txt",
+            "/Workspace/Shared/environments/myproj/myproj.requirements.txt",
         )
 
     def test_project_no_cluster_skips_cluster_creation(self):

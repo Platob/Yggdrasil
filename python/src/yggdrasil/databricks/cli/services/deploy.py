@@ -17,7 +17,8 @@ the **live** package on disk, uploads it into the workspace's PyPI-like registry
 
 ``project`` discovers the nearest ``pyproject.toml`` (from *path* or the cwd),
 builds the **project's own wheel**, writes a serverless base environment +
-classic-cluster requirements named for the project (``<name>-<version>``), and
+classic-cluster requirements named for the project (``<name>``; the version
+stays in the wheel, so redeploys upsert one stable environment), and
 get-or-creates a default single-user cluster that installs the project's
 dependencies — so a user's project runs on Databricks with one command.
 ``--mode`` sets the idempotency policy: ``overwrite`` (rebuild + update all),
