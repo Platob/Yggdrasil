@@ -105,7 +105,7 @@ docs/                   mkdocs (Material) — guides + auto-generated API refere
 ## CLI
 
 `ygg databricks` — Databricks management CLI (configure, seed, deploy, sql, jobs, fs, …)
-`ygg loki` — global yggdrasil agent (status / capabilities / behaviors / token / run)
+`ygg loki` — global yggdrasil agent (status / capabilities / behaviors / engines / tools / reason / do / token / run)
 
 ## Environment
 

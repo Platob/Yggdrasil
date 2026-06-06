@@ -39,6 +39,7 @@ from .api import (
 )
 from .base import YGGException
 from .cast import CastError
+from .loki import LokiError, TokenBudgetExceeded
 from .http import (
     AuthRequiredError,
     BadGatewayError,
@@ -101,6 +102,8 @@ __all__ = [
     "register_api_exception_handlers",
     # Cast
     "CastError",
+    "LokiError",
+    "TokenBudgetExceeded",
     # HTTP — base
     "HTTPError",
     # HTTP — request-bound

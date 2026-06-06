@@ -14,7 +14,7 @@ import pathlib
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["Backend", "detect", "detect_databricks", "detect_local"]
+__all__ = ["Backend", "detect", "detect_databricks", "detect_aws", "detect_local"]
 
 
 @dataclass
@@ -78,6 +78,35 @@ def _has_remembered_session(home: pathlib.Path) -> bool:
         return False
 
 
+def detect_aws() -> Backend:
+    """Detect a usable AWS session **without** a network round-trip.
+
+    Looks for the signals that mean "boto3 can resolve credentials": the
+    ``AWS_*`` env vars, an ``AWS_PROFILE``, a web-identity token (IRSA), or a
+    ``~/.aws`` config/credentials file. Offline only — never calls STS, so it
+    never blocks or raises.
+    """
+    home = pathlib.Path.home()
+    signals = {
+        "env_key": bool(os.getenv("AWS_ACCESS_KEY_ID")),
+        "env_profile": bool(os.getenv("AWS_PROFILE")),
+        "env_region": bool(os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")),
+        "web_identity": bool(os.getenv("AWS_WEB_IDENTITY_TOKEN_FILE")),
+        "config": (home / ".aws" / "credentials").exists() or (home / ".aws" / "config").exists(),
+    }
+    if not any(signals.values()):
+        return Backend("aws", available=False, detail={"signals": signals})
+    return Backend(
+        "aws",
+        available=True,
+        detail={
+            "signals": signals,
+            "region": os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
+            "profile": os.getenv("AWS_PROFILE"),
+        },
+    )
+
+
 def detect_local() -> Backend:
     """The local machine — always available."""
     import getpass
@@ -99,4 +128,4 @@ def _safe(fn) -> str:
 
 def detect() -> list[Backend]:
     """Every backend Loki can see from here, in priority order."""
-    return [detect_databricks(), detect_local()]
+    return [detect_databricks(), detect_aws(), detect_local()]

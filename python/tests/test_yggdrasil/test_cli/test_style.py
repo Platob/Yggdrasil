@@ -13,6 +13,27 @@ def _plain_formatter() -> style.LogFormatter:
     return style.LogFormatter()
 
 
+class TestLogo:
+    def setup_method(self):
+        style.force_color(False)
+
+    def test_known_services_have_full_combined_logos(self):
+        for key in ("YGG", "YGGLOKI", "YGGDBKS", "YGGAWS"):
+            lines = style.logo(key).splitlines()
+            assert len(lines) == 4, key                 # full wordmark, 4 rows
+            assert all("|" in ln or "_" in ln for ln in lines), key
+
+    def test_no_bare_subtitle_appended(self):
+        # The old behavior rendered the YGG art + a plain "YGGLOKI" text line.
+        art = style.logo("YGGLOKI")
+        assert "YGGLOKI" not in art          # rendered as art, not as a subtitle
+        assert len(art.splitlines()) == 4    # no extra subtitle row
+
+    def test_unknown_suffix_falls_back_to_plain_ygg_without_subtitle(self):
+        art = style.logo("YGGNOPE")
+        assert art == style.logo("YGG")      # plain mark, no "YGGNOPE" subtitle
+
+
 class TestLogFormatter:
     def test_renders_clock_glyph_name_message(self):
         fmt = _plain_formatter()

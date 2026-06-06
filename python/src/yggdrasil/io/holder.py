@@ -269,6 +269,8 @@ def _bootstrap_primitive_format_leaves() -> None:
     import yggdrasil.io.ndjson_file  # noqa: F401
     import yggdrasil.io.xlsx_file  # noqa: F401
     import yggdrasil.io.pickle_file  # noqa: F401
+    import yggdrasil.io.html_file  # noqa: F401
+    import yggdrasil.io.image_file  # noqa: F401
 
 
 def _bootstrap_holder_format_registry() -> None:
