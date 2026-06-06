@@ -103,6 +103,7 @@ class Loki:
         self.host = _safe(socket.gethostname)
         self._backends: "Optional[list[Backend]]" = None
         self._engines: "Optional[dict[str, TokenEngine]]" = None
+        self._capable: "Optional[bool]" = None
 
     # -- singleton ---------------------------------------------------------
 
@@ -314,10 +315,10 @@ class Loki:
         remotes = [available[n] for n in order if not available[n].local]
         base_eng = available.get(base or "")
 
-        # Can this workstation comfortably host a local model (and which size)?
-        from .resources import can_run_local
-
-        capable = can_run_local()
+        # Can this workstation comfortably host a local model? Only worth asking
+        # when a local engine is actually reachable — the probe imports torch
+        # (slow first call), so skip it entirely on a remote-only box.
+        capable = bool(locals_) and self.can_run_local()
 
         # The cheap/home choice for ordinary work: a capable local model if we
         # have one (free, private), else the session base, else the best engine.
@@ -338,6 +339,20 @@ class Loki:
             if not confirm(target, model):
                 return home
         return target
+
+    def can_run_local(self) -> bool:
+        """Whether this box can comfortably host a local model — cached.
+
+        Wraps :func:`yggdrasil.loki.resources.can_run_local` but memoizes the
+        result for the process: the probe imports ``torch`` to check for a CUDA
+        GPU (slow on the first call, on a box that has it), and engine selection
+        asks this on every turn. Hardware doesn't change within a session.
+        """
+        if self._capable is None:
+            from .resources import can_run_local
+
+            self._capable = can_run_local()
+        return self._capable
 
     def bootstrap_local(self, *, model: "Optional[str]" = None, pull: bool = True) -> dict[str, Any]:
         """Ready a free **local** reasoning engine, lazily installing on demand.

@@ -81,6 +81,15 @@ class LokiMemory:
 
     # -- compression -------------------------------------------------------
 
+    def should_compress(self) -> bool:
+        """True when the raw context is large enough to fold into the synthesis.
+
+        The cheap gate :meth:`maybe_compress` checks first — exposed so a caller
+        (the CLI) can show a waiting animation only when a compression (a real,
+        slow model call) is actually about to run, not on every turn.
+        """
+        return self.chars() >= self.compress_chars and len(self.turns) > self.keep_recent
+
     def maybe_compress(self, agent: "Loki", *, engine: Optional[str] = None) -> bool:
         """Fold older turns into the synthesis when context grows too large.
 
@@ -88,7 +97,7 @@ class LokiMemory:
         rest via the agent's fast engine. Returns whether it compressed.
         Reasoning failures (no engine) leave the raw turns intact.
         """
-        if self.chars() < self.compress_chars or len(self.turns) <= self.keep_recent:
+        if not self.should_compress():
             return False
         old = self.turns[: -self.keep_recent]
         transcript = "\n".join(f"{t['role']}: {t['content']}" for t in old)
