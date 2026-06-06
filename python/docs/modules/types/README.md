@@ -13,7 +13,7 @@ Single entry point for value / type / column / row description. Pair this page w
 | `convert(value, target, options=…)` | `yggdrasil.data.cast.registry` | Single dispatch surface for casts |
 | `register_converter(from, to)` | `yggdrasil.data.cast.registry` | Decorator to teach the registry |
 | `find_converter(from_type, to_hint)` | `yggdrasil.data.cast.registry` | Lookup-only path |
-| `CastOptions` | `yggdrasil.data.cast.options` | Normalised options carrier — target schema, safety, chunk size |
+| `CastOptions` | `yggdrasil.data.options` | Normalised options carrier — target schema, safety, chunk size |
 
 ## DataType — type hint round-trip
 
@@ -185,13 +185,12 @@ Tips:
 
 ```python
 import pyarrow as pa
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 opts = CastOptions(
     target=pa.schema([pa.field("id", pa.int64(), nullable=False)]),
     safe=True,
     byte_size=128 * 1024 * 1024,
-    strict_match_names=True,
 )
 ```
 

@@ -54,14 +54,14 @@ pip install ygg
     ```python
     import pyarrow as pa
     from yggdrasil.arrow.cast import cast_arrow_tabular
-    from yggdrasil.data.cast.options import CastOptions
+    from yggdrasil.data.options import CastOptions
 
     raw = pa.table({"id": ["1", "2"], "score": ["9.1", "8.7"]})
     target = pa.schema([
         pa.field("id",    pa.int64(),   nullable=False),
         pa.field("score", pa.float64(), nullable=False),
     ])
-    out = cast_arrow_tabular(raw, CastOptions(target_field=target))
+    out = cast_arrow_tabular(raw, CastOptions(target=target))
     ```
 
 === "Databricks SQL → any engine"

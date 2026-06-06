@@ -59,14 +59,14 @@ convert({"id": "7", "amount": "99.50", "paid": "yes"}, Order)
 ```python
 import pyarrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 raw = pa.table({"id": ["1", "2"], "score": ["9.1", "8.7"]})
 target = pa.schema([
     pa.field("id",    pa.int64(),   nullable=False),
     pa.field("score", pa.float64(), nullable=False),
 ])
-out = cast_arrow_tabular(raw, CastOptions(target_field=target, strict_match_names=True))
+out = cast_arrow_tabular(raw, CastOptions(target=target))
 ```
 
 ## 5. Engine bridges
@@ -82,13 +82,13 @@ Polars cast:
 
 ```python
 import pyarrow as pa
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.polars.cast import cast_polars_dataframe
 from yggdrasil.lazy_imports import polars
 
 df = polars.DataFrame({"id": ["1"], "value": ["4.2"]})
 target = pa.schema([pa.field("id", pa.int64()), pa.field("value", pa.float64())])
-out = cast_polars_dataframe(df, CastOptions(target_field=target))
+out = cast_polars_dataframe(df, CastOptions(target=target))
 ```
 
 ## 6. Register a custom converter
@@ -120,11 +120,10 @@ print(http.send(req).status)
 Batch:
 
 ```python
-from yggdrasil.io import SendManyConfig
 
 reqs = [http.prepare_request("GET", "https://httpbin.org/get",
                              params={"page": i}) for i in range(1, 6)]
-responses = list(http.send_many(reqs, send_config=SendManyConfig(max_workers=3)))
+responses = list(http.send_many(reqs, max_in_flight=3))
 ```
 
 ## 8. Databricks SQL

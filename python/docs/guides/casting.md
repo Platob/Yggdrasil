@@ -45,7 +45,7 @@ convert("19,95", Decimal)   # Decimal('19.95')
 
 ```python
 import pyarrow as pa
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.arrow.cast import cast_arrow_tabular
 
 source = pa.table({"id": ["1"], "price": ["9.99"]})
@@ -53,7 +53,7 @@ target = pa.schema([
     pa.field("id",    pa.int64(),   nullable=False),
     pa.field("price", pa.float64(), nullable=False),
 ])
-out = cast_arrow_tabular(source, CastOptions(target_field=target, strict_match_names=True))
+out = cast_arrow_tabular(source, CastOptions(target=target))
 ```
 
 Streaming readers:
@@ -100,13 +100,13 @@ from yggdrasil.lazy_imports import pandas
 
 ```python
 import pyarrow as pa
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 from yggdrasil.polars.cast import cast_polars_dataframe
 from yggdrasil.lazy_imports import polars
 
 df = polars.DataFrame({"id": ["1"], "score": ["4.5"]})
 target = pa.schema([pa.field("id", pa.int64()), pa.field("score", pa.float64())])
-out = cast_polars_dataframe(df, CastOptions(target_field=target))
+out = cast_polars_dataframe(df, CastOptions(target=target))
 ```
 
 ### Arrow ↔ Polars round-trip
@@ -134,14 +134,14 @@ from yggdrasil.spark.cast import cast_spark_dataframe
 ## Reusing `CastOptions` in custom helpers
 
 ```python
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 def normalize_options(options=None, *, target_field=None) -> CastOptions:
-    return CastOptions.check(options, target_field=target_field, strict_match_names=True)
+    return CastOptions.check(options, target=target_field)
 ```
 
 ## When the cast doesn't fire
 
 1. Confirm the engine cast module is imported (`yggdrasil.polars.cast`, etc.). Engines register on import — `find_converter` also auto-triggers these imports when the source or target lives in the `polars` / `pandas` / `pyspark` / `pyarrow` namespace, so missing converters past that probe are real misses.
-2. Check `CastOptions.target_field` — `cast_arrow_tabular` and friends need the target schema.
+2. Check `CastOptions.target` — `cast_arrow_tabular` and friends need the target schema.
 3. Inspect the dispatch order in [Architecture](architecture.md#the-cast-registry). Most "missing converter" cases are an MRO miss; register a converter or add an `Any`-wildcard fallback. The registry **does not** auto-compose two registered hops (`X → Y → int`) into a synthetic direct cast — that path was deliberately removed because the chosen intermediate depended on the order of unrelated registrations. Register the direct `X → int` if you need one.

@@ -13,13 +13,13 @@ The full literate nav is generated into `reference/SUMMARY.md` and rendered by `
 | Path | What it covers |
 |---|---|
 | `yggdrasil.data.cast.registry` | `convert`, `register_converter` — the central registry |
-| `yggdrasil.data.cast.options` | `CastOptions`, `CastOptions.check` |
+| `yggdrasil.data.options` | `CastOptions`, `CastOptions.check` |
 | `yggdrasil.arrow.cast` | `cast_arrow_tabular`, `cast_arrow_record_batch_reader` |
 | `yggdrasil.polars.cast` | `cast_polars_dataframe`, `cast_polars_lazyframe`, round-trip helpers |
 | `yggdrasil.pandas.cast` | `cast_pandas_dataframe` |
 | `yggdrasil.spark.cast` | `cast_spark_dataframe` |
-| `yggdrasil.http_` | `HTTPSession`, `PreparedRequest`, `Response` |
-| `yggdrasil.io` | `URL`, `SendConfig`, `SendManyConfig` |
+| `yggdrasil.http_` | `HTTPSession`, `PreparedRequest`, `Response`, `SendConfig` |
+| `yggdrasil.io` | `URL`, Tabular IO holders, codecs |
 | `yggdrasil.databricks` | `DatabricksClient` |
 | `yggdrasil.pyutils` | `retry`, `parallelize` |
 | `yggdrasil.concurrent` | `Job`, `JobPoolExecutor` |

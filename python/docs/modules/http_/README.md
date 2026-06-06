@@ -89,7 +89,6 @@ print(resp.json().get("json"))
 
 ```python
 from yggdrasil.http_ import HTTPSession
-from yggdrasil.io import SendManyConfig
 
 http = HTTPSession()
 requests = [
@@ -97,8 +96,7 @@ requests = [
     for i in range(10)
 ]
 
-cfg = SendManyConfig(max_workers=5)
-responses = list(http.send_many(requests, send_config=cfg))
+responses = list(http.send_many(requests, max_in_flight=5))
 print([r.status for r in responses])
 ```
 
@@ -180,7 +178,6 @@ If your endpoint returns tabular JSON/Arrow-compatible payloads, you can project
 
 ```python
 from yggdrasil.http_ import HTTPSession
-from yggdrasil.io import SendManyConfig
 
 http = HTTPSession()
 
@@ -189,7 +186,7 @@ reqs = [
     http.prepare_request("GET", "https://httpbin.org/get", params={"page": p})
     for p in range(1, 6)
 ]
-responses = list(http.send_many(reqs, send_config=SendManyConfig(max_workers=3)))
+responses = list(http.send_many(reqs, max_in_flight=3))
 
 # stage 2: normalize to python rows (replace with your own extraction logic)
 rows = []
