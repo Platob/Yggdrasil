@@ -25,10 +25,11 @@ It walks six areas:
   bundle. Lazy by default (no idle nodes → no cost until attached). Skip with
   ``--no-pools``.
 - **cluster**     — a default **single-user (dedicated)** all-purpose cluster
-  owned by the current user, **attached to the Light instance pool** so it
-  starts warm against the seeded zero-PyPI bundle. Lazy: created with
-  autotermination and not waited on (starts on attach, self-stops when idle →
-  no cost until used). Skip with ``--no-cluster``.
+  owned by the current user, **attached to the Light instance pool** and running
+  the seeded **generic environment** (the classic-cluster ``requirements.txt``,
+  zero-PyPI) so it matches the jobs' image. Lazy: created with autotermination
+  and not waited on (starts on attach, self-stops when idle → no cost until
+  used). Skip with ``--no-cluster``.
 
 In the default (seed) mode it builds/uploads the wheel, assembles and writes
 the environment files, and ensures a default warehouse exists. With ``--check``
@@ -307,14 +308,24 @@ class SeedCommand:
                             f"pool {light_name!r} not found — cluster will use a "
                             f"standalone node type"
                         )
+                    # Install the seeded **generic environment** (the classic-cluster
+                    # ``requirements.txt`` written by the environments step above) so
+                    # the cluster runs the same zero-PyPI ygg image as the jobs,
+                    # instead of resolving ``ygg[…]`` from PyPI.
+                    env_name = whl.ygg_base_environment_name()
+                    env_requirements = (
+                        f"{whl.WORKSPACE_ENV_DIR}/{env_name}/{env_name}.requirements.txt"
+                    )
                     with style.Spinner("provisioning default single-user cluster…"):
                         # ``single_user_name`` flips the cluster to dedicated
                         # (single-user) access mode for the current user;
                         # ``instance_pool_id`` attaches it to the Light pool;
+                        # ``environment`` installs the generic env (zero-PyPI);
                         # ``wait=False`` returns without blocking on start-up.
                         cluster = clusters_svc.all_purpose_cluster(
                             single_user_name=user,
                             instance_pool_id=pool_id,
+                            environment=env_requirements,
                             wait=False,
                         )
                     details = None
@@ -338,9 +349,10 @@ class SeedCommand:
                         f"    {style.dim('pool')}    "
                         f"{light_name if pool_id else style.dim('(standalone)')}\n"
                     )
+                    style.out(f"    {style.dim('env')}     {env_name}\n")
                     style.ok(
                         "default single-user cluster ready "
-                        "(dedicated, pool-backed, autoterminating)"
+                        "(dedicated, pool-backed, generic env, autoterminating)"
                     )
             except Exception as exc:
                 style.fail(f"cluster step failed: {exc}")

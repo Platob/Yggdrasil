@@ -113,6 +113,7 @@ class Clusters(DatabricksService):
         single_user_name: str | None = None,
         permissions: Optional[list[str | ClusterAccessControlRequest]] = None,
         libraries: Optional[Sequence[str]] = None,
+        environment: str | None = None,
         wait: WaitingConfigArg = True,
         **cluster_spec
     ):
@@ -141,11 +142,17 @@ class Clusters(DatabricksService):
             None
         )
 
-        libraries = (libraries or []) + [
-            f"ygg[http,data,databricks]=={YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}.*",
-            "uv",
-            "dill",
-        ]
+        # ``environment`` points at a seeded **generic environment** — a
+        # ``…requirements.txt`` installed as ``Library(requirements=…)`` — that
+        # already carries ygg + its deps as zero-PyPI workspace wheels. Use it in
+        # place of the PyPI ``ygg[…]`` resolve; otherwise fall back to that.
+        # ``uv`` / ``dill`` (small public runtime helpers the env doesn't bundle)
+        # ride along either way.
+        ygg_layer = (
+            environment if environment
+            else f"ygg[http,data,databricks]=={YGG_VERSION_INFO.major}.{YGG_VERSION_INFO.minor}.*"
+        )
+        libraries = (libraries or []) + [ygg_layer, "uv", "dill"]
 
         if existing is None:
             existing = self.create(

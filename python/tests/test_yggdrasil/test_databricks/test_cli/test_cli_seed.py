@@ -33,6 +33,14 @@ def _client_with(*, user="me@co.com", warehouses=None, default_wh=...):
     return client
 
 
+def _env_requirements():
+    """The seeded generic-environment requirements path for the local Python."""
+    from yggdrasil.databricks.job.wheel import WORKSPACE_ENV_DIR, ygg_base_environment_name
+
+    name = ygg_base_environment_name()
+    return f"{WORKSPACE_ENV_DIR}/{name}/{name}.requirements.txt"
+
+
 def _env(python):
     """A fake ``ensure_environment`` descriptor for one Python version."""
     key = "py" + (python or "3X").replace(".", "")
@@ -175,10 +183,12 @@ class TestSeedProvision(unittest.TestCase):
             rc = main(["seed"])
         self.assertEqual(rc, 0)
         # A default all-purpose cluster is provisioned in single-user (dedicated)
-        # mode for the current user, attached to the Light pool, without blocking.
+        # mode for the current user, attached to the Light pool, running the
+        # seeded generic environment (zero-PyPI requirements), without blocking.
         client.compute.instance_pools.find.assert_any_call(name="Yggdrasil Light")
         client.compute.clusters.all_purpose_cluster.assert_called_once_with(
-            single_user_name="alice@co.com", instance_pool_id="pool-light", wait=False,
+            single_user_name="alice@co.com", instance_pool_id="pool-light",
+            environment=_env_requirements(), wait=False,
         )
 
     def test_seed_cluster_without_light_pool_uses_standalone(self):
@@ -194,9 +204,11 @@ class TestSeedProvision(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed"])
         self.assertEqual(rc, 0)
-        # No pool to attach to → cluster created standalone (instance_pool_id=None).
+        # No pool to attach to → cluster created standalone (instance_pool_id=None),
+        # still running the seeded generic environment.
         client.compute.clusters.all_purpose_cluster.assert_called_once_with(
-            single_user_name="bob@co.com", instance_pool_id=None, wait=False,
+            single_user_name="bob@co.com", instance_pool_id=None,
+            environment=_env_requirements(), wait=False,
         )
 
     def test_seed_no_cluster_skips_cluster_step(self):
