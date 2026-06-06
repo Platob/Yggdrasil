@@ -29,9 +29,11 @@ if TYPE_CHECKING:
 
 __all__ = ["DatabricksLoki"]
 
-#: Default serving endpoint the agent reasons through (override with
-#: ``YGG_LOKI_SERVING_ENDPOINT`` or the ``serving_endpoint=`` arg).
-DEFAULT_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
+#: Default serving endpoint the agent reasons through — the **lowest**
+#: (smallest / cheapest) broadly-available Foundation Model endpoint, so the
+#: agent is cheap by default (override with ``YGG_LOKI_SERVING_ENDPOINT`` or the
+#: ``serving_endpoint=`` arg).
+DEFAULT_ENDPOINT = "databricks-meta-llama-3-1-8b-instruct"
 
 
 class DatabricksLoki(Loki):
@@ -127,8 +129,10 @@ class DatabricksLoki(Loki):
         """Deploy this agent to run on Databricks compute.
 
         Creates (or updates) a Databricks **Job** that runs the agent on
-        **serverless** against the seeded ygg image, invoking *behavior* with
-        *params* through the ``ygg-loki`` wheel entry point. The job is
+        **serverless** against the seeded ygg image through the single ``ygg``
+        wheel entry point — ``ygg loki reason ...`` for the default ``reason``
+        behavior, ``ygg loki run <behavior> --kwarg k=v ...`` otherwise (on the
+        runtime ``ygg loki`` resolves to this DatabricksLoki). The job is
         upserted by name and returned; trigger it with ``job.run()``.
 
         Requires a workspace seeded with ``ygg databricks seed`` (for the
@@ -144,10 +148,25 @@ class DatabricksLoki(Loki):
                 "only job deployment is implemented; pass job=True"
             )
 
+        import json
+
         from databricks.sdk.service.jobs import PythonWheelTask, Task
 
         from yggdrasil.databricks.job import wheel as whl
-        from yggdrasil.pickle import json as yjson
+
+        # The single ``ygg`` entry point with a ``loki`` subcommand. ``reason``
+        # takes the prompt positionally; every other behavior goes through
+        # ``run`` with JSON-encoded ``--kwarg`` pairs (the CLI JSON-decodes each).
+        if behavior == "reason":
+            parameters = ["loki", "reason", str(params.pop("prompt", ""))]
+            if params.get("system"):
+                parameters += ["--system", str(params["system"])]
+            if params.get("engine"):
+                parameters += ["--engine", str(params["engine"])]
+        else:
+            parameters = ["loki", "run", behavior]
+            for key, value in params.items():
+                parameters += ["--kwarg", f"{key}={json.dumps(value)}"]
 
         # Serverless environment carrying the pre-built ygg wheel image.
         environment = whl.ygg_environment(client, environment_key="default")
@@ -156,13 +175,13 @@ class DatabricksLoki(Loki):
             environment_key="default",
             python_wheel_task=PythonWheelTask(
                 package_name="ygg",
-                entry_point="ygg-loki",
-                parameters=[behavior, "--kwargs", yjson.dumps(params)],
+                entry_point="ygg",
+                parameters=parameters,
             ),
         )
         return client.jobs.create_or_update(
             name=name or f"loki-{self.user}",
             tasks=[task],
             environments=[environment],
-            tags={"ygg": "loki"},
+            tags={"ygg": "loki", "ygg_kind": "loki-agent", "ygg_behavior": behavior},
         )

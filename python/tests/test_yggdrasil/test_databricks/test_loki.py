@@ -67,8 +67,24 @@ class TestDeploy(unittest.TestCase):
         self.assertEqual(call.kwargs["name"], "loki-test")
         self.assertEqual(call.kwargs["environments"], ["ENV"])
         task = call.kwargs["tasks"][0]
-        self.assertEqual(task.python_wheel_task.entry_point, "ygg-loki")
+        # Single ``ygg`` entry point; reason routes through `ygg loki reason`.
+        self.assertEqual(task.python_wheel_task.entry_point, "ygg")
         self.assertEqual(task.python_wheel_task.package_name, "ygg")
+        self.assertEqual(task.python_wheel_task.parameters, ["loki", "reason", "hi"])
+
+    def test_deploy_behavior_routes_through_loki_run(self):
+        client = MagicMock()
+        with patch("yggdrasil.databricks.loki.agent.read_session", return_value=_session()), \
+             patch("yggdrasil.databricks.DatabricksClient", return_value=client), \
+             patch("yggdrasil.databricks.job.wheel.ygg_environment", return_value="ENV"):
+            loki = DatabricksLoki()
+            loki.deploy(name="loki-genie", behavior="genie", question="revenue?")
+        task = client.jobs.create_or_update.call_args.kwargs["tasks"][0]
+        self.assertEqual(task.python_wheel_task.entry_point, "ygg")
+        self.assertEqual(
+            task.python_wheel_task.parameters,
+            ["loki", "run", "genie", "--kwarg", 'question="revenue?"'],
+        )
 
 
 if __name__ == "__main__":

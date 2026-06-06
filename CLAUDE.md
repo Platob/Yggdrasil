@@ -46,6 +46,7 @@ Treat a cross-language divergence as a bug.
 5. **Collocate related code** — keep schemas, service logic, and the entry point for one concept readable together. Jumping between 5 files to understand one thing is worse than a 200-line service file.
 6. **Delete dead code** — no commented-out blocks, no `# TODO: maybe later`, no unused imports. If it's not called, it doesn't exist.
 7. **Prefer data over code** — dicts and lists over class hierarchies. Pydantic models over hand-rolled validation. Enum values over if/elif chains.
+8. **Real type hints, never stringified** — annotate with the **real type object**, not a quoted string (`def f(x: str | None)`, not `def f(x: "str | None")`). Every module carries `from __future__ import annotations`, so an annotation that names a not-yet-imported type evaluates lazily and needs no quotes. When the type can't be imported at runtime (circular import, optional/heavy dependency), import it under `if typing.TYPE_CHECKING:` and reference it bare — still no quotes. Don't sprinkle `"Any"`/string forward-refs to dodge an import; add the real import (top-level when free of cycles, `TYPE_CHECKING` when not). The mirror JS/TS port keeps its real types too.
 
 ## Principles
 

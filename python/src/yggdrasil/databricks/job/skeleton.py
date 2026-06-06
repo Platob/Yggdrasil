@@ -28,9 +28,10 @@ The :func:`task` / :func:`flow` decorators wrap a function into a **callable**
 The deploy ships the **live** code as a wheel (built from the package on disk —
 dev checkout or installed), placed in the shared workspace pypi registry, or in
 a per-user folder + rebuilt when the package is an editable install. The cluster
-task runs the ``ygg-run`` CLI (:mod:`yggdrasil.databricks.job.runner`), which
-imports the target, coerces parameters to the function signature via the cast
-registry, runs the body, and round-trips the result.
+task runs ``ygg run`` (the ``ygg`` entry point's ``run`` subcommand —
+:mod:`yggdrasil.databricks.job.runner`), which imports the target, coerces
+parameters to the function signature via the cast registry, runs the body, and
+round-trips the result.
 
 Class-based flows subclass :class:`Flow` and override :meth:`~Flow.run` (the
 body), :attr:`~_Runnable.name`, :meth:`~Flow.parameters`, :meth:`~Flow.trigger`.
@@ -54,7 +55,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = logging.getLogger(__name__)
 
 #: Active while a body runs **in-process** (``.local`` / ``.submit`` / the
-#: on-cluster ``ygg-run`` runner). Nested task/flow calls consult it so they run
+#: on-cluster ``ygg run`` runner). Nested task/flow calls consult it so they run
 #: locally too instead of each dispatching its own Databricks job — the flow,
 #: not every task, is the unit that ships to the cluster.
 _LOCAL_MODE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
@@ -132,9 +133,12 @@ class _Runnable:
     retry_delay_seconds: float
 
     # -- serverless / wheel defaults (shared by Task and Flow) -----------
-    package_name: str = "ygg"          # wheel that ships the ygg-run entry point
-    entry_point: str = "ygg-run"       # the runner CLI (runner.py)
+    package_name: str = "ygg"          # wheel that ships the single ``ygg`` entry point
+    entry_point: str = "ygg"           # the only console script; ``run`` subcommand → runner.py
     task_key: str = "run"
+    #: Job-level tags (key → value) carried onto :meth:`Jobs.create_or_update`,
+    #: merged on top of the client's owner/product defaults. ``None`` adds none.
+    job_tags: dict[str, str] | None = None
     serverless: bool = True
     environment_key: str = "default"
     #: Serverless environment version. ``None`` resolves at deploy time to match
@@ -243,7 +247,7 @@ class _Runnable:
     def _dispatch_remote(self, args: tuple, kwargs: dict) -> Any:
         """Deploy this task/flow, run it once on Databricks with *args*/*kwargs*
         marshalled through a workspace payload, block, and return the real
-        result. The cluster runs ``ygg-run`` against :meth:`_target_ref`."""
+        result. The cluster runs ``ygg run`` against :meth:`_target_ref`."""
         from yggdrasil.databricks.client import DatabricksClient
         from yggdrasil.databricks.path import DatabricksPath
 
@@ -286,11 +290,14 @@ class _Runnable:
         return []
 
     def _runner_parameters(self) -> list[str]:
-        """The wheel-task parameters: the per-call payload form when dispatching,
-        else ``[target, *scheduled-params]`` for a deploy."""
+        """The wheel-task parameters passed to the ``ygg`` entry point: a leading
+        ``run`` subcommand, then the per-call payload form when dispatching, else
+        ``[target, *scheduled-params]`` for a deploy."""
         if self._runner_params is not None:
-            return list(self._runner_params)
-        return [self._target_ref(), *self._scheduled_params()]
+            base = list(self._runner_params)
+        else:
+            base = [self._target_ref(), *self._scheduled_params()]
+        return ["run", *base]
 
     def _serverless_dependencies(self, client: Any) -> list[str]:
         """Build + upload the serverless wheels **for every Python version** and
@@ -456,7 +463,7 @@ class _Runnable:
         return envs
 
     def tasks(self) -> list:
-        """The single serverless python-wheel task that runs ``ygg-run``."""
+        """The single serverless python-wheel task that runs ``ygg run``."""
         from databricks.sdk.service.jobs import PythonWheelTask, Task as DBTask
 
         return [
@@ -477,6 +484,8 @@ class _Runnable:
         environments = self.environments()
         if environments is not None:
             spec["environments"] = environments
+        if self.job_tags:
+            spec["tags"] = dict(self.job_tags)
         return spec
 
     def deploy(self, client: Any) -> "Job":
@@ -525,10 +534,12 @@ class Task(_Runnable, Generic[T]):
             self.package_name = package_name
         functools.update_wrapper(self, fn)
 
-    def to_task(self, parameters: "list[str] | None" = None) -> Any:
+    def to_task(self, parameters: list[str] | None = None) -> Any:
         """Render a databricks ``Task`` (python-wheel) with explicit *parameters*
         and dependency edges — for hand-built multi-task job DAGs (the transparent
-        single-task dispatch uses :meth:`tasks`)."""
+        single-task dispatch uses :meth:`tasks`). *parameters* are the arguments
+        the runner receives; the ``run`` subcommand the ``ygg`` entry point needs
+        is prepended automatically."""
         from databricks.sdk.service.jobs import (
             PythonWheelTask,
             Task as DBTask,
@@ -542,7 +553,7 @@ class Task(_Runnable, Generic[T]):
             python_wheel_task=PythonWheelTask(
                 package_name=self.package_name,
                 entry_point=self.entry_point,
-                parameters=parameters or [],
+                parameters=["run", *(parameters or [])],
             ),
             **self.task_options,
         )

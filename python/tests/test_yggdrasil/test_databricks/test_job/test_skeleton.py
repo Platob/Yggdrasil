@@ -80,7 +80,9 @@ class TestTask:
         t = load.to_task(["c.s.t"])
         assert t.task_key == "ld"
         assert t.environment_key == "default"      # serverless
-        assert t.python_wheel_task.parameters == ["c.s.t"]
+        assert t.python_wheel_task.entry_point == "ygg"
+        # the single ``ygg`` entry point gets a leading ``run`` subcommand
+        assert t.python_wheel_task.parameters == ["run", "c.s.t"]
 
 
 # --------------------------------------------------------------------------- #
@@ -155,10 +157,11 @@ class TestFlow:
         assert spec["name"] == "etl"
         assert "trigger" not in spec
         task_obj = spec["tasks"][0]
-        # the cluster runs the ygg-run CLI against the target + scheduled params
+        # the cluster runs the single ``ygg`` entry point's ``run`` subcommand
+        # against the target + scheduled params
         assert task_obj.python_wheel_task.package_name == "ygg"
-        assert task_obj.python_wheel_task.entry_point == "ygg-run"
-        assert task_obj.python_wheel_task.parameters == [etl._target_ref(), "a", "b"]
+        assert task_obj.python_wheel_task.entry_point == "ygg"
+        assert task_obj.python_wheel_task.parameters == ["run", etl._target_ref(), "a", "b"]
         assert task_obj.environment_key == "default"
         env = spec["environments"][0]
         assert env.spec.environment_version == serverless_environment_version()
@@ -182,6 +185,15 @@ class TestFlow:
 
         assert etl.definition()["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
 
+    def test_job_tags_flow_into_definition(self):
+        @flow
+        def etl():
+            ...
+
+        assert "tags" not in etl.definition()           # none by default
+        etl.job_tags = {"ygg": "demo", "team": "data"}
+        assert etl.definition()["tags"] == {"ygg": "demo", "team": "data"}
+
     def test_deploy_ships_composed_wheels_by_default(self):
         @flow(name="ygg-demo", parameters=["a"])
         def demo(x):
@@ -198,7 +210,7 @@ class TestFlow:
         sd.assert_called_once_with(client)
         kwargs = client.jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-demo"
-        assert kwargs["tasks"][0].python_wheel_task.parameters == [demo._target_ref(), "a"]
+        assert kwargs["tasks"][0].python_wheel_task.parameters == ["run", demo._target_ref(), "a"]
         assert kwargs["environments"][0].spec.dependencies == wheels  # shipped by path
         assert deployed is client.jobs.create_or_update.return_value
 

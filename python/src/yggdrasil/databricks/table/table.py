@@ -3206,6 +3206,27 @@ class Table(DatabricksPath):
                 checkpoint or "", available_now, clean_source, clean_source_retention,
             ],
         )
+        # Tag the job so Auto Loader ingestion jobs are filterable in the
+        # workspace + cost reports by table, source, format, and trigger shape.
+        # Merged on top of the client's owner/product defaults at create time.
+        safe = self.client.safe_tag_value
+        trigger_kind = (
+            "custom" if trigger is not None and not file_arrival
+            else "file_arrival" if file_arrival
+            else "manual"
+        )
+        flow.job_tags = {
+            "ygg": "autoloader",
+            "ygg_kind": "autoloader",
+            "ygg_catalog": safe(self.catalog_name or ""),
+            "ygg_schema": safe(self.schema_name or ""),
+            "ygg_table": safe(self.full_name()),
+            "ygg_source": safe(str(source))[:255],
+            "ygg_format": safe(file_format),
+            "ygg_trigger": trigger_kind,
+            "ygg_available_now": str(available_now).lower(),
+            "ygg_clean_source": str(clean_source).lower(),
+        }
         # Ship the whole dependency closure as wheels so the serverless env
         # installs with zero PyPI access ("0 pip install").
         flow.bundle_dependencies = bundle_dependencies

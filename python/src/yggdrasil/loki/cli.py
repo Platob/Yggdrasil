@@ -40,14 +40,26 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: "Sequence[str] | None" = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    import os
+
     from yggdrasil.cli import style
-    from yggdrasil.loki import Loki
 
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     action = args.action or "status"
-    loki = Loki.current()
+
+    # On the Databricks runtime (a deployed agent job) ``ygg loki`` *is* the
+    # specialized DatabricksLoki — same single entry point, workspace-aware
+    # agent. Everywhere else it's the global Loki.
+    if os.getenv("DATABRICKS_RUNTIME_VERSION"):
+        from yggdrasil.databricks.loki import DatabricksLoki
+
+        loki = DatabricksLoki.current()
+    else:
+        from yggdrasil.loki import Loki
+
+        loki = Loki.current()
 
     style.print_logo("YGGLOKI")
 
