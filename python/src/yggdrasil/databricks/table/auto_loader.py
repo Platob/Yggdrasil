@@ -34,11 +34,13 @@ def auto_load(
     """Ingest files under *source* into *table* with Databricks Auto Loader.
 
     Each micro-batch is **cast to the target table's schema before the append**
-    (via ``foreachBatch``): the target's columns are projected in order, source
-    columns cast to the target type and missing ones NULL-filled, so the write is
-    schema-stable and tolerant of source drift — extra columns are dropped and
-    type mismatches are cast rather than failing or evolving the target schema.
-    Appends are made idempotent with Delta's ``(txnAppId, txnVersion)`` marker
+    (via ``foreachBatch`` + yggdrasil's ``Schema.cast_spark_tabular`` — the same
+    field casting ``arrow_insert`` / ``spark_insert`` use): columns are
+    name-matched, missing ones NULL-filled, and types — including nested
+    ``array<struct>`` and timestamp zones — cast to the target. The write stays
+    schema-stable and tolerant of source drift: extra columns are dropped and
+    mismatches cast, rather than failing the stream or evolving the target
+    schema. Appends are idempotent via Delta's ``(txnAppId, txnVersion)`` marker
     keyed on the batch id, preserving exactly-once across task retries.
 
     Args:
@@ -110,24 +112,19 @@ def auto_load(
     app_id = f"ygg_autoloader::{table}"
 
     def _write_batch(batch_df: Any, batch_id: int) -> None:
-        # Cast/align each micro-batch to the **target table** schema before the
-        # append: project the target's columns in order, casting each source
-        # column to the target type and NULL-filling any the batch doesn't carry.
-        # Per-batch alignment keeps the write schema-stable (no ``mergeSchema``)
-        # and tolerant of source drift — extra source columns are dropped and
-        # type mismatches are cast, rather than failing or silently evolving the
-        # target table's schema.
-        from pyspark.sql import functions as F
+        # Cast/align each micro-batch to the **target table** schema with
+        # yggdrasil's field casting (``Schema.from_spark(...).cast_spark_tabular``
+        # — the same coercion ``arrow_insert`` / ``spark_insert`` use): columns
+        # are name-matched, any the batch lacks are NULL-filled, and types —
+        # including nested ``array<struct>`` and timestamp zones — are cast to
+        # the target. The write stays schema-stable (no ``mergeSchema``) and
+        # tolerant of source drift: extra columns are dropped and mismatches
+        # cast, rather than failing the stream or silently evolving the target.
+        from yggdrasil.data import Schema
 
-        target_schema = batch_df.sparkSession.table(table).schema
-        present = set(batch_df.columns)
-        projection = [
-            (F.col(field.name) if field.name in present else F.lit(None))
-            .cast(field.dataType).alias(field.name)
-            for field in target_schema.fields
-        ]
+        target = Schema.from_spark(batch_df.sparkSession.table(table).schema)
         (
-            batch_df.select(*projection)
+            target.cast_spark_tabular(batch_df)
             .write.format("delta").mode("append")
             # Idempotent append: Delta no-ops a replay of the same batch id.
             .option("txnAppId", app_id)

@@ -127,15 +127,12 @@ class TestAutoLoadEntryPoint:
         writer.trigger.return_value = writer
         return spark, reader, frame, writer
 
-    def _with_pyspark(self, spark, functions=None):
+    def _with_pyspark(self, spark):
         pyspark = types.ModuleType("pyspark")
         pyspark_sql = types.ModuleType("pyspark.sql")
         session = MagicMock()
         session.builder.getOrCreate.return_value = spark
         pyspark_sql.SparkSession = session
-        if functions is not None:
-            # ``_write_batch`` does ``from pyspark.sql import functions as F``.
-            pyspark_sql.functions = functions
         return patch.dict(sys.modules, {"pyspark": pyspark, "pyspark.sql": pyspark_sql})
 
     def test_streams_cloudfiles_into_table_with_derived_checkpoint(self):
@@ -163,42 +160,31 @@ class TestAutoLoadEntryPoint:
 
     def test_foreachbatch_casts_each_batch_to_target_schema(self):
         spark, reader, frame, writer = self._spark()
-        functions = MagicMock(name="F")
 
-        # A micro-batch carrying only (a, b); the target table has (a, b, c).
         batch = MagicMock()
-        batch.columns = ["a", "b"]
-
-        def _field(name):
-            f = MagicMock()
-            f.name = name
-            f.dataType = f"<dt:{name}>"
-            return f
-
-        batch.sparkSession.table.return_value.schema.fields = [
-            _field("a"), _field("b"), _field("c"),
-        ]
-        aligned = batch.select.return_value
+        target_spark_schema = batch.sparkSession.table.return_value.schema
+        aligned = MagicMock()
         wb = aligned.write.format.return_value.mode.return_value
         wb.option.return_value = wb
 
-        # ``_write_batch`` imports pyspark.sql.functions lazily, so invoke the
-        # captured callback while the fake pyspark is still patched in.
-        with self._with_pyspark(spark, functions=functions):
+        target_field = MagicMock()
+        target_field.cast_spark_tabular.return_value = aligned
+
+        # ``_write_batch`` imports ``yggdrasil.data.Schema`` lazily, so invoke the
+        # captured callback while pyspark is still patched in.
+        with self._with_pyspark(spark), patch("yggdrasil.data.Schema") as Schema:
+            Schema.from_spark.return_value = target_field
             auto_load("cat.sch.tbl", "s3://src", checkpoint="s3://ckpt")
             fn = writer.foreachBatch.call_args.args[0]
             fn(batch, 7)
 
-        # Schema read off the *target* table.
-        batch.sparkSession.table.assert_called_once_with("cat.sch.tbl")
-        # Every target column projected (3), the missing one NULL-filled, the
-        # present ones referenced — all cast to the target type.
-        assert batch.select.call_count == 1
-        assert len(batch.select.call_args.args) == 3
-        functions.col.assert_any_call("a")
-        functions.col.assert_any_call("b")
-        functions.lit.assert_called_once_with(None)
-        # Idempotent Delta append into the target table, keyed on the batch id.
+            # The target schema is read off the live table and the batch cast to
+            # it via yggdrasil's field casting (Schema.from_spark -> Field).
+            batch.sparkSession.table.assert_called_once_with("cat.sch.tbl")
+            Schema.from_spark.assert_called_once_with(target_spark_schema)
+            target_field.cast_spark_tabular.assert_called_once_with(batch)
+
+        # Idempotent Delta append of the cast frame into the target table.
         aligned.write.format.assert_called_once_with("delta")
         aligned.write.format.return_value.mode.assert_called_once_with("append")
         wb.option.assert_any_call("txnAppId", "ygg_autoloader::cat.sch.tbl")
