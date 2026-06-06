@@ -62,11 +62,65 @@ loki.behaviors()                 # the catalog
 loki.run("hello", who="loki")    # dispatch (guards availability first)
 ```
 
-The built-in **`genie`** behavior is the reference: it guards on the
-`databricks` backend, then asks a Genie space a question (autonomously
-picking the first reachable space when none is named). Replication,
-inter-agent messaging, HTTP ingestion and serving land on this abstraction
-next.
+The built-in **`genie`** behavior is the reference for the *token-provider*
+pattern: it guards on the `databricks` backend, then asks a Genie space a
+question (autonomously picking the first reachable space when none is
+named). The **`agent`** behavior (below) is the reference for *autonomy*.
+Replication, inter-agent messaging, HTTP ingestion and serving land on this
+abstraction next.
+
+## Acting autonomously (`loki.act` / `ygg loki do`)
+
+`reason()` is one shot. `act()` is the agent **on its own**: a
+reason → act → observe loop where Loki's engine plans against a tool
+catalog, emits **one JSON tool call per turn**, and Loki runs it and feeds
+the observation back — discovering the project and modifying files itself —
+until it declares it's done (or hits the step budget).
+
+```python
+result = loki.act(
+    "find the failing assertion in tests/ and fix it",
+    root=".",            # the working tree the agent is confined to
+    max_steps=12,        # tool-call budget
+    read_only=False,     # set True for discovery only (no writes)
+    allow_shell=False,   # opt in to give it a shell tool too
+)
+result["files_changed"]  # ['tests/test_foo.py', ...]
+result["answer"]         # the agent's summary of what it did
+result["steps"]          # full transcript: thought / tool / args / observation
+```
+
+### Tools — the agent's hands
+
+The toolbox (`yggdrasil.loki.filesystem_toolbox`) is **confined to `root`**:
+a path that resolves outside it is refused, so an autonomous run can touch
+the project it was pointed at and nothing above it. Mutating tools record
+what they changed.
+
+| Tool | What it does | Group |
+|---|---|---|
+| `list_dir` | list a directory | discovery |
+| `read_file` | read a file (optional line range) | discovery |
+| `find` | find files by glob | discovery |
+| `grep` | search file contents by regex | discovery |
+| `write_file` | create/overwrite a file | write (skipped when `read_only`) |
+| `edit_file` | replace one unique occurrence | write (skipped when `read_only`) |
+| `run` | run a shell command in `root` | shell (only when `allow_shell`) |
+
+Implement your own `Tool`s and pass a custom `Toolbox` to `act(toolbox=…)`
+to give the agent different hands.
+
+```bash
+ygg loki tools                         # the catalog (✎ marks mutating tools)
+ygg loki do "add a __repr__ to the Backend dataclass"
+ygg loki do "audit imports" --read-only
+ygg loki do "format the package" --allow-shell --max-steps 20
+ygg loki do "tidy the docs" --json     # full transcript as JSON
+```
+
+`do` streams each step (the tool call, the agent's one-line thought, the
+head of the observation), then prints the files it changed and the agent's
+summary.
 
 ## Reasoning engines (`TokenEngine`)
 
@@ -123,8 +177,10 @@ ygg loki                  # status: identity + backends + engines + behaviors
 ygg loki capabilities     # the detected backends and their signals
 ygg loki engines          # the reasoning engines and which are available
 ygg loki behaviors        # the registered behavior catalog
+ygg loki tools            # the tools the autonomous agent acts through
 ygg loki token --probe    # the Databricks credentials Loki provides
 ygg loki reason "summarize failed jobs" --system "be terse"
+ygg loki do "fix the failing test in tests/test_io.py"
 ygg loki run genie --kwarg question='"top customers"' --json
 ```
 

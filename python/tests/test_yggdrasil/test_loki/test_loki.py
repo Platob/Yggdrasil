@@ -162,5 +162,125 @@ class TestPythonProjectBehavior(unittest.TestCase):
             loki.run("python_project", project="empty")
 
 
+class _ScriptedEngine:
+    """A TokenEngine stand-in that replays a fixed list of JSON replies."""
+
+    name = "scripted"
+    model = "scripted-1"
+
+    def __init__(self, replies):
+        self._replies = list(replies)
+        self.seen = []
+
+    def available(self):
+        return True
+
+    def complete(self, messages, *, system=None, max_tokens=4000, **_):
+        self.seen.append(messages[-1]["content"])
+        from yggdrasil.loki.engine import Completion
+
+        return Completion(text=self._replies.pop(0))
+
+
+class TestAgentAct(unittest.TestCase):
+    """The autonomous reason→act→observe loop over a confined toolbox."""
+
+    def setUp(self):
+        import tempfile
+
+        self.dir = tempfile.mkdtemp(prefix="ygg-act-")
+
+    def _loki(self, replies):
+        loki = Loki()
+        loki._backends = [Backend("local", True)]
+        eng = _ScriptedEngine(replies)
+        loki.engine = lambda name=None: eng  # force our scripted brain
+        return loki, eng
+
+    def test_act_writes_a_file_and_reports_change(self):
+        import json
+        import pathlib
+
+        loki, _ = self._loki([
+            json.dumps({"thought": "create it", "tool": "write_file",
+                        "args": {"path": "hi.txt", "content": "hello loki"}}),
+            json.dumps({"thought": "done", "done": True, "answer": "wrote hi.txt"}),
+        ])
+        result = loki.act("create hi.txt", root=self.dir, max_steps=5)
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["answer"], "wrote hi.txt")
+        self.assertEqual(result["files_changed"], ["hi.txt"])
+        self.assertEqual(len(result["steps"]), 1)
+        self.assertEqual((pathlib.Path(self.dir) / "hi.txt").read_text(), "hello loki")
+
+    def test_act_feeds_observations_back(self):
+        import json
+
+        loki, eng = self._loki([
+            json.dumps({"tool": "list_dir", "args": {"path": "."}}),
+            json.dumps({"done": True, "answer": "looked around"}),
+        ])
+        loki.act("inspect", root=self.dir, max_steps=5)
+        # The second turn must have received the list_dir observation.
+        self.assertTrue(any("Observation from list_dir" in m for m in eng.seen))
+
+    def test_act_tolerates_fenced_json(self):
+        loki, _ = self._loki([
+            "```json\n{\"done\": true, \"answer\": \"ok\"}\n```",
+        ])
+        result = loki.act("noop", root=self.dir, max_steps=3)
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["answer"], "ok")
+
+    def test_act_reprompts_on_garbage_then_finishes(self):
+        import json
+
+        loki, eng = self._loki([
+            "I will now think about this carefully.",  # no JSON
+            json.dumps({"done": True, "answer": "recovered"}),
+        ])
+        result = loki.act("noop", root=self.dir, max_steps=5)
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["answer"], "recovered")
+
+    def test_act_stops_at_max_steps(self):
+        import json
+
+        loki, _ = self._loki([
+            json.dumps({"tool": "list_dir", "args": {}}) for _ in range(10)
+        ])
+        result = loki.act("loop forever", root=self.dir, max_steps=3)
+        self.assertFalse(result["completed"])
+        self.assertIn("max_steps", result["answer"])
+        self.assertEqual(len(result["steps"]), 3)
+
+    def test_read_only_act_cannot_write(self):
+        import json
+
+        loki, _ = self._loki([
+            json.dumps({"tool": "write_file", "args": {"path": "x", "content": "y"}}),
+            json.dumps({"done": True, "answer": "tried"}),
+        ])
+        result = loki.act("write", root=self.dir, read_only=True, max_steps=5)
+        self.assertEqual(result["files_changed"], [])
+        self.assertIn("unknown tool", result["steps"][0]["observation"])
+
+    def test_act_via_behavior_dispatch(self):
+        import json
+
+        loki, _ = self._loki([
+            json.dumps({"done": True, "answer": "behavior path works"}),
+        ])
+        result = loki.run("agent", task="noop", root=self.dir, max_steps=3)
+        self.assertEqual(result["answer"], "behavior path works")
+
+    def test_act_without_engine_raises(self):
+        loki = Loki()
+        loki._backends = [Backend("local", True)]
+        loki.engine = lambda name=None: None
+        with self.assertRaises(RuntimeError):
+            loki.act("anything", root=self.dir)
+
+
 if __name__ == "__main__":
     unittest.main()

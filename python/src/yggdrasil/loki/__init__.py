@@ -12,6 +12,7 @@ from .agent import Loki
 from .behavior import LokiBehavior, register, registry
 from .capability import Backend, detect
 from .engine import Completion, TokenEngine
+from .tools import Tool, Toolbox, filesystem_toolbox
 
 # Import the built-in behaviors so they register on package import.
 from . import behaviors as _behaviors  # noqa: F401
@@ -25,4 +26,7 @@ __all__ = [
     "registry",
     "TokenEngine",
     "Completion",
+    "Tool",
+    "Toolbox",
+    "filesystem_toolbox",
 ]

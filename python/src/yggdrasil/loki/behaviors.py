@@ -26,7 +26,44 @@ from .behavior import LokiBehavior, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["GenieBehavior", "PythonProjectBehavior"]
+__all__ = ["AgentBehavior", "GenieBehavior", "PythonProjectBehavior"]
+
+
+@register
+class AgentBehavior(LokiBehavior):
+    """Pursue a task autonomously inside a file tree — Loki's agentic loop.
+
+    The headline "act on its own + modify files" behavior. Given a ``task``,
+    Loki reasons against a confined toolbox (list/read/find/grep, plus
+    write/edit unless ``read_only``, plus a shell when ``allow_shell``),
+    taking one tool call per turn until it's done — discovering the project
+    and changing files itself. Runs anywhere an engine is reachable; thin
+    wrapper over :meth:`Loki.act` so code and CLI share one implementation.
+    """
+
+    name = "agent"
+    description = "Autonomously discover and modify files to accomplish a task."
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        task: str,
+        root: str = ".",
+        engine: Optional[str] = None,
+        max_steps: int = 12,
+        read_only: bool = False,
+        allow_shell: bool = False,
+        **_: Any,
+    ) -> dict[str, Any]:
+        return agent.act(
+            task,
+            root=root,
+            engine=engine,
+            max_steps=max_steps,
+            read_only=read_only,
+            allow_shell=allow_shell,
+        )
 
 
 @register

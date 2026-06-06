@@ -16,7 +16,8 @@ dispatches :class:`~yggdrasil.loki.behavior.LokiBehavior` actions. The CLI
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+import json
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from . import behavior as _behavior
 from .capability import Backend, detect
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks import DatabricksClient
 
     from .engine import TokenEngine
+    from .tools import Toolbox
 
 __all__ = ["Loki"]
 
@@ -170,6 +172,106 @@ class Loki:
             )
         return eng.generate(prompt, system=system, **options)
 
+    # -- autonomous action loop -------------------------------------------
+
+    def act(
+        self,
+        task: str,
+        *,
+        root: str = ".",
+        engine: "Optional[str]" = None,
+        max_steps: int = 12,
+        read_only: bool = False,
+        allow_shell: bool = False,
+        toolbox: "Optional[Toolbox]" = None,
+        on_step: "Optional[Callable[[dict[str, Any]], None]]" = None,
+    ) -> dict[str, Any]:
+        """Pursue *task* autonomously: discover, decide, and modify files.
+
+        This is Loki acting on its own — the reason→act→observe loop. The
+        agent's engine plans against a tool catalog (filesystem discovery +
+        edits, optionally a shell), emits **one JSON tool call per turn**,
+        and Loki runs it and feeds the observation back, until the engine
+        declares it's ``done`` or *max_steps* is hit. The tools are confined
+        to *root* (the working tree the agent was pointed at).
+
+        Returns a transcript: the resolved ``engine``, every ``step`` (its
+        ``thought``/``tool``/``args``/``observation``), the final ``answer``,
+        whether it ``completed``, and the ``files_changed`` list. Pass
+        ``on_step`` to stream progress (the CLI uses it to print each turn).
+        """
+        from .tools import filesystem_toolbox
+
+        eng = self.engine(engine)
+        if eng is None or not eng.available():
+            raise RuntimeError(
+                "no reasoning engine available — set ANTHROPIC_API_KEY / "
+                "OPENAI_API_KEY, or run with a Databricks session"
+            )
+        box = toolbox or filesystem_toolbox(
+            root, read_only=read_only, allow_shell=allow_shell
+        )
+        system = (
+            "You are Loki, an autonomous engineering agent working inside a "
+            "file tree. Pursue the user's GOAL by taking one action at a time, "
+            "inspecting before you modify.\n\n"
+            f"Tools:\n{box.spec()}\n\n"
+            "Reply with EXACTLY ONE JSON object per turn and nothing else — "
+            "no prose, no markdown fences:\n"
+            '  to use a tool:  {"thought": "...", "tool": "<name>", "args": {...}}\n'
+            '  when finished:  {"thought": "...", "done": true, "answer": "<summary>"}\n\n'
+            "Rules: take the smallest useful step; read a file before editing "
+            "it; `edit_file` needs `old` to be unique, else write the whole "
+            "file; stop as soon as the goal is met and summarize what changed."
+        )
+        messages: list[dict[str, Any]] = [{"role": "user", "content": f"GOAL: {task}"}]
+        steps: list[dict[str, Any]] = []
+        answer, completed = "", False
+
+        for n in range(1, max_steps + 1):
+            reply = eng.complete(messages, system=system, max_tokens=4000).text
+            decision = _parse_decision(reply)
+            if decision is None:
+                # Nudge the model back onto the protocol rather than aborting.
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "user", "content":
+                                 "That was not a single JSON object. Reply with "
+                                 "one JSON tool call or a done object."})
+                continue
+            if decision.get("done"):
+                answer = str(decision.get("answer", "")).strip()
+                completed = True
+                if on_step:
+                    on_step({"n": n, "thought": decision.get("thought", ""), "done": True,
+                             "answer": answer})
+                break
+
+            name = decision.get("tool", "")
+            args = decision.get("args") or {}
+            if not isinstance(args, dict):
+                args = {}
+            observation = box.call(name, args)
+            record = {"n": n, "thought": decision.get("thought", ""),
+                      "tool": name, "args": args, "observation": observation}
+            steps.append(record)
+            if on_step:
+                on_step(record)
+            messages.append({"role": "assistant", "content": reply})
+            messages.append({"role": "user", "content":
+                             f"Observation from {name}:\n{observation}"})
+        else:
+            answer = "stopped: reached max_steps without finishing"
+
+        return {
+            "task": task,
+            "engine": eng.name,
+            "root": str(root),
+            "steps": steps,
+            "answer": answer,
+            "completed": completed,
+            "files_changed": list(box.changed),
+        }
+
     # -- behaviors ---------------------------------------------------------
 
     def behaviors(self) -> list["_behavior.LokiBehavior"]:
@@ -212,6 +314,29 @@ class Loki:
     def __repr__(self) -> str:
         reach = ",".join(b.name for b in self.backends() if b.available)
         return f"Loki(user={self.user!r}, host={self.host!r}, reach=[{reach}])"
+
+
+def _parse_decision(reply: str) -> "Optional[dict[str, Any]]":
+    """Extract the agent's single JSON decision from an engine reply.
+
+    Tolerates the slop a model wraps JSON in — markdown fences, a stray
+    sentence either side — by falling back to the outermost ``{...}`` span.
+    Returns ``None`` when nothing parses (the loop then re-prompts).
+    """
+    text = reply.strip()
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        obj = json.loads(text[start : end + 1])
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 
 def _safe(fn) -> str:
