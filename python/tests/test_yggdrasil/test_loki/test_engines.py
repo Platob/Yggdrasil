@@ -269,16 +269,26 @@ class TestDatabricksServingEngine(unittest.TestCase):
         )
 
     def test_complete_uses_openai_compatible_client(self):
-        client = MagicMock()
         oai = MagicMock()
         msg = MagicMock(); msg.content = "served"
         oai.chat.completions.create.return_value = MagicMock(
             choices=[MagicMock(message=msg)], model="ep",
         )
-        client.workspace_client.return_value.serving_endpoints.get_open_ai_client.return_value = oai
-        eng = DatabricksServingEngine(client=client, endpoint="ep")
-        self.assertEqual(eng.generate("hi"), "served")
+        eng = DatabricksServingEngine(client=MagicMock(), endpoint="ep")
+        # _oai_client() auto-installs the openai dep then returns the SDK's
+        # OpenAI-compatible client — patch it so the test needs neither.
+        with patch.object(DatabricksServingEngine, "_oai_client", return_value=oai):
+            self.assertEqual(eng.generate("hi"), "served")
         self.assertEqual(oai.chat.completions.create.call_args.kwargs["model"], "ep")
+
+    def test_oai_client_auto_installs_openai(self):
+        client = MagicMock()
+        eng = DatabricksServingEngine(client=client)
+        with patch("yggdrasil.loki.runtime.load") as load:
+            eng._oai_client()
+        # The openai dep is auto-installed via the databricks-sdk extra.
+        load.assert_called_once_with("openai", "databricks-sdk[openai]")
+        client.workspace_client.return_value.serving_endpoints.get_open_ai_client.assert_called_once()
 
 
 class TestTransformersEngine(unittest.TestCase):

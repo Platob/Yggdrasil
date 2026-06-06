@@ -54,6 +54,18 @@ class DatabricksServingEngine(TokenEngine):
         except Exception:
             return False
 
+    def _oai_client(self):
+        """The OpenAI-compatible client for the workspace's serving endpoints.
+
+        `serving_endpoints.get_open_ai_client()` needs the ``openai`` package
+        (shipped as the ``databricks-sdk[openai]`` extra) — auto-install it on
+        first use so reasoning just works.
+        """
+        from ..runtime import load
+
+        load("openai", "databricks-sdk[openai]")
+        return self.client.workspace_client().serving_endpoints.get_open_ai_client()
+
     def complete(
         self,
         messages: list[dict[str, Any]],
@@ -64,7 +76,7 @@ class DatabricksServingEngine(TokenEngine):
         **options: Any,
     ) -> Completion:
         msgs = ([{"role": "system", "content": system}] if system else []) + list(messages)
-        oai = self.client.workspace_client().serving_endpoints.get_open_ai_client()
+        oai = self._oai_client()
         endpoint, resp = self._create(oai, msgs, max_tokens, options, stream=False)
         choice = resp.choices[0]
         text = choice.message.content or ""
@@ -87,7 +99,7 @@ class DatabricksServingEngine(TokenEngine):
         **options: Any,
     ):
         msgs = ([{"role": "system", "content": system}] if system else []) + list(messages)
-        oai = self.client.workspace_client().serving_endpoints.get_open_ai_client()
+        oai = self._oai_client()
         endpoint, resp = self._create(oai, msgs, max_tokens, options, stream=True)
         parts: list[str] = []
         for chunk in resp:
