@@ -14,39 +14,64 @@ from yggdrasil.loki.session import LokiSession
 class TestLokiSession(unittest.TestCase):
     def setUp(self):
         self.tmp = Path("/tmp") / f"ygg-sess-{time.time_ns()}"
-        self.base = self.tmp / "session"
-        self._patch = patch.multiple(
-            "yggdrasil.loki.session", BASE=self.base)
+        self._patch = patch.multiple("yggdrasil.loki.session", BASE=self.tmp)
         self._patch.start()
 
     def tearDown(self):
         self._patch.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_start_creates_isolated_tree(self):
-        s = LokiSession.start()
+    def test_start_creates_isolated_per_user_tree(self):
+        s = LokiSession.start(user="alice")
         self.assertTrue(s.workspace.is_dir())
         self.assertTrue(s.memory_dir.is_dir())
         self.assertTrue(s.cache_dir.is_dir())
-        self.assertTrue(str(s.dir).startswith(str(self.base)))
+        self.assertTrue(s.meta_file.exists())
+        self.assertEqual(s.user, "alice")
+        self.assertTrue(str(s.dir).startswith(str(self.tmp / "users" / "alice")))
+
+    def test_sessions_are_isolated_per_user(self):
+        LokiSession.start(user="alice")
+        LokiSession.start(user="bob")
+        self.assertEqual(len(LokiSession.list(user="alice")), 1)
+        self.assertEqual(len(LokiSession.list(user="bob")), 1)
+
+    def test_name_from_first_prompt(self):
+        s = LokiSession.start(user="alice")
+        self.assertEqual(s.name_from_prompt("Build a Delta Lake ingestion job!"),
+                         "build-a-delta-lake-ingestion-job")
+        # persisted + reloaded
+        self.assertEqual(LokiSession.resume(s.id, user="alice").name,
+                         "build-a-delta-lake-ingestion-job")
+
+    def test_resume_touches_last_used(self):
+        s = LokiSession.start(user="alice")
+        old = s.last_used_at
+        time.sleep(0.02)
+        r = LokiSession.resume(s.id, user="alice")
+        self.assertIsNotNone(r)
+        self.assertGreater(r.last_used_at, old)          # purge clock reset
+
+    def test_resume_unknown_returns_none(self):
+        self.assertIsNone(LokiSession.resume("nope", user="alice"))
 
     def test_purge_keeps_recent_and_drops_excess(self):
         made = []
         for _ in range(5):
-            made.append(LokiSession.start(purge=False))
+            made.append(LokiSession.start(user="alice", purge=False))
             time.sleep(0.01)
         current = made[-1]
-        removed = LokiSession.purge(keep=2, max_age_days=999, exclude=current.dir)
+        removed = LokiSession.purge(user="alice", keep=2, max_age_days=999,
+                                    exclude=current.dir)
         self.assertGreaterEqual(len(removed), 1)
         self.assertTrue(current.dir.is_dir())            # current never purged
-        self.assertLessEqual(len(LokiSession.list()), 3)
+        self.assertLessEqual(len(LokiSession.list(user="alice")), 3)
 
-    def test_purge_drops_old_by_age(self):
-        old = LokiSession.start(purge=False)
-        past = time.time() - 30 * 86400
-        import os
-        os.utime(old.dir, (past, past))
-        LokiSession.purge(keep=99, max_age_days=14)
+    def test_purge_drops_idle_by_last_used(self):
+        old = LokiSession.start(user="alice", purge=False)
+        old.last_used_at = time.time() - 30 * 86400      # idle 30 days
+        old._save_meta()
+        LokiSession.purge(user="alice", keep=99, max_age_days=14)
         self.assertFalse(old.dir.is_dir())
 
 

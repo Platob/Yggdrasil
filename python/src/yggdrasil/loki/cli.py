@@ -181,16 +181,17 @@ def _repl(loki: Any, style: Any) -> int:
     from yggdrasil.loki.usage import METER
 
     METER.set_limit(METER.DEFAULT_COST_LIMIT)
-    session = LokiSession.start()  # isolated ~/.loki/session/<id>/ (auto-purges old)
+    session = _choose_session(style)  # resume a prior session for this user, or start new
     state: dict[str, Any] = {
-        "tier": None, "engine": None,
+        "tier": None, "engine": None, "session": session,
         "root": str(session.workspace),
         "memory": LokiMemory(session.memory_file),
+        "named": bool(session.name),
     }
 
-    style.out(f"  {style.bold('interactive session')} {style.dim('#' + session.id)} "
-              f"{style.dim('· streamed · self-purging · /help · /quit')}\n")
-    style.out(f"  {style.dim('workspace')} {style.dim(str(session.workspace))}\n")
+    style.out(f"  {style.bold('interactive session')} {style.dim('#' + session.label)} "
+              f"{style.dim('· ' + session.user)}\n")
+    style.out(f"  {style.dim('workspace ' + str(session.workspace))}\n")
     _select_engine(loki, style, state)
     style.out(f"  {style.dim('cost budget')} {style.brand(f'${METER.cost_limit:.2f}')} "
               f"{style.dim('· raised in $1 steps when reached')}\n\n")
@@ -213,12 +214,52 @@ def _repl(loki: Any, style: Any) -> int:
         # Pre-turn budget gate: at/over the cap, offer to raise before spending.
         if METER.over_budget() and not _budget_prompt(style):
             continue
+        # Name the session from its first prompt; mark used (resets purge clock).
+        if not state["named"]:
+            name = session.name_from_prompt(line)
+            state["named"] = True
+            style.out(f"  {style.dim('session named')} {style.brand(name)}\n")
+        session.touch()
         _repl_turn(loki, style, state, line)
 
+    session.touch()
     style.out("\n")
     _usage_line(style, prefix="session")
-    style.ok("session ended")
+    style.ok(f"session #{session.label} saved")
     return 0
+
+
+def _ago(ts: float) -> str:
+    import time as _t
+
+    d = max(0.0, _t.time() - ts)
+    for n, u in ((86400, "d"), (3600, "h"), (60, "m")):
+        if d >= n:
+            return f"{int(d // n)}{u}"
+    return f"{int(d)}s"
+
+
+def _choose_session(style: Any) -> Any:
+    """Offer to resume one of this user's recent sessions, or start a new one."""
+    from yggdrasil.loki.session import LokiSession
+
+    recent = LokiSession.list()
+    if recent:
+        style.out(f"  {style.bold('resume a session')} {style.dim('or Enter for a new one')}\n")
+        shown = recent[:6]
+        for i, s in enumerate(shown, 1):
+            style.out(f"    {style.brand(str(i))}  {(s.name or '(unnamed)').ljust(40)} "
+                      f"{style.dim(s.id)} {style.dim(_ago(s.last_used_at) + ' ago')}\n")
+        try:
+            ans = input(f"  [1-{len(shown)}] resume · Enter new: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans.isdigit() and 1 <= int(ans) <= len(shown):
+            resumed = LokiSession.resume(shown[int(ans) - 1].id)
+            if resumed is not None:
+                style.ok(f"resumed #{resumed.label}")
+                return resumed
+    return LokiSession.start()
 
 
 def _prompt(style: Any, state: dict) -> str:
@@ -451,9 +492,15 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
     elif cmd == "sessions":
         from yggdrasil.loki.session import LokiSession
 
-        for p in LokiSession.list()[:20]:
-            style.out(f"  {style.brand(p.name)}\n")
-        style.out(f"  {style.dim('auto-purged: keep 20 newest, drop >14 days old')}\n")
+        sessions = LokiSession.list()
+        current_id = getattr(state.get("session"), "id", None)
+        if not sessions:
+            style.out(f"  {style.dim('(no sessions yet)')}\n")
+        for s in sessions[:20]:
+            cur = style.good(" ← current") if s.id == current_id else ""
+            style.out(f"  {style.bold((s.name or '(unnamed)').ljust(40))} "
+                      f"{style.dim(s.id)} {style.dim(_ago(s.last_used_at) + ' ago')}{cur}\n")
+        style.out(f"  {style.dim('per-user · auto-purged: keep 20 most-recent, drop >14 days idle')}\n")
     elif cmd == "reset":
         METER.reset(); style.ok("usage meter reset")
     else:
