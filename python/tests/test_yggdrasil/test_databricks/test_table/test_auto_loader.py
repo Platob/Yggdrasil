@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.table.table import Table
@@ -123,7 +124,6 @@ class TestAutoLoadEntryPoint:
         frame = reader.load.return_value
         writer = frame.writeStream
         writer.option.return_value = writer
-        writer.foreachBatch.return_value = writer
         writer.trigger.return_value = writer
         return spark, reader, frame, writer
 
@@ -133,7 +133,16 @@ class TestAutoLoadEntryPoint:
         session = MagicMock()
         session.builder.getOrCreate.return_value = spark
         pyspark_sql.SparkSession = session
-        return patch.dict(sys.modules, {"pyspark": pyspark, "pyspark.sql": pyspark_sql})
+        stack = ExitStack()
+        stack.enter_context(
+            patch.dict(sys.modules, {"pyspark": pyspark, "pyspark.sql": pyspark_sql})
+        )
+        # ``auto_load`` always casts the stream via ``yggdrasil.data.Schema``;
+        # patch it with an identity cast so the writer chain is the frame's own
+        # ``writeStream`` (tests that care assert on from_spark / cast_spark_tabular).
+        self._Schema = stack.enter_context(patch("yggdrasil.data.Schema"))
+        self._Schema.from_spark.return_value.cast_spark_tabular.side_effect = lambda f: f
+        return stack
 
     def test_streams_cloudfiles_into_table_with_derived_checkpoint(self):
         spark, reader, frame, writer = self._spark()
@@ -148,48 +157,27 @@ class TestAutoLoadEntryPoint:
             "cloudFiles.schemaLocation", "s3://bkt/tbl/_ygg_autoloader/_schema",
         )
         reader.load.assert_called_once_with("s3://src/landing")
-        # writeStream checkpoint + AvailableNow trigger, sinking through a
-        # per-batch foreachBatch (cast-to-target) rather than a raw toTable.
+        # writeStream checkpoint + AvailableNow trigger, sinking into the table
+        # via ``.toTable`` (Structured Streaming's built-in exactly-once).
         writer.option.assert_any_call("checkpointLocation", "s3://bkt/tbl/_ygg_autoloader")
         writer.trigger.assert_called_once_with(availableNow=True)
-        writer.foreachBatch.assert_called_once()
-        writer.toTable.assert_not_called()
-        writer.start.assert_called_once_with()
-        writer.start.return_value.awaitTermination.assert_called_once()
+        writer.toTable.assert_called_once_with("cat.sch.tbl")
+        writer.toTable.return_value.awaitTermination.assert_called_once()
         assert out["checkpoint"] == "s3://bkt/tbl/_ygg_autoloader"
 
-    def test_foreachbatch_casts_each_batch_to_target_schema(self):
+    def test_casts_stream_to_target_schema_via_yggdrasil(self):
         spark, reader, frame, writer = self._spark()
-
-        batch = MagicMock()
-        target_spark_schema = batch.sparkSession.table.return_value.schema
-        aligned = MagicMock()
-        wb = aligned.write.format.return_value.mode.return_value
-        wb.option.return_value = wb
-
-        target_field = MagicMock()
-        target_field.cast_spark_tabular.return_value = aligned
-
-        # ``_write_batch`` imports ``yggdrasil.data.Schema`` lazily, so invoke the
-        # captured callback while pyspark is still patched in.
-        with self._with_pyspark(spark), patch("yggdrasil.data.Schema") as Schema:
-            Schema.from_spark.return_value = target_field
+        with self._with_pyspark(spark):
             auto_load("cat.sch.tbl", "s3://src", checkpoint="s3://ckpt")
-            fn = writer.foreachBatch.call_args.args[0]
-            fn(batch, 7)
 
-            # The target schema is read off the live table and the batch cast to
-            # it via yggdrasil's field casting (Schema.from_spark -> Field).
-            batch.sparkSession.table.assert_called_once_with("cat.sch.tbl")
-            Schema.from_spark.assert_called_once_with(target_spark_schema)
-            target_field.cast_spark_tabular.assert_called_once_with(batch)
-
-        # Idempotent Delta append of the cast frame into the target table.
-        aligned.write.format.assert_called_once_with("delta")
-        aligned.write.format.return_value.mode.assert_called_once_with("append")
-        wb.option.assert_any_call("txnAppId", "ygg_autoloader::cat.sch.tbl")
-        wb.option.assert_any_call("txnVersion", 7)
-        wb.saveAsTable.assert_called_once_with("cat.sch.tbl")
+            Schema = self._Schema
+            # Target schema read off the live table; the stream cast to it via
+            # yggdrasil's field casting before the ``.toTable`` sink.
+            spark.table.assert_called_once_with("cat.sch.tbl")
+            Schema.from_spark.assert_called_once_with(spark.table.return_value.schema)
+            Schema.from_spark.return_value.cast_spark_tabular.assert_called_once_with(frame)
+        # Identity cast here, so the casted frame is the frame that gets written.
+        writer.toTable.assert_called_once_with("cat.sch.tbl")
 
     def test_explicit_checkpoint_skips_describe_detail(self):
         spark, reader, _frame, writer = self._spark()

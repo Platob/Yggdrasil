@@ -34,14 +34,14 @@ def auto_load(
     """Ingest files under *source* into *table* with Databricks Auto Loader.
 
     Each micro-batch is **cast to the target table's schema before the append**
-    (via ``foreachBatch`` + yggdrasil's ``Schema.cast_spark_tabular`` — the same
-    field casting ``arrow_insert`` / ``spark_insert`` use): columns are
-    name-matched, missing ones NULL-filled, and types — including nested
-    ``array<struct>`` and timestamp zones — cast to the target. The write stays
-    schema-stable and tolerant of source drift: extra columns are dropped and
-    mismatches cast, rather than failing the stream or evolving the target
-    schema. Appends are idempotent via Delta's ``(txnAppId, txnVersion)`` marker
-    keyed on the batch id, preserving exactly-once across task retries.
+    (yggdrasil's ``Schema.cast_spark_tabular`` — the same field casting
+    ``arrow_insert`` / ``spark_insert`` use): columns are name-matched, missing
+    ones NULL-filled, and types — including nested ``array<struct>`` and
+    timestamp zones — cast to the target. The cast runs on every micro-batch as
+    the stream flows, so the write stays schema-stable and tolerant of source
+    drift (extra columns dropped, mismatches cast) rather than failing the stream
+    or evolving the target schema; ``.toTable`` keeps Structured Streaming's
+    built-in, checkpoint-coordinated exactly-once.
 
     Args:
         table: Target table, ``catalog.schema.table``.
@@ -106,42 +106,26 @@ def auto_load(
         )
     frame = reader.load(source)
 
-    # Idempotent app id so a re-run of the same micro-batch (e.g. after a task
-    # retry) is deduplicated by Delta's (txnAppId, txnVersion) transaction marker
-    # — preserving the exactly-once ``.toTable`` gave before foreachBatch.
-    app_id = f"ygg_autoloader::{table}"
+    # Cast/align the stream to the **target table** schema with yggdrasil's field
+    # casting (``Schema.from_spark(...).cast_spark_tabular`` — the same coercion
+    # ``arrow_insert`` / ``spark_insert`` use): columns name-matched, any the
+    # source lacks NULL-filled, and types — including nested ``array<struct>``
+    # and timestamp zones — cast to the target. It runs on every micro-batch as
+    # the stream flows, so the write conforms to the target (no ``mergeSchema``)
+    # and tolerates source drift — extra columns dropped, mismatches cast — while
+    # ``.toTable`` keeps Structured Streaming's built-in, checkpoint-coordinated
+    # exactly-once (no hand-rolled idempotency markers to break on a reset).
+    from yggdrasil.data import Schema
 
-    def _write_batch(batch_df: Any, batch_id: int) -> None:
-        # Cast/align each micro-batch to the **target table** schema with
-        # yggdrasil's field casting (``Schema.from_spark(...).cast_spark_tabular``
-        # — the same coercion ``arrow_insert`` / ``spark_insert`` use): columns
-        # are name-matched, any the batch lacks are NULL-filled, and types —
-        # including nested ``array<struct>`` and timestamp zones — are cast to
-        # the target. The write stays schema-stable (no ``mergeSchema``) and
-        # tolerant of source drift: extra columns are dropped and mismatches
-        # cast, rather than failing the stream or silently evolving the target.
-        from yggdrasil.data import Schema
+    frame = Schema.from_spark(spark.table(table).schema).cast_spark_tabular(frame)
 
-        target = Schema.from_spark(batch_df.sparkSession.table(table).schema)
-        (
-            target.cast_spark_tabular(batch_df)
-            .write.format("delta").mode("append")
-            # Idempotent append: Delta no-ops a replay of the same batch id.
-            .option("txnAppId", app_id)
-            .option("txnVersion", batch_id)
-            .saveAsTable(table)
-        )
-
-    writer = (
-        frame.writeStream.option("checkpointLocation", checkpoint)
-        .foreachBatch(_write_batch)
-    )
+    writer = frame.writeStream.option("checkpointLocation", checkpoint)
     writer = (
         writer.trigger(availableNow=True)
         if available_now
         else writer.trigger(processingTime="1 minute")
     )
-    query = writer.start()
+    query = writer.toTable(table)
     query.awaitTermination()
 
     summary: dict[str, Any] = {"table": table, "source": source, "checkpoint": checkpoint}
