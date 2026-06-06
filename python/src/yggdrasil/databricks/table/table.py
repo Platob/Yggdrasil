@@ -3212,6 +3212,21 @@ class Table(DatabricksPath):
         # Reference the reusable, version-pinned ygg base environment (resolved
         # above) — written once, shared across ygg jobs; ``None`` inlines deps.
         flow.base_environment_name = environment
+        # Tag the job richly so it's findable/auditable in the Jobs UI: what it
+        # is, what it ingests, where from, and how it's triggered.
+        flow.job_tags = {
+            "ygg": "autoloader",
+            "ygg_component": "auto_loader",
+            "ygg_managed": "true",
+            "ygg_table": self.full_name(),
+            "ygg_catalog": getattr(self, "catalog_name", "") or "",
+            "ygg_schema": getattr(self, "schema_name", "") or "",
+            "ygg_format": file_format,
+            "ygg_source": str(source)[:240],
+            "ygg_trigger": "file_arrival" if trigger is not None else "manual",
+            "ygg_available_now": str(available_now).lower(),
+            "ygg_clean_source": str(clean_source).lower(),
+        }
         return flow.deploy(self.client) if deploy else flow
 
     def stage_insert(

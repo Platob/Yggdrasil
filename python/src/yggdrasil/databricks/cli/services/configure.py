@@ -149,6 +149,31 @@ class ConfigureCommand:
             host = "https://" + host
         host = host.rstrip("/")
 
+        # -- interactive auth picker ------------------------------------
+        # When nothing on the command line says how to authenticate and we
+        # have a TTY, ask directly in the terminal (PAT / OAuth / SSO) and
+        # gather the credential — no flags needed.
+        has_auth_flag = bool(
+            token or client_id or client_secret
+            or getattr(args, "sso", False) or auth_type
+        )
+        if interactive and not has_auth_flag:
+            import getpass
+
+            style.out(f"  {style.bold('Auth method')}\n")
+            style.out(f"    {style.dim('1)')} Personal access token (PAT)\n")
+            style.out(f"    {style.dim('2)')} OAuth machine-to-machine (client id + secret)\n")
+            style.out(f"    {style.dim('3)')} SSO / browser login\n")
+            choice = input("  Choose [1]: ").strip() or "1"
+            if choice == "2":
+                client_id = input("    Client ID: ").strip()
+                client_secret = getpass.getpass("    Client secret (hidden): ").strip()
+            elif choice == "3":
+                auth_type = auth_type or "external-browser"
+            else:
+                token = getpass.getpass("    Token (hidden): ").strip()
+            style.out("\n")
+
         # -- pick the credential mode -----------------------------------
         # OAuth M2M (client id/secret) wins when supplied; SSO (a browser /
         # CLI flow, no static secret) when ``--sso`` / ``--auth-type`` is set;

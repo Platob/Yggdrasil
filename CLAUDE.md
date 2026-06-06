@@ -46,6 +46,8 @@ Treat a cross-language divergence as a bug.
 5. **Collocate related code** — keep schemas, service logic, and the entry point for one concept readable together. Jumping between 5 files to understand one thing is worse than a 200-line service file.
 6. **Delete dead code** — no commented-out blocks, no `# TODO: maybe later`, no unused imports. If it's not called, it doesn't exist.
 7. **Prefer data over code** — dicts and lists over class hierarchies. Pydantic models over hand-rolled validation. Enum values over if/elif chains.
+8. **Real type hints, never string-quoted** — every module starts with `from __future__ import annotations`, then annotate with the **real** types (`Optional[Loki]`, not `"Optional[Loki]"`). When a type isn't importable at runtime (circular import, optional dep), import it under `if typing.TYPE_CHECKING:` and reference it unquoted — future-annotations makes that safe. No quoted forward-refs.
+9. **One CLI entry point** — `ygg` is the only console script. New commands are subcommands of `ygg` (e.g. `ygg run`, `ygg loki`), never separate `ygg-*` scripts.
 
 ## Principles
 

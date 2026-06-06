@@ -50,25 +50,13 @@ class TestEngines(unittest.TestCase):
             self.assertNotIn("databricks", loki._engine_instances())
 
 
-class TestDeploy(unittest.TestCase):
-    def test_deploy_requires_session(self):
-        with patch("yggdrasil.databricks.loki.agent.read_session", return_value=None):
-            with self.assertRaises(RuntimeError):
-                DatabricksLoki().deploy()
-
-    def test_deploy_creates_serverless_job(self):
-        client = MagicMock()
-        with patch("yggdrasil.databricks.loki.agent.read_session", return_value=_session()), \
-             patch("yggdrasil.databricks.DatabricksClient", return_value=client), \
-             patch("yggdrasil.databricks.job.wheel.ygg_environment", return_value="ENV"):
-            loki = DatabricksLoki()
-            loki.deploy(name="loki-test", behavior="reason", prompt="hi")
-        call = client.jobs.create_or_update.call_args
-        self.assertEqual(call.kwargs["name"], "loki-test")
-        self.assertEqual(call.kwargs["environments"], ["ENV"])
-        task = call.kwargs["tasks"][0]
-        self.assertEqual(task.python_wheel_task.entry_point, "ygg-loki")
-        self.assertEqual(task.python_wheel_task.package_name, "ygg")
+class TestReplication(unittest.TestCase):
+    def test_inherits_local_spawn(self):
+        # Replication is local process spawning inherited from Loki — no jobs.
+        loki = DatabricksLoki()
+        self.assertTrue(hasattr(loki, "spawn"))
+        self.assertTrue(hasattr(loki, "gather"))
+        self.assertFalse(hasattr(loki, "deploy"))
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ The :func:`task` / :func:`flow` decorators wrap a function into a **callable**
 The deploy ships the **live** code as a wheel (built from the package on disk —
 dev checkout or installed), placed in the shared workspace pypi registry, or in
 a per-user folder + rebuilt when the package is an editable install. The cluster
-task runs the ``ygg-run`` CLI (:mod:`yggdrasil.databricks.job.runner`), which
+task runs the ``ygg run`` CLI (:mod:`yggdrasil.databricks.job.runner`), which
 imports the target, coerces parameters to the function signature via the cast
 registry, runs the body, and round-trips the result.
 
@@ -54,7 +54,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = logging.getLogger(__name__)
 
 #: Active while a body runs **in-process** (``.local`` / ``.submit`` / the
-#: on-cluster ``ygg-run`` runner). Nested task/flow calls consult it so they run
+#: on-cluster ``ygg run`` runner). Nested task/flow calls consult it so they run
 #: locally too instead of each dispatching its own Databricks job — the flow,
 #: not every task, is the unit that ships to the cluster.
 _LOCAL_MODE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
@@ -132,8 +132,8 @@ class _Runnable:
     retry_delay_seconds: float
 
     # -- serverless / wheel defaults (shared by Task and Flow) -----------
-    package_name: str = "ygg"          # wheel that ships the ygg-run entry point
-    entry_point: str = "ygg-run"       # the runner CLI (runner.py)
+    package_name: str = "ygg"          # wheel that ships the `ygg` entry point
+    entry_point: str = "ygg"           # the unified CLI; jobs run `ygg run …`
     task_key: str = "run"
     serverless: bool = True
     environment_key: str = "default"
@@ -243,7 +243,7 @@ class _Runnable:
     def _dispatch_remote(self, args: tuple, kwargs: dict) -> Any:
         """Deploy this task/flow, run it once on Databricks with *args*/*kwargs*
         marshalled through a workspace payload, block, and return the real
-        result. The cluster runs ``ygg-run`` against :meth:`_target_ref`."""
+        result. The cluster runs ``ygg run`` against :meth:`_target_ref`."""
         from yggdrasil.databricks.client import DatabricksClient
         from yggdrasil.databricks.path import DatabricksPath
 
@@ -456,7 +456,7 @@ class _Runnable:
         return envs
 
     def tasks(self) -> list:
-        """The single serverless python-wheel task that runs ``ygg-run``."""
+        """The single serverless python-wheel task that runs ``ygg run …``."""
         from databricks.sdk.service.jobs import PythonWheelTask, Task as DBTask
 
         return [
@@ -466,7 +466,9 @@ class _Runnable:
                 python_wheel_task=PythonWheelTask(
                     package_name=self.package_name,
                     entry_point=self.entry_point,
-                    parameters=self._runner_parameters(),
+                    # `ygg` is the only console script; the deployed-task runner
+                    # is its `run` subcommand.
+                    parameters=["run", *self._runner_parameters()],
                 ),
             )
         ]
@@ -477,6 +479,9 @@ class _Runnable:
         environments = self.environments()
         if environments is not None:
             spec["environments"] = environments
+        tags = getattr(self, "job_tags", None)
+        if tags:
+            spec["tags"] = dict(tags)
         return spec
 
     def deploy(self, client: Any) -> "Job":

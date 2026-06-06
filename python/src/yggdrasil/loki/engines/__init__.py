@@ -6,6 +6,12 @@
 """
 from .claude_engine import ClaudeEngine
 from .databricks_engine import DatabricksServingEngine
+from .loki_engine import LokiAgentEngine
 from .openai_engine import OpenAIEngine
 
-__all__ = ["OpenAIEngine", "ClaudeEngine", "DatabricksServingEngine"]
+__all__ = [
+    "OpenAIEngine",
+    "ClaudeEngine",
+    "DatabricksServingEngine",
+    "LokiAgentEngine",
+]

@@ -62,33 +62,88 @@ loki.behaviors()                 # the catalog
 loki.run("hello", who="loki")    # dispatch (guards availability first)
 ```
 
-The built-in **`genie`** behavior is the reference: it guards on the
-`databricks` backend, then asks a Genie space a question (autonomously
-picking the first reachable space when none is named). Replication,
-inter-agent messaging, HTTP ingestion and serving land on this abstraction
-next.
+Built-in behaviors:
+
+- **`genie`** — asks a Genie space a question (autonomously picking the first
+  reachable space when none is named), returning the rows as tabular.
+- **`code-project`** — reasons out a small Python program from a spec, writes
+  the project, and **runs it**, returning the program's output:
+
+  ```python
+  ans = loki.run("code-project", spec="print the first 10 primes", name="primes")
+  ans.text                 # the program's stdout
+  ans.meta["project"]      # where the project was written
+  ```
 
 ## Reasoning engines (`TokenEngine`)
 
 A `TokenEngine` is the LLM contract Loki reasons on — the seam between the
-agent and whatever model backs it. Three are built in:
+agent and whatever model backs it. Each declares an `EngineType`
+(`openai` / `claude` / `databricks` / `loki_agent`). Built in:
 
 | Engine | Backend | Credentials |
 |---|---|---|
-| `ClaudeEngine` | Anthropic Messages API (`claude-opus-4-8`) | `ANTHROPIC_API_KEY` |
+| `ClaudeEngine` | Anthropic Messages API | `ANTHROPIC_API_KEY` |
 | `OpenAIEngine` | OpenAI Chat Completions | `OPENAI_API_KEY` |
 | `DatabricksServingEngine` | a Databricks serving endpoint | the Databricks session (no extra key) |
+| `LokiAgentEngine` | another Loki agent (delegation) | — |
 
 ```python
-loki.engines()                       # all three, call .available() to filter
+loki.engines()                       # all known, call .available() to filter
 loki.engine()                        # the best available (preference order)
 loki.engine("claude")                # a specific one
-loki.reason("summarize today's failed jobs", system="be terse")
+r = loki.reason("summarize today's failed jobs", system="be terse")
+r.text                               # the reply (an AgentResponse)
 ```
 
 `Loki.ENGINE_PREFERENCE` picks the engine when none is named (`claude` →
 `openai` → `databricks` for the global agent). Implement `TokenEngine` to
 add another backend.
+
+### Models adapt to complexity (`TokenModel`)
+
+`TokenModel` is the model catalog, grouped by `Provider` and `Complexity`
+(`low`/`medium`/`high`). An engine adapts the model it uses to the task:
+
+```python
+loki.reason("classify this ticket", complexity="low")    # → a cheap/fast model
+loki.reason("design a migration plan", complexity="high")  # → the most capable
+```
+
+The catalog is extensible — `register_model(...)` / `unregister_model(...)`
+add or drop models; `select_model(provider, complexity)` picks the fit.
+
+### Tabular answers (`AgentResponse`)
+
+`reason()` and behaviors return an `AgentResponse` — narrative `text` plus,
+when the result is tabular-like, an optional `tabular` frame (Arrow /
+Polars / pandas). The `genie` behavior attaches the rows it computed:
+
+```python
+ans = loki.run("genie", question="top 10 customers by revenue")
+ans.text                # Genie's narrative
+ans.is_tabular          # True when it answered with SQL
+ans.tabular             # the rows (Polars), or ans.to_polars()
+```
+
+## Replication — local parallel agents
+
+A Loki replicates by **forking copies of itself into separate local
+processes**, each running a behavior in parallel; it monitors them and
+collects their `AgentResponse`s. This is on-machine parallelism, not remote
+jobs.
+
+```python
+rep = loki.spawn("genie", question="failures today")   # a child process
+rep.status                                              # running → done/failed
+rep.result(timeout=60)                                  # → AgentResponse
+
+reps = loki.map("genie", questions, arg="question")     # fan-out
+answers = loki.gather(reps)                             # collect all
+```
+
+Forked children inherit the live agent — its registered behaviors, detected
+backends, and engine — so a replica is a true copy of the current agent.
 
 ## DatabricksLoki — the specialized agent
 
@@ -101,8 +156,8 @@ Databricks at most:
 - **Reasons through a Databricks serving endpoint** by default
   (`ENGINE_PREFERENCE = ("databricks", "claude", "openai")`; override the
   endpoint with `serving_endpoint=` or `YGG_LOKI_SERVING_ENDPOINT`).
-- **Deploys to Databricks**: `deploy()` upserts a serverless Job that runs the
-  agent on the pre-built ygg image via the `ygg-loki` wheel entry point.
+- **Replicates locally** like every Loki — `spawn` / `map` / `gather` fork
+  child agent processes on the current machine.
 
 ```python
 from yggdrasil.databricks.loki import DatabricksLoki
@@ -110,8 +165,7 @@ from yggdrasil.databricks.loki import DatabricksLoki
 loki = DatabricksLoki.current()
 loki.databricks                      # client from the configure profile, or None
 loki.reason("which jobs failed in the last hour?")
-job = loki.deploy(behavior="reason", prompt="nightly health check")
-job.run()
+loki.gather(loki.map("genie", questions, arg="question"))
 ```
 
 ## CLI

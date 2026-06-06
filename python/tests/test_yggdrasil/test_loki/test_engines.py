@@ -8,8 +8,53 @@ from unittest.mock import MagicMock, patch
 
 from yggdrasil.loki import Loki
 from yggdrasil.loki.capability import Backend
-from yggdrasil.loki.engine import Completion, TokenEngine
+from yggdrasil.loki.engine import AgentResponse, Completion, EngineType, TokenEngine
 from yggdrasil.loki.engines import ClaudeEngine, DatabricksServingEngine, OpenAIEngine
+
+
+class TestEngineTypes(unittest.TestCase):
+    def test_each_engine_declares_its_type(self):
+        self.assertEqual(OpenAIEngine.type, EngineType.OPENAI)
+        self.assertEqual(ClaudeEngine.type, EngineType.CLAUDE)
+        self.assertEqual(DatabricksServingEngine.type, EngineType.DATABRICKS)
+
+    def test_loki_agent_engine_delegates(self):
+        from unittest.mock import MagicMock
+
+        from yggdrasil.loki.engines import LokiAgentEngine
+
+        agent = MagicMock()
+        agent.reason.return_value = AgentResponse(text="delegated")
+        eng = LokiAgentEngine(agent)
+        self.assertEqual(eng.type, EngineType.LOKI_AGENT)
+        self.assertEqual(eng.generate("hi"), "delegated")
+
+
+class TestComplexityAdaptation(unittest.TestCase):
+    def test_resolve_model_adapts_to_complexity(self):
+        eng = ClaudeEngine(api_key="k")
+        self.assertEqual(eng.resolve_model("low"), "claude-haiku-4-5")
+        self.assertEqual(eng.resolve_model("high"), "claude-opus-4-8")
+        self.assertEqual(eng.resolve_model(None), "claude-opus-4-8")  # default
+
+
+class TestAgentResponse(unittest.TestCase):
+    def test_detects_tabular(self):
+        import pyarrow as pa
+
+        tbl = pa.table({"a": [1, 2]})
+        resp = AgentResponse.from_(tbl)
+        self.assertTrue(resp.is_tabular)
+        self.assertIs(resp.tabular, tbl)
+
+    def test_string_becomes_text(self):
+        resp = AgentResponse.from_("hello")
+        self.assertEqual(resp.text, "hello")
+        self.assertFalse(resp.is_tabular)
+
+    def test_passthrough(self):
+        r = AgentResponse(text="x")
+        self.assertIs(AgentResponse.from_(r), r)
 
 
 class TestEngineContract(unittest.TestCase):

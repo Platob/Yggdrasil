@@ -40,7 +40,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: "Sequence[str] | None" = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     from yggdrasil.cli import style
     from yggdrasil.loki import Loki
 
@@ -110,7 +110,9 @@ def _reason(loki: Any, style: Any, args: Any) -> int:
     except (KeyError, RuntimeError) as exc:
         style.fail(exc.args[0] if exc.args else str(exc))
         return 1
-    style.out(f"\n{out}\n")
+    style.out(f"\n{out.text}\n")
+    if out.is_tabular:
+        style.out(f"\n{out.tabular}\n")
     return 0
 
 
@@ -171,9 +173,11 @@ def _run(loki: Any, style: Any, args: Any) -> int:
         style.fail(exc.args[0] if exc.args else str(exc))
         return 1
     if args.json:
+        from yggdrasil.loki import AgentResponse
         from yggdrasil.pickle import json as yjson
 
-        style.out(yjson.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result))
+        payload = result.to_dict() if isinstance(result, AgentResponse) else result
+        style.out(yjson.dumps(payload, indent=2) if isinstance(payload, (dict, list)) else str(payload))
         style.out("\n")
     else:
         style.ok(f"behavior {args.name!r} completed")
@@ -182,6 +186,16 @@ def _run(loki: Any, style: Any, args: Any) -> int:
 
 
 def _print_result(result: Any, style: Any) -> None:
+    from yggdrasil.loki import AgentResponse
+
+    if isinstance(result, AgentResponse):
+        if result.text:
+            style.out(f"    {_short(result.text)}\n")
+        for k, v in result.meta.items():
+            style.out(f"    {style.dim(k.ljust(14))} {_short(v)}\n")
+        if result.is_tabular:
+            style.out(f"\n{result.tabular}\n")
+        return
     if isinstance(result, dict):
         for k, v in result.items():
             style.out(f"    {style.dim(k.ljust(14))} {_short(v)}\n")

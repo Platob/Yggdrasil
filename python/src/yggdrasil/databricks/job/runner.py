@@ -1,12 +1,12 @@
-"""``ygg-run`` — the CLI a deployed ``@task`` / ``@flow`` runs *as* on the cluster.
+"""``ygg run`` — the subcommand a deployed ``@task`` / ``@flow`` runs *as* on the cluster.
 
 A serverless python-wheel task invokes this entry point (``package_name="ygg"``,
-``entry_point="ygg-run"``) with the **target** of the decorated object plus
+``entry_point="ygg"`` → ``ygg run``) with the **target** of the decorated object plus
 either a pickled argument payload (the transparent ``__call__`` dispatch from a
 laptop) or positional string parameters (a scheduled / triggered deploy)::
 
-    ygg-run pkg.flows:etl --payload <ws>/payload.pkl --result <ws>/result.pkl
-    ygg-run pkg.flows:etl 2024-01-01 7          # scheduled: string params
+    ygg run pkg.flows:etl --payload <ws>/payload.pkl --result <ws>/result.pkl
+    ygg run pkg.flows:etl 2024-01-01 7          # scheduled: string params
 
 It imports the target, binds the arguments to the function signature — coercing
 each to its annotation via :func:`yggdrasil.data.cast.convert` (so string job
@@ -75,7 +75,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     from yggdrasil.databricks.job.skeleton import ensure_console_logging
     from yggdrasil.databricks.path import DatabricksPath
 
-    parser = argparse.ArgumentParser(prog="ygg-run", description="Run a deployed @task/@flow.")
+    parser = argparse.ArgumentParser(prog="ygg run", description="Run a deployed @task/@flow.")
     parser.add_argument("target", help="module.path:qualname of the decorated task/flow")
     parser.add_argument("--payload", help="workspace path to a pickled (args, kwargs) tuple")
     parser.add_argument("--result", help="workspace path to write the pickled return value to")
@@ -83,7 +83,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     ns = parser.parse_args(list(argv) if argv is not None else sys.argv[1:])
 
     ensure_console_logging()  # surface ygg logs in the job task output
-    logger.info("ygg-run target=%s", ns.target)
+    logger.info("ygg run target=%s", ns.target)
 
     import importlib
 
@@ -121,8 +121,8 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         out = DatabricksPath.from_(ns.result, client=client)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(pickle.dumps(result))
-        logger.info("ygg-run wrote result to %s", ns.result)
-    logger.info("ygg-run target=%s done", ns.target)
+        logger.info("ygg run wrote result to %s", ns.result)
+    logger.info("ygg run target=%s done", ns.target)
     return 0
 
 

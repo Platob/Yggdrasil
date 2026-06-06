@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 from typing import Any, ClassVar, Optional
 
-from ..engine import DEFAULT_MAX_TOKENS, Completion, TokenEngine
+from ..engine import DEFAULT_MAX_TOKENS, Completion, EngineType, TokenEngine
+from ..model import Provider, TokenModel
 
 __all__ = ["OpenAIEngine"]
 
@@ -13,7 +14,9 @@ class OpenAIEngine(TokenEngine):
     """Reason via the OpenAI Chat Completions API (``openai`` SDK)."""
 
     name = "openai"
-    default_model: ClassVar[str] = "gpt-4o-mini"
+    type: ClassVar[EngineType] = EngineType.OPENAI
+    provider: ClassVar[Provider] = Provider.OPENAI
+    default_model: ClassVar[str] = TokenModel.GPT_4O_MINI.id
 
     def __init__(self, *, model: Optional[str] = None, api_key: Optional[str] = None,
                  base_url: Optional[str] = None) -> None:
@@ -35,11 +38,12 @@ class OpenAIEngine(TokenEngine):
         *,
         system: Optional[str] = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        complexity: Any = None,
         **options: Any,
     ) -> Completion:
         msgs = ([{"role": "system", "content": system}] if system else []) + list(messages)
         resp = self._client().chat.completions.create(
-            model=self.model, messages=msgs, max_tokens=max_tokens, **options,
+            model=self.resolve_model(complexity), messages=msgs, max_tokens=max_tokens, **options,
         )
         choice = resp.choices[0]
         usage = getattr(resp, "usage", None)

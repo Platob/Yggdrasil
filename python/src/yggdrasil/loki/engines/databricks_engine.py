@@ -9,19 +9,23 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Optional
 
-from ..engine import DEFAULT_MAX_TOKENS, Completion, TokenEngine
+from ..engine import DEFAULT_MAX_TOKENS, Completion, EngineType, TokenEngine
+from ..model import Provider, TokenModel
 
 __all__ = ["DatabricksServingEngine"]
 
-# A broadly-available Databricks Foundation Model API chat endpoint. Override
-# per workspace via ``endpoint=`` / the agent's configured endpoint.
-DEFAULT_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
+# Default to the lowest-tier (cheapest/fastest) Databricks chat endpoint;
+# complexity adaptation scales up from here. Override per workspace via
+# ``endpoint=`` / the agent's configured endpoint.
+DEFAULT_ENDPOINT = TokenModel.DBX_GPT_OSS_20B.id
 
 
 class DatabricksServingEngine(TokenEngine):
     """Reason via a Databricks serving endpoint."""
 
     name = "databricks"
+    type: ClassVar[EngineType] = EngineType.DATABRICKS
+    provider: ClassVar[Provider] = Provider.DATABRICKS
 
     def __init__(
         self,
@@ -55,9 +59,12 @@ class DatabricksServingEngine(TokenEngine):
         *,
         system: Optional[str] = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        complexity: Any = None,
         **options: Any,
     ) -> Completion:
         msgs = ([{"role": "system", "content": system}] if system else []) + list(messages)
+        # The endpoint name *is* the model selector; adapt it to complexity.
+        endpoint = self.resolve_model(complexity) or self.endpoint
         w = self.client.workspace_client()
 
         # Preferred path: the SDK's OpenAI-compatible client points straight at
@@ -65,12 +72,12 @@ class DatabricksServingEngine(TokenEngine):
         get_oai = getattr(w.serving_endpoints, "get_open_ai_client", None)
         if callable(get_oai):
             resp = get_oai().chat.completions.create(
-                model=self.endpoint, messages=msgs, max_tokens=max_tokens, **options,
+                model=endpoint, messages=msgs, max_tokens=max_tokens, **options,
             )
             choice = resp.choices[0]
             return Completion(
                 text=choice.message.content or "",
-                model=getattr(resp, "model", self.endpoint),
+                model=getattr(resp, "model", endpoint),
                 raw=resp,
             )
 
@@ -82,7 +89,7 @@ class DatabricksServingEngine(TokenEngine):
             for m in msgs
         ]
         resp = w.serving_endpoints.query(
-            name=self.endpoint, messages=chat, max_tokens=max_tokens,
+            name=endpoint, messages=chat, max_tokens=max_tokens,
         )
         choices = getattr(resp, "choices", None) or []
         text = choices[0].message.content if choices else ""

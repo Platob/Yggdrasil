@@ -20,11 +20,13 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from . import behavior as _behavior
 from .capability import Backend, detect
+from .engine import AgentResponse
 
 if TYPE_CHECKING:
     from yggdrasil.databricks import DatabricksClient
 
     from .engine import TokenEngine
+    from .replica import Replica
 
 __all__ = ["Loki"]
 
@@ -37,7 +39,7 @@ class Loki:
     #: Order in which Loki picks a reasoning engine when none is named.
     ENGINE_PREFERENCE: tuple[str, ...] = ("claude", "openai", "databricks")
 
-    _CURRENT: "Optional[Loki]" = None
+    _CURRENT: Optional[Loki] = None
 
     def __init__(self) -> None:
         import getpass
@@ -45,12 +47,13 @@ class Loki:
 
         self.user = _safe(getpass.getuser)
         self.host = _safe(socket.gethostname)
-        self._backends: "Optional[list[Backend]]" = None
+        self._backends: Optional[list[Backend]] = None
+        self._replicas: list[Replica] = []
 
     # -- singleton ---------------------------------------------------------
 
     @classmethod
-    def current(cls) -> "Loki":
+    def current(cls) -> Loki:
         """The process-global Loki (created on first use)."""
         if cls._CURRENT is None:
             cls._CURRENT = cls()
@@ -73,7 +76,7 @@ class Loki:
             self._backends = detect()
         return self._backends
 
-    def backend(self, name: str, *, refresh: bool = False) -> "Optional[Backend]":
+    def backend(self, name: str, *, refresh: bool = False) -> Optional[Backend]:
         for b in self.backends(refresh=refresh):
             if b.name == name:
                 return b
@@ -86,7 +89,7 @@ class Loki:
     # -- Databricks token provider ----------------------------------------
 
     @property
-    def databricks(self) -> "Optional[DatabricksClient]":
+    def databricks(self) -> Optional[DatabricksClient]:
         """The authenticated Databricks client when a session is present.
 
         This is Loki acting as a token provider: behaviors and downstream
@@ -114,7 +117,7 @@ class Loki:
             "schema": b.detail.get("schema"),
         }
 
-    def whoami(self, *, probe: bool = False) -> "Optional[str]":
+    def whoami(self, *, probe: bool = False) -> Optional[str]:
         """The Databricks user, if reachable. ``probe`` allows one network call."""
         client = self.databricks
         if client is None or not probe:
@@ -126,7 +129,7 @@ class Loki:
 
     # -- reasoning engines -------------------------------------------------
 
-    def _engine_instances(self) -> "dict[str, TokenEngine]":
+    def _engine_instances(self) -> dict[str, TokenEngine]:
         """One instance of every known engine (Databricks bound to our client)."""
         from .engines import ClaudeEngine, DatabricksServingEngine, OpenAIEngine
 
@@ -136,11 +139,11 @@ class Loki:
             "databricks": DatabricksServingEngine(client=self.databricks),
         }
 
-    def engines(self) -> "list[TokenEngine]":
+    def engines(self) -> list[TokenEngine]:
         """Every known reasoning engine (call ``.available()`` to filter)."""
         return list(self._engine_instances().values())
 
-    def engine(self, name: "Optional[str]" = None) -> "Optional[TokenEngine]":
+    def engine(self, name: Optional[str] = None) -> Optional[TokenEngine]:
         """Resolve a reasoning engine by name, or the best available one."""
         insts = self._engine_instances()
         if name is not None:
@@ -157,36 +160,76 @@ class Loki:
         self,
         prompt: str,
         *,
-        system: "Optional[str]" = None,
-        engine: "Optional[str]" = None,
+        system: Optional[str] = None,
+        engine: Optional[str] = None,
+        complexity: Any = None,
         **options: Any,
-    ) -> str:
-        """Reason about *prompt* with the best (or named) engine → reply text."""
+    ) -> AgentResponse:
+        """Reason about *prompt* with the best (or named) engine.
+
+        *complexity* (``"low"``/``"medium"``/``"high"`` or 1–3) lets the
+        engine adapt the model to the task. Returns an :class:`AgentResponse`.
+        """
         eng = self.engine(engine)
         if eng is None or not eng.available():
             raise RuntimeError(
                 "no reasoning engine available — set ANTHROPIC_API_KEY / "
                 "OPENAI_API_KEY, or run with a Databricks session"
             )
-        return eng.generate(prompt, system=system, **options)
+        completion = eng.complete(
+            [{"role": "user", "content": prompt}],
+            system=system, complexity=complexity, **options,
+        )
+        return AgentResponse(
+            text=completion.text,
+            data=completion,
+            meta={"engine": eng.name, "model": completion.model},
+        )
+
+    # -- replication (local parallel agent processes) ----------------------
+
+    def _agent_ref(self) -> str:
+        return f"{type(self).__module__}:{type(self).__name__}"
+
+    def spawn(self, behavior: str, **kwargs: Any) -> Replica:
+        """Fork a child **process** running *behavior* on a copy of this agent."""
+        from .replica import Replica
+
+        replica = Replica(self._agent_ref(), behavior, kwargs).start()
+        self._replicas.append(replica)
+        return replica
+
+    def map(self, behavior: str, items: Any, *, arg: str = "item", **common: Any) -> list[Replica]:
+        """Fan *behavior* out across *items* — one child process each."""
+        return [self.spawn(behavior, **{**common, arg: item}) for item in items]
+
+    def gather(self, replicas: Optional[list[Replica]] = None, *, timeout: Optional[float] = None) -> list[AgentResponse]:
+        """Wait for *replicas* (default: all spawned) and collect their responses."""
+        targets = self._replicas if replicas is None else replicas
+        return [r.result(timeout=timeout) for r in targets]
+
+    @property
+    def replicas(self) -> list[Replica]:
+        """The child processes this agent has spawned."""
+        return list(self._replicas)
 
     # -- behaviors ---------------------------------------------------------
 
     def behaviors(self) -> list["_behavior.LokiBehavior"]:
         return _behavior.registry()
 
-    def behavior(self, name: str) -> "Optional[_behavior.LokiBehavior]":
+    def behavior(self, name: str) -> Optional[_behavior.LokiBehavior]:
         return _behavior.get(name)
 
-    def run(self, name: str, **kwargs: Any) -> Any:
-        """Dispatch behavior *name* with *kwargs*, using self as the provider."""
-        b = self.behavior(name)
+    def run(self, behavior: str, **kwargs: Any) -> Any:
+        """Dispatch *behavior* with *kwargs*, using self as the provider."""
+        b = self.behavior(behavior)
         if b is None:
             known = ", ".join(x.name for x in self.behaviors()) or "(none)"
-            raise KeyError(f"unknown behavior {name!r}; registered: {known}")
+            raise KeyError(f"unknown behavior {behavior!r}; registered: {known}")
         if not b.available(self):
             raise RuntimeError(
-                f"behavior {name!r} needs backend {b.requires!r}, "
+                f"behavior {behavior!r} needs backend {b.requires!r}, "
                 f"which is not available here"
             )
         return b.run(self, **kwargs)

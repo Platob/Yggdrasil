@@ -36,7 +36,7 @@ class LokiBehavior(ABC):
     #: ``None`` when it runs anywhere. Drives the default :meth:`available`.
     requires: ClassVar[str | None] = None
 
-    def available(self, agent: "Loki") -> bool:
+    def available(self, agent: Loki) -> bool:
         """True when this behavior can run in *agent*'s environment.
 
         Default: available everywhere, unless :attr:`requires` names a
@@ -48,7 +48,7 @@ class LokiBehavior(ABC):
         return bool(backend and backend.available)
 
     @abstractmethod
-    def run(self, agent: "Loki", **kwargs: Any) -> Any:
+    def run(self, agent: Loki, **kwargs: Any) -> Any:
         """Perform the behavior, using *agent* as the capability/token provider."""
 
     def to_dict(self) -> dict[str, Any]:
@@ -62,7 +62,7 @@ class LokiBehavior(ABC):
         return f"{type(self).__name__}(name={self.name!r}, requires={self.requires!r})"
 
 
-def register(behavior: "type[LokiBehavior] | LokiBehavior") -> "type[LokiBehavior] | LokiBehavior":
+def register(behavior: type[LokiBehavior] | LokiBehavior) -> type[LokiBehavior] | LokiBehavior:
     """Register a behavior (class or instance) by its ``name``.
 
     Usable as a decorator on a :class:`LokiBehavior` subclass::
@@ -77,10 +77,10 @@ def register(behavior: "type[LokiBehavior] | LokiBehavior") -> "type[LokiBehavio
     return behavior
 
 
-def get(name: str) -> "LokiBehavior | None":
+def get(name: str) -> LokiBehavior | None:
     return REGISTRY.get(name)
 
 
-def registry() -> list["LokiBehavior"]:
+def registry() -> list[LokiBehavior]:
     """All registered behaviors, sorted by name."""
     return [REGISTRY[name] for name in sorted(REGISTRY)]

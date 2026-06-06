@@ -118,9 +118,45 @@ class TestGenieBehavior(unittest.TestCase):
         with patch("yggdrasil.databricks.DatabricksClient") as DC:
             DC.current.return_value = client
             out = loki.run("genie", question="how many orders?")
-        self.assertEqual(out["space_id"], "s1")
-        self.assertEqual(out["text"], "hi")
+        # The behavior returns an AgentResponse (no SQL → no tabular).
+        self.assertEqual(out.text, "hi")
+        self.assertEqual(out.meta["space_id"], "s1")
+        self.assertFalse(out.is_tabular)
         client.genie.spaces.assert_called_once()
+
+
+class TestCodeProjectSimulation(unittest.TestCase):
+    """Simulate Loki creating a Python project from a spec and executing it."""
+
+    CODE = (
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "if __name__ == '__main__':\n"
+        "    print('loki-sim', add(2, 3))\n"
+    )
+
+    def test_generates_writes_and_runs(self):
+        import pathlib
+
+        from yggdrasil.loki import AgentResponse
+
+        loki = Loki()
+        # Stub the reasoning engine with canned code (no live LLM in tests).
+        with patch.object(Loki, "reason", return_value=AgentResponse(text=self.CODE)):
+            resp = loki.run("code-project", spec="add two numbers", name="sim")
+        self.assertEqual(resp.meta["returncode"], 0)
+        self.assertIn("loki-sim 5", resp.text)
+        self.assertTrue(pathlib.Path(resp.meta["entry"]).is_file())
+
+    def test_strips_markdown_fences(self):
+        from yggdrasil.loki import AgentResponse
+
+        fenced = "```python\nprint('ok')\n```"
+        loki = Loki()
+        with patch.object(Loki, "reason", return_value=AgentResponse(text=fenced)):
+            resp = loki.run("code-project", spec="print ok", name="sim2")
+        self.assertEqual(resp.text, "ok")
+        self.assertNotIn("```", resp.data["code"])
 
 
 if __name__ == "__main__":
