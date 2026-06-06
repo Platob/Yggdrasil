@@ -102,6 +102,7 @@ class Loki:
         self.user = _safe(getpass.getuser)
         self.host = _safe(socket.gethostname)
         self._backends: "Optional[list[Backend]]" = None
+        self._engines: "Optional[dict[str, TokenEngine]]" = None
 
     # -- singleton ---------------------------------------------------------
 
@@ -215,24 +216,34 @@ class Loki:
 
     # -- reasoning engines -------------------------------------------------
 
-    def _engine_instances(self) -> "dict[str, TokenEngine]":
+    def _engine_instances(self, *, refresh: bool = False) -> "dict[str, TokenEngine]":
         """One instance of every known engine — remote APIs plus the free
-        local ones (Databricks bound to our client)."""
-        from .engines import (
-            ClaudeEngine,
-            DatabricksServingEngine,
-            OllamaEngine,
-            OpenAIEngine,
-            TransformersEngine,
-        )
+        local ones (Databricks bound to our client).
 
-        return {
-            "claude": ClaudeEngine(),
-            "openai": OpenAIEngine(),
-            "databricks": DatabricksServingEngine(client=self.databricks),
-            "ollama": OllamaEngine(),
-            "transformers": TransformersEngine(),
-        }
+        Cached for the process: ``engine()``, ``engines()``, and ``select()``
+        all resolve engines, and rebuilding them each time would re-run every
+        ``available()`` check — including the Ollama liveness *network* probe —
+        several times per ``ygg loki`` command. Reusing the instances keeps the
+        startup path to a single probe (each engine memoizes its own check).
+        ``refresh=True`` re-detects (e.g. after a Databricks session appears).
+        """
+        if self._engines is None or refresh:
+            from .engines import (
+                ClaudeEngine,
+                DatabricksServingEngine,
+                OllamaEngine,
+                OpenAIEngine,
+                TransformersEngine,
+            )
+
+            self._engines = {
+                "claude": ClaudeEngine(),
+                "openai": OpenAIEngine(),
+                "databricks": DatabricksServingEngine(client=self.databricks),
+                "ollama": OllamaEngine(),
+                "transformers": TransformersEngine(),
+            }
+        return self._engines
 
     def engines(self) -> "list[TokenEngine]":
         """Every known reasoning engine (call ``.available()`` to filter)."""

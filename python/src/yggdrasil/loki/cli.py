@@ -118,6 +118,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     style.print_logo("YGGLOKI")
 
+    # Surface local-model progress in the terminal: the transformers engine
+    # logs its (otherwise silent) weight download + model load through the
+    # `yggdrasil.loki` logger, so a long first run on a CPU box isn't a black
+    # box. Stderr-bound + styled — never tangles with streamed output on stdout.
+    import logging
+
+    style.install_logging(logger=logging.getLogger("yggdrasil.loki"), show_name=False)
+
     if action == "chat":
         return _repl(loki, style)
     if action == "usage":
@@ -348,9 +356,25 @@ def _select_engine(loki: Any, style: Any, state: dict) -> None:
     style.ok(f"engine → {state['engine']}")
 
 
+def _local_load_notice(agent: Any, style: Any, engine: "str | None") -> None:
+    """Warn that a local transformers model is about to load (slow + silent).
+
+    The first turn on a fresh box downloads weights and builds the pipeline
+    before a single token streams; say so up front so the wait isn't a black
+    box (the engine then logs the load itself via the routed loki logger)."""
+    if engine != "transformers":
+        return
+    eng = agent.engine("transformers")
+    model = eng.resolve_model()
+    if not eng.ready(model):
+        style.out(f"  {style.dim('▹ loading local model')} {style.brand(model)} "
+                  f"{style.dim('· first run downloads weights, then runs on CPU — this can take a while')}\n")
+
+
 def _stream_reply(agent: Any, style: Any, line: str, state: dict,
                   *, engine: "str | None" = None, system: "str | None" = None) -> str:
     """Stream a reasoned reply to the terminal token-by-token; return the full text."""
+    _local_load_notice(agent, style, engine)
     style.out("\n  ")
     parts: list[str] = []
     for chunk in agent.reason_stream(line, engine=engine,
