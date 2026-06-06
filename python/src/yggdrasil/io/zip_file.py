@@ -618,6 +618,24 @@ class ZipFile(IO):
             self.__dict__["__zip_blocks__"] = cache
         return cache[1], cache[2]
 
+    def _settle_size(self) -> int:
+        """The full archive size, pulling a streaming holder to EOF first.
+
+        A zip's central directory lives at the **end** of the archive, so a
+        partially-pulled stream can't be walked — and a streaming holder
+        (the ``stream=True`` :class:`HTTPStream`, a spilling
+        :class:`MemoryStream`) reports :attr:`size` as the bytes pulled *so
+        far* (``0`` before the first read, with ``size_known`` False). Drive
+        the pull to EOF so the directory walk and the seek-to-end reads
+        :mod:`zipfile` makes see the whole archive — the same way the format
+        leaves drive their own read. Settled in-memory / ranged-random-access
+        holders report ``size_known`` True and are left untouched (a ranged
+        holder fetches the directory tail lazily, no full download)."""
+        if not self.size_known:
+            holder = self._parent if self._parent is not None else self
+            holder.read_mv(-1, 0)  # pull to EOF; size now spans the whole archive
+        return int(self.size)
+
     def _cached_infos(self) -> "list[zipfile.ZipInfo]":
         """Parse + cache the central directory once.
 
@@ -627,7 +645,7 @@ class ZipFile(IO):
         Repeated ``list_entries`` / ``iter_children`` / ``child`` calls then
         cost zero extra round trips.
         """
-        size = int(self.size)
+        size = self._settle_size()
         cached = self.__dict__.get("__zip_dir__")
         if cached is not None and self.__dict__.get("__zip_dir_size__") == size:
             return cached
@@ -800,8 +818,9 @@ class ZipFile(IO):
         format, …) behind an empty read. Empty archives still
         return zero batches without raising.
         """
-        # ``size_known`` guard — a streaming holder is size 0 until pulled.
-        if self.size_known and self.size == 0:
+        # Settle a streaming holder to EOF (its directory is at the archive's
+        # end) so an un-pulled stream isn't mistaken for an empty archive.
+        if self._settle_size() == 0:
             return
 
         # Force every format leaf to register before we probe the
