@@ -355,24 +355,30 @@ class TestOllamaEngine(unittest.TestCase):
         with patch.dict(os.environ, {"OLLAMA_HOST": "http://box:1234/"}):
             self.assertEqual(OllamaEngine().host, "http://box:1234")
 
-    def test_available_pings_tags(self):
+    @staticmethod
+    def _fake_session(*, get_json=None, get_status=200, post_json=None):
+        """A stand-in HTTPSession whose get/post return canned HTTPResponses."""
+        sess = MagicMock()
+        sess.get.return_value = MagicMock(status_code=get_status,
+                                          json=MagicMock(return_value=get_json or {}))
+        sess.post.return_value = MagicMock(json=MagicMock(return_value=post_json or {}))
+        return sess
+
+    def test_available_pings_tags_via_httpsession(self):
         eng = OllamaEngine()
-        ok = MagicMock(); ok.status = 200
-        ok.__enter__ = lambda s: s; ok.__exit__ = lambda s, *a: False
-        with patch("urllib.request.urlopen", return_value=ok):
+        with patch.object(OllamaEngine, "_session", return_value=self._fake_session(get_status=200)):
             self.assertTrue(eng.available())
-        with patch("urllib.request.urlopen", side_effect=OSError("refused")):
+        sess = MagicMock(); sess.get.side_effect = OSError("refused")
+        with patch.object(OllamaEngine, "_session", return_value=sess):
             self.assertFalse(eng.available())
 
     def test_bootstrap_model_is_lightweight(self):
         self.assertEqual(OllamaEngine.bootstrap_model, "qwen2.5:3b")
 
     def test_installed_models_and_has_model(self):
-        tags = json.dumps({"models": [{"name": "qwen2.5:3b"}, {"name": "llama3.2:latest"}]}).encode()
-        resp = MagicMock()
-        resp.read.return_value = tags
-        resp.__enter__ = lambda s: s; resp.__exit__ = lambda s, *a: False
-        with patch("urllib.request.urlopen", return_value=resp):
+        sess = self._fake_session(get_json={"models": [{"name": "qwen2.5:3b"},
+                                                        {"name": "llama3.2:latest"}]})
+        with patch.object(OllamaEngine, "_session", return_value=sess):
             eng = OllamaEngine()
             self.assertEqual(eng.installed_models(), ["qwen2.5:3b", "llama3.2:latest"])
             self.assertTrue(eng.has_model("qwen2.5:3b"))
@@ -395,33 +401,27 @@ class TestOllamaEngine(unittest.TestCase):
         pull.assert_called_once_with("qwen2.5:3b")
         self.assertEqual((receipt["was_present"], receipt["status"]), (False, "success"))
 
-    def test_pull_streams_progress_and_returns_final_status(self):
-        lines = [json.dumps({"status": "pulling manifest"}).encode(),
-                 b"", json.dumps({"status": "success"}).encode()]
-        resp = MagicMock()
-        resp.__iter__ = lambda s: iter(lines)
-        resp.__enter__ = lambda s: s; resp.__exit__ = lambda s, *a: False
-        with patch("urllib.request.urlopen", return_value=resp) as urlopen:
+    def test_pull_posts_and_returns_final_status(self):
+        sess = self._fake_session(post_json={"status": "success"})
+        with patch.object(OllamaEngine, "_session", return_value=sess):
             status = OllamaEngine().pull("qwen2.5:3b")
         self.assertEqual(status, "success")
-        body = json.loads(urlopen.call_args.args[0].data)
-        self.assertEqual(body["name"], "qwen2.5:3b")
+        # The pull rides HTTPSession.post with the non-streaming body.
+        kwargs = sess.post.call_args.kwargs
+        self.assertEqual(kwargs["json"], {"name": "qwen2.5:3b", "stream": False})
 
     def test_complete_posts_chat_and_records_provider_tokens(self):
         from yggdrasil.loki.usage import METER
 
-        payload = json.dumps({
+        sess = self._fake_session(post_json={
             "message": {"role": "assistant", "content": "ollama reply"},
             "prompt_eval_count": 11, "eval_count": 4,
-        }).encode()
-        resp = MagicMock()
-        resp.read.return_value = payload
-        resp.__enter__ = lambda s: s; resp.__exit__ = lambda s, *a: False
+        })
         METER.reset()
-        with patch("urllib.request.urlopen", return_value=resp) as urlopen:
+        with patch.object(OllamaEngine, "_session", return_value=sess):
             out = OllamaEngine(model="llama3.2").generate("hi", system="sys")
         self.assertEqual(out, "ollama reply")
-        sent = json.loads(urlopen.call_args.args[0].data)
+        sent = sess.post.call_args.kwargs["json"]
         self.assertEqual(sent["messages"][0], {"role": "system", "content": "sys"})
         self.assertFalse(sent["stream"])
         row = METER.rows_for("ollama")[0]

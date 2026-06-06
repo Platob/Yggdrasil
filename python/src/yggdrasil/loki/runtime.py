@@ -6,12 +6,16 @@ browser (``playwright``) — only when a feature actually needs one. Rather than
 fail with an ``ImportError`` three frames deep, it **installs the missing
 package into the running interpreter on first use** and continues.
 
-The install is routed through the project's own
-:meth:`~yggdrasil.environ.PyEnv.runtime_import_module` (via
-:func:`yggdrasil.lazy_imports._lazy_import` with ``install=True``), which
-anchors on ``sys.executable`` so the package lands in the same site-packages
-the process already reads from. Set ``YGG_LOKI_AUTO_INSTALL=0`` to turn this
-off — then a missing package raises the normal ``ImportError``.
+This is a thin, default-on wrapper over the project's own optional-dependency
+guard, :func:`yggdrasil.lazy_imports._lazy_import`: it imports a module and, on
+a miss, installs *pip_name* via
+:meth:`~yggdrasil.environ.PyEnv.runtime_import_module` — which anchors on
+``sys.executable`` so the package **persists in the interpreter Loki is running
+in**. The only thing Loki adds is the default: ``_lazy_import`` defaults to
+``install=False`` (project-wide hygiene), while Loki's :func:`load` defaults to
+``install=True`` so a feature just works on first use. Set
+``YGG_LOKI_AUTO_INSTALL=0`` to turn that off — then a missing package raises the
+normal ``ImportError``.
 """
 from __future__ import annotations
 
@@ -29,25 +33,15 @@ def auto_install_enabled() -> bool:
 
 
 def load(module_name: str, pip_name: str | None = None, *, install: bool | None = None) -> Any:
-    """Import *module_name*, installing *pip_name* on miss when allowed.
+    """Import *module_name*, installing *pip_name* into the current env on miss.
 
-    ``install`` overrides the global :func:`auto_install_enabled` setting for
-    one call (``True`` forces a runtime install, ``False`` forbids it). Returns
-    the live module — identical to ``import module_name``. Imports through
-    :func:`importlib.import_module` (so it honors ``sys.modules``), and only on
-    a real miss hands off to :meth:`~yggdrasil.environ.PyEnv.runtime_import_module`,
-    which installs into the running interpreter and imports again.
+    Delegates to :func:`yggdrasil.lazy_imports._lazy_import` — the project's
+    one import-or-install guard. ``install`` overrides the default for a single
+    call (``True`` forces a runtime install, ``False`` forbids it); left
+    ``None`` it follows :func:`auto_install_enabled` (default ``True``). Returns
+    the live module — identical to ``import module_name``.
     """
-    import importlib
+    from yggdrasil.lazy_imports import _lazy_import
 
-    try:
-        return importlib.import_module(module_name)
-    except ImportError:
-        do_install = auto_install_enabled() if install is None else install
-        if not do_install:
-            raise
-        from yggdrasil.environ import PyEnv
-
-        return PyEnv.runtime_import_module(
-            module_name=module_name, pip_name=pip_name or module_name, install=True,
-        )
+    do_install = auto_install_enabled() if install is None else install
+    return _lazy_import(module_name, pip_name, install=do_install)

@@ -3,19 +3,48 @@
 Talks to a local `Ollama <https://ollama.com>`_ server (default
 ``http://localhost:11434``, override with ``OLLAMA_HOST``) over its native
 chat API — so any open model you've ``ollama pull``-ed runs on this machine,
-free and private. Available only when the server answers. Uses stdlib HTTP so
-it needs no extra dependency.
+free and private. Available only when the server answers.
+
+Every call rides the project's :class:`~yggdrasil.http_.HTTPSession` (its
+connection pooling, retry budget, and response parsing) — no bespoke HTTP — so
+probes get a quick single-shot waiting profile and the real calls reuse the
+shared pool.
 """
 from __future__ import annotations
 
-import json
 import os
-import urllib.request
 from typing import Any, ClassVar, Optional
+
+from yggdrasil.dataclasses.waiting import WaitingConfig
 
 from ..engine import DEFAULT_MAX_TOKENS, Completion, TokenEngine
 
 __all__ = ["OllamaEngine"]
+
+#: Quick, single-shot waiting profile for liveness probes — short timeout.
+_PROBE = WaitingConfig(timeout=2.0, retries=0, max_attempts=1)
+
+#: A no-retry HTTPSession for liveness probes (cached). The shared session
+#: retries a refused connection ~8× with backoff — right for real calls, but it
+#: would stall ``available()`` for tens of seconds when Ollama isn't running, so
+#: a probe gets its own zero-retry policy. Still an HTTPSession — all HTTP stays
+#: centralized there.
+_PROBE_SESSION: "Any" = None
+
+
+def _probe_session() -> "Any":
+    global _PROBE_SESSION
+    if _PROBE_SESSION is None:
+        from yggdrasil.http_ import HTTPSession
+
+        class _NoRetrySession(HTTPSession):
+            def _build_retry(self):
+                return super()._build_retry().new(
+                    total=0, connect=0, read=0, status=0, other=0,
+                )
+
+        _PROBE_SESSION = _NoRetrySession()
+    return _PROBE_SESSION
 
 
 class OllamaEngine(TokenEngine):
@@ -36,10 +65,23 @@ class OllamaEngine(TokenEngine):
         super().__init__(model=model or os.getenv("YGG_LOKI_OLLAMA_MODEL"), tier=tier)
         self.host = (host or os.getenv("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
 
+    def _session(self, *, probe: bool = False):
+        """The HTTPSession to use — pooling, retry, and parsing in one place.
+
+        ``probe=True`` returns the zero-retry probe session for liveness checks
+        so they fail fast; the default is the shared, retrying session.
+        """
+        if probe:
+            return _probe_session()
+        from yggdrasil.http_ import HTTPSession
+
+        return HTTPSession()
+
     def available(self) -> bool:
         try:
-            with urllib.request.urlopen(f"{self.host}/api/tags", timeout=0.5) as r:
-                return r.status == 200
+            resp = self._session(probe=True).get(f"{self.host}/api/tags",
+                                                 raise_error=False, wait=_PROBE)
+            return resp.status_code == 200
         except Exception:
             return False
 
@@ -48,8 +90,8 @@ class OllamaEngine(TokenEngine):
     def installed_models(self) -> list[str]:
         """Models already pulled onto this Ollama server (empty if unreachable)."""
         try:
-            with urllib.request.urlopen(f"{self.host}/api/tags", timeout=2.0) as r:
-                tags = json.loads(r.read())
+            tags = self._session(probe=True).get(f"{self.host}/api/tags",
+                                                 raise_error=False, wait=_PROBE).json()
         except Exception:
             return []
         return [m.get("name", "") for m in tags.get("models", []) if m.get("name")]
@@ -64,26 +106,15 @@ class OllamaEngine(TokenEngine):
     def pull(self, model: Optional[str] = None, *, timeout: float = 1800.0) -> str:
         """Download *model* onto the Ollama server (lazy — the heavy bit).
 
-        Streams ``POST /api/pull`` to completion and returns the final status
-        line. Defaults to :attr:`bootstrap_model`, the lightweight brain.
+        Uses the non-streaming pull so the server replies with a single final
+        status object. Defaults to :attr:`bootstrap_model`, the lightweight brain.
         """
         model = model or self.bootstrap_model
-        body = json.dumps({"name": model, "stream": True}).encode()
-        req = urllib.request.Request(
-            f"{self.host}/api/pull", data=body,
-            headers={"Content-Type": "application/json"},
+        resp = self._session().post(
+            f"{self.host}/api/pull", json={"name": model, "stream": False},
+            wait=WaitingConfig(timeout=timeout, retries=0, max_attempts=1),
         )
-        status = "unknown"
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            for raw in r:  # newline-delimited JSON progress
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    status = json.loads(line).get("status", status)
-                except Exception:
-                    pass
-        return status
+        return resp.json().get("status", "unknown")
 
     def ensure(self, model: Optional[str] = None) -> dict[str, Any]:
         """Make sure *model* is available, pulling it only if missing.
@@ -107,16 +138,13 @@ class OllamaEngine(TokenEngine):
     ) -> Completion:
         model = self.resolve_model(messages=messages, system=system, tier=tier)
         msgs = ([{"role": "system", "content": system}] if system else []) + list(messages)
-        body = json.dumps({
-            "model": model, "messages": msgs, "stream": False,
-            "options": {"num_predict": min(max_tokens, 1024)},
-        }).encode()
-        req = urllib.request.Request(
-            f"{self.host}/api/chat", data=body,
-            headers={"Content-Type": "application/json"},
+        resp = self._session().post(
+            f"{self.host}/api/chat",
+            json={"model": model, "messages": msgs, "stream": False,
+                  "options": {"num_predict": min(max_tokens, 1024)}},
+            wait=WaitingConfig(timeout=180.0, retries=0, max_attempts=1),
         )
-        with urllib.request.urlopen(req, timeout=180) as r:
-            data = json.loads(r.read())
+        data = resp.json()
         text = data.get("message", {}).get("content", "")
         self._record(model,
                      input_tokens=data.get("prompt_eval_count"),

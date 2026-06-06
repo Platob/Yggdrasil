@@ -532,11 +532,19 @@ Loki reaches for heavy optional packages only when a feature needs one — an
 engine SDK (`anthropic` / `openai`), a local-model runtime (`transformers` +
 `torch`), a headless browser (`playwright`), the MCP server (`mcp`). Rather than
 fail, it **installs the missing package into the running interpreter on first
-use** (`yggdrasil.loki.runtime.load`, routed through the project's
-`PyEnv.runtime_import_module` against `sys.executable`). Probes
-(`engine.available()`, `web.browser_available()`) never install — only the code
-path that actually needs the package does. Set `YGG_LOKI_AUTO_INSTALL=0` to turn
-this off, and a missing package raises the normal `ImportError` instead.
+use** so it persists in the env Loki runs in. `yggdrasil.loki.runtime.load` is a
+default-on wrapper over the project's one import-or-install guard
+(`yggdrasil.lazy_imports._lazy_import` → `PyEnv.runtime_import_module`, anchored
+on `sys.executable`); the only thing Loki changes is the default (`install=True`
+instead of the project-wide `False`). Probes (`engine.available()`,
+`web.browser_available()`) never install — only the code path that actually
+needs the package does. Set `YGG_LOKI_AUTO_INSTALL=0` to turn this off, and a
+missing package raises the normal `ImportError` instead.
+
+All HTTP, meanwhile, is centralized on `HTTPSession` — `web.*` and the Ollama
+engine drive their requests through it (pooling, retry budget, response
+parsing), with a zero-retry probe session for liveness checks so a not-running
+local server fails fast instead of stalling on the retry budget.
 
 ## Sessions & memory
 
