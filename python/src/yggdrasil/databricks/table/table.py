@@ -3109,8 +3109,14 @@ class Table(DatabricksPath):
                 files staged there are ingested with no explicit wiring.
             name: Job name override (default ``[YGG][AUTOLOADER] <full_name>``).
             file_format: ``cloudFiles.format`` (parquet / json / csv / avro / …).
-            checkpoint: Streaming checkpoint + schema location; ``None`` lets the
-                on-cluster step derive ``<table-location>/_ygg_autoloader``.
+            checkpoint: Streaming checkpoint + schema location. ``None`` (default)
+                on the zero-config path (when *source* also defaults) co-locates
+                it with the staging area on the volume's writable external storage
+                (``<staging-storage>/<CHECKPOINT_SUBPATH>``) — a MANAGED table's own
+                storage is governed ``__unitystorage`` that Unity Catalog forbids
+                Auto Loader from writing into. With an explicit *source*, ``None``
+                instead lets the on-cluster step derive
+                ``<table-location>/_ygg_autoloader``.
             available_now: ``True`` → a one-shot ``Trigger.AvailableNow`` sweep
                 (the shape a scheduled / file-arrival run wants); ``False`` →
                 continuous micro-batch.
@@ -3164,12 +3170,19 @@ class Table(DatabricksPath):
             environment = ygg_base_environment_name()
 
         if source is None:
-            # Default to the staging volume's own cloud storage path, so files
-            # staged there are ingested with no explicit wiring.
-            source = (
-                self.ensure_staging_volume().storage_path(mode=Mode.AUTO)
-                / self.STAGE_SUBPATH
-            ).full_path()
+            # Zero-config path: both source and checkpoint live on the staging
+            # volume's own (writable, external) cloud storage. The files staged
+            # there are ingested with no explicit wiring, and the streaming
+            # checkpoint + schema sit beside them as a sibling of
+            # ``STAGE_SUBPATH`` (outside the watched ``stage/`` dir so it isn't
+            # re-ingested). This deliberately avoids the on-cluster default of
+            # ``<table-location>/_ygg_autoloader``: a MANAGED table's storage is
+            # governed ``__unitystorage`` that Unity Catalog forbids Auto Loader
+            # from writing into (``LOCATION_OVERLAP`` on ``CheckPathAccess``).
+            staging_storage = self.ensure_staging_volume().storage_path(mode=Mode.AUTO)
+            source = (staging_storage / self.STAGE_SUBPATH).full_path()
+            if checkpoint is None:
+                checkpoint = (staging_storage / self.CHECKPOINT_SUBPATH).full_path()
 
         if file_arrival and trigger is None:
             from databricks.sdk.service.jobs import (
@@ -3346,7 +3359,15 @@ class Table(DatabricksPath):
     #: Sub-prefix under the staging volume's storage root where Auto Loader
     #: staged files live (kept apart from the ``.sql/tmp`` insert scratch so a
     #: deployed auto_loader job never sweeps up arrow_insert's temp Parquet).
-    STAGE_SUBPATH: ClassVar[str] = ".ygg/stage"
+    STAGE_SUBPATH: ClassVar[str] = ".staging/data"
+
+    #: Sub-prefix under the staging volume's storage root holding the Auto Loader
+    #: streaming checkpoint + inferred schema. A sibling of :attr:`STAGE_SUBPATH`
+    #: under ``.staging/`` (so the watched ``data/`` dir never ingests checkpoint
+    #: files) and on the writable external staging storage rather than a MANAGED
+    #: table's governed ``__unitystorage`` location (which Unity Catalog forbids
+    #: Auto Loader from writing into — ``LOCATION_OVERLAP``).
+    CHECKPOINT_SUBPATH: ClassVar[str] = ".staging/_autoloader"
 
     @property
     def staging_location(self) -> "str | None":

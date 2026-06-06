@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.table.table import Table
@@ -132,7 +133,16 @@ class TestAutoLoadEntryPoint:
         session = MagicMock()
         session.builder.getOrCreate.return_value = spark
         pyspark_sql.SparkSession = session
-        return patch.dict(sys.modules, {"pyspark": pyspark, "pyspark.sql": pyspark_sql})
+        stack = ExitStack()
+        stack.enter_context(
+            patch.dict(sys.modules, {"pyspark": pyspark, "pyspark.sql": pyspark_sql})
+        )
+        # ``auto_load`` always casts the stream via ``yggdrasil.data.Schema``;
+        # patch it with an identity cast so the writer chain is the frame's own
+        # ``writeStream`` (tests that care assert on from_spark / cast_spark_tabular).
+        self._Schema = stack.enter_context(patch("yggdrasil.data.Schema"))
+        self._Schema.from_spark.return_value.cast_spark_tabular.side_effect = lambda f: f
+        return stack
 
     def test_streams_cloudfiles_into_table_with_derived_checkpoint(self):
         spark, reader, frame, writer = self._spark()
@@ -147,12 +157,27 @@ class TestAutoLoadEntryPoint:
             "cloudFiles.schemaLocation", "s3://bkt/tbl/_ygg_autoloader/_schema",
         )
         reader.load.assert_called_once_with("s3://src/landing")
-        # writeStream checkpoint + AvailableNow trigger, sinking into the table.
+        # writeStream checkpoint + AvailableNow trigger, sinking into the table
+        # via ``.toTable`` (Structured Streaming's built-in exactly-once).
         writer.option.assert_any_call("checkpointLocation", "s3://bkt/tbl/_ygg_autoloader")
         writer.trigger.assert_called_once_with(availableNow=True)
         writer.toTable.assert_called_once_with("cat.sch.tbl")
         writer.toTable.return_value.awaitTermination.assert_called_once()
         assert out["checkpoint"] == "s3://bkt/tbl/_ygg_autoloader"
+
+    def test_casts_stream_to_target_schema_via_yggdrasil(self):
+        spark, reader, frame, writer = self._spark()
+        with self._with_pyspark(spark):
+            auto_load("cat.sch.tbl", "s3://src", checkpoint="s3://ckpt")
+
+            Schema = self._Schema
+            # Target schema read off the live table; the stream cast to it via
+            # yggdrasil's field casting before the ``.toTable`` sink.
+            spark.table.assert_called_once_with("cat.sch.tbl")
+            Schema.from_spark.assert_called_once_with(spark.table.return_value.schema)
+            Schema.from_spark.return_value.cast_spark_tabular.assert_called_once_with(frame)
+        # Identity cast here, so the casted frame is the frame that gets written.
+        writer.toTable.assert_called_once_with("cat.sch.tbl")
 
     def test_explicit_checkpoint_skips_describe_detail(self):
         spark, reader, _frame, writer = self._spark()
@@ -188,22 +213,44 @@ class TestAutoLoadEntryPoint:
 class TestStageStorageAndDefaultSource:
     def test_auto_loader_defaults_source_to_staging_volume_storage(self):
         # The default source is the staging volume's cloud storage path joined
-        # with STAGE_SUBPATH — resolved straight off the staging volume.
+        # with STAGE_SUBPATH, and (on this same zero-config path) the checkpoint
+        # defaults to its CHECKPOINT_SUBPATH sibling — both resolved straight off
+        # the staging volume's (writable, external) storage, never the MANAGED
+        # table's governed location.
         from yggdrasil.enums import Mode
         tbl = _table()
         vol = MagicMock()
         storage_root = MagicMock()
-        stage = MagicMock()
-        stage.full_path.return_value = "s3://bkt/3mv/.ygg/stage"
-        storage_root.__truediv__.return_value = stage
+        leaves = {
+            Table.STAGE_SUBPATH: "s3://bkt/3mv/.ygg/stage",
+            Table.CHECKPOINT_SUBPATH: "s3://bkt/3mv/.ygg/_autoloader",
+        }
+        def _join(sub):
+            m = MagicMock()
+            m.full_path.return_value = leaves[sub]
+            return m
+        storage_root.__truediv__.side_effect = _join
         vol.storage_path.return_value = storage_root
         with patch.object(Table, "ensure_staging_volume", return_value=vol), \
                 patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
-            tbl.auto_loader(file_arrival=True)  # no source
+            tbl.auto_loader(file_arrival=True)  # no source, no checkpoint
 
         assert vol.storage_path.call_args.kwargs["mode"] is Mode.AUTO
-        storage_root.__truediv__.assert_called_once_with(Table.STAGE_SUBPATH)
+        storage_root.__truediv__.assert_any_call(Table.STAGE_SUBPATH)
+        storage_root.__truediv__.assert_any_call(Table.CHECKPOINT_SUBPATH)
         params = Flow.call_args.kwargs["parameters"]
-        assert params[1] == "s3://bkt/3mv/.ygg/stage"            # source = staging storage path
+        assert params[1] == "s3://bkt/3mv/.ygg/stage"             # source = staging storage path
+        assert params[3] == "s3://bkt/3mv/.ygg/_autoloader"       # checkpoint = sibling, writable
         trig = Flow.call_args.kwargs["trigger"]
         assert trig.file_arrival.url == "s3://bkt/3mv/.ygg/stage/"  # file trigger on it
+
+    def test_explicit_source_leaves_checkpoint_to_on_cluster_default(self):
+        # With an explicit source and no checkpoint, the staging volume is not
+        # touched and the checkpoint param stays empty so the on-cluster step
+        # derives <table-location>/_ygg_autoloader (unchanged behavior).
+        tbl = _table()
+        with patch.object(Table, "ensure_staging_volume") as ensure, \
+                patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://bkt/landing", file_arrival=False)
+        ensure.assert_not_called()
+        assert Flow.call_args.kwargs["parameters"][3] == ""

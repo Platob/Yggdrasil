@@ -33,6 +33,16 @@ def auto_load(
 ) -> dict[str, Any]:
     """Ingest files under *source* into *table* with Databricks Auto Loader.
 
+    Each micro-batch is **cast to the target table's schema before the append**
+    (yggdrasil's ``Schema.cast_spark_tabular`` — the same field casting
+    ``arrow_insert`` / ``spark_insert`` use): columns are name-matched, missing
+    ones NULL-filled, and types — including nested ``array<struct>`` and
+    timestamp zones — cast to the target. The cast runs on every micro-batch as
+    the stream flows, so the write stays schema-stable and tolerant of source
+    drift (extra columns dropped, mismatches cast) rather than failing the stream
+    or evolving the target schema; ``.toTable`` keeps Structured Streaming's
+    built-in, checkpoint-coordinated exactly-once.
+
     Args:
         table: Target table, ``catalog.schema.table``.
         source: Cloud path Auto Loader watches (``s3://…`` / ``/Volumes/…``).
@@ -96,10 +106,20 @@ def auto_load(
         )
     frame = reader.load(source)
 
-    writer = (
-        frame.writeStream.option("checkpointLocation", checkpoint)
-        .option("mergeSchema", "true")
-    )
+    # Cast/align the stream to the **target table** schema with yggdrasil's field
+    # casting (``Schema.from_spark(...).cast_spark_tabular`` — the same coercion
+    # ``arrow_insert`` / ``spark_insert`` use): columns name-matched, any the
+    # source lacks NULL-filled, and types — including nested ``array<struct>``
+    # and timestamp zones — cast to the target. It runs on every micro-batch as
+    # the stream flows, so the write conforms to the target (no ``mergeSchema``)
+    # and tolerates source drift — extra columns dropped, mismatches cast — while
+    # ``.toTable`` keeps Structured Streaming's built-in, checkpoint-coordinated
+    # exactly-once (no hand-rolled idempotency markers to break on a reset).
+    from yggdrasil.data import Schema
+
+    frame = Schema.from_spark(spark.table(table).schema).cast_spark_tabular(frame)
+
+    writer = frame.writeStream.option("checkpointLocation", checkpoint)
     writer = (
         writer.trigger(availableNow=True)
         if available_now

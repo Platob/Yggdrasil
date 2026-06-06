@@ -7,7 +7,7 @@ One command to answer "is this workspace ready, and if not, make it ready":
     ygg databricks seed --check    # read-only readiness report (CI gate)
     ygg databricks seed --overwrite  # rebuild every wheel + the env from scratch, then end
 
-It walks five areas:
+It walks six areas:
 
 - **config**      — connectivity, host, current user, default catalog/schema.
 - **wheels**      — the versioned ygg image wheel in the workspace registry.
@@ -24,6 +24,12 @@ It walks five areas:
   runtime so pool-backed clusters attach warm against the seeded zero-PyPI wheel
   bundle. Lazy by default (no idle nodes → no cost until attached). Skip with
   ``--no-pools``.
+- **cluster**     — a default **single-user (dedicated)** all-purpose cluster
+  owned by the current user, **attached to the Light instance pool** and running
+  the seeded **generic environment** (the classic-cluster ``requirements.txt``,
+  zero-PyPI) so it matches the jobs' image. Lazy: created with autotermination
+  and not waited on (starts on attach, self-stops when idle → no cost until
+  used). Skip with ``--no-cluster``.
 
 In the default (seed) mode it builds/uploads the wheel, assembles and writes
 the environment files, and ensures a default warehouse exists. With ``--check``
@@ -59,6 +65,8 @@ class SeedCommand:
                                  "the environment files, then end (skips the warehouse + pools steps).")
         parser.add_argument("--no-pools", dest="no_pools", action="store_true",
                             help="Skip the default Light/Medium/Heavy instance pools step.")
+        parser.add_argument("--no-cluster", dest="no_cluster", action="store_true",
+                            help="Skip the default single-user (dedicated) all-purpose cluster step.")
         parser.set_defaults(handler=cls._seed)
 
     @classmethod
@@ -257,6 +265,97 @@ class SeedCommand:
                     )
             except Exception as exc:
                 style.fail(f"pools step failed: {exc}")
+                ok = False
+
+        # -- cluster -----------------------------------------------------
+        # A default single-user (dedicated) all-purpose cluster owned by the
+        # current user, so interactive ygg work has compute on hand. Lazy:
+        # created with autotermination and not waited on — it starts on attach
+        # and self-stops when idle, so seeding it costs nothing until used.
+        # ``--no-cluster`` opts out.
+        if not args.no_cluster:
+            style.info("cluster")
+            try:
+                clusters_svc = client.compute.clusters
+                default_name = client.user_scoped_name("All Purpose")
+                if check:
+                    found = clusters_svc.find_cluster(
+                        cluster_name=default_name, raise_error=False,
+                    )
+                    if found is None:
+                        style.warn(f"default cluster {default_name!r} not provisioned")
+                        ok = False
+                    else:
+                        style.out(
+                            f"    {style.dim('found')}  {default_name}  "
+                            f"{style.dim(str(found.cluster_id))}\n"
+                        )
+                        style.ok("default single-user cluster present")
+                else:
+                    # Attach to the default Light pool so the cluster starts warm
+                    # against the seeded zero-PyPI bundle (and inherits the pool's
+                    # node type). Falls back to a standalone node type if the pool
+                    # isn't present (e.g. seeded with ``--no-pools``).
+                    from yggdrasil.databricks.compute.instance_pool import (
+                        DEFAULT_POOL_TIERS,
+                    )
+
+                    light_name = DEFAULT_POOL_TIERS[0].pool_name()
+                    pool = client.compute.instance_pools.find(name=light_name)
+                    pool_id = getattr(pool, "instance_pool_id", None) if pool else None
+                    if pool_id is None:
+                        style.warn(
+                            f"pool {light_name!r} not found — cluster will use a "
+                            f"standalone node type"
+                        )
+                    # Install the seeded **generic environment** (the classic-cluster
+                    # ``requirements.txt`` written by the environments step above) so
+                    # the cluster runs the same zero-PyPI ygg image as the jobs,
+                    # instead of resolving ``ygg[…]`` from PyPI.
+                    env_name = whl.ygg_base_environment_name()
+                    env_requirements = (
+                        f"{whl.WORKSPACE_ENV_DIR}/{env_name}/{env_name}.requirements.txt"
+                    )
+                    with style.Spinner("provisioning default single-user cluster…"):
+                        # ``single_user_name`` flips the cluster to dedicated
+                        # (single-user) access mode for the current user;
+                        # ``instance_pool_id`` attaches it to the Light pool;
+                        # ``environment`` installs the generic env (zero-PyPI);
+                        # ``wait=False`` returns without blocking on start-up.
+                        cluster = clusters_svc.all_purpose_cluster(
+                            single_user_name=user,
+                            instance_pool_id=pool_id,
+                            environment=env_requirements,
+                            wait=False,
+                        )
+                    details = None
+                    try:
+                        details = cluster.details
+                    except Exception:
+                        pass
+                    mode = getattr(
+                        getattr(details, "data_security_mode", None), "value", None,
+                    )
+                    style.out(
+                        f"    {style.dim('cluster')} {cluster.cluster_name}  "
+                        f"{style.dim(str(cluster.cluster_id))}\n"
+                    )
+                    style.out(
+                        f"    {style.dim('access')}  "
+                        f"{mode or 'dedicated (single user)'}  "
+                        f"{style.dim('single_user=' + str(user))}\n"
+                    )
+                    style.out(
+                        f"    {style.dim('pool')}    "
+                        f"{light_name if pool_id else style.dim('(standalone)')}\n"
+                    )
+                    style.out(f"    {style.dim('env')}     {env_name}\n")
+                    style.ok(
+                        "default single-user cluster ready "
+                        "(dedicated, pool-backed, generic env, autoterminating)"
+                    )
+            except Exception as exc:
+                style.fail(f"cluster step failed: {exc}")
                 ok = False
 
         # -- summary -----------------------------------------------------

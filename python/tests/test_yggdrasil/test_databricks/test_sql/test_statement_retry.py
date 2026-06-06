@@ -42,6 +42,10 @@ from yggdrasil.databricks.warehouse.statement import (
 
 def _warehouse() -> SQLWarehouse:
     service = MagicMock(name="Warehouses")
+    # Give the mock a realistic base URL: rendered monitoring URLs / error
+    # strings otherwise embed a long MagicMock repr, which can push the error
+    # code past the retry-log detail truncation (a live workspace URL is short).
+    service.client.base_url.to_string.return_value = "https://test.databricks.net/"
     return SQLWarehouse(service=service, warehouse_id="wh-1", warehouse_name="wh")
 
 
@@ -160,19 +164,21 @@ class TestMergeRetryLog:
         import time
         from yggdrasil.dataclasses.waiting import WaitingConfig
 
-        code = next(iter(_RETRYABLE_ERROR_CODES))
-        r = _result_in_state(
-            StatementState.FAILED, error_message=code,
-            text="MERGE INTO main.s.t USING src ON t.id = src.id",
-        )
-        with patch("yggdrasil.databricks.warehouse.statement.logger") as log:
-            delay = r._retry_backoff(WaitingConfig.from_(True), time.time())
+        # Cover every retryable code — frozenset iteration order is hash-seeded,
+        # so asserting on a single ``next(iter(...))`` pick made this flaky.
+        for code in sorted(_RETRYABLE_ERROR_CODES):
+            r = _result_in_state(
+                StatementState.FAILED, error_message=code,
+                text="MERGE INTO main.s.t USING src ON t.id = src.id",
+            )
+            with patch("yggdrasil.databricks.warehouse.statement.logger") as log:
+                delay = r._retry_backoff(WaitingConfig.from_(True), time.time())
 
-        assert delay >= 0.0
-        calls = self._retry_calls(log)
-        assert calls, "expected a merge retry log line"
-        assert calls[0].args[1] == "MERGE"                       # operation named
-        assert any(code in str(a) for a in calls[0].args)        # conflict surfaced
+            assert delay >= 0.0
+            calls = self._retry_calls(log)
+            assert calls, f"expected a merge retry log line for {code}"
+            assert calls[0].args[1] == "MERGE"                       # operation named
+            assert any(code in str(a) for a in calls[0].args), code  # conflict surfaced
 
     def test_concurrent_append_retry_recovers_and_logs(self):
         from yggdrasil.dataclasses.waiting import WaitingConfig

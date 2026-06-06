@@ -9,7 +9,8 @@ Subcommands::
     ygg databricks job list/get/run/runs/logs/cancel/repair/delete
     ygg databricks tables autoload <catalog.schema.table>  (cloudFiles ingestion job)
     ygg databricks fs ls/cat/write/put/get/mkdir/rm/stat/cp/mv  (Workspace/Volumes/DBFS)
-    ygg databricks wheel build/upload/deploy/list  (workspace PyPI-like wheel registry)
+    ygg databricks wheel [build/upload/deploy/list]  (build+upload ygg wheel; workspace PyPI-like registry)
+    ygg databricks environment [list]  (build / get-or-install the base environment(s) from wheels)
     ygg databricks deploy [ygg|wheel <package>|environment]  (wheels + serverless env configs)
     ygg databricks seed [--check]  (provision/verify wheels, environments, default warehouse, config)
 """
@@ -24,6 +25,7 @@ from .services import (
     ClustersCommand,
     ConfigureCommand,
     DeployCommand,
+    EnvironmentCommand,
     FSCommand,
     JobsCommand,
     SeedCommand,
@@ -70,6 +72,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ClustersCommand.register(subparsers)
     ConfigureCommand.register(subparsers)
     DeployCommand.register(subparsers)
+    EnvironmentCommand.register(subparsers)
     FSCommand.register(subparsers)
     JobsCommand.register(subparsers)
     SeedCommand.register(subparsers)

@@ -88,3 +88,58 @@ class TestInstallLogging:
         assert other not in self._root.handlers
         styled = [x for x in self._root.handlers if getattr(x, "_ygg_styled", False)]
         assert len(styled) == 1
+
+
+class TestImportLeavesLoggingUnconfigured:
+    """``import yggdrasil`` must not configure logging at all — no handler on the
+    root logger, no swapped-out ``lastResort`` — so the normal stdlib idioms
+    (``logging.basicConfig``, ``setLevel``) fully decide whether ygg's INFO logs
+    show. Each case runs in a fresh subprocess so import executes against a
+    pristine logging state.
+    """
+
+    def _run(self, body: str):
+        import os
+        import subprocess
+        import sys
+
+        return subprocess.run(
+            [sys.executable, "-c", body],
+            capture_output=True, text=True, env=dict(os.environ),
+        )
+
+    def test_import_adds_no_root_handler(self):
+        out = self._run(
+            "import logging, yggdrasil;"
+            "print('ROOT_HANDLERS', len(logging.getLogger().handlers))"
+        )
+        assert "ROOT_HANDLERS 0" in out.stdout, (out.stdout, out.stderr)
+
+    def test_import_leaves_last_resort_default(self):
+        # The styled-default-on-import was removed: lastResort stays the stdlib's
+        # own handler, never a ygg-styled one.
+        out = self._run(
+            "import logging, yggdrasil;"
+            "print('STYLED', getattr(logging.lastResort, '_ygg_styled', False))"
+        )
+        assert "STYLED False" in out.stdout, (out.stdout, out.stderr)
+
+    def test_basicconfig_info_surfaces_ygg_info_once(self):
+        out = self._run(
+            "import logging, yggdrasil;"
+            "logging.basicConfig(level=logging.INFO);"
+            "logging.getLogger('yggdrasil.demo').info('YGG_INFO_MARKER')"
+        )
+        # basicConfig works normally (ygg didn't pre-configure root) ...
+        assert "YGG_INFO_MARKER" in out.stderr, (out.stdout, out.stderr)
+        # ... and the line shows exactly once.
+        assert out.stderr.count("YGG_INFO_MARKER") == 1, out.stderr
+
+    def test_default_quiet_at_info(self):
+        out = self._run(
+            "import logging, yggdrasil;"
+            "logging.getLogger('yggdrasil.demo').info('HIDDEN_INFO');"
+            "logging.getLogger('yggdrasil.demo').warning('SHOWN_WARNING')"
+        )
+        assert "HIDDEN_INFO" not in out.stderr, out.stderr
+        assert "SHOWN_WARNING" in out.stderr, out.stderr
