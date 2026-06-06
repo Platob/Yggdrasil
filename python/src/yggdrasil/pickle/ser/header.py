@@ -208,9 +208,16 @@ class Header:
             _meta_blob=meta_blob,
         )
 
-    def payload_view(self, buffer: IO) -> IO:
-        """Return a zero-copy view of the payload bytes."""
-        return buffer.view(pos=self.start, size=self.size)
+    def payload_view(self, buffer: "IO | _ScratchBuf") -> "IO | _ScratchBuf":
+        """Return a buffer over the payload sub-range ``[start, start+size)``.
+
+        A :class:`_ScratchBuf` slices in place (its own zero-copy ``view``); a
+        yggdrasil :class:`IO` is read directly (``pread``) into a fresh
+        :class:`_ScratchBuf` — the pickle module's lightweight read surface —
+        which is exactly what the bounded ``IO.view`` did before."""
+        if isinstance(buffer, _ScratchBuf):
+            return buffer.view(pos=self.start, size=self.size)
+        return _ScratchBuf(buffer.pread(self.size, self.start))
 
     def write_to(
         self,

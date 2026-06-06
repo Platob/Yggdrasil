@@ -604,7 +604,7 @@ class ZipFile(IO):
             blocks, lock = self._shared_blocks(int(self.size))
             yield _RangedBlockReader(holder, int(self.size), blocks=blocks, lock=lock)
         else:
-            with self.view(pos=0) as v:
+            with self.open("rb") as v:
                 yield v
 
     def _shared_blocks(self, size: int):
@@ -1003,7 +1003,7 @@ class ZipFile(IO):
             # ZipExtFile straight into the destination's writer; only
             # the in-flight chunk lives in memory at any moment.
             scratch = Memory()
-            with self.view(pos=0) as src_v:
+            with self.open("rb") as src_v:
                 with zipfile.ZipFile(src_v, "r") as src_zf:
                     with zipfile.ZipFile(scratch, "w", **write_kwargs) as dst_zf:
                         for info in src_zf.infolist():
@@ -1099,7 +1099,7 @@ class ZipFile(IO):
                 return
 
             scratch = Memory()
-            with self.view(pos=0) as src_v:
+            with self.open("rb") as src_v:
                 with zipfile.ZipFile(src_v, "r") as src_zf:
                     with zipfile.ZipFile(scratch, "w", **write_kwargs) as dst_zf:
                         for info in src_zf.infolist():

@@ -19,8 +19,8 @@ PyArrow accepts any ``IO[bytes]`` with ``read`` + ``seek`` for both
 the reader and the writer side, and the reworked :class:`IO`
 satisfies that protocol exactly. Wrapping in
 :class:`pa.BufferReader` would force a full bytes copy out of the
-holder; passing ``self`` (or ``self.view(pos=0)``) avoids that on the
-no-spill path and keeps Arrow IPC's "no decode" promise intact.
+holder; passing ``self`` (or a ``self.open("rb")`` cursor) avoids that on
+the no-spill path and keeps Arrow IPC's "no decode" promise intact.
 """
 
 from __future__ import annotations
