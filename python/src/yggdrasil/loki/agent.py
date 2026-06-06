@@ -269,14 +269,21 @@ class Loki:
         - **Resources** — a CUDA GPU, or enough CPU + RAM (≥ 4 cores, ≥ 8 GB),
           decides whether this box can comfortably run a local model.
 
-        A session pins a **base** provider and sticks with it. Ordinary/light
-        work runs on the cheapest capable option — a local model when the box
-        can host one (free, private), otherwise the base. Heavy work escalates
-        to the most capable remote (the base remote if it is one). When that
-        escalation means **switching from a free local model up to a paid
-        remote** model, ``confirm(engine, model)`` is asked first; a falsy
-        answer keeps the work on the cheap/local path. Returns an available
-        engine, or ``None`` when nothing is reachable.
+        A session pins a **base** provider, but complexity moves the choice
+        **both ways**:
+
+        - *remote → local* (demote): light work on a capable box drops to a
+          free local model even when the base is a remote API — saving money,
+          silently (no downside to ask about).
+        - *local → remote* (escalate): heavy work climbs to the most capable
+          remote (the base remote if it is one). When this means switching
+          **from a free local model up to a paid remote** one,
+          ``confirm(engine, model)`` is asked first; a falsy answer keeps the
+          work on the cheap/local path.
+
+        With no local engine the base simply stands; with no remote the local
+        engine carries even heavy work. Returns an available engine, or
+        ``None`` when nothing is reachable.
         """
         available = {n: e for n, e in self._engine_instances().items() if e.available()}
         if not available:
@@ -561,6 +568,15 @@ class Loki:
                             why="data/timeseries source → fetch as a cached tabular frame")
             return made("web", "web", url=url,
                         why="a URL / web-fetch request — uses the HTTP session + io handlers")
+        # A local (or s3/dbfs) tabular file → the same data path, read through
+        # the io handlers (IO.from_) and cached, no fetch needed.
+        file_match = re.search(
+            r"(?:[\w./~-]*/)?[\w.-]+\.(?:csv|tsv|parquet|pq|arrow|feather|xlsx|xls)\b",
+            text, re.I,
+        )
+        if file_match:
+            return made("data", "tabular", url=file_match.group(0),
+                        why="a local/columnar data file → io handlers → cached frame")
         if any(s in low for s in ROUTES["databricks"]):
             return made("databricks", "genie" if "genie" in low else "reason",
                         specialist="databricks",

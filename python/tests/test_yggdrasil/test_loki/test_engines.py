@@ -501,6 +501,24 @@ class TestResourceAwareSelection(unittest.TestCase):
         chosen = self._select(engines, cpu=8, ram_gb=16, text="hi there")
         self.assertEqual(chosen.name, "ollama")
 
+    def test_remote_base_demotes_to_local_for_light_work(self):
+        # The session is anchored on a remote (claude), but a light task on a
+        # capable box drops down to the free local model (remote → local).
+        engines = {"claude": self._eng("claude", False),
+                   "ollama": self._eng("ollama", True)}
+        chosen = self._select(engines, cpu=8, ram_gb=16, text="hi", base="claude")
+        self.assertEqual(chosen.name, "ollama")
+
+    def test_local_base_escalates_to_remote_for_heavy_work(self):
+        # Anchored on a local model, a heavy task climbs to the remote (local →
+        # remote), asked via confirm.
+        engines = {"claude": self._eng("claude", False),
+                   "ollama": self._eng("ollama", True)}
+        chosen = self._select(engines, cpu=8, ram_gb=16,
+                              text="refactor and debug the planner",
+                              base="ollama", confirm=lambda e, m: True)
+        self.assertEqual(chosen.name, "claude")
+
     def test_complex_goes_remote_even_on_capable_box(self):
         engines = {"claude": self._eng("claude", False),
                    "ollama": self._eng("ollama", True)}

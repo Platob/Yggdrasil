@@ -5,10 +5,12 @@ ygg loki                 # interactive session (modern REPL) on a terminal
 ygg loki status          # identity + reachable backends + engines + skills
 ygg loki capabilities    # the detected backends and why
 ygg loki engines         # the reasoning engines and which are available
+ygg loki setup [model]   # bootstrap a free local model, sized to this box
 ygg loki usage           # live token usage + USD KPIs, per model and global
 ygg loki tools           # the tools the autonomous agent acts through
 ygg loki reason "..."    # one-shot reasoning with the best engine
 ygg loki do "..."        # act autonomously: discover + modify files
+ygg loki guide "..."     # the optimized yggdrasil way to build something
 ygg loki token --probe   # the Databricks credentials Loki provides
 ygg loki run NAME --kwarg k=v ...
 ```
@@ -31,6 +33,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("engines", help="The reasoning engines and which are available.")
     setup = sub.add_parser("setup", help="Bootstrap a free local model (lazy-install on demand).")
     setup.add_argument("model", nargs="?", default=None, help="A specific local model to ready.")
+    guide = sub.add_parser("guide", help="The optimized yggdrasil way to build something.")
+    guide.add_argument("task", help="What you want to build.")
+    guide.add_argument("--plan", action="store_true", help="Also synthesize a grounded plan (uses an engine).")
     sub.add_parser("usage", help="Live token usage + USD KPIs, per model and global.")
     sub.add_parser("mcp", help="Run Loki as an MCP server (stdio) — expose it to MCP clients.")
 
@@ -127,6 +132,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _engines(loki, style)
     if action == "setup":
         return _setup(loki, style, args.model or "")
+    if action == "guide":
+        res = loki.run("guide", task=args.task, plan=args.plan)
+        _print_guide(style, res)
+        if res.get("plan"):
+            style.out(f"\n  {res['plan']}\n")
+        return 0
     if action == "reason":
         return _reason(loki, style, args)
     if action == "do":
@@ -365,15 +376,22 @@ def _escalation_confirm(style: Any):
 
 
 def _turn_engine(loki: Any, style: Any, state: dict, line: str) -> "str | None":
-    """The engine to use for this turn: keep light work on the session base /
-    a free local model, escalate heavy work to a remote — asking first.
-
-    Resolves once, up front (so any escalation prompt fires before output),
-    and returns the engine name to pin for the turn.
+    """The engine to use for this turn: complexity drives it **both ways** —
+    light work drops to a free local model, heavy work climbs to a remote
+    (asking first). Resolves once, up front (so any escalation prompt fires
+    before output), notes a silent demotion, and returns the engine to pin.
     """
-    chosen = loki.select(line, tier=state["tier"], base=state.get("engine"),
+    base = state.get("engine")
+    chosen = loki.select(line, tier=state["tier"], base=base,
                          confirm=_escalation_confirm(style))
-    return chosen.name if chosen is not None else state.get("engine")
+    if chosen is None:
+        return base
+    # Surface a remote→local demotion (the cost-saving switch is silent
+    # otherwise; an escalation already announced itself via the confirm).
+    if chosen.name != base and chosen.local:
+        style.out(f"  {style.dim('↓ local')} {style.brand(chosen.name)} "
+                  f"{style.dim('· lighter task, kept free/on-box')}\n")
+    return chosen.name
 
 
 def _short_text(s: str, n: int) -> str:

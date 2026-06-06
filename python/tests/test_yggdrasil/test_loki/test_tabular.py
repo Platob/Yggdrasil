@@ -46,6 +46,15 @@ class TestClassifyAndRoute(unittest.TestCase):
         plan = _loki().route("fetch https://example.com/about")
         self.assertEqual(plan["action"], "web")
 
+    def test_local_data_file_routes_to_tabular(self):
+        plan = _loki().route("analyze /tmp/cities.csv and summarize the trend")
+        self.assertEqual((plan["action"], plan["category"]), ("tabular", "data"))
+        self.assertEqual(plan["url"], "/tmp/cities.csv")
+
+    def test_code_file_still_routes_to_act_not_tabular(self):
+        plan = _loki().route("fix the bug in app.py")
+        self.assertNotEqual(plan["action"], "tabular")
+
 
 @unittest.skipUnless(_HAVE_STACK, "requires the polars/io stack")
 class TestTabularBehavior(unittest.TestCase):
@@ -96,6 +105,13 @@ class TestTabularBehavior(unittest.TestCase):
         self.assertEqual(again["rows"], 2)
         self.assertEqual(again["stored"], str(out))
         self.assertTrue(out.is_file())
+
+    def test_reads_local_path_via_io_not_http(self):
+        # A bare local path goes through the io handlers (IO.from_), not HTTP.
+        local = Path(self.dir) / "data.csv"
+        res = _loki().run("tabular", url=str(local), cache_dir=self.cache, key="local")
+        self.assertEqual(res["rows"], 2)
+        self.assertEqual(res["columns"], ["city", "pop"])
 
     def test_requires_url_or_cache(self):
         with self.assertRaises(ValueError):

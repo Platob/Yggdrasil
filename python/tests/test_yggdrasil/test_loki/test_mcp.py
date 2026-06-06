@@ -46,7 +46,18 @@ class TestLokiMCPServer(unittest.TestCase):
 
         server = build_server(self._loki())
         names = {t.name for t in asyncio.run(server.list_tools())}
-        self.assertEqual(names, {"reason", "skills", "run", "web", "capabilities"})
+        self.assertEqual(names, {"reason", "skills", "run", "web", "guide",
+                                 "tabular", "engines", "usage", "setup",
+                                 "capabilities"})
+
+    def test_guide_and_engines_tools(self):
+        from yggdrasil.loki.mcp import build_server
+
+        server = build_server(self._loki())
+        guided = asyncio.run(server.call_tool("guide", {"task": "read a parquet file"}))
+        self.assertIn("tabular-io", str(guided))
+        engines = asyncio.run(server.call_tool("engines", {}))
+        self.assertIn("ollama", str(engines))
 
     def test_run_tool_dispatches_a_behavior(self):
         from yggdrasil.loki.mcp import build_server

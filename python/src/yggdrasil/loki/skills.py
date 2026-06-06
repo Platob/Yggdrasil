@@ -207,6 +207,25 @@ def _auto_key(source: str) -> str:
     return f"{_tab_slug(source)[:24].rstrip('-')}-{digest}"
 
 
+def _read_tabular(source: str, fmt: Optional[str] = None):
+    """Read *source* into a polars frame the optimized yggdrasil way.
+
+    HTTP(S) sources go through :class:`HTTPSession` (``web.read_table`` →
+    ``HTTPResponse.to_polars``); everything else — a local path, ``s3://``,
+    ``dbfs:/``, a UC Volume — goes straight through the io handlers
+    (``IO.from_(path)``), which already know every scheme and format. So
+    ``tabular`` / ``transform`` accept any source the project can read, not
+    just web URLs.
+    """
+    from yggdrasil.io.holder import IO
+
+    from . import web
+
+    if str(source).startswith(("http://", "https://")):
+        return web.read_table(source, fmt=fmt)
+    return IO.from_(str(source)).to_polars()
+
+
 @register
 class TabularSkill(LokiSkill):
     """Fetch a data/timeseries source as a tabular frame, cache it, propose reuse.
@@ -237,12 +256,12 @@ class TabularSkill(LokiSkill):
     ) -> dict[str, Any]:
         from yggdrasil.io.holder import IO
 
-        from . import dataproto, web
+        from . import dataproto
 
         if cache:                       # reuse a previously cached frame
             df, source = IO.from_(str(cache)).to_polars(), cache
-        elif url:                       # io handlers parse the body (HTTPResponse)
-            df, source = web.read_table(url, fmt=fmt), url
+        elif url:                       # http → session; local/s3/dbfs → io handlers
+            df, source = _read_tabular(url, fmt), url
         else:
             raise ValueError("provide url= to fetch, or cache= to reuse a cached frame")
 
@@ -316,12 +335,12 @@ class TransformSkill(LokiSkill):
         from yggdrasil.data import DataType, Field
         from yggdrasil.io.holder import IO
 
-        from . import dataproto, web
+        from . import dataproto
 
         if cache:
             df, source = IO.from_(str(cache)).to_polars(), cache
-        elif url:                       # io handlers parse the body (HTTPResponse)
-            df, source = web.read_table(url, fmt=fmt), url
+        elif url:                       # http → session; local/s3/dbfs → io handlers
+            df, source = _read_tabular(url, fmt), url
         else:
             raise ValueError("provide cache= (or url=) to transform")
 

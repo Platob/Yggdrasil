@@ -608,16 +608,18 @@ synthesis; `/sessions` lists the workspaces.
 
 `ygg loki mcp` runs Loki as a **Model Context Protocol** server over stdio, so
 any MCP client (Claude Desktop, an editor) can drive the whole agent — tools
-`reason`, `behaviors`, `run` (dispatch any behavior: `databricks-sql`,
-`aws-s3`, `genie`, …), `web`, and `capabilities`. Requires the optional `mcp`
-package.
+`reason`, `skills`, `run` (dispatch any skill: `databricks-sql`, `aws-s3`,
+`genie`, …), `web`, `guide` (the optimized yggdrasil way), `tabular` (read any
+source → cached frame), `engines`, `usage` (token KPIs), `setup` (a free local
+model), and `capabilities`. Requires the optional `mcp` package (auto-installed
+on first use).
 
 ```jsonc
 // an MCP client config entry
 { "loki": { "command": "ygg", "args": ["loki", "mcp"] } }
 ```
 
-The other direction: the **`databricks-mcp`** behavior connects *out* to a
+The other direction: the **`databricks-mcp`** skill connects *out* to a
 workspace's managed MCP servers — Unity Catalog functions, Genie, or vector
 search — authenticating with the agent's Databricks credentials:
 
