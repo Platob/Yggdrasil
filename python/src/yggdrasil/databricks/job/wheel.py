@@ -978,6 +978,7 @@ def ensure_environment(
     version: "str | None" = None,
     workspace_dir: str = WORKSPACE_ENV_DIR,
     rebuild: bool = False,
+    mode: Mode = Mode.AUTO,
 ) -> "dict[str, Any]":
     """Build + persist one **self-contained** ygg base environment for a single
     Python version, returning a small descriptor of what was written.
@@ -997,8 +998,16 @@ def ensure_environment(
     cluster ``requirements.txt`` then list those wheel paths, so the runtime
     installs with zero PyPI access.
 
+    *mode* sets the env-config-file policy (the wheel closure is **get-or-create**
+    unless *rebuild*): :data:`Mode.APPEND` writes the ``.yml`` / ``.requirements.txt``
+    only when they don't exist yet; :data:`Mode.AUTO` / :data:`Mode.OVERWRITE`
+    (re)write them so they track the current closure.
+
     Returns ``{python, key, env_name, env_dir, n_wheels, serverless, cluster}``.
     """
+    from yggdrasil.databricks.path import DatabricksPath
+
+    overwrite_env = Mode.from_(mode) is not Mode.APPEND
     version = version or ilmd.version("ygg")
     key = environment_key_for(python)
     env_name = f"ygg-{version}-{key}"
@@ -1007,14 +1016,22 @@ def ensure_environment(
     bundle = ensure_bundle(
         client, "ygg", python=python, workspace_dir=f"{env_dir}/binaries", rebuild=rebuild,
     )
-    serverless = ensure_named_environment(
-        client, env_name, dependencies=bundle,
-        environment_version=serverless_environment_version(python),
-        workspace_dir=workspace_dir, filename=f"{env_name}.yml",
-    )
-    cluster = ensure_cluster_requirements(
-        client, env_name, dependencies=bundle, workspace_dir=workspace_dir,
-    )
+    serverless_dest = f"{env_dir}/{env_name}.yml"
+    cluster_dest = f"{env_dir}/{env_name}.requirements.txt"
+    if overwrite_env or not DatabricksPath.from_(serverless_dest, client=client).exists():
+        serverless = ensure_named_environment(
+            client, env_name, dependencies=bundle,
+            environment_version=serverless_environment_version(python),
+            workspace_dir=workspace_dir, filename=f"{env_name}.yml",
+        )
+    else:
+        serverless = serverless_dest
+    if overwrite_env or not DatabricksPath.from_(cluster_dest, client=client).exists():
+        cluster = ensure_cluster_requirements(
+            client, env_name, dependencies=bundle, workspace_dir=workspace_dir,
+        )
+    else:
+        cluster = cluster_dest
     return {
         "python": python,
         "key": key,
@@ -1032,6 +1049,7 @@ def ensure_environments(
     versions: "tuple[str | None, ...] | list[str | None]" = (None,),
     workspace_dir: str = WORKSPACE_ENV_DIR,
     rebuild: bool = False,
+    mode: Mode = Mode.AUTO,
     max_workers: "int | None" = None,
 ) -> "list[dict[str, Any]]":
     """:func:`ensure_environment` for several Python versions, **in parallel**.
@@ -1041,11 +1059,12 @@ def ensure_environments(
     :class:`~concurrent.futures.ThreadPoolExecutor` (the work is subprocess-bound
     — uv / pip — so threads give real overlap). Results are returned in the input
     order regardless of completion order. A single version skips the pool and
-    runs inline."""
+    runs inline. *mode* is forwarded to each :func:`ensure_environment`."""
     versions = list(versions) or [None]
     if len(versions) == 1:
         return [ensure_environment(
-            client, python=versions[0], workspace_dir=workspace_dir, rebuild=rebuild,
+            client, python=versions[0], workspace_dir=workspace_dir,
+            rebuild=rebuild, mode=mode,
         )]
 
     results: "dict[Any, dict[str, Any]]" = {}
@@ -1055,7 +1074,8 @@ def ensure_environments(
         futures = {
             pool.submit(
                 ensure_environment,
-                client, python=py, workspace_dir=workspace_dir, rebuild=rebuild,
+                client, python=py, workspace_dir=workspace_dir,
+                rebuild=rebuild, mode=mode,
             ): py
             for py in versions
         }
