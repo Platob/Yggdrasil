@@ -121,7 +121,7 @@ class HTTPPath(RemotePath):
 
     def _stat_uncached(self) -> IOStats:
         from .request import HTTPRequest
-        from ..send_config import SendConfig
+        from .send_config import SendConfig
 
         req = HTTPRequest.prepare("HEAD", self.url)
         try:
@@ -213,7 +213,7 @@ class HTTPPath(RemotePath):
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
         from .request import HTTPRequest
-        from ..send_config import SendConfig
+        from .send_config import SendConfig
 
         del wait
         req = HTTPRequest.prepare("DELETE", self.url)

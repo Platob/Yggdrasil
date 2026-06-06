@@ -23,7 +23,7 @@ class TestPreprompts(unittest.TestCase):
 
     def test_specialized_fleets_have_domain_preprompts(self):
         from yggdrasil.aws.loki.skills import AWSServiceSkill
-        from yggdrasil.databricks.loki.skills import DatabricksServiceSkill
+        from yggdrasil.databricks.loki.base import DatabricksServiceSkill
 
         self.assertIn("Databricks", DatabricksServiceSkill.preprompt)
         self.assertIn("serverless", DatabricksServiceSkill.preprompt)

@@ -23,10 +23,10 @@ class _Base(unittest.TestCase):
 class TestDatabricksBehaviors(_Base):
     def test_fleet_is_registered_and_requires_databricks(self):
         names = {b.name for b in Loki().skills()}
-        for n in ("databricks-sql", "databricks-catalogs", "databricks-tables",
-                  "databricks-warehouses", "databricks-jobs", "databricks-clusters",
-                  "databricks-volumes", "databricks-secrets", "databricks-iam",
-                  "databricks-serving"):
+        for n in ("databricks-sql", "databricks-catalogs", "databricks-schemas",
+                  "databricks-tables", "databricks-warehouses", "databricks-jobs",
+                  "databricks-job-runs", "databricks-clusters", "databricks-volumes",
+                  "databricks-secrets", "databricks-iam", "databricks-serving"):
             self.assertIn(n, names)
         beh = next(b for b in Loki().skills() if b.name == "databricks-sql")
         self.assertEqual(beh.requires, "databricks")
@@ -185,7 +185,7 @@ class TestDatabricksBehaviors(_Base):
         # The domain preprompt steers the served model (sent as the system msg).
         sent = oai.chat.completions.create.call_args.kwargs["messages"]
         self.assertEqual(sent[0]["role"], "system")
-        self.assertIn("Databricks expert", sent[0]["content"])
+        self.assertIn("model serving", sent[0]["content"])
 
 
 class TestDatabricksMCP(_Base):

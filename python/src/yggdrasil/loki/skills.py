@@ -208,21 +208,15 @@ def _auto_key(source: str) -> str:
 
 
 def _read_tabular(source: str, fmt: Optional[str] = None):
-    """Read *source* into a polars frame the optimized yggdrasil way.
+    """Read any *source* into a polars frame **through the io handlers**.
 
-    HTTP(S) sources go through :class:`HTTPSession` (``web.read_table`` →
-    ``HTTPResponse.to_polars``); everything else — a local path, ``s3://``,
-    ``dbfs:/``, a UC Volume — goes straight through the io handlers
-    (``IO.from_(path)``), which already know every scheme and format. So
-    ``tabular`` / ``transform`` accept any source the project can read, not
-    just web URLs.
+    ``IO.from_(source)`` already returns the right Tabular leaf for the scheme
+    *and* format — ``http(s)://`` (over the shared ``HTTPSession``), a local
+    path, ``s3://``, ``dbfs:/``, a UC Volume, CSV/JSON/Parquet/Arrow/XLSX — so
+    there's nothing bespoke to do: hand it the source, take ``to_polars()``.
     """
     from yggdrasil.io.holder import IO
 
-    from . import web
-
-    if str(source).startswith(("http://", "https://")):
-        return web.read_table(source, fmt=fmt)
     return IO.from_(str(source)).to_polars()
 
 
