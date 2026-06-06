@@ -38,6 +38,11 @@ ROUTES: dict[str, tuple[str, ...]] = {
         "http://", "https://", "www.", "fetch ", "download ", "browse",
         "look up", "on the internet", "search the web", "scrape", "this url",
     ),
+    "aws": (
+        "aws", " s3", "ec2", "lambda", "dynamodb", "cloudwatch", "sqs ",
+        "sns ", " ecr", " ecs", "step function", "secrets manager", "boto3",
+        "iam role", "rds ", "glue ",
+    ),
     "databricks": (
         "databricks", "genie", "unity catalog", "warehouse", "cluster",
         "dbfs", "delta", "spark", "serving endpoint", "notebook", "job run",
@@ -125,6 +130,39 @@ class Loki:
         from yggdrasil.databricks import DatabricksClient
 
         return DatabricksClient.current()
+
+    @property
+    def aws(self) -> Any:
+        """The configured :class:`~yggdrasil.aws.AWSClient` when AWS is reachable.
+
+        Loki as an AWS token provider — the AWS behavior fleet rides this
+        client (its resolved credentials / region / role). ``None`` when no
+        AWS session is detected.
+        """
+        if not self.has("aws"):
+            return None
+        from yggdrasil.aws import AWSClient
+
+        return AWSClient.current()
+
+    def load_specialists(self) -> list[str]:
+        """Import the specialized behavior fleets for every reachable backend.
+
+        Databricks problems get the ``databricks-*`` skills, AWS problems the
+        ``aws-*`` skills — registered only when their backend is detected, so
+        ``ygg loki behaviors`` shows the fleet that actually applies here.
+        Returns the backends whose fleet loaded.
+        """
+        loaded: list[str] = []
+        for name, module in (("databricks", "yggdrasil.databricks.loki"),
+                             ("aws", "yggdrasil.aws.loki")):
+            if self.has(name):
+                try:
+                    __import__(module)
+                    loaded.append(name)
+                except Exception:
+                    pass
+        return loaded
 
     def token_info(self) -> dict[str, Any]:
         """Non-secret summary of the Databricks credentials Loki provides."""
@@ -336,6 +374,9 @@ class Loki:
             return {"category": "databricks", "action": action,
                     "specialist": "databricks",
                     "why": "matched a Databricks/Unity/warehouse signal"}
+        if any(s in low for s in ROUTES["aws"]):
+            return {"category": "aws", "action": "reason", "specialist": None,
+                    "why": "matched an AWS service signal — see the aws-* behaviors"}
         if self.has("databricks") and any(s in low for s in ROUTES["sql"]):
             return {"category": "databricks", "action": "reason",
                     "specialist": "databricks", "why": "SQL with a live workspace"}

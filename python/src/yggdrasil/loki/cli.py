@@ -98,6 +98,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         loki = Loki.current()
 
+    # Register the specialized behavior fleets for every reachable backend
+    # (databricks-* / aws-*), so they show up and dispatch here.
+    loki.load_specialists()
+
     style.print_logo("YGGLOKI")
 
     if action == "chat":
