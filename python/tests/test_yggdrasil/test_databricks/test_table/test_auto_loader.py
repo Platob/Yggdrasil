@@ -105,6 +105,31 @@ class TestTableAutoLoader:
         assert flow.base_environment_name == ygg_base_environment_name()
         assert flow.base_environment_name.startswith("ygg-")
 
+    def test_job_is_tagged_with_table_source_format_and_trigger(self):
+        tbl = _table()
+        # Identity sanitizer so we can assert the literal tag values.
+        tbl.service.client.safe_tag_value = lambda v, **k: v
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://bkt/landing", file_format="json", deploy=False)
+        tags = Flow.return_value.job_tags
+        assert tags["ygg"] == "autoloader"
+        assert tags["ygg_kind"] == "autoloader"
+        assert tags["ygg_catalog"] == "cat"
+        assert tags["ygg_schema"] == "sch"
+        assert tags["ygg_table"] == "cat.sch.tbl"
+        assert tags["ygg_source"] == "s3://bkt/landing"
+        assert tags["ygg_format"] == "json"
+        assert tags["ygg_trigger"] == "file_arrival"
+        assert tags["ygg_available_now"] == "true"
+        assert tags["ygg_clean_source"] == "false"
+
+    def test_manual_trigger_tag_when_file_arrival_disabled(self):
+        tbl = _table()
+        tbl.service.client.safe_tag_value = lambda v, **k: v
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://x", file_arrival=False, deploy=False)
+        assert Flow.return_value.job_tags["ygg_trigger"] == "manual"
+
     def test_environment_override_and_disable(self):
         tbl = _table()
         with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:

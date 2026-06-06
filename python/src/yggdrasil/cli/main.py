@@ -4,6 +4,12 @@ Subcommands::
 
     ygg databricks      YGGDBKS Databricks management CLI
     ygg loki            Loki — the global yggdrasil agent (status/run/token)
+    ygg run             Run a deployed @task/@flow on the cluster (job runner)
+
+``ygg`` is the single console-script entry point: deployed Databricks
+python-wheel tasks (the transparent ``@task``/``@flow`` dispatch, Auto Loader,
+the Loki agent) all invoke ``ygg`` with a leading subcommand rather than a
+per-feature script.
 """
 from __future__ import annotations
 
@@ -29,6 +35,14 @@ def _build_parser() -> argparse.ArgumentParser:
     loki = sub.add_parser("loki", help="Loki — the global yggdrasil agent.", add_help=False)
     loki.set_defaults(handler=_loki)
 
+    # -- run ---------------------------------------------------------------
+    run = sub.add_parser(
+        "run",
+        help="Run a deployed @task/@flow on the cluster (the job runner).",
+        add_help=False,
+    )
+    run.set_defaults(handler=_run)
+
     return parser
 
 
@@ -42,6 +56,12 @@ def _loki(args: argparse.Namespace) -> int:
     from yggdrasil.loki.cli import main as loki_main
     remaining = sys.argv[2:] if len(sys.argv) > 2 else []
     return loki_main(remaining)
+
+
+def _run(args: argparse.Namespace) -> int:
+    from yggdrasil.databricks.job.runner import main as runner_main
+    remaining = sys.argv[2:] if len(sys.argv) > 2 else []
+    return runner_main(remaining)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

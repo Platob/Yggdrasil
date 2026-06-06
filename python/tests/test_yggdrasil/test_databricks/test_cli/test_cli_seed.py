@@ -235,9 +235,9 @@ class TestSeedProvision(unittest.TestCase):
              patch("yggdrasil.databricks.job.wheel.ensure_environments",
                    return_value=[_env(v) for v in SUPPORTED_PYTHONS]), \
              contextlib.redirect_stdout(io.StringIO()):
-            rc = main(["seed", "--overwrite"])
+            rc = main(["seed", "--mode", "overwrite"])
         self.assertEqual(rc, 0)
-        # --overwrite ends after the env rewrite, before the cluster step.
+        # overwrite mode ends after the env rewrite, before the cluster step.
         client.compute.clusters.all_purpose_cluster.assert_not_called()
 
     def test_seed_no_pools_skips_pool_step(self):
@@ -264,9 +264,9 @@ class TestSeedProvision(unittest.TestCase):
              patch("yggdrasil.databricks.job.wheel.ensure_environments",
                    return_value=[_env(v) for v in SUPPORTED_PYTHONS]), \
              contextlib.redirect_stdout(io.StringIO()):
-            rc = main(["seed", "--overwrite"])
+            rc = main(["seed", "--mode", "overwrite"])
         self.assertEqual(rc, 0)
-        # --overwrite ends after the env rewrite, before warehouses + pools.
+        # overwrite mode ends after the env rewrite, before warehouses + pools.
         client.compute.instance_pools.seed_default_pools.assert_not_called()
 
     def test_seed_all_versions_builds_every_python_environment(self):
@@ -288,7 +288,7 @@ class TestSeedProvision(unittest.TestCase):
         self.assertEqual(list(envs.call_args.kwargs["versions"]), list(SUPPORTED_PYTHONS))
 
     def test_seed_overwrite_rebuilds_all_wheels_and_ends(self):
-        """--overwrite forces a from-scratch rebuild (all Pythons + envs),
+        """overwrite mode forces a from-scratch rebuild (all Pythons + envs),
         rewrites the envs, and ends before the warehouse step."""
         from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
         client = _client_with(default_wh=MagicMock())
@@ -300,7 +300,7 @@ class TestSeedProvision(unittest.TestCase):
              patch("yggdrasil.databricks.job.wheel.ensure_environments",
                    return_value=[_env(v) for v in SUPPORTED_PYTHONS]) as envs, \
              contextlib.redirect_stdout(io.StringIO()):
-            rc = main(["seed", "--overwrite"])
+            rc = main(["seed", "--mode", "overwrite"])
         self.assertEqual(rc, 0)
         # All wheels rebuilt: the per-Python matrix (not the single-wheel builder)
         # and a self-contained environment per supported Python, all forced fresh.
@@ -333,6 +333,52 @@ class TestSeedProvision(unittest.TestCase):
         self.assertEqual(rc, 0)
         dep.assert_called_once()
         self.assertFalse(dep.call_args.kwargs.get("check", False))
+
+    def test_seed_auto_mode_forwards_mode_and_overwrites_assistant(self):
+        from yggdrasil.enums.mode import Mode
+
+        wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
+        client = _client_with(default_wh=wh)
+        deployed = {"uploaded": [], "missing": [], "skipped": [], "api": None}
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]) as one, \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]) as envs, \
+             patch("yggdrasil.databricks.assistant.deploy", return_value=deployed) as dep, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed"])                              # auto is the default
+        self.assertEqual(rc, 0)
+        one.assert_called_once()                             # get-or-create (no rebuild)
+        self.assertFalse(one.call_args.kwargs["rebuild"])
+        self.assertEqual(envs.call_args.kwargs["mode"], Mode.AUTO)
+        # auto create-or-updates the assistant bundle (overwrite=True)
+        self.assertTrue(dep.call_args.kwargs["overwrite"])
+
+    def test_seed_append_mode_adds_only_missing(self):
+        from yggdrasil.enums.mode import Mode
+
+        wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
+        client = _client_with(default_wh=wh)
+        deployed = {"uploaded": [], "missing": [], "skipped": [], "api": None}
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+                   return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]) as one, \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]) as envs, \
+             patch("yggdrasil.databricks.assistant.deploy", return_value=deployed) as dep, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["seed", "--mode", "append"])
+        self.assertEqual(rc, 0)
+        one.assert_called_once()                             # get-or-create, no rebuild
+        self.assertFalse(one.call_args.kwargs["rebuild"])
+        self.assertEqual(envs.call_args.kwargs["mode"], Mode.APPEND)
+        # append only writes assistant files that don't exist yet (overwrite=False)
+        self.assertFalse(dep.call_args.kwargs["overwrite"])
+        # still reaches the cluster step (append is not the early-exit overwrite)
+        client.compute.clusters.all_purpose_cluster.assert_called_once()
 
     def test_seed_no_assistant_skips_assistant_step(self):
         wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"

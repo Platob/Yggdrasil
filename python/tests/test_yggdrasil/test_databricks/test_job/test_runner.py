@@ -1,4 +1,4 @@
-"""Unit tests for the ``ygg-run`` CLI — target resolution + signature coercion.
+"""Unit tests for the ``ygg run`` CLI — target resolution + signature coercion.
 
 These exercise the on-cluster side of the transparent dispatch without a live
 workspace (no ``--payload`` / ``--result`` round-trip)."""

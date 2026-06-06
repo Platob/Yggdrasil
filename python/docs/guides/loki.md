@@ -102,7 +102,9 @@ Databricks at most:
   (`ENGINE_PREFERENCE = ("databricks", "claude", "openai")`; override the
   endpoint with `serving_endpoint=` or `YGG_LOKI_SERVING_ENDPOINT`).
 - **Deploys to Databricks**: `deploy()` upserts a serverless Job that runs the
-  agent on the pre-built ygg image via the `ygg-loki` wheel entry point.
+  agent on the pre-built ygg image through the single `ygg` wheel entry point
+  (`ygg loki reason …` / `ygg loki run …` — on the runtime `ygg loki` resolves
+  to this `DatabricksLoki`).
 
 ```python
 from yggdrasil.databricks.loki import DatabricksLoki

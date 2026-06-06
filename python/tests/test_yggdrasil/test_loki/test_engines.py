@@ -67,6 +67,13 @@ class TestClaudeEngine(unittest.TestCase):
 
 
 class TestDatabricksServingEngine(unittest.TestCase):
+    def test_defaults_to_the_lowest_endpoint(self):
+        # The smallest / cheapest broadly-available Foundation Model endpoint —
+        # cheap by default unless a caller opts up via endpoint=.
+        self.assertEqual(
+            DatabricksServingEngine().endpoint, "databricks-meta-llama-3-1-8b-instruct"
+        )
+
     def test_complete_uses_openai_compatible_client(self):
         client = MagicMock()
         oai = MagicMock()

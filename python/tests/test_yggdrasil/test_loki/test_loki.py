@@ -123,5 +123,44 @@ class TestGenieBehavior(unittest.TestCase):
         client.genie.spaces.assert_called_once()
 
 
+class TestPythonProjectBehavior(unittest.TestCase):
+    def test_runs_anywhere_and_executes_supplied_code(self):
+        loki = Loki()
+        loki._backends = [Backend("local", True)]
+        out = loki.run(
+            "python_project",
+            project="My Demo",
+            code="def main():\n    print('hi from', 7 * 6)\n\nif __name__ == '__main__':\n    main()\n",
+        )
+        self.assertEqual(out["package"], "my_demo")           # slugged
+        self.assertEqual(out["returncode"], 0)
+        self.assertIn("hi from 42", out["stdout"])
+        self.assertIn("pyproject.toml", out["files"])
+        self.assertIn("my_demo/main.py", out["files"])
+
+    def test_reasons_code_from_task_and_strips_fences(self):
+        loki = Loki()
+        loki._backends = [Backend("local", True)]
+        loki.reason = lambda prompt, *, system=None, **_: (
+            "```python\nprint('reasoned ok')\n```"
+        )
+        out = loki.run("python_project", project="r", task="say hello")
+        self.assertEqual(out["returncode"], 0)
+        self.assertIn("reasoned ok", out["stdout"])
+
+    def test_scaffold_only_without_run(self):
+        loki = Loki()
+        loki._backends = [Backend("local", True)]
+        out = loki.run("python_project", project="noexec", code="print('x')\n", run=False)
+        self.assertNotIn("returncode", out)
+        self.assertTrue(out["project_dir"].endswith("noexec"))
+
+    def test_requires_code_or_task(self):
+        loki = Loki()
+        loki._backends = [Backend("local", True)]
+        with self.assertRaises(ValueError):
+            loki.run("python_project", project="empty")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,11 +27,22 @@ def _hermetic_env(monkeypatch):
     """Strip ambient ``DATABRICKS_*`` credentials so these URL round-trip
     unit tests exercise only the explicit kwargs they pass — a real
     ``DATABRICKS_TOKEN`` in the environment would otherwise win over an
-    explicit OAuth ``client_id`` / ``client_secret`` and skew the URL."""
+    explicit OAuth ``client_id`` / ``client_secret`` and skew the URL.
+
+    The client resolves env defaults from a process-lifetime snapshot
+    (:func:`~yggdrasil.databricks.client._env_defaults_snapshot`), so an earlier
+    test that built a client while ``DATABRICKS_*`` was set would otherwise leak
+    that snapshot into these clients' singleton keys. Drop the snapshot after
+    stripping (so this test re-reads the now-empty env) and again on teardown (so
+    the next test re-reads the restored env)."""
+    from yggdrasil.databricks.client import invalidate_env_defaults
+
     for var in list(os.environ):
         if var.startswith("DATABRICKS_"):
             monkeypatch.delenv(var, raising=False)
+    invalidate_env_defaults()
     yield
+    invalidate_env_defaults()
 
 
 class TestSchemeRegistration:

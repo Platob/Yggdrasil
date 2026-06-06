@@ -717,6 +717,44 @@ ygg databricks deploy environment --key default
 ygg databricks deploy env --all-versions > environments.json
 ```
 
+### `deploy project [path]`
+
+Take **your own project** to Databricks in one command. Discovers the nearest
+`pyproject.toml` (from `path` — a project dir or the file — or the current
+working directory), then:
+
+1. builds the **project's own wheel** from its source tree (`uv build --wheel`),
+2. writes a serverless **base environment** + classic-cluster **requirements**
+   named for the project — `<name>-<version>`, where `<name>` is the
+   `[project].name` from the `pyproject.toml`,
+3. get-or-creates a **default single-user cluster** named for the project that
+   installs the project's dependencies (the requirements file from step 2).
+
+| Flag | Purpose |
+|---|---|
+| `--mode` | Idempotency policy — `overwrite` / `append` / `auto` (default `auto`) |
+| `--extra` | optional-dependency extra to fold into the environment (repeatable) |
+| `--bundle` | Bundle the dependency closure as Linux wheels (zero-PyPI install) |
+| `--no-cluster` | Build the wheel + environment only; don't create the cluster |
+| `--single-user` | Single-user owner for the cluster (default: the current user) |
+| `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`) |
+
+`--mode` controls what gets rebuilt vs. reused:
+
+| Mode | Wheel(s) | Env config files | Cluster |
+|---|---|---|---|
+| `overwrite` | rebuilt + overwritten | overwritten | created **or updated** |
+| `append` | reused if present, else built | written only if **missing** | created if missing |
+| `auto` (default) | get-or-create (reused if present) | **always overwritten** | get-or-create |
+
+```bash
+ygg databricks deploy project                      # discover from the cwd (auto)
+ygg databricks deploy project ./my-app --extra databricks
+ygg databricks deploy project --mode overwrite        # rebuild + update everything
+ygg databricks deploy project --mode append           # only add what's missing
+ygg databricks deploy project --bundle --no-cluster   # zero-PyPI env, no cluster
+```
+
 ---
 
 ## Seed
@@ -742,13 +780,27 @@ ygg databricks seed
 | Flag | Purpose |
 |---|---|
 | `--check` | **Read-only**: report readiness, create/upload nothing. Exits `1` if anything is missing — use it as a CI gate. |
+| `--mode` | Idempotency policy — `auto` / `append` / `overwrite` (default `auto`). |
 | `--rebuild` | Force a fresh wheel build even if the version is already deployed. |
 | `--all-versions` | Seed a wheel + environment for every supported Python (3.10–3.13). |
-| `--overwrite` | Rebuild every wheel (all Pythons + the bundle) and rewrite the environment files from scratch, then **end** (skips warehouse/pools/cluster/assistant). |
 | `--no-pools` | Skip the default Light/Medium/Heavy instance pools step. |
 | `--no-cluster` | Skip the default single-user all-purpose cluster step. |
 | `--no-assistant` | Skip deploying the Databricks Assistant skills + guidance bundle. |
 | `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`). |
+
+`--mode` mirrors `deploy project` — what gets rebuilt vs. reused across the seed steps:
+
+| Mode | Wheels | Env config files / warehouse / pools / assistant | Cluster | Other steps |
+|---|---|---|---|---|
+| `overwrite` | rebuilt (all Pythons + bundle) | env files rewritten | — | **ends** after environments |
+| `append` | get-or-create | written / deployed **only if missing** | created if missing | run |
+| `auto` (default) | get-or-create | **create-or-update** (refreshed) | get-or-create | run |
+
+```bash
+ygg databricks seed                  # auto (the default)
+ygg databricks seed --mode append    # add only what's missing
+ygg databricks seed --mode overwrite # rebuild the image + rewrite envs, then end
+```
 
 ### Assistant bundle
 

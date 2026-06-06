@@ -370,6 +370,33 @@ class TestWheel:
             "cluster": "/ws/env/ygg-9.9-py312/ygg-9.9-py312.requirements.txt",
         }
 
+    def test_ensure_environment_append_skips_existing_spec_files(self):
+        # In APPEND mode an env file that already exists is left untouched; a
+        # missing one is written. Here the serverless yml exists, requirements
+        # don't.
+        from unittest.mock import patch as _patch
+
+        from yggdrasil.enums.mode import Mode
+
+        client = MagicMock()
+        bundle = ["/ws/env/ygg-9.9-py312/binaries/ygg/ygg-9.9-py3-none-any.whl"]
+        present = MagicMock(); present.exists.return_value = True
+        absent = MagicMock(); absent.exists.return_value = False
+        dbp = MagicMock()
+        dbp.from_.side_effect = lambda dest, **k: present if str(dest).endswith(".yml") else absent
+        with _patch("yggdrasil.databricks.path.DatabricksPath", dbp), \
+             _patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
+             _patch("yggdrasil.databricks.job.wheel.ensure_bundle", return_value=bundle), \
+             _patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
+                    return_value="/written.yml") as ene, \
+             _patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
+                    return_value="/written.req") as ecr:
+            out = wheel.ensure_environment(client, python="3.12", mode=Mode.APPEND)
+        ene.assert_not_called()                              # yml present → left alone
+        ecr.assert_called_once()                             # requirements missing → written
+        assert out["serverless"].endswith("ygg-9.9-py312.yml")   # existing path reported
+        assert out["cluster"] == "/written.req"
+
     def test_ensure_environments_runs_every_version_order_preserved(self):
         # ensure_environments fans the per-version builds out across threads;
         # record under a lock (Mock isn't thread-safe) and assert on that.
@@ -379,7 +406,7 @@ class TestWheel:
         seen: list = []
         lock = threading.Lock()
 
-        def _fake(c, *, python, workspace_dir, rebuild):
+        def _fake(c, *, python, workspace_dir, rebuild, mode=None):
             with lock:
                 seen.append(python)
             return {"python": python, "key": wheel.environment_key_for(python)}

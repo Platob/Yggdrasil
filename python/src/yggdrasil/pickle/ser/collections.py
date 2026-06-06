@@ -196,9 +196,12 @@ class CollectionSerialized(Serialized[T], Generic[T]):
 
     def _payload_buffer(self):  # → _ScratchBuf | IO
         if self.codec == CODEC_NONE:
-            # Non-owning view at pos=0. Works for both _ScratchBuf (from
-            # build()) and yggdrasil IO (from read_from()).
-            return self.data.view(pos=0)
+            # Non-owning read cursor at pos 0 over the payload. A _ScratchBuf
+            # (from build()) slices in place; a yggdrasil IO (from read_from())
+            # mints a cursor via open() — both zero-copy.
+            if isinstance(self.data, _ScratchBuf):
+                return self.data.view(pos=0)
+            return self.data.open("rb")
         return _ScratchBuf(self.decode())
 
     def _read_count(self, buffer: IO) -> int:

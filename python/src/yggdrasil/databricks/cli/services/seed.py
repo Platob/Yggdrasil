@@ -3,9 +3,21 @@ for running ygg on Databricks.
 
 One command to answer "is this workspace ready, and if not, make it ready":
 
-    ygg databricks seed            # provision anything missing, then report
-    ygg databricks seed --check    # read-only readiness report (CI gate)
-    ygg databricks seed --overwrite  # rebuild every wheel + the env from scratch, then end
+    ygg databricks seed                  # auto: get-or-create heavy artifacts,
+                                         # create-or-update the light ones
+    ygg databricks seed --check          # read-only readiness report (CI gate)
+    ygg databricks seed --mode append    # add only what's missing
+    ygg databricks seed --mode overwrite # rebuild every wheel + the env from scratch, then end
+
+``--mode`` (a :class:`~yggdrasil.enums.Mode`) sets the idempotency policy:
+
+- ``auto`` (default) — **get-or-create** the heavy artifacts (wheels reused when
+  already deployed, the cluster get-or-created) but **create-or-update** the
+  light/configurable ones (the env config files, warehouse, pools, assistant).
+- ``append`` — add only what's **missing** (don't rewrite existing env files or
+  redeploy existing assistant files).
+- ``overwrite`` — rebuild every wheel (all Pythons + the bundle) from scratch
+  and rewrite the environment files, then **end** (skips the later steps).
 
 It walks six areas:
 
@@ -17,7 +29,7 @@ It walks six areas:
   ``ygg-<version>-py3XX.requirements.txt`` (classic-cluster
   ``Library(requirements=...)``). Both list only **built wheels in the workspace
   pypi registry**, so the runtime installs with zero PyPI access. ``--all-versions``
-  (and ``--overwrite``) writes the pair for every supported Python (3.10–3.13).
+  (and ``--mode overwrite``) writes the pair for every supported Python (3.10–3.13).
 - **warehouses**  — a default SQL warehouse to execute statements against.
 - **pools**       — the default Light / Medium / Heavy Yggdrasil instance pools
   (AWS r5d memory-optimized, local NVMe), each preloading the local-Python DBR
@@ -37,13 +49,14 @@ It walks six areas:
   Assistant-settings push). They teach the Assistant to drive ygg in Python
   on serverless — never via the CLI. Skip with ``--no-assistant``.
 
-In the default (seed) mode it builds/uploads the wheel, assembles and writes
-the environment files, and ensures a default warehouse exists. With ``--check``
-it touches nothing and exits non-zero when something is missing — so a
-pipeline can gate on ``ygg databricks seed --check``. With ``--overwrite`` it
-forces a fresh rebuild of every wheel (all supported Pythons + the dependency
-bundle), rewrites the environment files, and **ends** — skipping the warehouse
-step (a focused "rebuild the image from scratch" command).
+In the default (``auto``) mode it builds/uploads the wheel (reusing one already
+deployed), assembles and writes the environment files, and ensures a default
+warehouse, pools, cluster, and assistant bundle exist. With ``--check`` it
+touches nothing and exits non-zero when something is missing — so a pipeline can
+gate on ``ygg databricks seed --check``. With ``--mode overwrite`` it forces a
+fresh rebuild of every wheel (all supported Pythons + the dependency bundle),
+rewrites the environment files, and **ends** — skipping the warehouse step (a
+focused "rebuild the image from scratch" command).
 """
 from __future__ import annotations
 
@@ -66,9 +79,13 @@ class SeedCommand:
                             help="Force a fresh wheel build even if the version is already deployed.")
         parser.add_argument("--all-versions", dest="all_versions", action="store_true",
                             help="Seed a wheel + environment for every supported Python (3.10–3.13).")
-        parser.add_argument("--overwrite", action="store_true",
-                            help="Rebuild every wheel (all Pythons + the bundle) from scratch and rewrite "
-                                 "the environment files, then end (skips the warehouse + pools steps).")
+        parser.add_argument("--mode", default="auto", choices=["auto", "append", "overwrite"],
+                            help="Idempotency policy. auto (default): get-or-create the wheels + "
+                                 "cluster, but create-or-update the light/configurable artifacts "
+                                 "(env config files, warehouse, pools, assistant). append: add only "
+                                 "what's missing. overwrite: rebuild every wheel (all Pythons + the "
+                                 "bundle) from scratch and rewrite the environment files, then end "
+                                 "(skips the warehouse + pools + cluster + assistant steps).")
         parser.add_argument("--no-pools", dest="no_pools", action="store_true",
                             help="Skip the default Light/Medium/Heavy instance pools step.")
         parser.add_argument("--no-cluster", dest="no_cluster", action="store_true",
@@ -80,18 +97,23 @@ class SeedCommand:
     @classmethod
     def _seed(cls, args: Any, build_client: Any) -> int:
         from yggdrasil.cli import style
+        from yggdrasil.enums.mode import Mode
 
         check = args.check
-        # --overwrite forces a full from-scratch rebuild (every Python + the
-        # bundle) and rewrites the environment files; --check stays read-only and
-        # wins if both are given.
-        overwrite = args.overwrite and not check
+        deploy_mode = Mode.from_(args.mode)
+        # OVERWRITE forces a full from-scratch rebuild (every Python + the bundle)
+        # and rewrites the environment files, then ends. AUTO (default) is
+        # get-or-create for the heavy artifacts (wheels, cluster) but create-or-
+        # update for the light/configurable ones (env files, warehouse, pools,
+        # assistant). APPEND adds only what's missing. --check stays read-only and
+        # wins if combined with a mode.
+        overwrite = deploy_mode is Mode.OVERWRITE and not check
         rebuild = overwrite or args.rebuild
         all_versions = overwrite or args.all_versions
-        mode = "check" if check else ("overwrite" if overwrite else "provision")
+        label = "check" if check else deploy_mode.name.lower()
         client = build_client(args)
         style.out(f"\n  {style.bold('ygg databricks seed')}  "
-                  f"{style.dim('(' + mode + ' mode)')}\n\n")
+                  f"{style.dim('(' + label + ' mode)')}\n\n")
 
         ok = True  # flips false on any missing prerequisite or step error
 
@@ -182,6 +204,7 @@ class SeedCommand:
                     envs = whl.ensure_environments(
                         client, versions=pythons,
                         workspace_dir=whl.WORKSPACE_ENV_DIR, rebuild=rebuild,
+                        mode=deploy_mode,
                     )
                 for env in envs:
                     style.out(
@@ -198,7 +221,7 @@ class SeedCommand:
             style.fail(f"environment step failed: {exc}")
             ok = False
 
-        # --overwrite is a focused "rebuild the image" command: stop after the
+        # OVERWRITE is a focused "rebuild the image" command: stop after the
         # wheels + environments are rewritten, before the warehouse step.
         if overwrite:
             style.out("\n")
@@ -394,8 +417,12 @@ class SeedCommand:
                             f"({len(res['uploaded'])} files: skills + guidance)"
                         )
                 else:
+                    # APPEND only writes assistant files that don't exist yet;
+                    # AUTO/OVERWRITE refresh them (create-or-update).
                     with style.Spinner("deploying assistant skills + guidance…"):
-                        res = ax.deploy(client, check=False)
+                        res = ax.deploy(
+                            client, check=False, overwrite=deploy_mode is not Mode.APPEND,
+                        )
                     for path in res["uploaded"][:8]:
                         style.out(f"    {style.dim('file')}   {path}\n")
                     if len(res["uploaded"]) > 8:

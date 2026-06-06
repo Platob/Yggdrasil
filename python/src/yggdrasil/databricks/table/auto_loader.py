@@ -2,7 +2,7 @@
 
 :func:`auto_load` is what the Databricks job built by
 :meth:`yggdrasil.databricks.table.table.Table.auto_loader` actually runs on
-the cluster (imported by ``ygg-run`` from the shipped ygg wheel). It streams
+the cluster (imported by ``ygg run`` from the shipped ygg wheel). It streams
 files from a source path into a Unity Catalog table via Spark Structured
 Streaming + Databricks Auto Loader — incremental, exactly-once, schema-evolving
 — so a table keeps absorbing new files dropped at *source* without a bespoke

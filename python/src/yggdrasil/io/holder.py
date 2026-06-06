@@ -3339,35 +3339,6 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
         """Bytes from the cursor to EOF on the active payload."""
         return self._active().size - self._pos
 
-    def view(
-        self,
-        *,
-        pos: int = 0,
-        size: Optional[int] = None,
-        mode: ModeLike = "rb",
-    ) -> "IO":
-        """Return a fresh, non-owning cursor over this IO.
-
-        With *size* unset the view shares the same backing storage —
-        zero copy, cursor seeded at *pos*. Useful for Parquet footer
-        probes, zip directory walks, magic-byte sniffs.
-
-        With *size* set, the view holds an in-memory copy of bytes
-        ``[pos, pos+size)``. That's the right shape for a *bounded*
-        sub-view that should not race with later mutations of the
-        parent buffer.
-        """
-        if size is None:
-            target = self._parent if self._parent is not None else self
-            v = type(self)(holder=target, owns_holder=False, mode=mode)
-            v._pos = int(pos)
-            return v
-        if size < 0:
-            raise ValueError(f"view size must be >= 0, got {size!r}")
-        # Bounded view: snapshot the requested range.
-        payload = self.pread(int(size), int(pos))
-        return type(self)(payload)
-
     # ---- codec auto-handling -------------------------------------------
 
     def _codec(self):
@@ -3388,13 +3359,13 @@ class IO(Tabular[O], BinaryIO, Generic[T, O]):
     def _format_view(self) -> "IO":
         """A read-only IO over the *format* bytes.
 
-        Uncompressed → non-owning :meth:`view` of ``self``. Codec
-        present → fresh in-memory IO whose bytes are the decompressed
+        Uncompressed → a fresh non-owning :meth:`open` cursor over ``self``.
+        Codec present → fresh in-memory IO whose bytes are the decompressed
         payload. Caller closes the returned buffer.
         """
         codec = self._codec()
         if codec is None:
-            return self.view(pos=0)
+            return self.open("rb")
         return codec.decompress(self)
 
     def _format_input(self) -> "_FormatInputContext":

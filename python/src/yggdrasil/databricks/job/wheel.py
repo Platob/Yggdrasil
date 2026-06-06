@@ -27,6 +27,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from yggdrasil.enums.mode import Mode
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +81,11 @@ __all__ = [
     "ensure_cluster_requirements",
     "ensure_environment",
     "ensure_environments",
+    "find_pyproject",
+    "read_pyproject",
+    "build_project_wheel",
+    "download_dependency_wheels",
+    "ensure_project_environment",
     "ygg_base_environment_name",
     "deployed_environments",
     "ygg_runtime_dependencies",
@@ -971,6 +978,7 @@ def ensure_environment(
     version: "str | None" = None,
     workspace_dir: str = WORKSPACE_ENV_DIR,
     rebuild: bool = False,
+    mode: Mode = Mode.AUTO,
 ) -> "dict[str, Any]":
     """Build + persist one **self-contained** ygg base environment for a single
     Python version, returning a small descriptor of what was written.
@@ -990,8 +998,16 @@ def ensure_environment(
     cluster ``requirements.txt`` then list those wheel paths, so the runtime
     installs with zero PyPI access.
 
+    *mode* sets the env-config-file policy (the wheel closure is **get-or-create**
+    unless *rebuild*): :data:`Mode.APPEND` writes the ``.yml`` / ``.requirements.txt``
+    only when they don't exist yet; :data:`Mode.AUTO` / :data:`Mode.OVERWRITE`
+    (re)write them so they track the current closure.
+
     Returns ``{python, key, env_name, env_dir, n_wheels, serverless, cluster}``.
     """
+    from yggdrasil.databricks.path import DatabricksPath
+
+    overwrite_env = Mode.from_(mode) is not Mode.APPEND
     version = version or ilmd.version("ygg")
     key = environment_key_for(python)
     env_name = f"ygg-{version}-{key}"
@@ -1000,14 +1016,22 @@ def ensure_environment(
     bundle = ensure_bundle(
         client, "ygg", python=python, workspace_dir=f"{env_dir}/binaries", rebuild=rebuild,
     )
-    serverless = ensure_named_environment(
-        client, env_name, dependencies=bundle,
-        environment_version=serverless_environment_version(python),
-        workspace_dir=workspace_dir, filename=f"{env_name}.yml",
-    )
-    cluster = ensure_cluster_requirements(
-        client, env_name, dependencies=bundle, workspace_dir=workspace_dir,
-    )
+    serverless_dest = f"{env_dir}/{env_name}.yml"
+    cluster_dest = f"{env_dir}/{env_name}.requirements.txt"
+    if overwrite_env or not DatabricksPath.from_(serverless_dest, client=client).exists():
+        serverless = ensure_named_environment(
+            client, env_name, dependencies=bundle,
+            environment_version=serverless_environment_version(python),
+            workspace_dir=workspace_dir, filename=f"{env_name}.yml",
+        )
+    else:
+        serverless = serverless_dest
+    if overwrite_env or not DatabricksPath.from_(cluster_dest, client=client).exists():
+        cluster = ensure_cluster_requirements(
+            client, env_name, dependencies=bundle, workspace_dir=workspace_dir,
+        )
+    else:
+        cluster = cluster_dest
     return {
         "python": python,
         "key": key,
@@ -1025,6 +1049,7 @@ def ensure_environments(
     versions: "tuple[str | None, ...] | list[str | None]" = (None,),
     workspace_dir: str = WORKSPACE_ENV_DIR,
     rebuild: bool = False,
+    mode: Mode = Mode.AUTO,
     max_workers: "int | None" = None,
 ) -> "list[dict[str, Any]]":
     """:func:`ensure_environment` for several Python versions, **in parallel**.
@@ -1034,11 +1059,12 @@ def ensure_environments(
     :class:`~concurrent.futures.ThreadPoolExecutor` (the work is subprocess-bound
     — uv / pip — so threads give real overlap). Results are returned in the input
     order regardless of completion order. A single version skips the pool and
-    runs inline."""
+    runs inline. *mode* is forwarded to each :func:`ensure_environment`."""
     versions = list(versions) or [None]
     if len(versions) == 1:
         return [ensure_environment(
-            client, python=versions[0], workspace_dir=workspace_dir, rebuild=rebuild,
+            client, python=versions[0], workspace_dir=workspace_dir,
+            rebuild=rebuild, mode=mode,
         )]
 
     results: "dict[Any, dict[str, Any]]" = {}
@@ -1048,7 +1074,8 @@ def ensure_environments(
         futures = {
             pool.submit(
                 ensure_environment,
-                client, python=py, workspace_dir=workspace_dir, rebuild=rebuild,
+                client, python=py, workspace_dir=workspace_dir,
+                rebuild=rebuild, mode=mode,
             ): py
             for py in versions
         }
@@ -1056,6 +1083,253 @@ def ensure_environments(
             py = futures[future]
             results[py] = future.result()
     return [results[py] for py in versions]
+
+
+# ---------------------------------------------------------------------------
+# Arbitrary on-disk projects — discover a pyproject.toml, build it, and write a
+# project-named environment (the user-project counterpart of the ygg image).
+# ---------------------------------------------------------------------------
+
+
+def find_pyproject(start: str | Path | None = None) -> Path:
+    """The nearest ``pyproject.toml`` at or above *start* (cwd by default).
+
+    *start* may point at the file itself, at its directory, or at any nested
+    directory — the search walks up to the first ``pyproject.toml``. Raises
+    :class:`FileNotFoundError` when none exists on the way up to the root."""
+    start_path = Path(start).resolve() if start else Path.cwd()
+    if start_path.is_file():
+        if start_path.name == "pyproject.toml":
+            return start_path
+        start_path = start_path.parent
+    for directory in (start_path, *start_path.parents):
+        candidate = directory / "pyproject.toml"
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"no pyproject.toml found at or above {start_path}")
+
+
+def read_pyproject(path: str | Path) -> dict[str, Any]:
+    """Parse a ``pyproject.toml``'s ``[project]`` table into what the deploy
+    needs: ``name``, ``version``, base ``dependencies``, ``optional_dependencies``
+    (keyed by extra), ``requires_python``, and the project ``dir``."""
+    try:
+        import tomllib as toml_reader
+    except ModuleNotFoundError:                       # Python 3.10 has no tomllib
+        import tomli as toml_reader
+
+    path = Path(path).resolve()
+    data = toml_reader.loads(path.read_text(encoding="utf-8"))
+    project = data.get("project") or {}
+    name = project.get("name")
+    if not name:
+        raise ValueError(f"{path} has no [project].name — not a deployable project")
+    return {
+        "name": name,
+        "version": project.get("version", "0.0.0"),
+        "dependencies": list(project.get("dependencies") or []),
+        "optional_dependencies": {
+            extra: list(reqs)
+            for extra, reqs in (project.get("optional-dependencies") or {}).items()
+        },
+        "requires_python": project.get("requires-python"),
+        "dir": path.parent,
+    }
+
+
+def build_project_wheel(
+    project_dir: str | Path,
+    *,
+    python: str | None = None,
+    dest_dir: str | Path | None = None,
+) -> list[Path]:
+    """Build the **on-disk project** at *project_dir* into a wheel (``uv build
+    --wheel``, ``--python X.Y`` when given; ``pip wheel --no-deps`` fallback).
+
+    Unlike :func:`build_wheel` — which synthesizes a project from an *installed*
+    package's metadata — this builds the real discovered project from its own
+    ``pyproject.toml``, so a user's source tree ships exactly as written."""
+    project_dir = Path(project_dir).resolve()
+    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-proj-"))
+    cmd = ["uv", "build", "--wheel"]
+    if python:
+        cmd += ["--python", python]
+    cmd += ["--out-dir", str(out), str(project_dir)]
+    try:
+        _run_build(cmd)
+    except FileNotFoundError:
+        logger.info("uv not found — building project %s with pip", project_dir)
+        _run_build(
+            [sys.executable, "-m", "pip", "wheel", str(project_dir),
+             "--no-deps", "--wheel-dir", str(out)]
+        )
+    wheels = sorted(out.glob("*.whl"))
+    if not wheels:
+        raise FileNotFoundError(f"no wheel produced for project {project_dir}")
+    return wheels
+
+
+def download_dependency_wheels(
+    dependencies: list[str] | tuple[str, ...],
+    *,
+    python: str | None = None,
+    dest_dir: str | Path | None = None,
+) -> list[Path]:
+    """Download *dependencies* as **Linux-x86_64** wheels for the serverless /
+    cluster runtime (the same platform pins :func:`build_bundle` uses), so a
+    zero-PyPI environment can install entirely from them. Runtime-provided
+    distributions (:func:`_bundle_exclude`) are dropped. Empty in → empty out."""
+    deps = [d for d in dependencies if d]
+    if not deps:
+        return []
+    out = Path(dest_dir) if dest_dir else Path(tempfile.mkdtemp(prefix="ygg-deps-"))
+    py = _py_minor(python)
+    abi = "cp" + py.replace(".", "")                  # 3.12 → cp312
+    platform_args: list[str] = []
+    for platform_tag in _serverless_wheel_platforms():
+        platform_args += ["--platform", platform_tag]
+    logger.info("downloading %d dependency requirement(s) as linux wheels (py%s)", len(deps), py)
+    _run_build(
+        [sys.executable, "-m", "pip", "download", "--only-binary=:all:",
+         "--python-version", py, "--implementation", "cp",
+         "--abi", abi, "--abi", "abi3", "--abi", "none",
+         *platform_args, "--dest", str(out), *deps]
+    )
+    exclude = _bundle_exclude()
+    wheels: list[Path] = []
+    for whl in sorted(out.glob("*.whl")):
+        if _wheel_dist(whl.name) in exclude:
+            whl.unlink(missing_ok=True)
+            continue
+        wheels.append(whl)
+    return wheels
+
+
+def ensure_project_environment(
+    client: Any,
+    pyproject: str | Path | None = None,
+    *,
+    python: str | None = None,
+    extras: tuple[str, ...] | list[str] = (),
+    bundle: bool = False,
+    mode: Mode = Mode.AUTO,
+    workspace_dir: str = WORKSPACE_ENV_DIR,
+    pypi_dir: str = WORKSPACE_PYPI_DIR,
+) -> dict[str, Any]:
+    """Discover a project's ``pyproject.toml``, build its wheel, and write a
+    serverless **base environment** + classic-cluster **requirements** named for
+    the project (``<name>-<version>``) — the user-project counterpart of
+    :func:`ensure_environment`.
+
+    The environment's dependency list is the **project wheel** plus the
+    project's own ``[project].dependencies`` (and any requested *extras*' deps).
+    With ``bundle=True`` those dependencies are downloaded as Linux-x86_64 wheels
+    into the env's ``binaries/`` folder and listed by workspace path, so the
+    runtime installs with zero PyPI access; otherwise they're listed as index
+    requirements resolved at install time.
+
+    *mode* (a :class:`~yggdrasil.enums.Mode`) sets the idempotency policy:
+
+    - :data:`Mode.OVERWRITE` — rebuild the wheel(s) and **overwrite** everything
+      (the deployed wheel and the env config files).
+    - :data:`Mode.APPEND` — **add only what's missing**: reuse an already-deployed
+      wheel, and write the env config files only when they don't exist yet.
+    - :data:`Mode.AUTO` (default) — **get-or-create** the wheel(s) (reuse when
+      already deployed, build when not) but always **overwrite** the env config
+      files so they track the current dependency set.
+
+    Returns a descriptor with the project name/version, the env name, the written
+    file paths, the dependency list, and the resolved *mode*.
+    """
+    from yggdrasil.databricks.path import DatabricksPath
+
+    mode = Mode.from_(mode)
+    rebuild = mode is Mode.OVERWRITE           # OVERWRITE rebuilds wheels
+    overwrite_env = mode is not Mode.APPEND    # OVERWRITE + AUTO rewrite env files
+
+    meta = read_pyproject(find_pyproject(pyproject))
+    name, version = meta["name"], meta["version"]
+    proj = _norm(name)
+    env_name = f"{proj}-{_norm_version(version)}"
+    env_dir = f"{workspace_dir.rstrip('/')}/{env_name}"
+
+    # The project's declared deps, with any requested extras flattened in.
+    deps = list(meta["dependencies"])
+    for extra in extras:
+        deps += meta["optional_dependencies"].get(extra, [])
+
+    if bundle:
+        # Zero-PyPI: project wheel + dependency closure, all under the env's own
+        # ``binaries/`` folder and listed by workspace path. A ``.manifest``
+        # beside the project wheel records the full path set so a get-or-create
+        # (non-OVERWRITE) deploy can reuse the closure without rebuilding.
+        binaries = f"{env_dir}/binaries"
+        manifest = DatabricksPath.from_(f"{binaries}/{proj}/{env_name}.manifest", client=client)
+        reused = (
+            [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip()]
+            if (not rebuild and manifest.exists()) else []
+        )
+        if reused and DatabricksPath.from_(reused[0], client=client).exists():
+            logger.info("reusing %d-wheel project bundle for %s", len(reused), env_name)
+            dependencies = reused
+        else:
+            dependencies = [
+                registry_upload(client, w, workspace_dir=binaries, overwrite=True)
+                for w in build_project_wheel(meta["dir"], python=python)
+            ]
+            dependencies += [
+                registry_upload(client, w, workspace_dir=binaries)
+                for w in download_dependency_wheels(deps, python=python)
+            ]
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text("\n".join(dependencies) + "\n")
+    else:
+        # Project wheel by path + its declared deps resolved from the index.
+        proj_dir = f"{pypi_dir.rstrip('/')}/{proj}"
+        existing = (
+            [] if rebuild
+            else deployed_wheels(client, name, version, workspace_dir=proj_dir, dist_only=True)
+        )
+        if existing:
+            logger.info("reusing deployed project wheel(s) for %s", env_name)
+            wheel_paths = existing
+        else:
+            wheel_paths = [
+                registry_upload(client, w, workspace_dir=pypi_dir, overwrite=True)
+                for w in build_project_wheel(meta["dir"], python=python)
+            ]
+        dependencies = wheel_paths + deps
+
+    # Env config files: OVERWRITE/AUTO always rewrite; APPEND writes only the
+    # ones that don't exist yet ("add missing").
+    serverless_dest = f"{env_dir}/{env_name}.yml"
+    cluster_dest = f"{env_dir}/{env_name}.requirements.txt"
+    if overwrite_env or not DatabricksPath.from_(serverless_dest, client=client).exists():
+        serverless = ensure_named_environment(
+            client, env_name, dependencies=dependencies,
+            environment_version=serverless_environment_version(python),
+            workspace_dir=workspace_dir, filename=f"{env_name}.yml",
+        )
+    else:
+        serverless = serverless_dest
+    if overwrite_env or not DatabricksPath.from_(cluster_dest, client=client).exists():
+        cluster = ensure_cluster_requirements(
+            client, env_name, dependencies=dependencies, workspace_dir=workspace_dir,
+        )
+    else:
+        cluster = cluster_dest
+    return {
+        "name": name,
+        "version": version,
+        "env_name": env_name,
+        "env_dir": env_dir,
+        "dependencies": dependencies,
+        "n_wheels": len(dependencies),
+        "serverless": serverless,
+        "cluster": cluster,
+        "requires_python": meta["requires_python"],
+        "mode": mode.name,
+    }
 
 
 def deployed_environments(client: Any, *, workspace_dir: str = WORKSPACE_ENV_DIR) -> list[str]:

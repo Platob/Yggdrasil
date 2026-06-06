@@ -13,9 +13,11 @@ from ..engine import DEFAULT_MAX_TOKENS, Completion, TokenEngine
 
 __all__ = ["DatabricksServingEngine"]
 
-# A broadly-available Databricks Foundation Model API chat endpoint. Override
-# per workspace via ``endpoint=`` / the agent's configured endpoint.
-DEFAULT_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
+# The **lowest** (smallest / cheapest) broadly-available Databricks Foundation
+# Model API chat endpoint — the default so reasoning is cheap unless a caller
+# opts up. Override per workspace via ``endpoint=`` / the agent's configured
+# endpoint.
+DEFAULT_ENDPOINT = "databricks-meta-llama-3-1-8b-instruct"
 
 
 class DatabricksServingEngine(TokenEngine):

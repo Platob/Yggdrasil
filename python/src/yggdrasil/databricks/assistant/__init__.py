@@ -115,22 +115,29 @@ def _try_assistant_api(client: Any) -> str:
     return "skipped (no public Assistant-settings API in this SDK)"
 
 
-def deploy(client: Any, *, check: bool = False) -> "dict[str, Any]":
+def deploy(client: Any, *, check: bool = False, overwrite: bool = True) -> "dict[str, Any]":
     """Deploy (or, with ``check``, verify) the Assistant bundle in a workspace.
 
     Writes the workspace guidance + skills under
     :data:`WORKSPACE_ASSISTANT_DIR` and the per-user guidance + skills under
     :data:`USER_ASSISTANT_DIR`, then attempts a live Assistant-settings push.
 
-    Returns ``{"uploaded": [paths], "missing": [paths], "api": status}``.
+    With ``overwrite=False`` (append semantics) a file that already exists is
+    left untouched — only missing files are written — and is reported under
+    ``skipped`` rather than ``uploaded``.
+
+    Returns ``{"uploaded": [paths], "missing": [paths], "skipped": [paths], "api": status}``.
     """
-    result: "dict[str, Any]" = {"uploaded": [], "missing": [], "api": None}
+    result: "dict[str, Any]" = {"uploaded": [], "missing": [], "skipped": [], "api": None}
     for remote, body in _bundle():
         p = client.path(remote)
         if check:
             (result["uploaded"] if p.exists() else result["missing"]).append(
                 p.full_path()
             )
+            continue
+        if not overwrite and p.exists():
+            result["skipped"].append(p.full_path())
             continue
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(body)

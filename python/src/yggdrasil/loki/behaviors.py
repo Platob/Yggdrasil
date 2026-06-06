@@ -1,13 +1,24 @@
 """Built-in Loki behaviors.
 
-The seed of the behavior catalog — currently the Databricks **Genie**
-behavior, which shows the pattern: guard on a detected backend, then drive
-a Databricks service endpoint through Loki's token provider
-(``agent.databricks``). Replication, inter-agent messaging, HTTP ingestion
-and serving land here next.
+The behavior catalog. Two patterns live here:
+
+- :class:`GenieBehavior` — guard on a detected backend, then drive a
+  Databricks service endpoint through Loki's token provider
+  (``agent.databricks``).
+- :class:`PythonProjectBehavior` — a *local* behavior: Loki scaffolds a
+  Python project, writes code into it (provided, or reasoned from a task via
+  the agent's engine), and runs it — the agent authoring and executing code.
+
+Replication, inter-agent messaging, HTTP ingestion and serving land here next.
 """
 from __future__ import annotations
 
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
 from typing import TYPE_CHECKING, Any, Optional
 
 from .behavior import LokiBehavior, register
@@ -15,7 +26,7 @@ from .behavior import LokiBehavior, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["GenieBehavior"]
+__all__ = ["GenieBehavior", "PythonProjectBehavior"]
 
 
 @register
@@ -28,7 +39,7 @@ class GenieBehavior(LokiBehavior):
 
     def run(
         self,
-        agent: "Loki",
+        agent: Loki,
         *,
         question: str,
         space: Optional[str] = None,
@@ -60,3 +71,87 @@ class GenieBehavior(LokiBehavior):
         if rows and answer.query:
             out["rows"] = answer.to_polars()
         return out
+
+
+@register
+class PythonProjectBehavior(LokiBehavior):
+    """Scaffold a small Python project, write code into it, and execute it.
+
+    Runs anywhere (no backend required). Either pass ``code`` directly, or a
+    ``task`` description that the agent reasons into a script via its engine
+    (``agent.reason``). Loki then writes a minimal project (``pyproject.toml``
+    + a package with a ``main`` module), runs ``main.py`` in a subprocess, and
+    returns where it landed plus the captured output — the agent authoring and
+    executing code end-to-end.
+    """
+
+    name = "python_project"
+    description = "Create a Python project, write code (given or reasoned), and run it."
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        project: str = "ygg_demo",
+        task: Optional[str] = None,
+        code: Optional[str] = None,
+        base_dir: Optional[str] = None,
+        run: bool = True,
+        timeout: float = 60.0,
+        **_: Any,
+    ) -> dict[str, Any]:
+        # Reason the code from the task when none is supplied (needs an engine).
+        if code is None and task:
+            code = agent.reason(
+                f"Write a single self-contained Python script that: {task}. "
+                "Print its result to stdout. Output only the code — no prose, "
+                "no markdown fences.",
+                system="You are a senior Python engineer. Return runnable code only.",
+            )
+        if code is None:
+            raise ValueError("provide `code=` directly or a `task=` to reason it from")
+        # Strip markdown fences a reasoned reply may wrap the code in.
+        code = re.sub(r"\A\s*```(?:python)?\n|\n```\s*\Z", "", code).strip() + "\n"
+
+        pkg = re.sub(r"[^0-9A-Za-z_]+", "_", project).strip("_").lower() or "app"
+        root = (
+            pathlib.Path(base_dir)
+            if base_dir
+            else pathlib.Path(tempfile.mkdtemp(prefix="ygg-loki-"))
+        )
+        project = root / pkg
+        package = project / pkg
+        package.mkdir(parents=True, exist_ok=True)
+
+        (project / "pyproject.toml").write_text(
+            f'[project]\nname = "{pkg}"\nversion = "0.1.0"\n'
+            f'requires-python = ">=3.9"\n\n'
+            f'[project.scripts]\n{pkg} = "{pkg}.main:main"\n'
+        )
+        (project / "README.md").write_text(f"# {pkg}\n\nScaffolded by Loki.\n")
+        (package / "__init__.py").write_text('__all__ = ["main"]\n')
+        (package / "main.py").write_text(code)
+
+        files = sorted(
+            str(p.relative_to(project)) for p in project.rglob("*") if p.is_file()
+        )
+        result: dict[str, Any] = {
+            "project_dir": str(project),
+            "package": pkg,
+            "files": files,
+        }
+        if run:
+            proc = subprocess.run(
+                [sys.executable, str(package / "main.py")],
+                cwd=str(project),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**os.environ, "PYTHONPATH": str(project)},
+            )
+            result.update(
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+            )
+        return result

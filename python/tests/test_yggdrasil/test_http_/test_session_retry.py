@@ -9,7 +9,9 @@ socket.
 """
 from __future__ import annotations
 
+import contextlib
 import http.server
+import logging
 import threading
 
 import pytest
@@ -151,3 +153,58 @@ def test_429_retries_on_a_fresh_connection(server):
     assert r.content == b"ok"
     assert _FlakyHandler.requests == 4   # 3 × 429 + 1 × 200
     assert _FlakyHandler.conns == 4      # a fresh connection per attempt
+
+
+# -- connection-error logging: quiet until past the 4th retry ------------
+
+
+@contextlib.contextmanager
+def _capture_conn_logs():
+    """Capture the session logger's connection-drop retry records (debug +
+    warning) directly off ``yggdrasil.http_.session`` — the project attaches its
+    own handler and the ``yggdrasil`` logger doesn't propagate to root, so
+    pytest's ``caplog`` (a root handler) never sees these."""
+    logger = logging.getLogger("yggdrasil.http_.session")
+    records: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "Connection error on" in record.getMessage():
+                records.append(record)
+
+    sink = _Sink(level=logging.DEBUG)
+    prev_level = logger.level
+    logger.addHandler(sink)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(sink)
+        logger.setLevel(prev_level)
+
+
+def test_early_connection_drops_stay_quiet(server):
+    # Three transient drops then success: every retry is within the first
+    # four, so none escalate to WARNING — they're logged at DEBUG only.
+    _FlakyHandler.fail_first = 3
+    with _capture_conn_logs() as records:
+        session = HTTPSession(base_url=server)
+        assert session.get("/x").status_code == 200
+
+    assert len(records) == 3                                   # one per drop
+    assert all(r.levelno == logging.DEBUG for r in records)    # none warned
+
+
+def test_persistent_connection_drops_warn_after_fourth_retry(server):
+    # Five drops then success: retries 1–3 stay DEBUG, the 4th and 5th escalate
+    # to WARNING — only persistent drops surface as warnings.
+    _FlakyHandler.fail_first = 5
+    with _capture_conn_logs() as records:
+        session = HTTPSession(base_url=server)
+        assert session.get("/x").status_code == 200
+
+    assert len(records) == 5
+    debugs = [r for r in records if r.levelno == logging.DEBUG]
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    assert len(debugs) == 3       # the first three retries stay quiet
+    assert len(warnings) == 2     # the 4th and 5th retries warn

@@ -90,6 +90,89 @@ class TestDeployEnvironment(unittest.TestCase):
         self.assertEqual([e["environment_key"] for e in json.loads(buf.getvalue())], ["default", "py311"])
 
 
+class TestDeployProject(unittest.TestCase):
+    def _info(self):
+        return {
+            "name": "myproj", "version": "0.1.0",
+            "env_name": "myproj-0-1-0", "env_dir": "/Workspace/Shared/environments/myproj-0-1-0",
+            "dependencies": ["/Workspace/Shared/pypi/myproj/myproj-0.1.0-py3-none-any.whl", "polars"],
+            "n_wheels": 2,
+            "serverless": "/Workspace/Shared/environments/myproj-0-1-0/myproj-0-1-0.yml",
+            "cluster": "/Workspace/Shared/environments/myproj-0-1-0/myproj-0-1-0.requirements.txt",
+            "requires_python": ">=3.10",
+        }
+
+    def test_project_builds_env_and_creates_cluster(self):
+        client = MagicMock()
+        client.workspace_client.return_value.current_user.me.return_value.user_name = "me@co.com"
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_project_environment",
+                   return_value=self._info()) as ensure, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["deploy", "project", "/tmp/myproj", "--extra", "databricks"])
+        self.assertEqual(rc, 0)
+        # discovered + built from the given path, with the requested extra
+        self.assertEqual(ensure.call_args.args[1], "/tmp/myproj")
+        self.assertEqual(ensure.call_args.kwargs["extras"], ("databricks",))
+        # default cluster created, named for the project, installing its requirements
+        create = client.compute.clusters.all_purpose_cluster
+        create.assert_called_once()
+        self.assertEqual(create.call_args.kwargs["name"], "myproj")
+        self.assertEqual(create.call_args.kwargs["single_user_name"], "me@co.com")
+        self.assertEqual(
+            create.call_args.kwargs["environment"],
+            "/Workspace/Shared/environments/myproj-0-1-0/myproj-0-1-0.requirements.txt",
+        )
+
+    def test_project_no_cluster_skips_cluster_creation(self):
+        client = MagicMock()
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_project_environment",
+                   return_value=self._info()) as ensure, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["deploy", "project", "--no-cluster", "--bundle"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(ensure.call_args.kwargs["bundle"])
+        client.compute.clusters.all_purpose_cluster.assert_not_called()
+
+    def test_project_mode_threaded_into_deploy(self):
+        from yggdrasil.enums.mode import Mode
+
+        client = MagicMock()
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_project_environment",
+                   return_value=self._info()) as ensure, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["deploy", "project", "--mode", "append"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(ensure.call_args.kwargs["mode"], Mode.APPEND)
+        # append → get-or-create the cluster (never the OVERWRITE update path)
+        client.compute.clusters.all_purpose_cluster.assert_called_once()
+        client.compute.clusters.find_cluster.assert_not_called()
+
+    def test_project_overwrite_updates_existing_cluster(self):
+        client = MagicMock()
+        client.workspace_client.return_value.current_user.me.return_value.user_name = "me@co.com"
+        existing = MagicMock()
+        client.compute.clusters.find_cluster.return_value = existing
+        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_project_environment",
+                   return_value=self._info()), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["deploy", "project", "--mode", "overwrite"])
+        self.assertEqual(rc, 0)
+        # overwrite → update the existing cluster's libraries (no fresh create)
+        client.compute.clusters.find_cluster.assert_called_once()
+        existing.update.assert_called_once()
+        libs = existing.update.call_args.kwargs["libraries"]
+        self.assertIn(self._info()["cluster"], libs)
+        client.compute.clusters.all_purpose_cluster.assert_not_called()
+
+
 class TestDeployDefault(unittest.TestCase):
     def test_bare_deploy_ships_wheel_then_environment(self):
         env = MagicMock()
