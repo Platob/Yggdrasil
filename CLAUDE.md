@@ -206,6 +206,7 @@ The `@function` decorator infers: name, source code, dependencies (AST), python 
 `ygg node status` — show pid, port, boot service state
 `ygg node run <func>` — call a @remote function
 `ygg databricks` — Databricks management CLI
+`ygg loki` — global yggdrasil agent (status/capabilities/behaviors/token/run)
 
 ## Environment
 

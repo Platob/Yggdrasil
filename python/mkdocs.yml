@@ -158,6 +158,7 @@ nav:
       - Casting: guides/casting.md
       - IO & HTTP: guides/io-http.md
       - Bot & Mesh: guides/bot.md
+      - Loki Agent: guides/loki.md
       - Execution Plans & SQL: guides/plan.md
       - Databricks: guides/databricks.md
       - Databricks CLI: guides/databricks-cli.md

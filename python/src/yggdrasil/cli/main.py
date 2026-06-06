@@ -22,6 +22,7 @@ Subcommands::
     ygg node run        Call a @remote function
     ygg node chat       Open YGGCHAT terminal
     ygg databricks      YGGDBKS Databricks management CLI
+    ygg loki            Loki — the global yggdrasil agent (status/run/token)
 """
 from __future__ import annotations
 
@@ -174,6 +175,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # -- databricks --------------------------------------------------------
     dbks = sub.add_parser("databricks", help="YGGDBKS Databricks management.", add_help=False)
     dbks.set_defaults(handler=_databricks)
+
+    # -- loki --------------------------------------------------------------
+    loki = sub.add_parser("loki", help="Loki — the global yggdrasil agent.", add_help=False)
+    loki.set_defaults(handler=_loki)
 
     return parser
 
@@ -1269,6 +1274,12 @@ def _databricks(args: argparse.Namespace) -> int:
     from yggdrasil.databricks.cli import main as dbks_main
     remaining = sys.argv[2:] if len(sys.argv) > 2 else []
     return dbks_main(remaining)
+
+
+def _loki(args: argparse.Namespace) -> int:
+    from yggdrasil.loki.cli import main as loki_main
+    remaining = sys.argv[2:] if len(sys.argv) > 2 else []
+    return loki_main(remaining)
 
 
 # ── entry point ──────────────────────────────────────────────────
