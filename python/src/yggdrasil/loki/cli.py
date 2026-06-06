@@ -172,13 +172,12 @@ def _repl(loki: Any, style: Any) -> int:
     from yggdrasil.loki.usage import METER
 
     METER.set_limit(METER.DEFAULT_LIMIT)
-    state: dict[str, Any] = {"tier": None, "root": "."}
+    state: dict[str, Any] = {"tier": None, "root": ".", "engine": None}
 
-    best = loki.engine()
-    eng_line = style.brand(best.name) if best else style.bad("none — set a key / log in")
-    style.out(f"  {style.bold('interactive session')}  {style.dim('·')}  engine {eng_line}\n")
-    style.out(f"  {style.dim('budget')} {style.brand(f'{METER.limit:,}')} {style.dim('tokens')}  "
-              f"{style.dim('·  type your request, or /help · /usage · /quit')}\n\n")
+    style.out(f"  {style.bold('interactive session')}  "
+              f"{style.dim('· live prompts, streamed replies · /help · /quit')}\n")
+    _select_engine(loki, style, state)
+    style.out(f"  {style.dim('budget')} {style.brand(f'{METER.limit:,}')} {style.dim('tokens')}\n\n")
 
     while True:
         try:
@@ -207,8 +206,60 @@ def _repl(loki: Any, style: Any) -> int:
 
 
 def _prompt(style: Any, state: dict) -> str:
-    tag = state["tier"] or "auto"
+    tag = f"{state.get('engine') or 'auto'}·{state['tier'] or 'auto'}"
     return f"  {style.brand('⟢')} {style.dim(tag)} {style.bold('›')} "
+
+
+def _select_engine(loki: Any, style: Any, state: dict) -> None:
+    """Detect the configured/available engines and pick a default for the session.
+
+    Auto-selects the single available engine; when several are configured
+    (Claude key/login, a Databricks session, OpenAI key, …) it lists them and
+    lets the user choose. ``/engine`` switches mid-session.
+    """
+    available = [e for e in loki.engines() if e.available()]
+    if not available:
+        style.warn("no engine configured — set ANTHROPIC_API_KEY, log into Claude Code, "
+                   "or run with a Databricks session")
+        style.out(f"  {style.dim('(web fetches and `run` behaviors still work without one)')}\n")
+        state["engine"] = None
+        return
+
+    best = loki.engine()
+    state["engine"] = best.name if best is not None else available[0].name
+    if len(available) == 1:
+        only = available[0]
+        style.out(f"  {style.dim('engine')} {style.brand(only.name)} "
+                  f"{style.dim('· ' + only.model_label)}\n")
+        return
+
+    style.out(f"  {style.bold('configured engines')} "
+              f"{style.dim('— pick a default for this session')}\n")
+    for i, e in enumerate(available, 1):
+        mark = style.dim(" (best)") if e.name == state["engine"] else ""
+        style.out(f"    {style.brand(str(i))}  {e.name.ljust(11)} "
+                  f"{style.dim(e.model_label)}{mark}\n")
+    try:
+        ans = input(f"  choose [1-{len(available)}] or Enter for "
+                    f"{style.brand(state['engine'])}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    if ans.isdigit() and 1 <= int(ans) <= len(available):
+        state["engine"] = available[int(ans) - 1].name
+    elif ans and any(e.name == ans for e in available):
+        state["engine"] = ans
+    style.ok(f"engine → {state['engine']}")
+
+
+def _stream_reply(agent: Any, style: Any, line: str, state: dict) -> str:
+    """Stream a reasoned reply to the terminal token-by-token; return the full text."""
+    style.out("\n  ")
+    parts: list[str] = []
+    for chunk in agent.reason_stream(line, engine=state.get("engine"), tier=state["tier"]):
+        style.out(chunk)
+        parts.append(chunk)
+    style.out("\n\n")
+    return "".join(parts)
 
 
 def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
@@ -224,16 +275,12 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             agent, tail = spec, f"  →  {style.brand(spec.name)} {style.dim('(isolated)')}"
     style.out(f"  {style.dim('▹ ' + plan['category'] + ' · ' + plan['why'])}{tail}\n")
 
+    streamed = False
     try:
-        if plan["action"] == "web":
-            url = plan.get("url")
-            if not url:
-                with style.Spinner("thinking…"):
-                    reply = agent.reason(line, tier=state["tier"])
-            else:
-                res = agent.run("web", url=url, question=line)
-                _print_web(style, res)
-                reply = res.get("answer") or style.dim(f"fetched {url}")
+        if plan["action"] == "web" and plan.get("url"):
+            res = agent.run("web", url=plan["url"], question=line)
+            _print_web(style, res)
+            reply = res.get("answer") or style.dim(f"fetched {plan['url']}")
         elif plan["action"] == "act":
             res = agent.act(line, root=state["root"], tier=state["tier"], allow_web=True,
                             on_step=lambda r: _act_step(style, r))
@@ -244,12 +291,15 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             res = agent.run("genie", question=line)
             reply = res.get("text", "") if isinstance(res, dict) else str(res)
         else:
-            with style.Spinner("thinking…"):
-                reply = agent.reason(line, tier=state["tier"])
+            # chat (or a web verb with no URL) → stream the reply live
+            reply = _stream_reply(agent, style, line, state)
+            streamed = True
     except Exception as exc:  # never let one turn kill the session
+        style.out("\n")
         style.fail(exc.args[0] if exc.args else str(exc))
         return
-    style.out(f"\n  {reply}\n\n")
+    if not streamed:
+        style.out(f"\n  {reply}\n\n")
     _usage_line(style, delta=METER.total_tokens - before)
 
 
@@ -295,16 +345,31 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
     if cmd in ("help", "h", "?"):
         style.out(
             f"  {style.bold('commands')}\n"
-            f"    {style.brand('/status')}   identity + backends + engines + behaviors\n"
+            f"    {style.brand('/engine')}   pick the session engine (claude/databricks/openai/auto)\n"
             f"    {style.brand('/engines')}  reasoning engines and adaptive models\n"
+            f"    {style.brand('/status')}   identity + backends + engines + behaviors\n"
             f"    {style.brand('/usage')}    token KPIs (per model + global, USD)\n"
             f"    {style.brand('/tier')}     fast | deep | auto  (model tier for this session)\n"
             f"    {style.brand('/root')}     set the working tree for file tasks\n"
             f"    {style.brand('/budget')}   show, set N, +N step, or off\n"
             f"    {style.brand('/reset')}    zero the usage meter\n"
             f"    {style.brand('/quit')}     leave\n"
-            f"  {style.dim('plain text is routed automatically — reason, act on files, or a Databricks specialist')}\n"
+            f"  {style.dim('plain text is routed automatically — reason (streamed), act on files, web, or a specialist')}\n"
         )
+    elif cmd == "engine":
+        if not arg or arg == "auto":
+            best = loki.engine()
+            state["engine"] = best.name if best else None
+            style.ok(f"engine → {state['engine'] or 'none available'}")
+        elif any(e.name == arg for e in loki.engines()):
+            eng = loki.engine(arg)
+            if not eng.available():
+                style.warn(f"engine {arg!r} is not configured/available")
+            else:
+                state["engine"] = arg
+                style.ok(f"engine → {arg}")
+        else:
+            style.warn(f"unknown engine {arg!r} — see /engines")
     elif cmd == "status":
         _status(loki, style)
     elif cmd == "engines":

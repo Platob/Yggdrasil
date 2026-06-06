@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Iterator, Optional
 
 __all__ = ["Completion", "TokenEngine"]
 
@@ -193,6 +193,40 @@ class TokenEngine(ABC):
         return self.complete(
             [{"role": "user", "content": prompt}], system=system, tier=tier, **options
         ).text
+
+    # -- streaming ---------------------------------------------------------
+
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        system: Optional[str] = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        tier: Optional[str] = None,
+        **options: Any,
+    ) -> "Iterator[str]":
+        """Yield reply text incrementally as it is produced.
+
+        The default has no real streaming — it runs :meth:`complete` and
+        yields the whole reply once. Engines whose SDK streams override this
+        to yield token deltas live (and still record usage on completion).
+        """
+        yield self.complete(
+            messages, system=system, max_tokens=max_tokens, tier=tier, **options
+        ).text
+
+    def generate_stream(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        tier: Optional[str] = None,
+        **options: Any,
+    ) -> "Iterator[str]":
+        """Convenience: stream a single user *prompt* → text chunks."""
+        yield from self.stream(
+            [{"role": "user", "content": prompt}], system=system, tier=tier, **options
+        )
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(model={self.model_label!r}, available={self.available()})"

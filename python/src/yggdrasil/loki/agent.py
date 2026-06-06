@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 from . import behavior as _behavior
 from .capability import Backend, detect
@@ -239,6 +239,29 @@ class Loki:
                 "Databricks session"
             )
         return eng.generate(prompt, system=system, tier=tier, **options)
+
+    def reason_stream(
+        self,
+        prompt: str,
+        *,
+        system: "Optional[str]" = None,
+        engine: "Optional[str]" = None,
+        tier: "Optional[str]" = None,
+        **options: Any,
+    ) -> "Iterator[str]":
+        """Stream a reply to *prompt* — yields text chunks as they arrive.
+
+        Same engine/tier resolution as :meth:`reason`, but live: the chosen
+        engine streams token deltas so the terminal prints them as they come.
+        """
+        eng = self.engine(engine)
+        if eng is None or not eng.available():
+            raise RuntimeError(
+                "no reasoning engine available — log into Claude Code, or set "
+                "ANTHROPIC_API_KEY / OPENAI_API_KEY, or run with a "
+                "Databricks session"
+            )
+        yield from eng.generate_stream(prompt, system=system, tier=tier, **options)
 
     # -- autonomous action loop -------------------------------------------
 

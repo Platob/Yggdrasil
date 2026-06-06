@@ -26,6 +26,48 @@ class TestEngineContract(unittest.TestCase):
         self.assertEqual(Fixed().generate("there"), "hi there")
 
 
+class TestStreaming(unittest.TestCase):
+    def test_base_stream_falls_back_to_complete(self):
+        class Fixed(TokenEngine):
+            name = "fixed"
+
+            def available(self):
+                return True
+
+            def complete(self, messages, *, system=None, max_tokens=16000, tier=None, **o):
+                return Completion(text="whole reply")
+
+        self.assertEqual(list(Fixed().generate_stream("x")), ["whole reply"])
+
+    def test_claude_streams_text_and_records_usage(self):
+        from yggdrasil.loki.usage import METER
+
+        class _Stream:
+            text_stream = ["Hel", "lo!"]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get_final_message(self):
+                m = MagicMock()
+                m.usage = MagicMock(input_tokens=5, output_tokens=2)
+                return m
+
+        fake = types.ModuleType("anthropic")
+        client = MagicMock()
+        client.messages.stream.return_value = _Stream()
+        fake.Anthropic = MagicMock(return_value=client)
+        METER.reset()
+        with patch.dict(sys.modules, {"anthropic": fake}):
+            chunks = list(ClaudeEngine(api_key="k").generate_stream("hi"))
+        self.assertEqual(chunks, ["Hel", "lo!"])
+        row = METER.rows_for("claude")[0]
+        self.assertEqual((row.input_tokens, row.output_tokens), (5, 2))
+
+
 class TestOpenAIEngine(unittest.TestCase):
     def test_available_requires_key(self):
         self.assertFalse(OpenAIEngine(api_key=None).available())

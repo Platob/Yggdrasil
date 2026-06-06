@@ -93,12 +93,51 @@ class ClaudeEngine(TokenEngine):
         tier: Optional[str] = None,
         **options: Any,
     ) -> Completion:
+        client, kwargs, model = self._request(messages, system, max_tokens, tier, options)
+        resp = client.messages.create(**kwargs)
+        text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+        usage = getattr(resp, "usage", None)
+        in_tok = getattr(usage, "input_tokens", None) if usage else None
+        out_tok = getattr(usage, "output_tokens", None) if usage else None
+        self._record(model, input_tokens=in_tok, output_tokens=out_tok,
+                     messages=messages, system=system, text=text)
+        return Completion(
+            text=text,
+            model=getattr(resp, "model", model),
+            usage={"input_tokens": in_tok, "output_tokens": out_tok} if usage else {},
+            raw=resp,
+        )
+
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        system: Optional[str] = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        tier: Optional[str] = None,
+        **options: Any,
+    ):
+        client, kwargs, model = self._request(messages, system, max_tokens, tier, options)
+        text_parts: list[str] = []
+        with client.messages.stream(**kwargs) as stream:
+            for chunk in stream.text_stream:
+                text_parts.append(chunk)
+                yield chunk
+            final = stream.get_final_message()
+        usage = getattr(final, "usage", None)
+        self._record(
+            model,
+            input_tokens=getattr(usage, "input_tokens", None) if usage else None,
+            output_tokens=getattr(usage, "output_tokens", None) if usage else None,
+            messages=messages, system=system, text="".join(text_parts),
+        )
+
+    def _request(self, messages, system, max_tokens, tier, options):
+        """Build the (client, kwargs, model) shared by complete + stream."""
         import anthropic
 
         # Adaptive default: pick fast/deep from the request unless pinned.
         model = self.resolve_model(messages=messages, system=system, tier=tier)
-
-        # Anthropic keeps the system prompt out of the message list.
         kwargs: dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens,
@@ -121,17 +160,4 @@ class ClaudeEngine(TokenEngine):
                 system_blocks.append({"type": "text", "text": system})
             kwargs["system"] = system_blocks
         kwargs.update(options)
-
-        resp = client.messages.create(**kwargs)
-        text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-        usage = getattr(resp, "usage", None)
-        in_tok = getattr(usage, "input_tokens", None) if usage else None
-        out_tok = getattr(usage, "output_tokens", None) if usage else None
-        self._record(model, input_tokens=in_tok, output_tokens=out_tok,
-                     messages=messages, system=system, text=text)
-        return Completion(
-            text=text,
-            model=getattr(resp, "model", model),
-            usage={"input_tokens": in_tok, "output_tokens": out_tok} if usage else {},
-            raw=resp,
-        )
+        return client, kwargs, model

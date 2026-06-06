@@ -238,8 +238,25 @@ KPI line.
   usage  ↑16 ↓111  127 tok  $0.0006  (+67)  49,873 left
 ```
 
-Slash commands: `/status` `/engines` `/usage` `/tier fast|deep|auto`
-`/root <dir>` `/budget [N|+N|off]` `/reset` `/help` `/quit`.
+Replies **stream live** — the chosen engine prints token deltas as they
+arrive, not after a pause. At startup Loki **detects the configured engines**
+(a Claude key or Claude Code login, a Databricks session, an OpenAI key) and
+picks a default for the session; when several are configured it lets you
+choose. Switch any time with `/engine claude|databricks|openai|auto`.
+
+```text
+  interactive session  · live prompts, streamed replies · /help · /quit
+  engine databricks · databricks-meta-llama-3-1-8b-instruct
+  ⟢ databricks·auto ›  In one short sentence, what is Apache Arrow?
+  ▹ chat · no specialized signal — plain reasoning
+  Apache Arrow is an open-source, cross-language in-memory columnar format…   ← streamed
+  usage  ↑11 ↓33  44 tok  $0.0000  (+44)  49,956 left
+```
+
+Slash commands: `/engine` `/engines` `/status` `/usage` `/tier fast|deep|auto`
+`/root <dir>` `/budget [N|+N|off]` `/reset` `/help` `/quit`. (A Databricks
+serving engine self-heals to a deployed endpoint if its configured one is
+missing.)
 
 ### Token budget
 

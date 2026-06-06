@@ -58,3 +58,36 @@ class OpenAIEngine(TokenEngine):
             usage=usage.model_dump() if hasattr(usage, "model_dump") else {},
             raw=resp,
         )
+
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        system: Optional[str] = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        tier: Optional[str] = None,
+        **options: Any,
+    ):
+        model = self.resolve_model(messages=messages, system=system, tier=tier)
+        msgs = ([{"role": "system", "content": system}] if system else []) + list(messages)
+        resp = self._client().chat.completions.create(
+            model=model, messages=msgs, max_tokens=max_tokens, stream=True,
+            stream_options={"include_usage": True}, **options,
+        )
+        parts: list[str] = []
+        usage = None
+        for chunk in resp:
+            if chunk.choices:
+                delta = getattr(chunk.choices[0], "delta", None)
+                piece = getattr(delta, "content", None) if delta else None
+                if piece:
+                    parts.append(piece)
+                    yield piece
+            if getattr(chunk, "usage", None):
+                usage = chunk.usage
+        self._record(
+            model,
+            input_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+            output_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+            messages=messages, system=system, text="".join(parts),
+        )

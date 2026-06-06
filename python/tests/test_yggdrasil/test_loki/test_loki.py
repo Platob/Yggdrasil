@@ -281,6 +281,22 @@ class TestAgentAct(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             loki.act("anything", root=self.dir)
 
+    def test_reason_stream_yields_chunks(self):
+        loki = Loki()
+        loki._backends = [Backend("local", True)]
+        eng = _ScriptedEngine([""])
+        eng.stream = lambda messages, **k: iter(["A", "B", "C"])
+        eng.generate_stream = lambda prompt, **k: eng.stream([], **k)
+        loki.engine = lambda name=None: eng
+        self.assertEqual("".join(loki.reason_stream("hi")), "ABC")
+
+    def test_reason_stream_without_engine_raises(self):
+        loki = Loki()
+        loki._backends = [Backend("local", True)]
+        loki.engine = lambda name=None: None
+        with self.assertRaises(RuntimeError):
+            list(loki.reason_stream("x"))
+
 
 class TestReasoningRouter(unittest.TestCase):
     """Loki categorizes a request and picks a solution path / specialist."""
@@ -368,6 +384,33 @@ class TestReplCommands(unittest.TestCase):
         self.METER.set_limit(100)
         with patch("builtins.input", return_value="s"):
             self.assertFalse(cli._budget_prompt(style))
+
+    def test_select_engine_auto_picks_available(self):
+        from yggdrasil.cli import style
+        from yggdrasil.loki import cli
+
+        loki = Loki()
+        loki._backends = [Backend("local", True)]
+        eng = MagicMock(name="claude"); eng.name = "claude"; eng.available.return_value = True
+        eng.model_label = "claude-opus-4-8 (adaptive)"
+        loki.engines = lambda: [eng]
+        loki.engine = lambda name=None: eng
+        state = {"tier": None, "root": ".", "engine": None}
+        cli._select_engine(loki, style, state)
+        self.assertEqual(state["engine"], "claude")
+
+    def test_engine_command_switches_when_available(self):
+        from yggdrasil.cli import style
+        from yggdrasil.loki import cli
+
+        loki = Loki()
+        c = MagicMock(); c.name = "claude"; c.available.return_value = True
+        d = MagicMock(); d.name = "databricks"; d.available.return_value = True
+        loki.engines = lambda: [c, d]
+        loki.engine = lambda name=None: {"claude": c, "databricks": d}.get(name, c)
+        state = {"tier": None, "root": ".", "engine": "claude"}
+        cli._repl_command(loki, style, state, "/engine databricks")
+        self.assertEqual(state["engine"], "databricks")
 
     def test_json_helper_returns_str_not_bytes(self):
         # Regression: orjson emits bytes; the CLI --json path must decode.
