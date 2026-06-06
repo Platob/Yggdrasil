@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 _TRANSIENT_SSL = ("EOF", "UNEXPECTED_EOF", "Connection reset")
 
+# Transient connection EOF / reset mid-stream is usually a one-off (a dropped
+# keep-alive socket); the range-reconnect picks right back up. Keep those retries
+# at DEBUG and only escalate to WARNING once they persist to the 4th retry, so a
+# single blip mid-download doesn't surface as a warning.
+_EOF_LOG_AFTER = 4
+
 
 def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, (socket.timeout, TimeoutError, ConnectionResetError, BrokenPipeError)):
@@ -138,7 +144,8 @@ class HTTPStream(MemoryStream):
                 )
                 raise
             self._retry_count += 1
-            logger.warning(
+            logger.log(
+                logging.WARNING if self._retry_count >= _EOF_LOG_AFTER else logging.DEBUG,
                 "HTTPStream retry %d/%d for %s %s at offset %d: %s",
                 self._retry_count, self._max_retries,
                 self._request.method, self._request.url,

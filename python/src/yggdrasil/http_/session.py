@@ -677,6 +677,15 @@ _BACKOFF_429_MAX = 5.0
 
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
+# Connection EOF / reset / drop errors are routinely transient — a stale
+# keep-alive socket, a TLS EOF, a peer RST — and the very next attempt on a
+# fresh socket usually succeeds. Logging a warning on every such retry is noise,
+# so we keep them at DEBUG and only escalate to a WARNING once they persist past
+# the 4th retry (a genuinely flaky/unreachable host rather than a one-off drop).
+# Both the TLS-EOF and the generic connection-error branches spend the ``other``
+# retry budget, so ``_RETRY_TOTAL - retries.other`` is the connection-retry count.
+_EOF_LOG_AFTER = 4
+
 
 class _TieredRetry(Retry):
     """:class:`Retry` variant with status-aware backoff.
@@ -1261,7 +1270,11 @@ class HTTPSession(Session):
                         method=current_request.method, url=url_str,
                         error=wrapped, _pool=self,
                     )
-                    LOGGER.warning(
+                    # Quiet for the first few transient EOFs; only warn once they
+                    # persist past the 4th retry (see ``_EOF_LOG_AFTER``).
+                    conn_retries = _RETRY_TOTAL - (retries.other if retries.other is not None else 0)
+                    LOGGER.log(
+                        logging.WARNING if conn_retries >= _EOF_LOG_AFTER else logging.DEBUG,
                         "TLS EOF/reset on %s %s — retrying on a fresh socket (%s left): %s",
                         current_request.method, url_str, retries.total, msg,
                     )
@@ -1290,7 +1303,11 @@ class HTTPSession(Session):
                     method=current_request.method, url=url_str,
                     error=wrapped, _pool=self,
                 )
-                LOGGER.warning(
+                # Quiet for the first few transient connection drops; only warn
+                # once they persist past the 4th retry (see ``_EOF_LOG_AFTER``).
+                conn_retries = _RETRY_TOTAL - (retries.other if retries.other is not None else 0)
+                LOGGER.log(
+                    logging.WARNING if conn_retries >= _EOF_LOG_AFTER else logging.DEBUG,
                     "Connection error on %s %s — retrying on a fresh socket (%s left): %s",
                     current_request.method, url_str, retries.total, exc,
                 )
