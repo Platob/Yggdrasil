@@ -26,6 +26,7 @@ __all__ = [
     "DatabricksServiceSkill",
     "DatabricksMCPSkill",
     "DatabricksSQLSkill",
+    "DatabricksCatalogsSkill",
     "DatabricksTablesSkill",
     "DatabricksWarehousesSkill",
     "DatabricksJobsSkill",
@@ -99,11 +100,32 @@ class DatabricksSQLSkill(DatabricksServiceSkill):
 
 
 @register
+class DatabricksCatalogsSkill(DatabricksServiceSkill):
+    """Navigate Unity Catalog — list catalogs, or the schemas within one
+    (``dbc.catalogs``). The entry point for "what data is here?"."""
+
+    name = "databricks-catalogs"
+    description = "List Unity Catalog catalogs, or the schemas in a catalog."
+
+    def run(self, agent: "Loki", *, catalog: Optional[str] = None, **_: Any) -> dict[str, Any]:
+        client = self._client(agent)
+        if catalog:
+            schemas = [
+                getattr(s, "schema_name", None) or getattr(s, "name", None) or str(s)
+                for s in client.catalogs.catalog(catalog).schemas()
+            ]
+            return {"catalog": catalog, "schemas": schemas}
+        return {"catalogs": _names(client.catalogs.list_catalogs())}
+
+
+@register
 class DatabricksTablesSkill(DatabricksServiceSkill):
-    """List tables (or describe one) in a catalog.schema — via SHOW/DESCRIBE."""
+    """List tables in a catalog.schema, or describe one — through the Unity
+    Catalog ``dbc.tables`` accessor (the UC API), so it needs **no SQL
+    warehouse** and returns typed column metadata."""
 
     name = "databricks-tables"
-    description = "List tables in a catalog.schema, or describe a table."
+    description = "List tables in a catalog.schema, or describe a table (Unity Catalog API)."
 
     def run(
         self,
@@ -117,10 +139,19 @@ class DatabricksTablesSkill(DatabricksServiceSkill):
         client = self._client(agent)
         if table:
             full = ".".join(p for p in (catalog, schema, table) if p)
-            return {"table": full, "schema": _frame(client.sql.execute(f"DESCRIBE TABLE {full}"))}
-        where = ".".join(p for p in (catalog, schema) if p)
-        stmt = f"SHOW TABLES IN {where}" if where else "SHOW TABLES"
-        return {"in": where or "(current)", "tables": _frame(client.sql.execute(stmt))}
+            t = client.tables.get(full)
+            if t is None:
+                return {"table": full, "found": False}
+            return {
+                "table": t.full_name(),
+                "type": str(t.table_type),
+                "columns": [
+                    {"name": c.name, "type": str(getattr(getattr(c, "field", None), "dtype", ""))}
+                    for c in t.columns
+                ],
+            }
+        tables = client.tables.list_tables(catalog_name=catalog, schema_name=schema)
+        return {"catalog": catalog, "schema": schema, "tables": _names(tables)}
 
 
 @register
@@ -137,16 +168,31 @@ class DatabricksWarehousesSkill(DatabricksServiceSkill):
 
 @register
 class DatabricksJobsSkill(DatabricksServiceSkill):
-    """List jobs, or run one by name/id."""
+    """List jobs, or trigger a run of one by name/id (returns the new run)."""
 
     name = "databricks-jobs"
-    description = "List Databricks jobs, or run one by name/id."
+    description = "List Databricks jobs, or trigger a run of one by name/id."
 
-    def run(self, agent: "Loki", *, run: Optional[str] = None, **_: Any) -> dict[str, Any]:
+    def run(
+        self,
+        agent: "Loki",
+        *,
+        run: Optional[str] = None,
+        parameters: Optional[dict] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
         client = self._client(agent)
         if run:
-            job = client.jobs.get(run)
-            return {"ran": run, "run": str(getattr(job, "run", lambda: None)() or job)}
+            job = client.jobs.get(run, default=None)
+            if job is None:
+                return {"job": run, "found": False}
+            job_run = job.run(parameters=parameters or None)
+            return {
+                "job": job.name or job.job_id,
+                "job_id": job.job_id,
+                "run_id": getattr(job_run, "run_id", None),
+                "url": str(getattr(job_run, "url", "")) or None,
+            }
         return {"jobs": _names(client.jobs.list())}
 
 

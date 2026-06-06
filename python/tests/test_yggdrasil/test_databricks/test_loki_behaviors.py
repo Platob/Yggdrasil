@@ -23,9 +23,10 @@ class _Base(unittest.TestCase):
 class TestDatabricksBehaviors(_Base):
     def test_fleet_is_registered_and_requires_databricks(self):
         names = {b.name for b in Loki().skills()}
-        for n in ("databricks-sql", "databricks-tables", "databricks-warehouses",
-                  "databricks-jobs", "databricks-clusters", "databricks-volumes",
-                  "databricks-secrets", "databricks-iam", "databricks-serving"):
+        for n in ("databricks-sql", "databricks-catalogs", "databricks-tables",
+                  "databricks-warehouses", "databricks-jobs", "databricks-clusters",
+                  "databricks-volumes", "databricks-secrets", "databricks-iam",
+                  "databricks-serving"):
             self.assertIn(n, names)
         beh = next(b for b in Loki().skills() if b.name == "databricks-sql")
         self.assertEqual(beh.requires, "databricks")
@@ -68,12 +69,42 @@ class TestDatabricksBehaviors(_Base):
         self.assertEqual(out["statement_id"], "st1")
         self.assertEqual(out["row_count"], 3)
 
-    def test_tables_uses_show_tables(self):
+    def test_catalogs_list_and_schemas(self):
         client = MagicMock()
-        client.sql.execute.return_value = MagicMock(to_polars=lambda: [])
+        c1 = MagicMock(); c1.name = "main"
+        c2 = MagicMock(); c2.name = "samples"
+        client.catalogs.list_catalogs.return_value = [c1, c2]
         loki = self._loki_with_client(client)
-        loki.run("databricks-tables", catalog="main", schema="sales")
-        client.sql.execute.assert_called_once_with("SHOW TABLES IN main.sales")
+        self.assertEqual(loki.run("databricks-catalogs")["catalogs"], ["main", "samples"])
+        # With a catalog, list its schemas.
+        s = MagicMock(); s.schema_name = "sales"
+        client.catalogs.catalog.return_value.schemas.return_value = [s]
+        out = loki.run("databricks-catalogs", catalog="main")
+        client.catalogs.catalog.assert_called_once_with("main")
+        self.assertEqual(out["schemas"], ["sales"])
+
+    def test_tables_list_via_uc_api(self):
+        client = MagicMock()
+        t1 = MagicMock(); t1.name = "orders"
+        t2 = MagicMock(); t2.name = "customers"
+        client.tables.list_tables.return_value = [t1, t2]
+        loki = self._loki_with_client(client)
+        out = loki.run("databricks-tables", catalog="main", schema="sales")
+        # Uses the Unity Catalog tables accessor (no SQL warehouse).
+        client.tables.list_tables.assert_called_once_with(catalog_name="main", schema_name="sales")
+        client.sql.execute.assert_not_called()
+        self.assertEqual(out["tables"], ["orders", "customers"])
+
+    def test_tables_describe_returns_typed_columns(self):
+        client = MagicMock()
+        col = MagicMock(); col.name = "amount"; col.field.dtype = "Float64"
+        t = MagicMock(); t.full_name.return_value = "main.sales.orders"
+        t.table_type = "MANAGED"; t.columns = [col]
+        client.tables.get.return_value = t
+        loki = self._loki_with_client(client)
+        out = loki.run("databricks-tables", catalog="main", schema="sales", table="orders")
+        self.assertEqual(out["table"], "main.sales.orders")
+        self.assertEqual(out["columns"], [{"name": "amount", "type": "Float64"}])
 
     def test_warehouses_lists_names(self):
         client = MagicMock()
@@ -93,6 +124,18 @@ class TestDatabricksBehaviors(_Base):
         loki = self._loki_with_client(client)
         self.assertEqual(loki.run("databricks-jobs")["jobs"], ["nightly"])
         self.assertEqual(loki.run("databricks-clusters")["clusters"], ["cl-1"])
+
+    def test_jobs_run_triggers_and_returns_run(self):
+        client = MagicMock()
+        job = MagicMock(); job.name = "nightly"; job.job_id = 7
+        job_run = MagicMock(); job_run.run_id = 99; job_run.url = "https://w/jobs/7/runs/99"
+        job.run.return_value = job_run
+        client.jobs.get.return_value = job
+        loki = self._loki_with_client(client)
+        out = loki.run("databricks-jobs", run="nightly", parameters={"date": "2026-01-01"})
+        job.run.assert_called_once_with(parameters={"date": "2026-01-01"})
+        self.assertEqual((out["job_id"], out["run_id"]), (7, 99))
+        self.assertEqual(out["url"], "https://w/jobs/7/runs/99")
 
     def test_secrets_lists_scopes(self):
         client = MagicMock()

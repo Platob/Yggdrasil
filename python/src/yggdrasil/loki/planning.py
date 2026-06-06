@@ -76,7 +76,8 @@ DEFAULT_PERSONA: dict[str, str] = {
 SKILLS_FOR: dict[str, tuple[str, ...]] = {
     "data": ("tabular", "web", "transform"),
     "web": ("web",),
-    "databricks": ("databricks-sql", "databricks-tables", "genie", "databricks-serving"),
+    "databricks": ("databricks-catalogs", "databricks-tables", "databricks-sql",
+                   "genie", "databricks-serving"),
     "aws": ("aws-identity", "aws-s3"),
     "files": ("agent", "run_python"),
     "chat": (),

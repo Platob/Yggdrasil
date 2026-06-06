@@ -196,7 +196,19 @@ class ConfigureCommand:
 
         # Build straight off the profile we just wrote so the verify reflects
         # exactly what's on disk (not the in-process env / flags).
-        client = DatabricksClient(profile=profile, config_file=str(config_file))
+        if kind == "sso":
+            # SSO is a U2M **browser** login — force ``external-browser`` and
+            # explicitly carry *no* static credential so an ambient
+            # ``DATABRICKS_TOKEN`` (or a profile token) can't shortcut the flow
+            # or trip the SDK's "more than one auth method" guard. ``token=None``
+            # (not the sentinel) keeps the env default out.
+            client = DatabricksClient(
+                profile=profile, config_file=str(config_file),
+                auth_type=auth_type or "external-browser",
+                token=None, client_id=None, client_secret=None,
+            )
+        else:
+            client = DatabricksClient(profile=profile, config_file=str(config_file))
 
         # SSO must authenticate to mint a token to remember — force the flow
         # even if the user passed --no-verify.
@@ -205,13 +217,21 @@ class ConfigureCommand:
         if verify:
             try:
                 with style.Spinner(
-                    "signing in via SSO..." if kind == "sso" else "verifying credentials...",
+                    "signing in via SSO (external browser)..." if kind == "sso"
+                    else "verifying credentials...",
                     color="33",
                 ):
                     user = client.workspace_client().current_user.me().user_name
                 style.ok(f"authenticated as {style.bold(user)}")
-            except Exception as exc:  # noqa: BLE001 — profile is saved regardless
-                style.warn(f"profile saved, but verification failed: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                # Could not connect → don't leave a broken profile to fail
+                # silently later. Invalidate it: drop the section we wrote and
+                # forget any remembered session that pointed at it.
+                cls._remove_profile(config_file, profile)
+                cls._forget_session(profile)
+                style.fail(f"could not connect with profile {style.bold(profile)} — "
+                           f"config invalidated and removed: {exc}")
+                return 1
 
         if not args.no_session:
             DatabricksClient.set_current(client)
@@ -256,6 +276,37 @@ class ConfigureCommand:
             config_file.chmod(0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _remove_profile(config_file: Path, profile: str) -> None:
+        """Drop ``[profile]`` from the INI file (invalidate a broken config).
+
+        Preserves every other section, mirroring :meth:`_write_profile`. A
+        ``DEFAULT`` profile is emptied (its keys cleared) since configparser's
+        special default section can't be "removed".
+        """
+        if not config_file.exists():
+            return
+        parser = configparser.ConfigParser()
+        parser.read(config_file)
+        if profile.upper() == "DEFAULT":
+            for key in list(parser["DEFAULT"].keys()):
+                del parser["DEFAULT"][key]
+        elif parser.has_section(profile):
+            parser.remove_section(profile)
+        with open(config_file, "w") as fh:
+            parser.write(fh)
+
+    @classmethod
+    def _forget_session(cls, profile: str) -> None:
+        """Remove the remembered session **iff** it points at *profile* — a
+        config that just failed to connect shouldn't stay the current session."""
+        meta = cls._read_session()
+        if meta and meta.get("profile") == profile:
+            try:
+                cls._session_file().unlink()
+            except OSError:
+                pass
 
     @classmethod
     def _dump_session(

@@ -116,6 +116,12 @@ class TestConfigureWrite(unittest.TestCase):
         self.assertEqual(meta["access_token"], "sso-tok-xyz")
         self.assertEqual(meta["token_type"], "Bearer")
         client.files_authorization.assert_called_once()
+        # The verify client is built for the browser flow with NO static
+        # credential, so an ambient DATABRICKS_TOKEN can't shortcut SSO.
+        ckw = client._cls.call_args.kwargs
+        self.assertEqual(ckw["auth_type"], "external-browser")
+        self.assertIsNone(ckw["token"])
+        self.assertIsNone(ckw["client_id"])
 
     def test_explicit_auth_type_implies_sso(self):
         with _sandbox() as (cfg, session, client):
@@ -152,18 +158,29 @@ class TestConfigureWrite(unittest.TestCase):
         self.assertEqual(rc, 0)
         client.workspace_client.assert_not_called()
 
-    def test_verification_failure_still_saves_profile(self):
+    def test_verification_failure_invalidates_and_removes_profile(self):
         with _sandbox() as (cfg, session, client):
             client.workspace_client.return_value.current_user.me.side_effect = RuntimeError("401")
-            rc = main(["configure", "--config-file", cfg,
-                       "--host", "https://ws", "--token", "bad"])
-        # Profile is written regardless; configure itself succeeded.
-        self.assertEqual(rc, 0)
+            rc = main(["configure", "--config-file", cfg, "--profile", "bad",
+                       "--host", "https://ws", "--token", "nope"])
+        # Could not connect → configure fails and the broken profile is removed.
+        self.assertEqual(rc, 1)
         parser = configparser.ConfigParser()
         parser.read(cfg)
-        self.assertEqual(parser["DEFAULT"]["token"], "bad")
-        # Session still remembered, but with no resolved user.
-        self.assertIsNone(json.loads(session.read_text())["user"])
+        self.assertFalse(parser.has_section("bad"))
+        # Nothing remembered as the current session.
+        self.assertFalse(session.exists())
+
+    def test_failure_forgets_a_matching_remembered_session(self):
+        with _sandbox() as (cfg, session, client):
+            # A prior good session for this profile is remembered …
+            session.write_text(json.dumps({"profile": "prod", "host": "https://old"}))
+            client.workspace_client.return_value.current_user.me.side_effect = RuntimeError("401")
+            rc = main(["configure", "--config-file", cfg, "--profile", "prod",
+                       "--host", "https://ws", "--token", "nope"])
+        self.assertEqual(rc, 1)
+        # … and is dropped because the reconfigure failed to connect.
+        self.assertFalse(session.exists())
 
     def test_missing_host_noninteractive_returns_one(self):
         with _sandbox() as (cfg, session, client), \
