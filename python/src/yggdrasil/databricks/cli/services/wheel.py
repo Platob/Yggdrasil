@@ -5,9 +5,10 @@ Where ``deploy`` ships the whole ygg image (wheel + serverless
 ``JobEnvironment``) in one shot, this group exposes the wheel lifecycle on
 its own:
 
-    ygg databricks wheel build <package>    # build from the live package → local .whl(s)
+    ygg databricks wheel                     # build + upload the ygg wheel(s) to shared pypi
+    ygg databricks wheel build [package]    # build from the live package → local .whl(s)
     ygg databricks wheel upload <wheel>...   # upload prebuilt .whl(s) to the registry
-    ygg databricks wheel deploy <package>    # build + upload in one step
+    ygg databricks wheel deploy [package]    # build + upload in one step (default package: ygg)
     ygg databricks wheel list [package]      # browse the workspace registry
 
 ``build`` is fully offline — it synthesizes a buildable project from the
@@ -29,12 +30,21 @@ class WheelCommand:
             "wheels", aliases=["wheel"],
             help="Build, upload, and browse wheels in the workspace registry.",
         )
+        # Bare ``wheel`` builds + uploads the versioned ygg wheel(s) to the
+        # registry (the common case); subcommands cover the rest.
+        parser.add_argument("--workspace-dir", dest="workspace_dir", default=None,
+                            help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
+        parser.add_argument("--rebuild", action="store_true",
+                            help="Force a fresh build even if the version is already deployed.")
+        parser.add_argument("--all-versions", dest="all_versions", action="store_true",
+                            help="A wheel for every supported Python (3.10–3.13).")
         sub = parser.add_subparsers(dest="wheels_action")
 
         build = sub.add_parser(
             "build", help="Build wheel(s) from the live package on disk (no upload)."
         )
-        build.add_argument("package", help="Import or distribution name (e.g. yggdrasil / ygg).")
+        build.add_argument("package", nargs="?", default="ygg",
+                           help="Import or distribution name (default: ygg).")
         build.add_argument("--out-dir", dest="out_dir", default=None,
                            help="Directory to write the .whl(s) into (default: a temp dir).")
         build.add_argument("--extra", action="append", default=None,
@@ -54,7 +64,8 @@ class WheelCommand:
         upload.set_defaults(handler=cls._upload)
 
         deploy = sub.add_parser("deploy", help="Build the live package and upload its wheel(s).")
-        deploy.add_argument("package", help="Import or distribution name (e.g. yggdrasil / ygg).")
+        deploy.add_argument("package", nargs="?", default="ygg",
+                           help="Import or distribution name (default: ygg).")
         deploy.add_argument("--workspace-dir", dest="workspace_dir", default=None,
                            help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
         deploy.add_argument("--extra", action="append", default=None,
@@ -74,9 +85,30 @@ class WheelCommand:
                        help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
         ls.set_defaults(handler=cls._list)
 
-        parser.set_defaults(handler=lambda args, bc: parser.print_help() or 1)
+        parser.set_defaults(handler=cls._default)
 
     # -- handlers --------------------------------------------------------
+    @classmethod
+    def _default(cls, args: Any, build_client: Any) -> int:
+        """Bare ``wheel`` — build + upload the versioned ygg wheel(s) to the
+        workspace PyPI-like registry (shared pypi)."""
+        from yggdrasil.cli import style
+        from yggdrasil.databricks.job.wheel import (
+            WORKSPACE_PYPI_DIR, ensure_ygg_wheel, ensure_ygg_wheels,
+        )
+
+        client = build_client(args)
+        workspace_dir = args.workspace_dir or WORKSPACE_PYPI_DIR
+        rebuild = getattr(args, "rebuild", False)
+        with style.Spinner("building + uploading ygg wheel(s)…"):
+            if getattr(args, "all_versions", False):
+                paths = ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=rebuild)
+            else:
+                paths = ensure_ygg_wheel(client, workspace_dir=workspace_dir, rebuild=rebuild)
+        for path in paths:
+            style.ok(f"deployed {style.brand(path)}")
+        return 0
+
     @classmethod
     def _build(cls, args: Any, build_client: Any) -> int:
         from yggdrasil.cli import style

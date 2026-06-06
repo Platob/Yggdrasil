@@ -6,6 +6,7 @@ and dispatches to the yggdrasil service layer.
 from .clusters import ClustersCommand
 from .configure import ConfigureCommand
 from .deploy import DeployCommand
+from .environment import EnvironmentCommand
 from .fs import FSCommand
 from .jobs import JobsCommand
 from .seed import SeedCommand
@@ -18,6 +19,7 @@ __all__ = [
     "ClustersCommand",
     "ConfigureCommand",
     "DeployCommand",
+    "EnvironmentCommand",
     "FSCommand",
     "JobsCommand",
     "SeedCommand",

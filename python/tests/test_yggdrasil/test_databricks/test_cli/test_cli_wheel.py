@@ -68,6 +68,38 @@ class TestWheelUpload(unittest.TestCase):
         self.assertIn("/Workspace/Shared/pypi/b.whl", out)
 
 
+class TestWheelDefault(unittest.TestCase):
+    def test_bare_wheel_builds_and_uploads_ygg(self):
+        with patch("yggdrasil.databricks.client.DatabricksClient"), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure, \
+             contextlib.redirect_stdout(io.StringIO()):
+            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
+            rc = main(["wheel"])
+        self.assertEqual(rc, 0)
+        ensure.assert_called_once()
+
+    def test_bare_wheel_all_versions(self):
+        with patch("yggdrasil.databricks.client.DatabricksClient"), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels") as ensure, \
+             contextlib.redirect_stdout(io.StringIO()):
+            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
+            rc = main(["wheel", "--all-versions"])
+        self.assertEqual(rc, 0)
+        ensure.assert_called_once()
+
+    def test_deploy_defaults_package_to_ygg(self):
+        with patch("yggdrasil.databricks.client.DatabricksClient"), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_wheel") as ensure, \
+             contextlib.redirect_stdout(io.StringIO()):
+            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
+            rc = main(["wheel", "deploy"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(ensure.call_args.args[1], "ygg")
+
+
 class TestWheelDeploy(unittest.TestCase):
     def test_deploy_builds_and_uploads_package(self):
         with patch("yggdrasil.databricks.client.DatabricksClient"), \
