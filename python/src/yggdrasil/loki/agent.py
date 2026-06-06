@@ -104,6 +104,8 @@ class Loki:
         self._backends: "Optional[list[Backend]]" = None
         self._engines: "Optional[dict[str, TokenEngine]]" = None
         self._capable: "Optional[bool]" = None
+        self._agent_id: "Optional[int]" = None
+        self._specialists: "dict[str, Optional[Loki]]" = {}
 
     # -- singleton ---------------------------------------------------------
 
@@ -118,10 +120,12 @@ class Loki:
 
     @property
     def agent_id(self) -> int:
-        """Stable int64 id derived from ``user@host`` (xxhash, not crypto)."""
-        import xxhash
+        """Stable int64 id derived from ``user@host`` (xxhash, not crypto); cached."""
+        if self._agent_id is None:
+            import xxhash
 
-        return xxhash.xxh64_intdigest(f"{self.user}@{self.host}") & 0x7FFFFFFFFFFFFFFF
+            self._agent_id = xxhash.xxh64_intdigest(f"{self.user}@{self.host}") & 0x7FFFFFFFFFFFFFFF
+        return self._agent_id
 
     # -- backends / capabilities ------------------------------------------
 
@@ -660,16 +664,24 @@ class Loki:
         ``"databricks"`` resolves the workspace-bound
         :class:`~yggdrasil.databricks.loki.DatabricksLoki` when the SDK and a
         session are present; otherwise falls back to ``self``.
+
+        Cached per name: the REPL asks for the same specialist on every
+        databricks turn, and the resolution (import + singleton lookup +
+        backend check) is stable for the process.
         """
+        if name in self._specialists:
+            return self._specialists[name]
+        resolved: "Optional[Loki]" = None
         if name == "databricks":
             try:
                 from yggdrasil.databricks.loki import DatabricksLoki
 
                 agent = DatabricksLoki.current()
+                resolved = agent if agent.has("databricks") else None
             except Exception:
-                return None
-            return agent if agent.has("databricks") else None
-        return None
+                resolved = None
+        self._specialists[name] = resolved
+        return resolved
 
     # -- skills ------------------------------------------------------------
 

@@ -98,6 +98,28 @@ class TestAgent(unittest.TestCase):
         self.assertIn("skills", card)
         self.assertIn("token", card)
 
+    def test_can_run_local_probe_is_cached(self):
+        # The hardware probe imports torch (slow first call) and is asked on
+        # every turn by select() — resolve it once per process.
+        loki = Loki()
+        with patch("yggdrasil.loki.resources.can_run_local", return_value=True) as crl:
+            self.assertTrue(loki.can_run_local())
+            self.assertTrue(loki.can_run_local())
+        crl.assert_called_once()
+
+    def test_specialist_resolution_is_cached(self):
+        # The REPL asks for the databricks specialist every databricks turn;
+        # the import + singleton lookup + backend check resolves once (here,
+        # with no databricks SDK/session, to None) and is then memoized.
+        loki = Loki()
+        first = loki.specialist("databricks")
+        self.assertIn("databricks", loki._specialists)
+        self.assertIs(loki.specialist("databricks"), first)
+        # The cache is authoritative — a seeded value short-circuits resolution.
+        sentinel = object()
+        loki._specialists["databricks"] = sentinel
+        self.assertIs(loki.specialist("databricks"), sentinel)
+
 
 class TestPythonProjectBehavior(unittest.TestCase):
     def test_runs_anywhere_and_executes_supplied_code(self):
