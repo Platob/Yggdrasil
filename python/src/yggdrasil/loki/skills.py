@@ -36,7 +36,7 @@ __all__ = ["AgentSkill", "PythonProjectSkill", "SetupSkill",
 class AgentSkill(LokiSkill):
     """Pursue a task autonomously inside a file tree — Loki's agentic loop.
 
-    The headline "act on its own + modify files" behavior. Given a ``task``,
+    The headline "act on its own + modify files" skill. Given a ``task``,
     Loki reasons against a confined toolbox (list/read/find/grep, plus
     write/edit unless ``read_only``, plus a shell when ``allow_shell``),
     taking one tool call per turn until it's done — discovering the project

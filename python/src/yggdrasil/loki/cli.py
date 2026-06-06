@@ -60,7 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
     tok = sub.add_parser("token", help="The Databricks credentials Loki provides (non-secret).")
     tok.add_argument("--probe", action="store_true", help="Make one network call to resolve the user.")
 
-    run = sub.add_parser("run", help="Run a behavior by name.")
+    run = sub.add_parser("run", help="Run a skill by name.")
     run.add_argument("name", help="Skill name (see `ygg loki skills`).")
     run.add_argument("--kwarg", action="append", default=[], metavar="KEY=VALUE",
                      help="Keyword argument (JSON-decoded; repeatable).")
@@ -101,7 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         loki = Loki.current()
 
-    # Register the specialized behavior fleets for every reachable backend
+    # Register the specialized skill fleets for every reachable backend
     # (databricks-* / aws-*), so they show up and dispatch here.
     loki.load_specialists()
 
@@ -420,6 +420,12 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
         elif plan["action"] == "genie":
             res = agent.run("genie", question=line)
             reply = res.get("text", "") if isinstance(res, dict) else str(res)
+        elif plan["action"] == "guide":
+            res = agent.run("guide", task=line, plan=True)
+            _print_guide(style, res)
+            reply = res.get("plan") or style.dim("see the yggdrasil recipes above")
+            if res.get("plan"):
+                style.out(f"\n  {res['plan']}\n")
         else:
             # chat (or a web verb with no URL) → stream the reply live, with
             # the persona system prompt + session memory as context. The engine
@@ -481,7 +487,7 @@ def _print_tabular(style: Any, res: dict) -> None:
 
 
 def _print_web(style: Any, res: dict) -> None:
-    """Pretty-print a `web` behavior result by kind: table / image / json / page."""
+    """Pretty-print a `web` skill result by kind: table / image / json / page."""
     kind = res.get("action")
     style.out(f"  {style.dim('🌐 ' + str(res.get('url', '')))}\n")
     if kind == "table":
@@ -502,6 +508,18 @@ def _print_web(style: Any, res: dict) -> None:
         body = (res.get("text") or "").strip()
         if body:
             style.out(style.dim("  " + body[:600].replace("\n", "\n  ")) + "\n")
+
+
+def _print_guide(style: Any, res: dict) -> None:
+    """Pretty-print the `guide` skill — the matched yggdrasil recipes."""
+    style.out(f"  {style.bold('yggdrasil recipes')} {style.dim('— the optimized path')}\n")
+    for g in res.get("guides", []):
+        style.out(f"  {style.brand('▸')} {style.bold(g['title'])}\n")
+        style.out(f"    {style.dim(g['summary'])}\n")
+        for u in g["use"][:3]:
+            style.out(f"      {style.good('use')} {style.dim(u)}\n")
+        for a in g["avoid"][:2]:
+            style.out(f"      {style.amber('avoid')} {style.dim(a)}\n")
 
 
 def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
@@ -809,7 +827,7 @@ def _run(loki: Any, style: Any, args: Any) -> int:
         style.out(_json(result) if isinstance(result, (dict, list)) else str(result))
         style.out("\n")
     else:
-        style.ok(f"behavior {args.name!r} completed")
+        style.ok(f"skill {args.name!r} completed")
         _print_result(result, style)
     return 0
 

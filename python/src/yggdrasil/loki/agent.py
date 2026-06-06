@@ -59,6 +59,14 @@ ROUTES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+#: Meta/advice phrasing that asks *how to build* something rather than to do it
+#: now — routed to the ``guide`` skill when paired with a yggdrasil mention.
+GUIDE_SIGNALS: tuple[str, ...] = (
+    "best way", "how do i", "how should i", "how to", "idiomatic", "best practice",
+    "most optimized", "most efficient", "recommended way", "which abstraction",
+    "optimi",
+)
+
 #: Signals that a request is about *data* (worth fetching as a tabular frame).
 DATA_SIGNALS: tuple[str, ...] = (
     "dataset", "data set", " csv", "parquet", "table of", "rows", "columns",
@@ -137,7 +145,7 @@ class Loki:
     def databricks(self) -> "Optional[DatabricksClient]":
         """The authenticated Databricks client when a session is present.
 
-        This is Loki acting as a token provider: behaviors and downstream
+        This is Loki acting as a token provider: skills and downstream
         code take this client to reach Databricks service endpoints (SQL,
         Genie, jobs, serving, …) under the agent's resolved credentials.
         Returns ``None`` when no Databricks session is detected.
@@ -152,7 +160,7 @@ class Loki:
     def aws(self) -> Any:
         """The configured :class:`~yggdrasil.aws.AWSClient` when AWS is reachable.
 
-        Loki as an AWS token provider — the AWS behavior fleet rides this
+        Loki as an AWS token provider — the AWS skill fleet rides this
         client (its resolved credentials / region / role). ``None`` when no
         AWS session is detected.
         """
@@ -163,11 +171,11 @@ class Loki:
         return AWSClient.current()
 
     def load_specialists(self) -> list[str]:
-        """Import the specialized behavior fleets for every reachable backend.
+        """Import the specialized skill fleets for every reachable backend.
 
         Databricks problems get the ``databricks-*`` skills, AWS problems the
         ``aws-*`` skills — registered only when their backend is detected, so
-        ``ygg loki behaviors`` shows the fleet that actually applies here.
+        ``ygg loki skills`` shows the fleet that actually applies here.
         Returns the backends whose fleet loaded.
         """
         loaded: list[str] = []
@@ -551,6 +559,11 @@ class Loki:
                 url=url, persona=persona, data=dataf["data"], timeseries=dataf["timeseries"],
                 required_skills=skills_for(category, data=dataf["data"]), why=why)
 
+        # "How do I build X the yggdrasil way?" → guidance, not execution.
+        if ("yggdrasil" in low or "ygg " in low) and any(s in low for s in GUIDE_SIGNALS):
+            return made("guide", "guide",
+                        why="how-to: the optimized yggdrasil implementation path")
+
         url_match = re.search(r"https?://\S+", text)
         if url_match or any(s in low for s in ROUTES["web"]):
             url = url_match.group(0).rstrip(").,") if url_match else None
@@ -634,7 +647,7 @@ class Loki:
     # -- self-description --------------------------------------------------
 
     def card(self, *, refresh: bool = False) -> dict[str, Any]:
-        """Everything Loki knows about itself — identity, reach, behaviors."""
+        """Everything Loki knows about itself — identity, reach, skills."""
         return {
             "agent": self.name,
             "agent_id": self.agent_id,

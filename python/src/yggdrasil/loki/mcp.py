@@ -3,8 +3,9 @@
 ``ygg loki mcp`` runs a `Model Context Protocol <https://modelcontextprotocol.io>`_
 server (stdio) that surfaces Loki to editors/clients like Claude Desktop. The
 agent's whole surface is available as MCP tools: reason with the best engine,
-list/dispatch any behavior (``databricks-sql``, ``aws-s3``, ``genie``, ``web``,
-…), fetch the web, and read capabilities. Requires the optional ``mcp`` package.
+list/dispatch any skill (``databricks-sql``, ``aws-s3``, ``genie``, ``web``,
+``guide``, …), fetch the web, and read capabilities. Requires the optional
+``mcp`` package.
 
     from yggdrasil.loki.mcp import build_server
     build_server().run()        # stdio transport
@@ -63,8 +64,8 @@ def build_server(loki: "Optional[Loki]" = None) -> "FastMCP":
     def run(skill: str, kwargs: Optional[dict] = None) -> Any:
         """Run a Loki skill by name with keyword args.
 
-        Examples: behavior="databricks-sql" kwargs={"query": "SELECT 1"};
-        behavior="aws-s3"; behavior="web" kwargs={"url": "https://…"}.
+        Examples: skill="databricks-sql" kwargs={"query": "SELECT 1"};
+        skill="aws-s3"; skill="web" kwargs={"url": "https://…"}.
         """
         return _sanitize(agent.run(skill, **(kwargs or {})))
 
@@ -75,7 +76,7 @@ def build_server(loki: "Optional[Loki]" = None) -> "FastMCP":
 
     @server.tool()
     def capabilities() -> dict:
-        """Loki's identity, detected backends, engines, and behaviors (its card)."""
+        """Loki's identity, detected backends, engines, and skills (its card)."""
         return _sanitize(agent.card())
 
     return server

@@ -18,6 +18,7 @@ from .session import LokiSession
 from .memory import LokiMemory
 
 # Import the built-in skills so they register on package import.
+from . import guides as _guides  # noqa: F401
 from . import skills as _skills  # noqa: F401
 from . import web
 

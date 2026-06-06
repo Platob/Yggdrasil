@@ -40,17 +40,17 @@ authenticated client — Loki reasons against Databricks service endpoints
 `loki.token_info()` returns a **non-secret** summary (host, auth type,
 catalog/schema); the token itself stays inside the client.
 
-## Behaviors
+## Skills
 
-A `LokiBehavior` is one discoverable, environment-aware action. Behaviors
-declare a backend they `require` (so a Databricks-only behavior stays dark
-on a bare shell) and register into a global catalog:
+A `LokiSkill` is one discoverable, environment-aware capability. Skills
+declare a backend they `require` (so a Databricks-only skill stays dark on a
+bare shell) and register into a global catalog:
 
 ```python
-from yggdrasil.loki import LokiBehavior, register
+from yggdrasil.loki import LokiSkill, register
 
 @register
-class Hello(LokiBehavior):
+class Hello(LokiSkill):
     name = "hello"
     description = "say hi"
     def run(self, agent, *, who="world", **_):
@@ -58,16 +58,36 @@ class Hello(LokiBehavior):
 ```
 
 ```python
-loki.behaviors()                 # the catalog
+loki.skills()                    # the catalog
 loki.run("hello", who="loki")    # dispatch (guards availability first)
 ```
 
-The built-in **`genie`** behavior is the reference for the *token-provider*
-pattern: it guards on the `databricks` backend, then asks a Genie space a
-question (autonomously picking the first reachable space when none is
-named). The **`agent`** behavior (below) is the reference for *autonomy*.
-Replication, inter-agent messaging, HTTP ingestion and serving land on this
-abstraction next.
+The backend-agnostic catalog is `agent` (autonomy, below), `web`, `tabular` /
+`transform` (the data path), `python_project`, `setup`, and `guide` (below).
+Backend-specialized skills register only when their backend is reachable —
+`genie` / `databricks-*` from `yggdrasil.databricks.loki`, `aws-*` from
+`yggdrasil.aws.loki`.
+
+### `guide` — the optimized yggdrasil way
+
+Loki knows the project it lives in. The **`guide`** skill is its
+*do-it-the-yggdrasil-way* adviser: for a task it matches a curated set of
+recipes (`yggdrasil.loki.guides.GUIDES`) — naming the right abstraction (the io
+handlers, `HTTPSession`, `Field`/`DataType` casting, the `dbc` accessors,
+`dataproto`, …), the idiomatic snippet, and the hand-rolled anti-pattern to
+avoid — and, with `plan=True`, has the engine synthesize a concrete plan
+**grounded only in those features**.
+
+```python
+loki.run("guide", task="fetch a CSV from an API and cache it typed")
+#   → recipes: http-fetch (HTTPSession → to_polars), tabular-io (IO.from_),
+#     schema-cast (Field/DataType)
+loki.run("guide", topic="databricks-compute")   # a specific recipe
+```
+
+In the session, asking *how* to build something the yggdrasil way routes here
+automatically: `best way to … in yggdrasil`, `the idiomatic way to … with ygg`.
+It's data over code — add a `Guide` to `GUIDES` and it's instantly discoverable.
 
 ## Acting autonomously (`loki.act` / `ygg loki do`)
 
