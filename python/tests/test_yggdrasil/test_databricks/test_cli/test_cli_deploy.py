@@ -130,11 +130,10 @@ class TestDeployProject(unittest.TestCase):
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
              patch("yggdrasil.databricks.job.wheel.ensure_project_environment",
-                   return_value=self._info()) as ensure, \
+                   return_value=self._info()), \
              contextlib.redirect_stdout(io.StringIO()):
-            rc = main(["deploy", "project", "--no-cluster", "--bundle"])
+            rc = main(["deploy", "project", "--no-cluster"])
         self.assertEqual(rc, 0)
-        self.assertTrue(ensure.call_args.kwargs["bundle"])
         client.compute.clusters.all_purpose_cluster.assert_not_called()
 
     def test_project_mode_threaded_into_deploy(self):
@@ -169,7 +168,8 @@ class TestDeployProject(unittest.TestCase):
         client.compute.clusters.find_cluster.assert_called_once()
         existing.update.assert_called_once()
         libs = existing.update.call_args.kwargs["libraries"]
-        self.assertIn(self._info()["cluster"], libs)
+        # only the requirements file — no uv / dill injected by default
+        self.assertEqual(libs, [self._info()["cluster"]])
         client.compute.clusters.all_purpose_cluster.assert_not_called()
 
 

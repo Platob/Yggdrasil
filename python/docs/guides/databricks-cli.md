@@ -723,27 +723,31 @@ Take **your own project** to Databricks in one command. Discovers the nearest
 `pyproject.toml` (from `path` — a project dir or the file — or the current
 working directory), then:
 
-1. builds the **project's own wheel** from its source tree (`uv build --wheel`),
+1. builds the **project's own wheel** *and its whole dependency closure* as
+   wheels in the shared PyPI registry (`/Workspace/Shared/pypi/<dist>/`, one
+   folder per distribution, generic per-Python naming — pure-python →
+   `py3-none-any`, native deps → `cp3XX` linux_x86_64),
 2. writes a serverless **base environment** + classic-cluster **requirements**
    named for the project — `<name>`, the `[project].name` from the
    `pyproject.toml` (version-free, so redeploys upsert one stable environment
    rather than orphaning a version-suffixed copy each bump; the version stays in
-   the wheel filename and the dependency list),
+   the wheel filename and the dependency list). Both files list the **same**
+   shared-registry wheel paths — there is one unique way to lay this out — so the
+   environment installs entirely from wheels with zero PyPI access,
 3. get-or-creates a **default single-user cluster** named for the project that
-   installs the project's dependencies (the requirements file from step 2).
+   installs from the requirements file from step 2 (and nothing else).
 
 | Flag | Purpose |
 |---|---|
 | `--mode` | Idempotency policy — `overwrite` / `append` / `auto` (default `auto`) |
 | `--extra` | optional-dependency extra to fold into the environment (repeatable) |
-| `--bundle` | Bundle the dependency closure as Linux wheels (zero-PyPI install) |
 | `--no-cluster` | Build the wheel + environment only; don't create the cluster |
 | `--single-user` | Single-user owner for the cluster (default: the current user) |
 | `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`) |
 
 `--mode` controls what gets rebuilt vs. reused:
 
-| Mode | Wheel(s) | Env config files | Cluster |
+| Mode | Wheel closure | Env config files | Cluster |
 |---|---|---|---|
 | `overwrite` | rebuilt + overwritten | overwritten | created **or updated** |
 | `append` | reused if present, else built | written only if **missing** | created if missing |
@@ -754,7 +758,7 @@ ygg databricks deploy project                      # discover from the cwd (auto
 ygg databricks deploy project ./my-app --extra databricks
 ygg databricks deploy project --mode overwrite        # rebuild + update everything
 ygg databricks deploy project --mode append           # only add what's missing
-ygg databricks deploy project --bundle --no-cluster   # zero-PyPI env, no cluster
+ygg databricks deploy project --no-cluster            # env only, no cluster
 ```
 
 ---

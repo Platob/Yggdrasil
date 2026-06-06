@@ -163,10 +163,11 @@ class Clusters(DatabricksService):
         # (zero-PyPI workspace wheels via :meth:`_default_ygg_layer`) rather than
         # ``pip install``-ing ygg from PyPI. An explicit ``environment`` overrides
         # it — a ``…requirements.txt`` / ``…whl`` path, or a PyPI spec to opt back
-        # into a pip resolve. ``uv`` / ``dill`` (small public runtime helpers the
-        # env doesn't bundle) ride along either way.
+        # into a pip resolve. The environment is the single source of truth: any
+        # runtime helper it needs (e.g. ``dill``, a declared ygg dependency) is
+        # listed in its requirements as a wheel — nothing is injected here.
         ygg_layer = environment if environment else self._default_ygg_layer()
-        libraries = (libraries or []) + [ygg_layer, "uv", "dill"]
+        libraries = (libraries or []) + [ygg_layer]
 
         if existing is None:
             existing = self.create(

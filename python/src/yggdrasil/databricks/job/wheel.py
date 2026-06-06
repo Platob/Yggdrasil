@@ -1211,31 +1211,36 @@ def ensure_project_environment(
     *,
     python: str | None = None,
     extras: tuple[str, ...] | list[str] = (),
-    bundle: bool = False,
     mode: Mode = Mode.AUTO,
     workspace_dir: str = WORKSPACE_ENV_DIR,
     pypi_dir: str = WORKSPACE_PYPI_DIR,
 ) -> dict[str, Any]:
-    """Discover a project's ``pyproject.toml``, build its wheel, and write a
+    """Discover a project's ``pyproject.toml``, build its wheel **and its whole
+    dependency closure** into the shared workspace pypi registry, and write a
     serverless **base environment** + classic-cluster **requirements** named for
     the project (``<name>`` — version-free, so redeploys upsert one stable
-    environment) — the user-project counterpart of :func:`ensure_environment`.
+    environment) — the user-project counterpart of :func:`ensure_bundle` /
+    :func:`ensure_environment`.
 
-    The environment's dependency list is the **project wheel** plus the
-    project's own ``[project].dependencies`` (and any requested *extras*' deps).
-    With ``bundle=True`` those dependencies are downloaded as Linux-x86_64 wheels
-    into the env's ``binaries/`` folder and listed by workspace path, so the
-    runtime installs with zero PyPI access; otherwise they're listed as index
-    requirements resolved at install time.
+    There is **one unique way** to lay this out, shared with the ygg image: the
+    project wheel and every dependency are built as wheels and deployed into the
+    shared registry under *pypi_dir* — one folder per distribution, generic
+    per-Python naming (pure-python → ``py3-none-any``; native deps → ``cp3XX``
+    linux_x86_64 via :func:`download_dependency_wheels`). The serverless ``.yml``
+    and the cluster ``requirements.txt`` then list those **same** shared-registry
+    wheel paths, so both install entirely from wheels with zero PyPI access. The
+    closure is cached by a ``.bundle`` manifest beside the project wheel (the dep
+    wheels scatter across dist folders), exactly as :func:`ensure_bundle` caches
+    the ygg closure.
 
     *mode* (a :class:`~yggdrasil.enums.Mode`) sets the idempotency policy:
 
-    - :data:`Mode.OVERWRITE` — rebuild the wheel(s) and **overwrite** everything
-      (the deployed wheel and the env config files).
-    - :data:`Mode.APPEND` — **add only what's missing**: reuse an already-deployed
-      wheel, and write the env config files only when they don't exist yet.
-    - :data:`Mode.AUTO` (default) — **get-or-create** the wheel(s) (reuse when
-      already deployed, build when not) but always **overwrite** the env config
+    - :data:`Mode.OVERWRITE` — rebuild the wheel closure and **overwrite**
+      everything (the deployed wheels and the env config files).
+    - :data:`Mode.APPEND` — **add only what's missing**: reuse an already-built
+      closure, and write the env config files only when they don't exist yet.
+    - :data:`Mode.AUTO` (default) — **get-or-create** the closure (reuse when
+      already built, build when not) but always **overwrite** the env config
       files so they track the current dependency set.
 
     Returns a descriptor with the project name/version, the env name, the written
@@ -1244,7 +1249,7 @@ def ensure_project_environment(
     from yggdrasil.databricks.path import DatabricksPath
 
     mode = Mode.from_(mode)
-    rebuild = mode is Mode.OVERWRITE           # OVERWRITE rebuilds wheels
+    rebuild = mode is Mode.OVERWRITE           # OVERWRITE rebuilds the closure
     overwrite_env = mode is not Mode.APPEND    # OVERWRITE + AUTO rewrite env files
 
     meta = read_pyproject(find_pyproject(pyproject))
@@ -1257,53 +1262,42 @@ def ensure_project_environment(
     # diverging from the cluster, which is already named for the project alone.
     env_name = proj
     env_dir = f"{workspace_dir.rstrip('/')}/{env_name}"
+    py = _py_minor(python)
 
     # The project's declared deps, with any requested extras flattened in.
     deps = list(meta["dependencies"])
     for extra in extras:
         deps += meta["optional_dependencies"].get(extra, [])
 
-    if bundle:
-        # Zero-PyPI: project wheel + dependency closure, all under the env's own
-        # ``binaries/`` folder and listed by workspace path. A ``.manifest``
-        # beside the project wheel records the full path set so a get-or-create
-        # (non-OVERWRITE) deploy can reuse the closure without rebuilding.
-        binaries = f"{env_dir}/binaries"
-        manifest = DatabricksPath.from_(f"{binaries}/{proj}/{env_name}.manifest", client=client)
-        reused = (
-            [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip()]
-            if (not rebuild and manifest.exists()) else []
-        )
-        if reused and DatabricksPath.from_(reused[0], client=client).exists():
-            logger.info("reusing %d-wheel project bundle for %s", len(reused), env_name)
-            dependencies = reused
-        else:
-            dependencies = [
-                registry_upload(client, w, workspace_dir=binaries, overwrite=True)
-                for w in build_project_wheel(meta["dir"], python=python)
-            ]
-            dependencies += [
-                registry_upload(client, w, workspace_dir=binaries)
-                for w in download_dependency_wheels(deps, python=python)
-            ]
-            manifest.parent.mkdir(parents=True, exist_ok=True)
-            manifest.write_text("\n".join(dependencies) + "\n")
+    # Project wheel + dependency closure → shared pypi registry (one folder per
+    # distribution), listed by workspace path. Mirrors :func:`ensure_bundle`: a
+    # ``.bundle`` manifest beside the project wheel records the full path set so a
+    # get-or-create (non-OVERWRITE) deploy reuses the closure without rebuilding.
+    root = pypi_dir.rstrip("/")
+    manifest = DatabricksPath.from_(
+        f"{root}/{proj}/{proj}-{_norm_version(version)}-{environment_key_for(py)}-linux_x86_64.bundle",
+        client=client,
+    )
+    reused = (
+        [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip()]
+        if (not rebuild and manifest.exists()) else []
+    )
+    if reused and DatabricksPath.from_(reused[0], client=client).exists():
+        logger.info("reusing %d-wheel project bundle for %s", len(reused), env_name)
+        dependencies = reused
     else:
-        # Project wheel by path + its declared deps resolved from the index.
-        proj_dir = f"{pypi_dir.rstrip('/')}/{proj}"
-        existing = (
-            [] if rebuild
-            else deployed_wheels(client, name, version, workspace_dir=proj_dir, dist_only=True)
-        )
-        if existing:
-            logger.info("reusing deployed project wheel(s) for %s", env_name)
-            wheel_paths = existing
-        else:
-            wheel_paths = [
-                registry_upload(client, w, workspace_dir=pypi_dir, overwrite=True)
-                for w in build_project_wheel(meta["dir"], python=python)
-            ]
-        dependencies = wheel_paths + deps
+        # Project wheel(s) first (so the env lists the project first, overwritten
+        # since its code can change under a fixed version), then the deps.
+        dependencies = [
+            registry_upload(client, w, workspace_dir=root, overwrite=True)
+            for w in build_project_wheel(meta["dir"], python=py)
+        ]
+        dependencies += [
+            registry_upload(client, w, workspace_dir=root)
+            for w in download_dependency_wheels(deps, python=py)
+        ]
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text("\n".join(dependencies) + "\n")
 
     # Env config files: OVERWRITE/AUTO always rewrite; APPEND writes only the
     # ones that don't exist yet ("add missing").

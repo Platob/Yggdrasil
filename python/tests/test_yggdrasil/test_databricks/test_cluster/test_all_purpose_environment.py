@@ -34,12 +34,9 @@ class TestAllPurposeClusterEnvironment(DatabricksTestCase):
             single_user_name="me@co.com", wait=False,
         )
         libs = clusters.create.call_args.kwargs["libraries"]
-        # The generic env requirements file is installed (Library(requirements=…)),
-        # uv/dill ride along, and no PyPI ``ygg[…]`` resolve is added.
-        self.assertIn(_REQS, libs)
-        self.assertIn("uv", libs)
-        self.assertIn("dill", libs)
-        self.assertFalse(any(str(lib).startswith("ygg[") for lib in libs))
+        # The generic env requirements file is the only library — nothing is
+        # injected alongside it (no uv/dill), and no PyPI ``ygg[…]`` resolve.
+        self.assertEqual(libs, [_REQS])
 
     def test_default_uses_seeded_environment_not_pypi(self):
         clusters = self._clusters()
@@ -48,11 +45,8 @@ class TestAllPurposeClusterEnvironment(DatabricksTestCase):
         )
         libs = clusters.create.call_args.kwargs["libraries"]
         # Default installs the seeded generic-env requirements (zero-PyPI), not a
-        # PyPI ``ygg[…]`` resolve. uv/dill still ride along.
-        self.assertIn(_seeded_env_requirements(), libs)
-        self.assertIn("uv", libs)
-        self.assertIn("dill", libs)
-        self.assertFalse(any(str(lib).startswith("ygg[") for lib in libs))
+        # PyPI ``ygg[…]`` resolve — and nothing else (no uv/dill injected).
+        self.assertEqual(libs, [_seeded_env_requirements()])
 
     def test_get_or_create_defaults_to_seeded_environment(self):
         clusters = self._clusters()

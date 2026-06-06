@@ -74,10 +74,13 @@ def test_read_pyproject_requires_a_name(tmp_path):
         W.read_pyproject(path)
 
 
-# ── ensure_project_environment — dependency composition ──────────────────────
+# ── ensure_project_environment — closure to the shared registry ──────────────
 
 
-def test_non_bundle_lists_wheel_then_index_deps(tmp_path):
+def test_builds_project_wheel_then_dependency_wheels(tmp_path):
+    """One unique way: the project wheel **and** its dependency closure are
+    deployed as wheels into the shared registry, and the yml + requirements list
+    those same paths (project wheel first)."""
     _write_pyproject(
         tmp_path,
         '[project]\nname = "demo"\nversion = "0.1.0"\n'
@@ -85,110 +88,124 @@ def test_non_bundle_lists_wheel_then_index_deps(tmp_path):
         '[project.optional-dependencies]\nextra = ["httpx"]\n',
     )
     client = MagicMock()
-    with patch.object(W, "deployed_wheels", return_value=[]), \
-         patch.object(W, "build_project_wheel",
-                      return_value=[Path("/tmp/demo-0.1.0-py3-none-any.whl")]), \
-         patch.object(W, "registry_upload",
-                      return_value="/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl"), \
-         patch.object(W, "ensure_named_environment", return_value="/env/demo.yml") as named, \
-         patch.object(W, "ensure_cluster_requirements", return_value="/env/demo.req") as req:
-        info = W.ensure_project_environment(client, tmp_path, extras=("extra",))
-
-    assert info["name"] == "demo"
-    assert info["env_name"] == "demo"          # version-free: named for the project alone
-    assert info["mode"] == "AUTO"
-    assert info["dependencies"] == [
-        "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl", "polars", "httpx",
-    ]
-    assert info["serverless"] == "/env/demo.yml"
-    assert info["cluster"] == "/env/demo.req"
-    assert named.call_args.kwargs["dependencies"] == info["dependencies"]
-    assert req.call_args.kwargs["dependencies"] == info["dependencies"]
-
-
-def test_bundle_downloads_and_lists_wheels(tmp_path):
-    _write_pyproject(
-        tmp_path,
-        '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["polars"]\n',
-    )
-    client = MagicMock()
     uploads = iter([
-        "/env/demo/binaries/demo/demo-0.1.0-py3-none-any.whl",
-        "/env/demo/binaries/polars/polars-1.0-cp312.whl",
+        "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl",
+        "/Workspace/Shared/pypi/polars/polars-1.0-cp312.whl",
+        "/Workspace/Shared/pypi/httpx/httpx-0.27-py3-none-any.whl",
     ])
     with patch("yggdrasil.databricks.path.DatabricksPath", _fake_dbpath(exists=False)), \
          patch.object(W, "build_project_wheel",
                       return_value=[Path("/tmp/demo-0.1.0-py3-none-any.whl")]), \
          patch.object(W, "download_dependency_wheels",
-                      return_value=[Path("/tmp/polars-1.0-cp312.whl")]) as dl, \
+                      return_value=[Path("/tmp/polars-1.0-cp312.whl"),
+                                    Path("/tmp/httpx-0.27-py3-none-any.whl")]) as dl, \
          patch.object(W, "registry_upload", side_effect=lambda *a, **k: next(uploads)), \
-         patch.object(W, "ensure_named_environment", return_value="/env/demo.yml"), \
-         patch.object(W, "ensure_cluster_requirements", return_value="/env/demo.req"):
-        info = W.ensure_project_environment(client, tmp_path, bundle=True)
+         patch.object(W, "ensure_named_environment", return_value="/env/demo.yml") as named, \
+         patch.object(W, "ensure_cluster_requirements", return_value="/env/demo.req") as req:
+        info = W.ensure_project_environment(client, tmp_path, extras=("extra",))
 
-    dl.assert_called_once()
+    # extras flattened into the deps handed to the wheel downloader
+    assert dl.call_args.args[0] == ["polars", "httpx"]
+    assert info["name"] == "demo"
+    assert info["env_name"] == "demo"          # version-free: named for the project alone
+    assert info["mode"] == "AUTO"
+    # every dependency is a wheel in the shared registry — project wheel first
     assert info["dependencies"] == [
-        "/env/demo/binaries/demo/demo-0.1.0-py3-none-any.whl",
-        "/env/demo/binaries/polars/polars-1.0-cp312.whl",
+        "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl",
+        "/Workspace/Shared/pypi/polars/polars-1.0-cp312.whl",
+        "/Workspace/Shared/pypi/httpx/httpx-0.27-py3-none-any.whl",
     ]
+    assert info["serverless"] == "/env/demo.yml"
+    assert info["cluster"] == "/env/demo.req"
+    # the yml and the requirements list the *same* shared-registry wheel paths
+    assert named.call_args.kwargs["dependencies"] == info["dependencies"]
+    assert req.call_args.kwargs["dependencies"] == info["dependencies"]
 
 
 # ── ensure_project_environment — deploy modes ────────────────────────────────
 
 
-def _proj(tmp_path):
+def test_auto_reuses_cached_closure_without_building(tmp_path):
     _write_pyproject(
         tmp_path, '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["polars"]\n',
     )
-    return MagicMock()
-
-
-def test_auto_reuses_deployed_wheel_without_building(tmp_path):
-    client = _proj(tmp_path)
-    with patch.object(W, "deployed_wheels",
-                      return_value=["/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl"]), \
+    client = MagicMock()
+    cached = (
+        "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl\n"
+        "/Workspace/Shared/pypi/polars/polars-1.0-cp312.whl\n"
+    )
+    with patch("yggdrasil.databricks.path.DatabricksPath",
+               _fake_dbpath(exists=True, text=cached)), \
          patch.object(W, "build_project_wheel") as build, \
+         patch.object(W, "download_dependency_wheels") as dl, \
          patch.object(W, "ensure_named_environment", return_value="/env/demo.yml") as named, \
          patch.object(W, "ensure_cluster_requirements", return_value="/env/demo.req") as req:
         info = W.ensure_project_environment(client, tmp_path, mode=Mode.AUTO)
-    build.assert_not_called()                         # get-or-create → reused
+    build.assert_not_called()                         # cached closure reused
+    dl.assert_not_called()
     named.assert_called_once()                        # but env files overwritten
     req.assert_called_once()
-    assert info["dependencies"][0].endswith("demo-0.1.0-py3-none-any.whl")
+    assert info["dependencies"] == [
+        "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl",
+        "/Workspace/Shared/pypi/polars/polars-1.0-cp312.whl",
+    ]
+    assert info["mode"] == "AUTO"
 
 
-def test_overwrite_rebuilds_even_when_deployed(tmp_path):
-    client = _proj(tmp_path)
-    with patch.object(W, "deployed_wheels",
-                      return_value=["/already/there.whl"]) as deployed, \
+def test_overwrite_rebuilds_even_when_cached(tmp_path):
+    _write_pyproject(
+        tmp_path, '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["polars"]\n',
+    )
+    client = MagicMock()
+    # A cached manifest is present, but OVERWRITE ignores it and rebuilds.
+    with patch("yggdrasil.databricks.path.DatabricksPath",
+               _fake_dbpath(exists=True, text="/old/cached.whl\n")), \
          patch.object(W, "build_project_wheel",
                       return_value=[Path("/tmp/demo-0.1.0-py3-none-any.whl")]) as build, \
+         patch.object(W, "download_dependency_wheels", return_value=[]) as dl, \
          patch.object(W, "registry_upload",
                       return_value="/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl"), \
          patch.object(W, "ensure_named_environment", return_value="/env/demo.yml"), \
          patch.object(W, "ensure_cluster_requirements", return_value="/env/demo.req"):
         info = W.ensure_project_environment(client, tmp_path, mode=Mode.OVERWRITE)
-    deployed.assert_not_called()                      # OVERWRITE never checks; always builds
-    build.assert_called_once()
+    build.assert_called_once()                        # OVERWRITE always rebuilds
+    dl.assert_called_once()
     assert info["mode"] == "OVERWRITE"
+    assert info["dependencies"] == [
+        "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl",
+    ]
 
 
 def test_append_writes_env_files_only_when_missing(tmp_path):
-    client = _proj(tmp_path)
-    # Serverless yml already present, requirements absent → only the missing one
-    # is written.
+    _write_pyproject(
+        tmp_path, '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = ["polars"]\n',
+    )
+    client = MagicMock()
+    # Closure cached (manifest present); serverless yml already present,
+    # requirements absent → only the missing one is written.
+    node_manifest = MagicMock()
+    node_manifest.exists.return_value = True
+    node_manifest.read_text.return_value = (
+        "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl\n"
+    )
     node_present = MagicMock(); node_present.exists.return_value = True
     node_absent = MagicMock(); node_absent.exists.return_value = False
-    dbp = MagicMock()
-    dbp.from_.side_effect = lambda dest, **k: (
-        node_present if str(dest).endswith(".yml") else node_absent
-    )
+
+    def _from(dest, **k):
+        d = str(dest)
+        if d.endswith(".bundle"):
+            return node_manifest
+        if d.endswith(".whl") or d.endswith(".yml"):
+            return node_present          # cached wheel + serverless yml exist
+        return node_absent               # requirements.txt missing
+
+    dbp = MagicMock(); dbp.from_.side_effect = _from
     with patch("yggdrasil.databricks.path.DatabricksPath", dbp), \
-         patch.object(W, "deployed_wheels",
-                      return_value=["/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl"]), \
+         patch.object(W, "build_project_wheel") as build, \
          patch.object(W, "ensure_named_environment", return_value="/env/demo.yml") as named, \
          patch.object(W, "ensure_cluster_requirements", return_value="/env/demo.req") as req:
         info = W.ensure_project_environment(client, tmp_path, mode=Mode.APPEND)
+    build.assert_not_called()                         # closure reused
     named.assert_not_called()                         # yml exists → left alone
     req.assert_called_once()                          # requirements missing → written
     assert info["serverless"].endswith("demo.yml")   # reported existing path
