@@ -107,12 +107,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         loki = Loki.current()
 
     # Register the specialized skill fleets for every reachable backend
-    # (databricks-* / aws-*) only for the actions that actually surface or run
-    # them — the import is heavy (pulls the Databricks SDK). Lightweight reads
-    # (engines/usage/capabilities/token) and pure-reasoning actions stay fast;
-    # the REPL routes to specialist skills, so it loads them up front. On the
-    # Databricks runtime ``ygg loki`` *is* the specialist, so always load.
-    if action in ("chat", "status", "skills", "run") or os.getenv("DATABRICKS_RUNTIME_VERSION"):
+    # (databricks-* / aws-*) only for the actions that surface or run them right
+    # away — the import is heavy (pulls the Databricks SDK). Lightweight reads
+    # (engines/usage/capabilities/token) and pure-reasoning actions stay fast.
+    # The REPL warms the fleet *asynchronously* (see _repl) so the logo is
+    # instant. On the Databricks runtime ``ygg loki`` *is* the specialist.
+    if action in ("status", "skills", "run") or os.getenv("DATABRICKS_RUNTIME_VERSION"):
         loki.load_specialists()
 
     # The MCP server speaks JSON-RPC on stdio — no logo / chatter on stdout.
@@ -234,6 +234,28 @@ def _repl(loki: Any, style: Any) -> int:
     from yggdrasil.loki.usage import METER
 
     METER.set_limit(METER.DEFAULT_COST_LIMIT)
+
+    # Warm in the background while the user picks a session and types the first
+    # prompt: register the specialist skill fleets (heavy Databricks import) and
+    # build the chosen engine's client. Overlapping this with the input wait
+    # keeps the logo instant and the first turn's submit fast.
+    import threading
+
+    def _warm() -> None:
+        try:
+            loki.load_specialists()
+        except Exception:
+            pass
+        try:
+            eng = loki.engine()
+            warm = getattr(eng, "warm", None)
+            if callable(warm):
+                warm()
+        except Exception:
+            pass
+
+    threading.Thread(target=_warm, daemon=True).start()
+
     session = _choose_session(style)  # resume a prior session for this user, or start new
     state: dict[str, Any] = {
         "tier": None, "engine": None, "session": session,
@@ -704,7 +726,8 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
         else:
             style.warn(f"unknown engine {arg!r} — see /engines")
     elif cmd == "status":
-        _status(loki, style)
+        loki.load_specialists()   # ensure the specialist fleet is listed even
+        _status(loki, style)      # if the background warmer hasn't finished yet
     elif cmd == "engines":
         _engines(loki, style)
     elif cmd == "setup":
