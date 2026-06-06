@@ -132,6 +132,18 @@ _LOGOS: dict[str, tuple[str, ...]] = {
         r" \ V / | (_ || (_ || |) || _ \| ' < \__ \ ",
         r"  |_|   \___| \___||___/ |___/|_|\_\|___/",
     ),
+    "YGGLOKI": (
+        r"__   __ ___   ___   _     ___    _  __ ___ ",
+        r"\ \ / // __| / __| | |   / _ \  | |/ /|_ _|",
+        r" \ V / | (_ || (_ || |__ | (_) || ' <  | | ",
+        r"  |_|   \___| \___||____| \___/ |_|\_\|___|",
+    ),
+    "YGGAWS": (
+        r"__   __ ___   ___    _   __      __ ___  ",
+        r"\ \ / // __| / __|  /_\  \ \    / // __| ",
+        r" \ V / | (_ || (_ |/ _ \  \ \/\/ / \__ \ ",
+        r"  |_|   \___| \___|_/ \_\  \_/\_/  |___/ ",
+    ),
 }
 
 
@@ -141,7 +153,12 @@ _LOGO_GRADIENT = ("38;5;216", "38;5;209", "38;5;208", "38;5;202")
 
 
 def logo(suffix: str = "") -> str:
-    """Render the YGG logo with an optional suffix like BOT, CHAT, GENIE."""
+    """Render the full combined CLI logo for *suffix* (``YGGLOKI``, ``YGGDBKS``,
+    ``YGGAWS``, …).
+
+    Each CLI gets ONE full ``ygg``+service wordmark — never the bare ``YGG``
+    art with a text subtitle tacked underneath. An unknown suffix falls back to
+    the plain ``YGG`` mark (no subtitle)."""
     key = suffix or "YGG"
     lines = _LOGOS.get(key, _LOGOS["YGG"])
     # Pad every row to the widest so the block is a true rectangle — guards
@@ -149,19 +166,13 @@ def logo(suffix: str = "") -> str:
     width = max((len(ln) for ln in lines), default=0)
     lines = [ln.ljust(width) for ln in lines]
     if not _COLOR:
-        parts = ["  " + ln for ln in lines]
-        if key not in _LOGOS and suffix:
-            parts.append(f"  {suffix}")
-        return "\n".join(parts)
+        return "\n".join("  " + ln for ln in lines)
 
     r = _RESET
-    rendered = [
+    return "\n".join(
         f"  {_CSI}{_LOGO_GRADIENT[min(i, len(_LOGO_GRADIENT) - 1)]}m{ln}{r}"
         for i, ln in enumerate(lines)
-    ]
-    if key not in _LOGOS and suffix:
-        rendered.append(f"  {_CSI}1m{suffix}{r}")
-    return "\n".join(rendered)
+    )
 
 
 def print_logo(suffix: str = "") -> None:
