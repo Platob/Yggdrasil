@@ -1,15 +1,17 @@
-"""Built-in Loki behaviors.
+"""Built-in Loki skills — the backend-agnostic catalog.
 
-The behavior catalog. Two patterns live here:
+These run anywhere Loki runs (no cloud session required):
 
-- :class:`GenieSkill` — guard on a detected backend, then drive a
-  Databricks service endpoint through Loki's token provider
-  (``agent.databricks``).
-- :class:`PythonProjectSkill` — a *local* behavior: Loki scaffolds a
-  Python project, writes code into it (provided, or reasoned from a task via
-  the agent's engine), and runs it — the agent authoring and executing code.
+- :class:`WebSkill` — reach and *drive* the internet (browse, tables, forms).
+- :class:`TabularSkill` / :class:`TransformSkill` — the data path: fetch a
+  source into a frame through the io handlers, cache it, reshape it.
+- :class:`PythonProjectSkill` — scaffold a Python project, write code into it
+  (provided, or reasoned from a task via the agent's engine), and run it.
+- :class:`SetupSkill` — bootstrap a free local model on demand.
 
-Replication, inter-agent messaging, HTTP ingestion and serving land here next.
+Backend-specialized skills live in their own packages and register only when
+their backend is reachable — Databricks (``genie``, ``databricks-*``) in
+:mod:`yggdrasil.databricks.loki`, AWS (``aws-*``) in :mod:`yggdrasil.aws.loki`.
 """
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ from .skill import LokiSkill, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentSkill", "GenieSkill", "PythonProjectSkill", "SetupSkill",
+__all__ = ["AgentSkill", "PythonProjectSkill", "SetupSkill",
            "WebSkill", "TabularSkill", "TransformSkill"]
 
 
@@ -146,7 +148,7 @@ class WebSkill(LokiSkill):
                 action = "text"
 
         if action in ("form", "interact"):
-            if not web.browser_available():
+            if not web.ensure_browser():  # auto-installs unless disabled
                 return {"action": action, "url": url, "error": "browser automation unavailable",
                         "install": "pip install playwright && playwright install chromium"}
             if action == "form":
@@ -200,59 +202,15 @@ def _auto_key(source: str) -> str:
     return f"{_tab_slug(source)[:24].rstrip('-')}-{digest}"
 
 
-def _json_to_frame(data: Any):
-    """Normalize a decoded JSON payload into a polars frame.
-
-    Handles the common shapes external data APIs return: a list of records, a
-    nested ``{key: {date: {sym: val}}}`` time series (→ long ``date/symbol/value``),
-    a flat ``{date: value}`` mapping, or a single record.
-    """
-    import polars as pl
-
-    if isinstance(data, list):
-        return pl.DataFrame(data)
-    if isinstance(data, dict):
-        for key in ("rates", "data", "results", "observations", "values", "series"):
-            v = data.get(key)
-            if isinstance(v, dict) and v and all(isinstance(x, dict) for x in v.values()):
-                rows = [{"date": d, "symbol": s, "value": val}
-                        for d, m in sorted(v.items()) for s, val in m.items()]
-                return pl.DataFrame(rows)
-            if isinstance(v, dict) and v:
-                return pl.DataFrame({"date": list(v.keys()), "value": list(v.values())})
-            if isinstance(v, list) and v:
-                return pl.DataFrame(v)
-        return pl.DataFrame([data])
-    return pl.DataFrame({"value": [data]})
-
-
-def _fetch_frame(url: str, fmt: Optional[str]):
-    """Fetch *url* as a polars frame.
-
-    JSON bodies are **normalized** into a flat/long frame (a time series →
-    ``date/symbol/value``), since API JSON rarely maps 1:1 to rows. Genuinely
-    tabular bodies (CSV / Parquet / Arrow / XLSX) go through the io handlers.
-    """
-    from . import web
-
-    resp = web.fetch(url)
-    mime = str(resp.media_type.mime_type.value)
-    if not fmt and "json" in mime:
-        return _json_to_frame(resp.json())
-    try:
-        return web.read_table(url, fmt=fmt)
-    except Exception:
-        return _json_to_frame(web.read_json(url))
-
-
 @register
 class TabularSkill(LokiSkill):
     """Fetch a data/timeseries source as a tabular frame, cache it, propose reuse.
 
     Loki's data path: when a request is data- or time-series-shaped, fetch it
-    straight into a polars frame (through the io handlers for CSV/Parquet/…, or
-    a normalized JSON payload), **cache it as Parquet** in the session cache via
-    the io abstraction (an optimized columnar copy), and return the frame
+    straight into a polars frame — through :func:`web.read_table`, i.e. the
+    :class:`HTTPResponse` → io tabular handlers (CSV / JSON / Parquet / Arrow /
+    XLSX, format auto-detected) — **cache it as Parquet** in the session cache
+    via the io abstraction (an optimized columnar copy), and return the frame
     preview plus concrete **next steps** — reuse the cache, store it elsewhere
     (Parquet / Arrow / CSV / Delta), or load it into Databricks.
     """
@@ -274,10 +232,12 @@ class TabularSkill(LokiSkill):
     ) -> dict[str, Any]:
         from yggdrasil.io.holder import IO
 
+        from . import dataproto, web
+
         if cache:                       # reuse a previously cached frame
             df, source = IO.from_(str(cache)).to_polars(), cache
-        elif url:
-            df, source = _fetch_frame(url, fmt), url
+        elif url:                       # io handlers parse the body (HTTPResponse)
+            df, source = web.read_table(url, fmt=fmt), url
         else:
             raise ValueError("provide url= to fetch, or cache= to reuse a cached frame")
 
@@ -309,7 +269,7 @@ class TabularSkill(LokiSkill):
             "source": source,
             "rows": df.height,
             "columns": list(df.columns),
-            "preview": str(df.head(10)),
+            "preview": dataproto.encode(df),   # token-efficient view for the LLM
             "cached_to": str(cached_to),
             "stored": stored,
             "next_steps": steps,
@@ -351,10 +311,12 @@ class TransformSkill(LokiSkill):
         from yggdrasil.data import DataType, Field
         from yggdrasil.io.holder import IO
 
+        from . import dataproto, web
+
         if cache:
             df, source = IO.from_(str(cache)).to_polars(), cache
-        elif url:
-            df, source = _fetch_frame(url, fmt), url
+        elif url:                       # io handlers parse the body (HTTPResponse)
+            df, source = web.read_table(url, fmt=fmt), url
         else:
             raise ValueError("provide cache= (or url=) to transform")
 
@@ -387,57 +349,13 @@ class TransformSkill(LokiSkill):
             "rows": df.height,
             "columns": list(df.columns),
             "schema": {c: str(t) for c, t in zip(df.columns, df.dtypes)},
-            "preview": str(df.head(10)),
+            "preview": dataproto.encode(df),   # token-efficient view for the LLM
             "cached_to": str(cached_to),
             "next_steps": [
                 f"reuse:  loki.run('tabular', cache={str(cached_to)!r})",
                 f"store:  loki.run('tabular', cache={str(cached_to)!r}, store='out.parquet')",
             ],
         }
-
-
-@register
-class GenieSkill(LokiSkill):
-    """Ask a Databricks Genie space a question and return its answer."""
-
-    name = "genie"
-    description = "Ask a Databricks AI/BI Genie space a question (text + SQL + rows)."
-    requires = "databricks"
-
-    def run(
-        self,
-        agent: Loki,
-        *,
-        question: str,
-        space: Optional[str] = None,
-        rows: bool = False,
-        **_: Any,
-    ) -> dict[str, Any]:
-        client = agent.databricks
-        if client is None:  # available() already guards, belt-and-suspenders
-            raise RuntimeError("no Databricks session")
-
-        # Autonomy: when no space is named, reason against the first space the
-        # current user can reach.
-        if space is None:
-            spaces = client.genie.spaces()
-            if not spaces:
-                raise RuntimeError("no Genie spaces are accessible to this user")
-            target = spaces[0]
-        else:
-            target = client.genie.space(space)
-
-        answer = target.ask(question)
-        out: dict[str, Any] = {
-            "space_id": target.space_id,
-            "conversation_id": answer.conversation_id,
-            "text": answer.text,
-            "query": answer.query,
-            "statement_id": answer.statement_id,
-        }
-        if rows and answer.query:
-            out["rows"] = answer.to_polars()
-        return out
 
 
 @register

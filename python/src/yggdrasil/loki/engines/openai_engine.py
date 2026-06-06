@@ -27,9 +27,9 @@ class OpenAIEngine(TokenEngine):
         return bool(self.api_key)
 
     def _client(self):
-        from openai import OpenAI
+        from ..runtime import load
 
-        return OpenAI(api_key=self.api_key, base_url=self.base_url)
+        return load("openai").OpenAI(api_key=self.api_key, base_url=self.base_url)
 
     def complete(
         self,

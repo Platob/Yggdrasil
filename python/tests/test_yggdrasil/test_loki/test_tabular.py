@@ -14,7 +14,7 @@ from yggdrasil.loki.capability import Backend
 try:
     import polars  # noqa: F401
 
-    from yggdrasil.loki.skills import _json_to_frame
+    from yggdrasil.loki import web  # noqa: F401  (HTTPResponse → io handlers)
 
     _HAVE_STACK = True
 except Exception:  # pragma: no cover
@@ -48,30 +48,16 @@ class TestClassifyAndRoute(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAVE_STACK, "requires the polars/io stack")
-class TestJsonToFrame(unittest.TestCase):
-    def test_list_of_records(self):
-        df = _json_to_frame([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
-        self.assertEqual(df.shape, (2, 2))
-
-    def test_nested_timeseries_becomes_long(self):
-        df = _json_to_frame({"rates": {"2026-05-22": {"USD": 1.1}, "2026-05-23": {"USD": 1.2}}})
-        self.assertEqual(set(df.columns), {"date", "symbol", "value"})
-        self.assertEqual(df.height, 2)
-
-    def test_flat_date_value_map(self):
-        df = _json_to_frame({"data": {"2026-01-01": 10, "2026-01-02": 11}})
-        self.assertEqual(set(df.columns), {"date", "value"})
-
-
-@unittest.skipUnless(_HAVE_STACK, "requires the polars/io stack")
 class TestTabularBehavior(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.dir = tempfile.mkdtemp(prefix="ygg-tab-")
         d = Path(cls.dir)
         (d / "data.csv").write_text("city,pop\nParis,2161\nTokyo,13960\n")
+        # A JSON array of records — the io JSON handler tabularizes it directly
+        # (HTTPResponse.to_polars), no custom normalization needed.
         (d / "ts.json").write_text(
-            '{"rates": {"2026-05-22": {"USD": 1.1595}, "2026-05-23": {"USD": 1.1643}}}')
+            '[{"date":"2026-05-22","value":1.1595},{"date":"2026-05-23","value":1.1643}]')
         handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=cls.dir)
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
         cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
@@ -93,10 +79,12 @@ class TestTabularBehavior(unittest.TestCase):
         self.assertTrue(cached.is_file() and cached.suffix == ".parquet")
         self.assertTrue(any("reuse" in s for s in res["next_steps"]))
 
-    def test_fetch_json_timeseries_normalized(self):
+    def test_fetch_json_array_via_io(self):
+        # JSON → frame is the io layer's job (HTTPResponse.to_polars), not a
+        # bespoke normalizer: an array of records lands as proper columns.
         res = _loki().run("tabular", url=f"{self.base}/ts.json",
                           cache_dir=self.cache, key="ts")
-        self.assertEqual(res["columns"], ["date", "symbol", "value"])
+        self.assertEqual(res["columns"], ["date", "value"])
         self.assertEqual(res["rows"], 2)
 
     def test_reuse_cache_then_store(self):
@@ -130,6 +118,14 @@ class TestTabularBehavior(unittest.TestCase):
         self.assertEqual(t["columns"], ["date", "usd"])
         self.assertEqual(t["schema"]["date"], "Date")
         self.assertEqual(t["schema"]["usd"], "Float64")
+
+    def test_preview_is_compact_dataproto(self):
+        res = _loki().run("tabular", url=f"{self.base}/data.csv",
+                          cache_dir=self.cache, key="cities")
+        # The LLM-facing preview is the token-efficient dataproto encoding:
+        # a schema header line + CSV body.
+        self.assertTrue(res["preview"].startswith("# 2 rows × 2 cols"))
+        self.assertIn("city,pop", res["preview"])
 
 
 class TestPlanning(unittest.TestCase):

@@ -99,30 +99,6 @@ class TestAgent(unittest.TestCase):
         self.assertIn("token", card)
 
 
-class TestGenieBehavior(unittest.TestCase):
-    def test_genie_requires_databricks_and_asks_first_space(self):
-        from yggdrasil.loki.skills import GenieSkill
-
-        beh = GenieSkill()
-        self.assertEqual(beh.requires, "databricks")
-
-        loki = Loki()
-        loki._backends = [Backend("databricks", True)]
-        client = MagicMock()
-        space = MagicMock(); space.space_id = "s1"
-        answer = MagicMock()
-        answer.conversation_id = "c1"; answer.text = "hi"; answer.query = None
-        answer.statement_id = None
-        space.ask.return_value = answer
-        client.genie.spaces.return_value = [space]
-        with patch("yggdrasil.databricks.DatabricksClient") as DC:
-            DC.current.return_value = client
-            out = loki.run("genie", question="how many orders?")
-        self.assertEqual(out["space_id"], "s1")
-        self.assertEqual(out["text"], "hi")
-        client.genie.spaces.assert_called_once()
-
-
 class TestPythonProjectBehavior(unittest.TestCase):
     def test_runs_anywhere_and_executes_supplied_code(self):
         loki = Loki()

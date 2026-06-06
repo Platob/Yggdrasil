@@ -37,6 +37,7 @@ __all__ = [
     "discover_apis",
     "Browser",
     "browser_available",
+    "ensure_browser",
     "fill_form",
     "interact",
 ]
@@ -287,7 +288,10 @@ def _json_ld(html: str) -> list:
 
 
 def browser_available() -> bool:
-    """True when Playwright (and a browser binary) is installed for automation."""
+    """True when Playwright (and a browser binary) is installed for automation.
+
+    A pure probe — never installs. :func:`ensure_browser` is the install path.
+    """
     import importlib.util
 
     if importlib.util.find_spec("playwright") is None:
@@ -299,6 +303,36 @@ def browser_available() -> bool:
             return bool(pw.chromium.executable_path)
     except Exception:
         return False
+
+
+def ensure_browser(*, install: Optional[bool] = None) -> bool:
+    """Make the headless browser usable, auto-installing on demand.
+
+    Installs the ``playwright`` package (via Loki's runtime auto-installer) and
+    then its Chromium binary (``python -m playwright install chromium``) when
+    either is missing — unless auto-install is disabled
+    (``YGG_LOKI_AUTO_INSTALL=0`` or ``install=False``), in which case it just
+    probes. Returns whether the browser is ready.
+    """
+    from .runtime import auto_install_enabled, load
+
+    do = auto_install_enabled() if install is None else install
+    if not do:
+        return browser_available()
+    load("playwright")  # the python package — installed if absent
+    # The browser binary is separate from the pip package; install it once if
+    # Playwright can't find the Chromium executable.
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        if pw.chromium.executable_path:
+            return True
+    import subprocess
+    import sys
+
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                   check=False)
+    return browser_available()
 
 
 class Browser:
@@ -328,6 +362,9 @@ class Browser:
         self.page: Any = None
 
     def __enter__(self) -> "Browser":
+        from .runtime import load
+
+        load("playwright")  # auto-install the package on first use if missing
         from playwright.sync_api import sync_playwright
 
         self._pw = sync_playwright().start()

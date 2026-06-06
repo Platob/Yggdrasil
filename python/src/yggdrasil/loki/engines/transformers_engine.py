@@ -56,9 +56,10 @@ class TransformersEngine(TokenEngine):
         model = self.resolve_model(messages=messages, system=system, tier=tier)
         pipe = self._PIPES.get(model)
         if pipe is None:
-            from transformers import pipeline
+            from ..runtime import load
 
-            pipe = self._PIPES[model] = pipeline(
+            load("torch")  # the pipeline backend — auto-installed if missing
+            pipe = self._PIPES[model] = load("transformers").pipeline(
                 "text-generation", model=model,
                 device=self.device, trust_remote_code=False,
             )

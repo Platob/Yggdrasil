@@ -116,7 +116,7 @@ class TestWebSkillAutomation(unittest.TestCase):
         from yggdrasil.loki.capability import Backend
 
         loki = Loki(); loki._backends = [Backend("local", True)]
-        with patch.object(web, "browser_available", return_value=True), \
+        with patch.object(web, "ensure_browser", return_value=True), \
              patch.object(web, "fill_form", return_value={"url": "u", "title": "t"}) as ff:
             res = loki.run("web", url="https://site/form", action="form",
                            fields={"#a": "1"}, submit="#go")
@@ -129,7 +129,7 @@ class TestWebSkillAutomation(unittest.TestCase):
         from yggdrasil.loki.capability import Backend
 
         loki = Loki(); loki._backends = [Backend("local", True)]
-        with patch.object(web, "browser_available", return_value=False):
+        with patch.object(web, "ensure_browser", return_value=False):
             res = loki.run("web", url="https://x", action="interact", steps=[])
         self.assertIn("install", res)
         self.assertIn("playwright", res["install"])

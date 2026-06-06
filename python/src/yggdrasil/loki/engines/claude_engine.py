@@ -134,7 +134,9 @@ class ClaudeEngine(TokenEngine):
 
     def _request(self, messages, system, max_tokens, tier, options):
         """Build the (client, kwargs, model) shared by complete + stream."""
-        import anthropic
+        from ..runtime import load
+
+        anthropic = load("anthropic")
 
         # Adaptive default: pick fast/deep from the request unless pinned.
         model = self.resolve_model(messages=messages, system=system, tier=tier)

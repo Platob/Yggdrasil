@@ -35,7 +35,9 @@ def _sanitize(obj: Any) -> Any:
 
 def build_server(loki: "Optional[Loki]" = None) -> "FastMCP":
     """Build the Loki MCP server (does not run it). Registers the agent's tools."""
-    from mcp.server.fastmcp import FastMCP
+    from .runtime import load
+
+    FastMCP = load("mcp.server.fastmcp", "mcp").FastMCP
 
     from . import Loki
 

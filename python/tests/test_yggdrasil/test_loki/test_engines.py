@@ -317,8 +317,9 @@ class TestTransformersEngine(unittest.TestCase):
 
         fake = types.ModuleType("transformers")
         fake.pipeline = MagicMock(return_value=pipe)
+        fake_torch = types.ModuleType("torch")   # the pipeline backend (loaded first)
         METER.reset()
-        with patch.dict(sys.modules, {"transformers": fake}):
+        with patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch}):
             out = TransformersEngine(model="m").generate("hi", system="sys")
         self.assertEqual(out, "local reply")
         # System prompt leads the chat; new-token cap kept small for CPU.

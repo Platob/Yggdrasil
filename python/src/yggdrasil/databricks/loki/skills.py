@@ -10,8 +10,8 @@ global Loki catalog on import, so ``ygg loki behaviors`` lists them and
 Read/list operations are the default (safe to run); the few that act (run a
 job, query a serving endpoint, execute SQL) take explicit arguments. The
 catalog mirrors the client's accessors: ``sql``, ``tables``, ``warehouses``,
-``jobs``, ``clusters``, ``volumes``, ``secrets``, ``iam``, ``serving``
-(``genie`` ships in the global behavior set).
+``jobs``, ``clusters``, ``volumes``, ``secrets``, ``iam``, ``serving``, and
+``genie`` (AI/BI Genie spaces).
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ __all__ = [
     "DatabricksSecretsSkill",
     "DatabricksIAMSkill",
     "DatabricksServingSkill",
+    "GenieSkill",
 ]
 
 
@@ -297,3 +298,39 @@ class DatabricksServingSkill(DatabricksServiceSkill):
             return {"endpoint": eng.endpoint, "reply": eng.generate(prompt)}
         eps = client.workspace_client().serving_endpoints.list()
         return {"endpoints": _names(eps, attrs=("name", "id"))}
+
+
+@register
+class GenieSkill(DatabricksServiceSkill):
+    """Ask a Databricks AI/BI Genie space a question (text + SQL + rows).
+
+    A Databricks-native skill: it drives ``dbc.genie`` through the agent's
+    token provider. When no space is named it reasons against the first space
+    the current user can reach.
+    """
+
+    name = "genie"
+    description = "Ask a Databricks AI/BI Genie space a question (text + SQL + rows)."
+
+    def run(self, agent: "Loki", *, question: str, space: Optional[str] = None,
+            rows: bool = False, **_: Any) -> dict[str, Any]:
+        client = self._client(agent)
+        if space is None:
+            spaces = client.genie.spaces()
+            if not spaces:
+                raise RuntimeError("no Genie spaces are accessible to this user")
+            target = spaces[0]
+        else:
+            target = client.genie.space(space)
+
+        answer = target.ask(question)
+        out: dict[str, Any] = {
+            "space_id": target.space_id,
+            "conversation_id": answer.conversation_id,
+            "text": answer.text,
+            "query": answer.query,
+            "statement_id": answer.statement_id,
+        }
+        if rows and answer.query:
+            out["rows"] = answer.to_polars()
+        return out

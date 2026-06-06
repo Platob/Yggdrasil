@@ -38,6 +38,25 @@ class TestDatabricksBehaviors(_Base):
         with self.assertRaises(RuntimeError):
             loki.run("databricks-sql", query="select 1")
 
+    def test_genie_is_a_databricks_skill_and_asks_first_space(self):
+        # Genie now lives in the Databricks fleet (not the base Loki catalog).
+        names = {b.name for b in Loki().skills()}
+        self.assertIn("genie", names)
+        beh = next(b for b in Loki().skills() if b.name == "genie")
+        self.assertEqual(beh.requires, "databricks")
+
+        client = MagicMock()
+        space = MagicMock(); space.space_id = "s1"
+        answer = MagicMock()
+        answer.conversation_id = "c1"; answer.text = "hi"; answer.query = None
+        answer.statement_id = None
+        space.ask.return_value = answer
+        client.genie.spaces.return_value = [space]
+        loki = self._loki_with_client(client)
+        out = loki.run("genie", question="how many orders?")
+        self.assertEqual((out["space_id"], out["text"]), ("s1", "hi"))
+        client.genie.spaces.assert_called_once()
+
     def test_sql_executes_and_returns_rows(self):
         client = MagicMock()
         result = MagicMock(); result.statement_id = "st1"

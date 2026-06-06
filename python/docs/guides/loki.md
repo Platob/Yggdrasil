@@ -412,8 +412,9 @@ web.read_image("https://…/logo.png")           # → bytes + dims + content-ty
 Reading a page is a plain HTTP fetch; *operating* one — typing into fields,
 ticking boxes, clicking buttons, submitting a form and reading what the page
 becomes — drives a real **headless browser** (`web.Browser`, Playwright /
-Chromium, imported lazily). Available when `pip install playwright && playwright
-install chromium` has been run (`web.browser_available()`):
+Chromium, imported lazily). Playwright (and its Chromium binary) **auto-install
+on first use** — `web.ensure_browser()` pulls them on demand — unless you
+disable that (see *Auto-installing optional deps* below):
 
 ```python
 from yggdrasil.loki import web
@@ -464,12 +465,18 @@ the last N weeks", a `.csv`/`.parquet`, …). When such a request carries a
 source URL, the router sends it to the **data path** (`category: "data"`,
 action `tabular`) instead of a plain page fetch — the `tabular` behavior:
 
-1. **fetches it into a polars frame** — tabular bodies through the io handlers,
-   JSON normalized into a flat/long frame (a time series → `date/symbol/value`);
+1. **fetches it into a polars frame** through `web.read_table` — i.e. the io
+   tabular handlers (`HTTPResponse.to_polars()` auto-detects CSV / JSON /
+   Parquet / Arrow / XLSX); the io layer owns JSON→frame, not a bespoke
+   normalizer;
 2. **caches an optimized Parquet copy** in the session `cache/` via the io
    abstraction (`IO.from_(path).write_polars_frame(df)`);
 3. **proposes next steps** — reuse the cache, store elsewhere
    (Parquet / Arrow / CSV / Delta), or load it into Databricks.
+
+The frame preview it returns is the **token-efficient `dataproto` encoding**
+(see *Sharing data with a model* below), so the sample handed to the LLM is
+compact.
 
 ```text
 ⟢ get EUR/USD exchange rates over the last 2 weeks from https://api.frankfurter.dev/…
@@ -487,6 +494,49 @@ action `tabular`) instead of a plain page fetch — the `tabular` behavior:
 res = loki.run("tabular", url="https://…/rates.json")   # fetch → frame → cache
 loki.run("tabular", cache=res["cached_to"], store="prices.parquet")   # reuse + store
 ```
+
+## Sharing data with a model (`yggdrasil.loki.dataproto`)
+
+Putting a table in front of an LLM is a token-budget problem: the model reads
+text, and verbose encodings spend most tokens on punctuation. `dataproto` picks
+the **most compact legible encoding — CSV with a one-line schema header** — and
+keeps the binary channel separate. Measured on a 100-row × 5-col frame:
+
+| format | tokens (vs CSV) | role |
+|---|---|---|
+| **csv** | **1.00×** | into the model's context |
+| tsv | 1.00× | — |
+| markdown | 1.28× | (avoided — punctuation tax) |
+| Arrow IPC (zstd, base64) | 1.40× | binary wire only, *not* a prompt |
+| json records | 2.01× | (avoided) |
+
+So tabular previews/observations go to the model via `dataproto.encode(df)`
+(schema header + CSV, truncated with a note), while the **compressed Arrow IPC**
+channel (`dataproto.to_ipc` / `from_ipc`) carries data between tools, agents,
+and the cache where no model reads it — smallest on the wire, but token-hostile
+in a prompt. `dataproto.compare(df)` reports the bytes/tokens per format (plug a
+real tokenizer) so the choice stays evidence-based.
+
+```python
+from yggdrasil.loki import dataproto
+
+dataproto.encode(df)                 # "# 150 rows × 3 cols | date:str, …\ndate,sym,…"
+dataproto.best_text_format(df)       # "csv"
+ipc = dataproto.to_ipc(df)           # compressed Arrow IPC bytes (inter-agent)
+dataproto.from_ipc(ipc)              # → frame, lossless round-trip
+```
+
+## Auto-installing optional deps (`YGG_LOKI_AUTO_INSTALL`)
+
+Loki reaches for heavy optional packages only when a feature needs one — an
+engine SDK (`anthropic` / `openai`), a local-model runtime (`transformers` +
+`torch`), a headless browser (`playwright`), the MCP server (`mcp`). Rather than
+fail, it **installs the missing package into the running interpreter on first
+use** (`yggdrasil.loki.runtime.load`, routed through the project's
+`PyEnv.runtime_import_module` against `sys.executable`). Probes
+(`engine.available()`, `web.browser_available()`) never install — only the code
+path that actually needs the package does. Set `YGG_LOKI_AUTO_INSTALL=0` to turn
+this off, and a missing package raises the normal `ImportError` instead.
 
 ## Sessions & memory
 
