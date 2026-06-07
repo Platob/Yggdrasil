@@ -205,7 +205,12 @@ def _print_hardware(style: Any) -> None:
 
     snap = resources.snapshot()
     accel = {"cuda": "NVIDIA GPU (cuda)", "xpu": "Intel GPU (xpu)",
-             "mps": "Apple GPU (mps)"}.get(snap.get("accelerator") or "", "CPU only")
+             "mps": "Apple GPU (mps)"}.get(snap.get("accelerator") or "", None)
+    if accel is None:
+        # Present but torch can't drive it yet — name it and point at the fix,
+        # so the GPU shows instead of a flat "CPU only".
+        accel = (style.brand("Intel GPU") + style.dim(" (present · pip install intel-extension-for-pytorch to use)")
+                 if snap.get("intel_gpu") else "CPU only")
     bits = [f"{snap['cpu']} cores", f"{snap['ram_gb']:g} GB", accel]
     if snap.get("npu"):
         bits.append(style.brand("Intel NPU"))

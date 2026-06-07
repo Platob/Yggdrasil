@@ -96,9 +96,19 @@ class TestHardwareLine(unittest.TestCase):
 
     def test_cpu_only_box(self):
         line = self._render({"cpu": 4, "ram_gb": 8.0, "gpu": False,
-                             "accelerator": None, "npu": False})
+                             "accelerator": None, "intel_gpu": False, "npu": False})
         self.assertIn("CPU only", line)
         self.assertNotIn("NPU", line)
+
+    def test_present_intel_gpu_without_torch_support(self):
+        # torch can't drive it (accelerator None) but the OS detected the iGPU:
+        # show the GPU + the install hint instead of a flat "CPU only".
+        line = self._render({"cpu": 8, "ram_gb": 16.0, "gpu": False,
+                             "accelerator": None, "intel_gpu": True, "npu": True})
+        self.assertIn("Intel GPU", line)
+        self.assertNotIn("CPU only", line)
+        self.assertIn("intel-extension-for-pytorch", line)
+        self.assertIn("Intel NPU", line)
 
 
 class TestActMonitor(unittest.TestCase):

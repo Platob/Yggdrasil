@@ -938,17 +938,62 @@ class TestResourceAccelerator(unittest.TestCase):
         ov.Core = lambda: types.SimpleNamespace(available_devices=["CPU", "GPU", "NPU"])
         with patch.dict(sys.modules, {"openvino": ov}):
             self.assertTrue(resources.has_npu())
-        # No NPU listed → False.
+        # No NPU listed → falls through to the OS probe (stubbed off here so the
+        # result is deterministic on a host that actually has an NPU).
         ov.Core = lambda: types.SimpleNamespace(available_devices=["CPU", "GPU"])
-        with patch.dict(sys.modules, {"openvino": ov}):
+        with patch.dict(sys.modules, {"openvino": ov}), \
+                patch.object(resources, "_os_has_npu", return_value=False):
             self.assertFalse(resources.has_npu())
 
-    def test_has_npu_false_when_openvino_missing(self):
+    def test_has_npu_falls_back_to_os_probe_without_openvino(self):
         from yggdrasil.loki import resources
 
-        # Importing a guaranteed-absent module name fails → best-effort False.
-        with patch.dict(sys.modules, {"openvino": None}):
+        # No OpenVINO, but the OS reports the intel_vpu accel device → True.
+        with patch.dict(sys.modules, {"openvino": None}), \
+                patch.object(resources, "_os_has_npu", return_value=True):
+            self.assertTrue(resources.has_npu())
+        with patch.dict(sys.modules, {"openvino": None}), \
+                patch.object(resources, "_os_has_npu", return_value=False):
             self.assertFalse(resources.has_npu())
+
+    def test_os_has_npu_matches_intel_vpu_accel_device(self):
+        from yggdrasil.loki import resources
+
+        # A /sys/class/accel/accel0 whose driver is intel_vpu → NPU present.
+        with patch.object(resources.glob, "glob",
+                          side_effect=lambda p: ["/sys/class/accel/accel0"] if "accel" in p else []), \
+                patch.object(resources.os, "readlink", return_value="/.../bus/pci/drivers/intel_vpu"):
+            self.assertTrue(resources._os_has_npu())
+        # Nothing present anywhere → False.
+        with patch.object(resources.glob, "glob", return_value=[]):
+            self.assertFalse(resources._os_has_npu())
+
+    def test_intel_gpu_present_reads_drm_vendor(self):
+        from unittest.mock import mock_open
+
+        from yggdrasil.loki import resources
+
+        with patch.object(resources.glob, "glob",
+                          return_value=["/sys/class/drm/card0/device/vendor"]), \
+                patch("builtins.open", mock_open(read_data="0x8086\n")):
+            self.assertTrue(resources.intel_gpu_present())
+        # A non-Intel vendor id (NVIDIA 0x10de) → not an Intel GPU.
+        with patch.object(resources.glob, "glob",
+                          return_value=["/sys/class/drm/card0/device/vendor"]), \
+                patch("builtins.open", mock_open(read_data="0x10de\n")):
+            self.assertFalse(resources.intel_gpu_present())
+
+    def test_snapshot_reports_present_intel_gpu_even_without_torch(self):
+        from yggdrasil.loki import resources
+
+        # torch can't drive it (accelerator None) but the OS sees the iGPU.
+        with patch.object(resources, "accelerator", return_value=None), \
+                patch.object(resources, "intel_gpu_present", return_value=True), \
+                patch.object(resources, "has_npu", return_value=False):
+            snap = resources.snapshot()
+        self.assertTrue(snap["intel_gpu"])
+        self.assertIsNone(snap["accelerator"])
+        self.assertFalse(snap["gpu"])
 
 
 if __name__ == "__main__":
