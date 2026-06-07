@@ -29,24 +29,7 @@ class TestEnvironmentHelp(unittest.TestCase):
 
 
 class TestEnvironmentEnsure(unittest.TestCase):
-    def test_bare_command_get_or_installs_local_python_env(self):
-        buf = io.StringIO()
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
-                   return_value=[_env(None)]) as ensure, \
-             contextlib.redirect_stdout(buf):
-            rc = main(["environment"])
-        self.assertEqual(rc, 0)
-        ensure.assert_called_once()
-        # local Python only, no forced rebuild
-        self.assertEqual(ensure.call_args.kwargs["versions"], [None])
-        self.assertFalse(ensure.call_args.kwargs["rebuild"])
-        out = buf.getvalue()
-        self.assertIn("ygg-1.0-py3X.yml", out)
-        self.assertIn("ygg-1.0-py3X.requirements.txt", out)
-
-    def test_all_versions_and_rebuild_flow_through(self):
+    def test_bare_command_builds_all_supported_pythons(self):
         from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
 
         with patch("yggdrasil.databricks.client.DatabricksClient"), \
@@ -54,10 +37,29 @@ class TestEnvironmentEnsure(unittest.TestCase):
              patch("yggdrasil.databricks.job.wheel.ensure_environments",
                    return_value=[_env(v) for v in SUPPORTED_PYTHONS]) as ensure, \
              contextlib.redirect_stdout(io.StringIO()):
-            rc = main(["environment", "--all-versions", "--rebuild"])
+            rc = main(["environment", "--rebuild"])
         self.assertEqual(rc, 0)
+        ensure.assert_called_once()
+        # default → every supported Python
         self.assertEqual(ensure.call_args.kwargs["versions"], list(SUPPORTED_PYTHONS))
         self.assertTrue(ensure.call_args.kwargs["rebuild"])
+
+    def test_current_get_or_installs_local_python_env(self):
+        buf = io.StringIO()
+        with patch("yggdrasil.databricks.client.DatabricksClient"), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+                   return_value=[_env(None)]) as ensure, \
+             contextlib.redirect_stdout(buf):
+            rc = main(["environment", "--current"])
+        self.assertEqual(rc, 0)
+        ensure.assert_called_once()
+        # ``--current`` → local Python only, no forced rebuild
+        self.assertEqual(ensure.call_args.kwargs["versions"], [None])
+        self.assertFalse(ensure.call_args.kwargs["rebuild"])
+        out = buf.getvalue()
+        self.assertIn("ygg-1.0-py3X.yml", out)
+        self.assertIn("ygg-1.0-py3X.requirements.txt", out)
 
     def test_alias_env_works(self):
         with patch("yggdrasil.databricks.client.DatabricksClient"), \

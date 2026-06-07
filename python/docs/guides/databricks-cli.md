@@ -713,7 +713,11 @@ Shared flags (accepted on `deploy` and most subcommands):
 |---|---|
 | `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`) |
 | `--rebuild` | Force a fresh build even if the version is already deployed |
-| `--all-versions` | One wheel + environment per supported Python (3.10–3.13) |
+| `--current` | Only the local interpreter's Python (default: **all** supported, 3.10–3.13) |
+
+> By default the deploy builds a wheel + environment for **every** supported
+> Python (3.10–3.13), so jobs and clusters on any runtime find their image.
+> Pass `--current` to narrow it to the local interpreter's Python.
 
 ### Bare `deploy`
 
@@ -722,9 +726,9 @@ serverless `JobEnvironment` JSON assembled off that fresh build (no double
 build).
 
 ```bash
-ygg databricks deploy
+ygg databricks deploy              # all supported Pythons
 ygg databricks deploy --rebuild
-ygg databricks deploy --all-versions
+ygg databricks deploy --current    # only the local Python
 ```
 
 ### `deploy ygg`
@@ -733,8 +737,8 @@ Build + upload only the versioned ygg image wheel(s); prints the deployed
 workspace path(s).
 
 ```bash
-ygg databricks deploy ygg
-ygg databricks deploy ygg --all-versions
+ygg databricks deploy ygg              # all supported Pythons
+ygg databricks deploy ygg --current
 ```
 
 ### `deploy wheel <package>`
@@ -744,13 +748,13 @@ Build + upload **any** package's wheel(s) by import or distribution name.
 | Flag | Purpose |
 |---|---|
 | `--extra` | Optional-dependency extra to fold in (repeatable) |
-| `-r`, `--requirement` | Extra requirement to bundle alongside (repeatable) |
-| `--no-deps` | Project wheel only; deps resolve on the cluster |
-| `--all-versions` | A wheel for every supported Python |
+| `-r`, `--requirement` | Extra requirement to bundle alongside (`--current` only, repeatable) |
+| `--no-deps` | Project wheel only; deps resolve on the cluster (`--current` only) |
+| `--current` | Only the local interpreter's Python (default: all supported) |
 
 ```bash
-ygg databricks deploy wheel yggdrasil --extra databricks
-ygg databricks deploy wheel mypkg -r "pandas>=2" --no-deps
+ygg databricks deploy wheel yggdrasil --extra databricks   # all supported Pythons
+ygg databricks deploy wheel mypkg --current -r "pandas>=2" --no-deps
 ```
 
 ### `deploy environment`
@@ -761,14 +765,14 @@ JSON — ready to paste into a job's `environments` block. Aliased as
 
 | Flag | Purpose |
 |---|---|
-| `--key` | `environment_key` for the config (default `default`) |
-| `--env-version` | Serverless environment version (default: matched to local Python) |
+| `--key` | `environment_key` for the config (`--current` only; default `default`) |
+| `--env-version` | Serverless environment version (`--current` only; default: matched to local Python) |
 | `--rebuild` | Force a fresh wheel build first |
-| `--all-versions` | One `JobEnvironment` per supported Python plus a default |
+| `--current` | Only the local interpreter's Python (default: one per supported Python) |
 
 ```bash
-ygg databricks deploy environment --key default
-ygg databricks deploy env --all-versions > environments.json
+ygg databricks deploy environment > environments.json   # all supported Pythons
+ygg databricks deploy env --current --key default
 ```
 
 ### `deploy project [path]`
