@@ -1,4 +1,4 @@
-"""Dispatch tests for ``ygg databricks environment`` (mocked ``dbc.environments``)."""
+"""Dispatch tests for ``ygg databricks environment`` — CRUD via ``dbc.environments``."""
 from __future__ import annotations
 
 import contextlib
@@ -10,17 +10,23 @@ from unittest.mock import MagicMock, patch
 from yggdrasil.databricks.cli import main
 
 
-def _env(python=None):
-    """An ``Environment``-shaped handle (the CLI reads ``.name`` / ``.serverless`` / …)."""
-    key = "py" + (python or "3X").replace(".", "")
-    name = f"ygg-1.0-{key}"
-    env_dir = f"/Workspace/Shared/environments/{name}"
+def _env(name="ygg-1.0-py311"):
+    env_dir = f"/Workspace/Shared/environment/{name.split('-')[0]}"
     return types.SimpleNamespace(
-        name=name, project="ygg", env_dir=env_dir, python=python,
+        name=name, project="ygg",
         serverless=f"{env_dir}/{name}.yml",
         cluster=f"{env_dir}/{name}.requirements.txt",
-        dependencies=["a", "b", "c", "d", "e", "f", "g"],
+        dependencies=["a", "b", "c"],
     )
+
+
+def _run(argv, client):
+    buf = io.StringIO()
+    with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+         patch("yggdrasil.cli.style.print_logo"), \
+         contextlib.redirect_stdout(buf):
+        rc = main(argv)
+    return rc, buf.getvalue()
 
 
 class TestEnvironmentHelp(unittest.TestCase):
@@ -30,69 +36,62 @@ class TestEnvironmentHelp(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0)
 
 
-class TestEnvironmentEnsure(unittest.TestCase):
-    def test_bare_command_builds_all_supported_pythons(self):
-        from yggdrasil.databricks.wheels.service import SUPPORTED_PYTHONS
-
+class TestEnvironmentCreate(unittest.TestCase):
+    def test_create_builds_and_writes(self):
         client = MagicMock()
-        client.environments.deploy_ygg.return_value = [_env(v) for v in SUPPORTED_PYTHONS]
-        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             contextlib.redirect_stdout(io.StringIO()):
-            rc = main(["environment", "--rebuild"])
+        client.environments.create.return_value = _env()
+        rc, out = _run(["environment", "create", "ygg", "--python", "3.11", "--extra", "databricks"], client)
         self.assertEqual(rc, 0)
-        client.environments.deploy_ygg.assert_called_once()
-        # default → every supported Python
-        self.assertEqual(client.environments.deploy_ygg.call_args.kwargs["versions"], list(SUPPORTED_PYTHONS))
-        self.assertTrue(client.environments.deploy_ygg.call_args.kwargs["rebuild"])
+        client.environments.create.assert_called_once()
+        self.assertEqual(client.environments.create.call_args.args[0], "ygg")
+        self.assertEqual(client.environments.create.call_args.kwargs["python"], "3.11")
+        self.assertIn("ygg-1.0-py311.yml", out)
 
-    def test_current_get_or_installs_local_python_env(self):
+    def test_update_overwrites(self):
         client = MagicMock()
-        client.environments.deploy_ygg.return_value = [_env(None)]
-        buf = io.StringIO()
-        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             contextlib.redirect_stdout(buf):
-            rc = main(["environment", "--current"])
+        client.environments.update.return_value = _env()
+        rc, _ = _run(["environment", "update", "ygg"], client)
         self.assertEqual(rc, 0)
-        client.environments.deploy_ygg.assert_called_once()
-        # ``--current`` → local Python only, no forced rebuild
-        self.assertEqual(client.environments.deploy_ygg.call_args.kwargs["versions"], [None])
-        self.assertFalse(client.environments.deploy_ygg.call_args.kwargs["rebuild"])
-        out = buf.getvalue()
-        self.assertIn("ygg-1.0-py3X.yml", out)
-        self.assertIn("ygg-1.0-py3X.requirements.txt", out)
+        client.environments.update.assert_called_once()
 
-    def test_alias_env_works(self):
+
+class TestEnvironmentFindGet(unittest.TestCase):
+    def test_find_builds_on_miss(self):
         client = MagicMock()
-        client.environments.deploy_ygg.return_value = [_env(None)]
-        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             contextlib.redirect_stdout(io.StringIO()):
-            rc = main(["env"])
+        client.environments.find.return_value = _env()
+        rc, out = _run(["environment", "find", "ygg"], client)
         self.assertEqual(rc, 0)
-        client.environments.deploy_ygg.assert_called_once()
+        self.assertTrue(client.environments.find.call_args.kwargs["install"])
+        self.assertIn("ygg-1.0-py311.requirements.txt", out)
+
+    def test_get_missing_returns_one(self):
+        client = MagicMock()
+        client.environments.get.return_value = None
+        rc, _ = _run(["environment", "get", "ygg"], client)
+        self.assertEqual(rc, 1)
+
+
+class TestEnvironmentDelete(unittest.TestCase):
+    def test_delete_removes(self):
+        client = MagicMock()
+        client.environments.delete.return_value = [_env()]
+        rc, out = _run(["environment", "delete", "ygg"], client)
+        self.assertEqual(rc, 0)
+        self.assertIn("deleted", out)
 
 
 class TestEnvironmentList(unittest.TestCase):
-    def test_list_prints_deployed_files(self):
+    def test_list_prints_files(self):
         client = MagicMock()
-        client.environments.list.return_value = [_env("3.12")]
-        buf = io.StringIO()
-        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             contextlib.redirect_stdout(buf):
-            rc = main(["environment", "list"])
+        client.environments.list.return_value = [_env("ygg-1.0-py312")]
+        rc, out = _run(["environment", "list"], client)
         self.assertEqual(rc, 0)
-        self.assertIn("ygg-1.0-py312.yml", buf.getvalue())
+        self.assertIn("ygg-1.0-py312.yml", out)
 
     def test_list_empty_returns_one(self):
         client = MagicMock()
         client.environments.list.return_value = []
-        with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             contextlib.redirect_stdout(io.StringIO()):
-            rc = main(["environment", "list"])
+        rc, _ = _run(["env", "list"], client)
         self.assertEqual(rc, 1)
 
 

@@ -136,36 +136,26 @@ class SeedCommand:
             style.fail(f"cannot reach workspace: {exc}")
             return 1
 
-        from yggdrasil.databricks.wheels import service as whl
-        from yggdrasil.databricks.environments import service as E
-        workspace_dir = (args.workspace_dir or whl.WORKSPACE_PYPI_DIR).rstrip("/")
-        import importlib.metadata as ilmd
-        version = ilmd.version("ygg")
+        from yggdrasil.databricks.wheels.service import SUPPORTED_PYTHONS
+        pythons = list(SUPPORTED_PYTHONS) if all_versions else [None]
 
         # -- wheels ------------------------------------------------------
         style.info("wheels")
         try:
-            dist_dir = f"{workspace_dir}/ygg"
             if check:
-                existing = whl.deployed_wheels(
-                    client, "ygg", version, workspace_dir=dist_dir, dist_only=True,
-                )
-                if existing:
-                    for path in existing:
-                        style.out(f"    {style.dim('found')}  {path}\n")
-                    style.ok(f"ygg {version} wheel deployed")
+                wheel = client.wheels.get("ygg")
+                if wheel is not None:
+                    style.out(f"    {style.dim('found')}  {wheel.path}\n")
+                    style.ok(f"ygg {wheel.version} wheel deployed")
                 else:
-                    style.warn(f"ygg {version} wheel not deployed under {dist_dir}")
+                    style.warn("ygg wheel not deployed")
                     ok = False
             else:
-                with style.Spinner(f"building ygg {version} wheel…"):
-                    if all_versions:
-                        paths = whl.ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=rebuild)
-                    else:
-                        paths = whl.ensure_ygg_wheel(client, workspace_dir=workspace_dir, rebuild=rebuild)
-                for path in paths:
-                    style.out(f"    {style.dim('wheel')}  {path}\n")
-                style.ok(f"ygg {version} wheel ready ({len(paths)})")
+                with style.Spinner("fetching + uploading ygg wheel…"):
+                    wheels = client.wheels.create("ygg", rebuild=rebuild)
+                for w in wheels:
+                    style.out(f"    {style.dim('wheel')}  {w.path}\n")
+                style.ok(f"ygg wheel ready ({len(wheels)})")
         except Exception as exc:
             style.fail(f"wheel step failed: {exc}")
             ok = False
@@ -174,48 +164,26 @@ class SeedCommand:
         style.info("environments")
         try:
             if check:
-                # Read-only: verify the reusable environment files were written.
-                persisted = E.deployed_environments(client)
-                if persisted:
-                    for path in persisted[:6]:
-                        style.out(f"    {style.dim('found')}  {path}\n")
-                    style.ok("base environment files present (serverless + cluster)")
+                env = client.environments.get("ygg")
+                if env is not None:
+                    style.out(f"    {style.dim('found')}  {env.serverless}\n")
+                    style.ok("base environment present (serverless + cluster)")
                 else:
-                    style.warn(f"no base environment files under {E.WORKSPACE_ENV_DIR}")
+                    style.warn("no ygg base environment deployed")
                     ok = False
             else:
-                # Persist the version-pinned base environments under the project
-                # folder /Workspace/Shared/environment/ygg. Each Python gets a
-                # version-tagged pair in that one folder — a serverless
-                # ``ygg-<version>-py3XX.yml`` (referenced by path via
-                # ``base_environment``) and a classic-cluster
-                # ``ygg-<version>-py3XX.requirements.txt``. Both list that
-                # Python's whole transitive dependency set as wheels in the
-                # shared pypi registry (/Workspace/Shared/pypi) — so the runtime
-                # installs with zero PyPI access and the env is self-describing. With
-                # --all-versions/--overwrite this covers every supported Python
-                # (3.10–3.13); otherwise just the local one.
-                pythons = list(whl.SUPPORTED_PYTHONS) if all_versions else [None]
-                # Each Python gets a version-tagged spec pair in the shared ygg
-                # project folder; their wheel closures land in the shared pypi
-                # registry, so the per-Python builds overlap on a thread pool.
+                # The project's zero-PyPI base environment(s): one version-tagged
+                # serverless ``.yml`` + cluster ``.requirements.txt`` per Python,
+                # each listing the whole wheel closure from the shared registry.
                 plural = "s" if len(pythons) > 1 else ""
-                with style.Spinner(
-                    f"building {len(pythons)} base environment{plural} "
-                    f"(parallel, wheel bundle into shared pypi)…"
-                ):
-                    envs = E.ensure_environments(
-                        client, versions=pythons,
-                        workspace_dir=E.WORKSPACE_ENV_DIR, rebuild=rebuild,
-                        mode=deploy_mode,
-                    )
+                with style.Spinner(f"building {len(pythons)} base environment{plural} "
+                                   f"(wheel bundle into shared pypi)…"):
+                    envs = [client.environments.create("ygg", python=py, rebuild=rebuild)
+                            for py in pythons]
                 for env in envs:
-                    style.out(
-                        f"    {style.dim(env['key'])}  {env['n_wheels']} wheels  "
-                        f"{style.dim('dir')} {env['env_dir']}\n"
-                    )
-                    style.out(f"          {style.dim('serverless')} {env['serverless']}\n")
-                    style.out(f"          {style.dim('cluster')}    {env['cluster']}\n")
+                    style.out(f"    {style.dim(env.name)}  {len(env.dependencies)} wheels\n")
+                    style.out(f"          {style.dim('serverless')} {env.serverless}\n")
+                    style.out(f"          {style.dim('cluster')}    {env.cluster}\n")
                 style.ok(
                     f"base environments written for {len(envs)} Python version(s) "
                     f"(serverless + cluster, wheels in shared pypi)"
@@ -350,11 +318,9 @@ class SeedCommand:
                     # seeded), so its requirements file — selected by Python version —
                     # matches the runtime it lands on.
                     local_python = f"3.{sys.version_info.minor}"
-                    env_name = E.ygg_base_environment_name()
-                    env_requirements = (
-                        f"{E.WORKSPACE_ENV_DIR}/{E.environment_folder('ygg')}/"
-                        f"{env_name}.requirements.txt"
-                    )
+                    seeded = client.environments.get("ygg", python=local_python) \
+                        or client.environments.get("ygg")
+                    env_requirements = seeded.cluster if seeded is not None else None
                     with style.Spinner("provisioning default single-user cluster…"):
                         # ``single_user_name`` flips the cluster to dedicated
                         # (single-user) access mode for the current user;
@@ -390,7 +356,7 @@ class SeedCommand:
                         f"    {style.dim('pool')}    "
                         f"{light_name if pool_id else style.dim('(standalone)')}\n"
                     )
-                    style.out(f"    {style.dim('env')}     {env_name}\n")
+                    style.out(f"    {style.dim('env')}     {seeded.name if seeded else '(none)'}\n")
                     style.ok(
                         "default single-user cluster ready "
                         "(dedicated, pool-backed, generic env, autoterminating)"

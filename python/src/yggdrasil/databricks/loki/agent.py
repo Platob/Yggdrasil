@@ -167,7 +167,7 @@ class DatabricksLoki(Loki):
                 parameters += ["--kwarg", f"{key}={json.dumps(value)}"]
 
         # Serverless environment carrying the pre-built ygg wheel image.
-        environment = client.environments.job_environment(environment_key="default")
+        environment = client.environments.find("ygg").job_environment(environment_key="default")
         task = Task(
             task_key="loki",
             environment_key="default",

@@ -76,8 +76,8 @@ class TablesCommand:
         elif args.environment is not None:
             environment = args.environment           # explicit shared env name
         else:
-            from yggdrasil.databricks.environments.service import ygg_base_environment_name
-            environment = ygg_base_environment_name()  # canonical version-pinned ygg image
+            from yggdrasil.databricks.environments.service import environment_stem
+            environment = environment_stem("ygg")  # canonical version-pinned ygg image
         deploy = not args.no_deploy
 
         style.step(

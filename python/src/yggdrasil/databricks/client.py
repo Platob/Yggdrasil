@@ -1166,55 +1166,8 @@ class DatabricksClient(Singleton, URLBased):
         return header
 
     # -------------------------------------------------------------------------
-    # Serverless ygg image — versioned wheel bundle + environment
+    # Serverless image — wheels + environments live on dbc.wheels / dbc.environments
     # -------------------------------------------------------------------------
-
-    def ensure_ygg_wheel(
-        self,
-        *,
-        rebuild: bool = False,
-        workspace_dir: Optional[str] = None,
-    ) -> list[str]:
-        """Get-or-create the **versioned pure-python ygg wheel** in this workspace.
-
-        A pinned, per-version image of the ``ygg`` package (CLI included), built
-        ``--no-deps`` (via uv) as a ``py3-none-any`` wheel and deployed into the
-        workspace's PyPI-like registry under the distribution's folder
-        (``/Workspace/Shared/pypi/ygg/ygg-<version>-py3-none-any.whl``), alongside
-        any other versions. The first call for a version builds + uploads it;
-        later calls find and reuse it. Pass ``rebuild=True`` to force a fresh
-        build. Returns the wheel's workspace path — a serverless job installs it
-        by path while resolving the runtime dependencies from the index (see
-        :meth:`ygg_environment`), so they land as platform-correct builds rather
-        than wheels bundled from this host.
-        """
-        wheels = self.wheels.deploy_ygg(
-            all_versions=False, rebuild=rebuild, workspace_dir=workspace_dir,
-        )
-        return [w.path for w in wheels]
-
-    def ygg_environment(
-        self,
-        *,
-        environment_key: str = "default",
-        environment_version: Optional[str] = None,
-        rebuild: bool = False,
-    ) -> Any:
-        """The serverless ``JobEnvironment`` for the versioned ygg image.
-
-        Pairs the serverless runtime — defaulting to
-        :func:`~yggdrasil.databricks.wheels.service.serverless_environment_version`
-        so the cluster Python matches the local interpreter — with the
-        get-or-created :meth:`ensure_ygg_wheel` bundle.
-        Drop it straight into a serverless job's ``environments=[...]`` so its
-        python-wheel tasks run the ``ygg`` CLI against a pinned, pre-installed
-        image.
-        """
-        return self.environments.job_environment(
-            environment_key=environment_key,
-            environment_version=environment_version,
-            rebuild=rebuild,
-        )
 
     def get_workspace_id(self) -> int:
         if self.workspace_id:
@@ -2147,9 +2100,9 @@ class DatabricksClient(Singleton, URLBased):
             # cluster without a public index (the same reason the loader job's
             # image uses a wheel). Its runtime dependencies ride along as index
             # requirement names so the cluster resolves platform-correct builds.
-            from yggdrasil.databricks.environments.service import ygg_runtime_dependencies
+            from yggdrasil.databricks.wheels.service import runtime_dependencies
 
-            deps = ["ygg", *ygg_runtime_dependencies(), *deps]
+            deps = ["ygg", *runtime_dependencies("ygg"), *deps]
 
         # Compute target: an explicit cluster (arg or ``cluster_id``) → classic;
         # otherwise serverless (the modern default — Spark Connect serverless

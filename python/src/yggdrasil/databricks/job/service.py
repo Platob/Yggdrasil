@@ -225,7 +225,7 @@ def _resolve_submit_environment(client: DatabricksClient, environment: Any) -> A
             spec=Environment(base_environment=spec_path),
         )
 
-    name = W.ygg_base_environment_name()
+    name = W.environment_stem("ygg")
     spec_path = _environment_spec_path(client, name)
     if spec_path is None:
         LOGGER.debug(

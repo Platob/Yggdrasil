@@ -129,7 +129,7 @@ class TestRunNotebookIntegration(DatabricksIntegrationCase):
             _resolve_submit_environment,
         )
 
-        name = W.ygg_base_environment_name()
+        name = W.environment_stem('ygg')
         spec_path = _environment_spec_path(self.client, name)
         if spec_path is None:
             self.skipTest(

@@ -251,26 +251,24 @@ def module_level_flow(x):
 
 
 def test_all_environments_attaches_one_env_per_python():
-    from yggdrasil.databricks.environments import service as W
+    import types
+    from unittest.mock import MagicMock, patch
 
     @flow(name="multi")
     def f(x):
         ...
 
     f.all_environments = True
-    # simulate a completed deploy build (per-Python wheel matrix stashed)
-    f._ygg_wheels = ["/ws/ygg-1.0-py3-none-any.whl"]
-    f._user_wheels = []
-    f._user_deps = []
-    f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl", "pyarrow>=20")
-    from unittest.mock import patch
-    with patch.object(W, "ygg_runtime_dependencies", return_value=["pyarrow>=20"]):
+    client = MagicMock()
+    client.environments.create.side_effect = lambda spec, *, extras=(), python=None, **k: \
+        types.SimpleNamespace(serverless=f"/ws/env/ygg-{python or 'default'}.yml", dependencies=[])
+    with patch.object(type(f), "_project_spec", return_value="ygg"):
+        f._serverless_dependencies(client)
         envs = f.environments()
     keys = [e.environment_key for e in envs]
     assert keys == ["default", "py310", "py311", "py312", "py313"]
     by = {e.environment_key: e for e in envs}
-    assert by["py310"].spec.environment_version == "1"
-    assert by["py311"].spec.environment_version == "2"
+    assert by["py311"].spec.base_environment == "/ws/env/ygg-3.11.yml"
 
 
 def test_default_only_single_environment_without_flag():
@@ -279,63 +277,44 @@ def test_default_only_single_environment_without_flag():
         ...
 
     f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl",)
-    envs = f.environments()
+    envs = f.environments()                          # no deploy yet → inline fallback
     assert [e.environment_key for e in envs] == ["default"]
 
 
-def test_named_base_environment_referenced_when_present():
-    @flow(name="yellowjob")
+def test_built_environment_referenced_by_path():
+    import types
+
+    @flow(name="job")
     def f(x):
         ...
 
-    # Simulate a deploy that wrote a reusable base env + a user-package layer.
-    f._base_environment_path = "/Workspace/Shared/environments/yellow.env.yaml"
-    f._user_layer = ["/ws/userpkg-2.0-py3-none-any.whl", "requests==2"]
-    f._wheel_paths = ("/ws/ygg-1.0-py3-none-any.whl",)  # inline fallback, unused here
-
+    # Simulate a deploy that built the project's base environment.
+    f._environment = types.SimpleNamespace(
+        serverless="/Workspace/Shared/environment/ygg/ygg-1.0-py311.yml", dependencies=[])
     envs = f.environments()
     assert len(envs) == 1
     spec = envs[0].spec
-    assert spec.base_environment == "/Workspace/Shared/environments/yellow.env.yaml"
-    # base env carries the version → not set alongside it; only the layer rides on top.
-    assert spec.environment_version is None
-    assert spec.dependencies == ["/ws/userpkg-2.0-py3-none-any.whl", "requests==2"]
+    assert spec.base_environment == "/Workspace/Shared/environment/ygg/ygg-1.0-py311.yml"
 
 
-def test_named_base_environment_empty_layer_is_none():
-    @flow(name="yellowonly")
-    def f(x):
-        ...
-
-    f._base_environment_path = "/Workspace/Shared/environments/yellow.env.yaml"
-    f._user_layer = []  # ygg-only job — nothing layered on top
-    envs = f.environments()
-    assert envs[0].spec.dependencies is None
-
-
-def test_serverless_dependencies_writes_base_env_and_splits_layer():
-    from yggdrasil.databricks.wheels import service as W
-    from yggdrasil.databricks.environments import service as E
+def test_serverless_dependencies_builds_env_via_service():
+    import types
+    from unittest.mock import MagicMock, patch
 
     @flow(name="splitjob")
     def f(x):
         ...
 
-    f.base_environment_name = "yellow"
-    client = object()
-    with patch.object(W, "is_editable_install", return_value=False), \
-         patch.object(W, "distribution_for", return_value="ygg"), \
-         patch.object(W, "_norm", side_effect=lambda s: s), \
-         patch.object(W, "ensure_ygg_wheels", return_value=["/ws/ygg-1.0-py3-none-any.whl"]), \
-         patch.object(W, "wheel_for_python", side_effect=lambda wheels, *a: wheels[0]), \
-         patch.object(E, "ygg_runtime_dependencies", return_value=["pyarrow>=20"]), \
-         patch.object(E, "ensure_named_environment", return_value="/ws/env/yellow.env.yaml") as ene:
+    client = MagicMock()
+    env = types.SimpleNamespace(
+        serverless="/ws/env/ygg-1.0-py311.yml",
+        dependencies=["/ws/pypi/ygg/ygg-1.0-py3-none-any.whl", "pyarrow>=20"])
+    client.environments.create.return_value = env
+    with patch.object(type(f), "_project_spec", return_value="ygg"):
         flat = f._serverless_dependencies(client)
 
-    # The shared ygg image (wheel + runtime) was written to the named env...
-    ene.assert_called_once()
-    assert ene.call_args.kwargs["dependencies"] == ["/ws/ygg-1.0-py3-none-any.whl", "pyarrow>=20"]
-    assert f._base_environment_path == "/ws/env/yellow.env.yaml"
-    assert f._user_layer == []                       # ygg-only → no layer
-    # ...and the flat fallback list is the union (here just the image).
-    assert flat == ["/ws/ygg-1.0-py3-none-any.whl", "pyarrow>=20"]
+    # The project's zero-PyPI base environment was built once through the service…
+    client.environments.create.assert_called_once()
+    assert f._environment is env
+    # …and its wheel closure is the flat (inline) fallback dependency list.
+    assert flat == ["/ws/pypi/ygg/ygg-1.0-py3-none-any.whl", "pyarrow>=20"]

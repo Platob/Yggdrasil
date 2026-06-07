@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 from yggdrasil.databricks.environments.service import (
     WORKSPACE_ENV_DIR,
     environment_folder,
-    ygg_base_environment_name,
+    environment_stem,
 )
 from yggdrasil.databricks.tests import DatabricksTestCase
 
@@ -18,7 +18,7 @@ _REQS = "/Workspace/Shared/environment/ygg/ygg-1.0-py312.requirements.txt"
 def _seeded_env_requirements() -> str:
     # The mock client can't resolve a cluster runtime → _default_ygg_layer falls
     # back to the local interpreter's Python, the new project-folder layout.
-    name = ygg_base_environment_name()
+    name = environment_stem('ygg')
     return f"{WORKSPACE_ENV_DIR}/{environment_folder('ygg')}/{name}.requirements.txt"
 
 

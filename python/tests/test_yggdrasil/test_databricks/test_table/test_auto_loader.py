@@ -94,7 +94,7 @@ class TestTableAutoLoader:
         assert Flow.call_args.kwargs["name"] == "[YGG][AUTOLOADER] cat.sch.tbl"
 
     def test_defaults_bundle_and_canonical_ygg_environment(self):
-        from yggdrasil.databricks.environments.service import ygg_base_environment_name
+        from yggdrasil.databricks.environments.service import environment_stem
 
         tbl = _table()
         with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
@@ -102,7 +102,7 @@ class TestTableAutoLoader:
         flow = Flow.return_value
         assert flow.bundle_dependencies is True
         # Default env is the version-pinned ygg image the seed writes, not "yellow".
-        assert flow.base_environment_name == ygg_base_environment_name()
+        assert flow.base_environment_name == environment_stem('ygg')
         assert flow.base_environment_name.startswith("ygg-")
 
     def test_job_is_tagged_with_table_source_format_and_trigger(self):

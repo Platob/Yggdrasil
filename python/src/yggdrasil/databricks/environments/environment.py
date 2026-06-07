@@ -1,15 +1,15 @@
 """``Environment`` — a deployed base environment in the workspace.
 
 A handle over a project's reusable image under
-``/Workspace/Shared/environment/<proj>/``: the serverless ``<stem>.yml``
-(``environment_version`` + wheel dependency paths) and the classic-cluster
-``<stem>.requirements.txt`` that sit side by side. Built by the
-:class:`~yggdrasil.databricks.environments.service.Environments` service; not
-constructed directly.
+``/Workspace/Shared/environment/<proj>/``: the serverless ``<stem>.yml`` and the
+classic-cluster ``<stem>.requirements.txt``. Built by the
+:class:`~yggdrasil.databricks.environments.service.Environments` service.
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Sequence
+
+from yggdrasil.version import VersionInfo
 
 from ..resource import DatabricksResource
 
@@ -26,28 +26,27 @@ class Environment(DatabricksResource):
         *,
         name: str,
         project: Optional[str] = None,
+        version: Optional[VersionInfo] = None,
+        python: Optional[str] = None,
         env_dir: Optional[str] = None,
         serverless: Optional[str] = None,
         cluster: Optional[str] = None,
         dependencies: Sequence[str] = (),
-        version: Optional[str] = None,
-        python: Optional[str] = None,
     ) -> None:
         super().__init__(service=service)
         #: Version-tagged file stem (``ygg-0.8.57-py311``).
         self.name = name
-        #: The project / distribution name (``ygg``), when known.
+        #: Project / distribution name (``ygg``).
         self.project = project
-        #: The project folder holding the env files.
-        self.env_dir = env_dir
-        #: Serverless ``.yml`` workspace path.
-        self.serverless = serverless
-        #: Classic-cluster ``.requirements.txt`` workspace path — the cluster
-        #: install layer (``Library(requirements=…)``).
-        self.cluster = cluster
-        self.dependencies = list(dependencies)
+        #: :class:`VersionInfo` of the image, when known.
         self.version = version
         self.python = python
+        self.env_dir = env_dir
+        #: Serverless ``.yml`` workspace path (a job's ``base_environment``).
+        self.serverless = serverless
+        #: Classic-cluster ``.requirements.txt`` path (the cluster install layer).
+        self.cluster = cluster
+        self.dependencies = list(dependencies)
 
     def _path(self, dest: Optional[str]) -> "Optional[WorkspacePath]":
         if dest is None:
@@ -58,17 +57,24 @@ class Environment(DatabricksResource):
 
     @property
     def serverless_path(self) -> "Optional[WorkspacePath]":
-        """The serverless ``.yml`` :class:`WorkspacePath` (job ``base_environment``)."""
         return self._path(self.serverless)
 
     @property
     def requirements_path(self) -> "Optional[WorkspacePath]":
-        """The cluster ``.requirements.txt`` :class:`WorkspacePath`."""
         return self._path(self.cluster)
 
     def exists(self) -> bool:
         p = self.serverless_path
         return bool(p and p.exists())
+
+    def job_environment(self, environment_key: str = "default") -> "Any":
+        """The serverless ``JobEnvironment`` referencing this image by path —
+        drop into a job's ``environments=[…]``."""
+        from databricks.sdk.service.compute import Environment as _Env
+        from databricks.sdk.service.jobs import JobEnvironment
+
+        return JobEnvironment(environment_key=environment_key,
+                              spec=_Env(base_environment=self.serverless))
 
     def delete(self) -> "Environment":
         for p in (self.serverless_path, self.requirements_path):

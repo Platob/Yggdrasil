@@ -1,20 +1,16 @@
-"""``ygg databricks wheel`` — build, upload, and browse wheels in the
-workspace's PyPI-like registry.
+"""``ygg databricks wheel`` — uniform CRUD over the workspace wheel registry.
 
-Where ``deploy`` ships the whole ygg image (wheel + serverless
-``JobEnvironment``) in one shot, this group exposes the wheel lifecycle on
-its own:
+A wheel is keyed by ``(project, version)``. ``create``/``find`` fetch it — a
+local path (with a ``pyproject.toml``) is built from source, anything else is a
+PyPI project downloaded by name — and upload it under ``/Workspace/Shared/pypi``.
+Every project, ``ygg`` included, is handled the same way::
 
-    ygg databricks wheel                     # build + upload the ygg wheel(s) to shared pypi
-    ygg databricks wheel build [package]    # build from the live package → local .whl(s)
-    ygg databricks wheel upload <wheel>...   # upload prebuilt .whl(s) to the registry
-    ygg databricks wheel deploy [package]    # build + upload in one step (default package: ygg)
-    ygg databricks wheel list [package]      # browse the workspace registry
-
-``build`` is fully offline — it synthesizes a buildable project from the
-*installed* package and runs ``uv``/``pip`` locally, so it needs no
-Databricks connection. ``upload`` / ``deploy`` / ``list`` talk to the
-workspace registry (``/Workspace/Shared/pypi`` by default).
+    ygg databricks wheel create <project> [version]   # fetch + upload
+    ygg databricks wheel find <project> [version]      # get, building on a miss
+    ygg databricks wheel get <project> [version]       # get, never builds
+    ygg databricks wheel update <project> [version]    # re-fetch + overwrite
+    ygg databricks wheel delete <project> [version]    # remove
+    ygg databricks wheel list [project]                # browse the registry
 """
 from __future__ import annotations
 
@@ -28,148 +24,137 @@ class WheelCommand:
     def register(cls, subparsers: Any) -> None:
         parser = subparsers.add_parser(
             "wheels", aliases=["wheel"],
-            help="Build, upload, and browse wheels in the workspace registry.",
+            help="CRUD over wheels in the workspace registry (create/find/update/delete/list).",
         )
-        # Bare ``wheel`` builds + uploads the versioned ygg wheel(s) to the
-        # registry (the common case); subcommands cover the rest.
         parser.add_argument("--workspace-dir", dest="workspace_dir", default=None,
-                            help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
-        parser.add_argument("--rebuild", action="store_true",
-                            help="Force a fresh build even if the version is already deployed.")
-        parser.add_argument("--all-versions", dest="all_versions", action="store_true",
-                            help="A wheel for every supported Python (3.10–3.13).")
+                            help="Registry root (default: /Workspace/Shared/pypi).")
         sub = parser.add_subparsers(dest="wheels_action")
 
-        build = sub.add_parser(
-            "build", help="Build wheel(s) from the live package on disk (no upload)."
-        )
-        build.add_argument("package", nargs="?", default="ygg",
-                           help="Import or distribution name (default: ygg).")
-        build.add_argument("--out-dir", dest="out_dir", default=None,
-                           help="Directory to write the .whl(s) into (default: a temp dir).")
-        build.add_argument("--extra", action="append", default=None,
-                           help="Optional-dependency extra to fold in (repeatable).")
-        build.add_argument("-r", "--requirement", dest="requirement", action="append", default=None,
-                           help="Extra requirement to bundle alongside (repeatable).")
-        build.add_argument("--no-deps", dest="no_deps", action="store_true",
-                           help="Pure-python project wheel only; deps resolve at install time.")
-        build.add_argument("--all-versions", dest="all_versions", action="store_true",
-                           help="A wheel for every supported Python (3.10–3.13).")
-        build.set_defaults(handler=cls._build)
+        def _proj(p, *, version=True):
+            p.add_argument("project", nargs="?", default="ygg",
+                           help="Project: a local path (built from source) or a PyPI name.")
+            if version:
+                p.add_argument("version", nargs="?", default=None, help="Version (default: latest).")
+            p.add_argument("--workspace-dir", dest="workspace_dir", default=None,
+                           help="Registry root (default: /Workspace/Shared/pypi).")
+            return p
 
-        upload = sub.add_parser("upload", help="Upload prebuilt .whl file(s) to the registry.")
-        upload.add_argument("wheels", nargs="+", help="Local .whl file path(s).")
-        upload.add_argument("--workspace-dir", dest="workspace_dir", default=None,
-                           help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
-        upload.set_defaults(handler=cls._upload)
+        create = _proj(sub.add_parser("create", help="Fetch (build/download) + upload a wheel."))
+        create.add_argument("--python", default=None, help="Target Python (e.g. 3.11).")
+        create.add_argument("--extra", action="append", default=None, help="Extra to fold in (repeatable).")
+        create.add_argument("--deps", action="store_true", help="Also upload the whole dependency closure.")
+        create.add_argument("--rebuild", action="store_true", help="Force a fresh fetch.")
+        create.set_defaults(handler=cls._create)
 
-        deploy = sub.add_parser("deploy", help="Build the live package and upload its wheel(s).")
-        deploy.add_argument("package", nargs="?", default="ygg",
-                           help="Import or distribution name (default: ygg).")
-        deploy.add_argument("--workspace-dir", dest="workspace_dir", default=None,
-                           help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
-        deploy.add_argument("--extra", action="append", default=None,
-                           help="Optional-dependency extra to fold in (repeatable).")
-        deploy.add_argument("-r", "--requirement", dest="requirement", action="append", default=None,
-                           help="Extra requirement to bundle alongside (repeatable).")
-        deploy.add_argument("--no-deps", dest="no_deps", action="store_true",
-                           help="Pure-python project wheel only; deps resolve on the cluster.")
-        deploy.add_argument("--all-versions", dest="all_versions", action="store_true",
-                           help="A wheel for every supported Python (3.10–3.13).")
-        deploy.set_defaults(handler=cls._deploy)
+        update = _proj(sub.add_parser("update", help="Re-fetch + overwrite a wheel."))
+        update.add_argument("--python", default=None, help="Target Python (e.g. 3.11).")
+        update.add_argument("--extra", action="append", default=None, help="Extra to fold in (repeatable).")
+        update.add_argument("--deps", action="store_true", help="Also upload the dependency closure.")
+        update.set_defaults(handler=cls._update)
+
+        find = _proj(sub.add_parser("find", help="Get a wheel, building it on a miss."))
+        find.add_argument("--python", default=None, help="Target Python (e.g. 3.11).")
+        find.add_argument("--no-install", dest="install", action="store_false",
+                          help="Don't build on a miss (like `get`).")
+        find.set_defaults(handler=cls._find, install=True)
+
+        get = _proj(sub.add_parser("get", help="Get a deployed wheel (never builds)."))
+        get.add_argument("--python", default=None, help="Target Python (e.g. 3.11).")
+        get.set_defaults(handler=cls._get)
+
+        delete = _proj(sub.add_parser("delete", aliases=["rm"], help="Delete a wheel (a version, or all)."))
+        delete.set_defaults(handler=cls._delete)
 
         ls = sub.add_parser("list", help="List wheels (or distributions) in the registry.")
-        ls.add_argument("package", nargs="?", default=None,
-                       help="Distribution/import name to list wheels for (default: list distributions).")
+        ls.add_argument("project", nargs="?", default=None,
+                        help="Project to list wheels for (default: list distributions).")
         ls.add_argument("--workspace-dir", dest="workspace_dir", default=None,
-                       help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
+                        help="Registry root (default: /Workspace/Shared/pypi).")
         ls.set_defaults(handler=cls._list)
 
-        parser.set_defaults(handler=cls._default)
+        parser.set_defaults(handler=cls._list)   # bare `wheel` → browse
 
     # -- handlers --------------------------------------------------------
     @classmethod
-    def _default(cls, args: Any, build_client: Any) -> int:
-        """Bare ``wheel`` — build + upload the versioned ygg wheel(s) to the
-        workspace PyPI-like registry (shared pypi)."""
+    def _create(cls, args: Any, build_client: Any) -> int:
         from yggdrasil.cli import style
 
         client = build_client(args)
-        with style.Spinner("building + uploading ygg wheel(s)…"):
-            wheels = client.wheels.deploy_ygg(
-                all_versions=getattr(args, "all_versions", False),
-                rebuild=getattr(args, "rebuild", False),
-                workspace_dir=args.workspace_dir,
+        with style.Spinner(f"fetching + uploading {args.project}…"):
+            wheels = client.wheels.create(
+                args.project, args.version, python=args.python,
+                extras=tuple(args.extra or ()), deps=args.deps,
+                workspace_dir=args.workspace_dir, rebuild=args.rebuild,
             )
         for wheel in wheels:
             style.ok(f"deployed {style.brand(wheel.path)}")
         return 0
 
     @classmethod
-    def _build(cls, args: Any, build_client: Any) -> int:
+    def _update(cls, args: Any, build_client: Any) -> int:
         from yggdrasil.cli import style
 
         client = build_client(args)
-        wheels = client.wheels.build(
-            args.package,
-            extras=tuple(args.extra or ()),
-            requirements=tuple(args.requirement or ()),
-            no_deps=args.no_deps,
-            all_versions=args.all_versions,
-            dest_dir=args.out_dir,
-        )
+        with style.Spinner(f"re-fetching {args.project}…"):
+            wheels = client.wheels.update(
+                args.project, args.version, python=args.python,
+                extras=tuple(args.extra or ()), deps=args.deps,
+                workspace_dir=args.workspace_dir,
+            )
         for wheel in wheels:
-            sys.stdout.write(f"{wheel}\n")
-        style.ok(f"built {len(wheels)} wheel(s)")
+            style.ok(f"updated {style.brand(wheel.path)}")
         return 0
 
     @classmethod
-    def _upload(cls, args: Any, build_client: Any) -> int:
+    def _find(cls, args: Any, build_client: Any) -> int:
         from yggdrasil.cli import style
 
         client = build_client(args)
-        for wheel in args.wheels:
-            uploaded = client.wheels.upload(wheel, workspace_dir=args.workspace_dir, registry=False)
-            sys.stdout.write(f"{uploaded.path}\n")
-            style.ok(f"uploaded {style.brand(uploaded.path)}")
+        with style.Spinner(f"resolving {args.project}…"):
+            wheel = client.wheels.find(args.project, args.version, install=args.install,
+                                       python=args.python, workspace_dir=args.workspace_dir)
+        if wheel is None:
+            style.warn(f"no wheel for {args.project!r}")
+            return 1
+        sys.stdout.write(f"{wheel.path}\n")
+        style.ok(f"{style.brand(wheel.dist)} {wheel.version}")
         return 0
 
     @classmethod
-    def _deploy(cls, args: Any, build_client: Any) -> int:
+    def _get(cls, args: Any, build_client: Any) -> int:
         from yggdrasil.cli import style
 
         client = build_client(args)
-        wheels = client.wheels.deploy(
-            args.package,
-            workspace_dir=args.workspace_dir,
-            extras=tuple(args.extra or ()),
-            requirements=tuple(args.requirement or ()),
-            no_deps=args.no_deps,
-            all_versions=args.all_versions,
-        )
-        for wheel in wheels:
-            sys.stdout.write(f"{wheel.path}\n")
-            style.ok(f"deployed {style.brand(wheel.path)}")
+        wheel = client.wheels.get(args.project, args.version, python=args.python,
+                                  workspace_dir=args.workspace_dir)
+        if wheel is None:
+            style.warn(f"{args.project!r} not deployed")
+            return 1
+        sys.stdout.write(f"{wheel.path}\n")
+        return 0
+
+    @classmethod
+    def _delete(cls, args: Any, build_client: Any) -> int:
+        from yggdrasil.cli import style
+
+        client = build_client(args)
+        removed = client.wheels.delete(args.project, args.version, workspace_dir=args.workspace_dir)
+        for wheel in removed:
+            style.ok(f"deleted {style.brand(wheel.path)}")
+        if not removed:
+            style.warn(f"nothing to delete for {args.project!r}")
+            return 1
         return 0
 
     @classmethod
     def _list(cls, args: Any, build_client: Any) -> int:
         client = build_client(args)
-        workspace_dir = args.workspace_dir or client.wheels.default_dir
-        result = client.wheels.list(args.package or None, workspace_dir=workspace_dir)
-
-        if args.package:
-            if not result:
-                sys.stderr.write(f"no deployed wheels for {args.package!r} under {workspace_dir}\n")
-                return 1
-            for wheel in result:
-                sys.stdout.write(f"{wheel.path}\n")
-            return 0
-
-        # No package — list the distribution folders in the registry.
+        project = getattr(args, "project", None)
+        result = client.wheels.list(project, workspace_dir=args.workspace_dir)
         if not result:
-            sys.stderr.write(f"no registry at {workspace_dir}\n")
+            sys.stderr.write(f"nothing under {args.workspace_dir or client.wheels.default_dir}\n")
             return 1
-        for name in result:
-            sys.stdout.write(f"{name}/\n")
+        for item in result:
+            # A Wheel handle (has a workspace .path) vs a distribution folder name.
+            sys.stdout.write(f"{item.path}\n" if hasattr(item, "path") else f"{item}/\n")
         return 0

@@ -10,16 +10,14 @@ with one command.
 
     ygg databricks deploy                 # deploy the project under the cwd
     ygg databricks deploy ./my-app        # deploy the project under ./my-app
-    ygg databricks deploy --mode overwrite # rebuild + update everything
-    ygg databricks deploy --bundle --no-cluster  # zero-PyPI env, no cluster
+    ygg databricks deploy --rebuild --no-cluster
 
-``--mode`` sets the idempotency policy: ``overwrite`` (rebuild + update all),
-``append`` (add only what's missing), or ``auto`` (get-or-create wheels but
-overwrite the env config files; the default). ``--no-cluster`` / ``--no-warehouse``
-skip provisioning the respective compute.
+The environment bundles the project wheel + its whole dependency closure as
+wheels (zero-PyPI). ``--rebuild`` forces a fresh build; ``--no-cluster`` /
+``--no-warehouse`` skip provisioning the respective compute.
 
-(The ygg image and arbitrary-package wheels/environments live under the
-dedicated ``ygg databricks wheel`` and ``ygg databricks environment`` commands.)
+(Lower-level wheel/environment CRUD lives under the ``ygg databricks wheel`` and
+``ygg databricks environment`` commands; this is the one-shot project deploy.)
 """
 from __future__ import annotations
 
@@ -32,20 +30,16 @@ class DeployCommand:
     def register(cls, subparsers: Any) -> None:
         parser = subparsers.add_parser(
             "deploy",
-            help="Deploy the current project (wheel + environment + warehouse + cluster) to Databricks.",
+            help="Deploy the current project (environment + warehouse + cluster) to Databricks.",
         )
         parser.add_argument("path", nargs="?", default=None,
                             help="Project dir or pyproject.toml (default: discover from the cwd).")
         parser.add_argument("--workspace-dir", dest="workspace_dir", default=None,
-                            help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
+                            help="Environment root (default: /Workspace/Shared/environment).")
         parser.add_argument("--extra", action="append", default=None,
                             help="Optional-dependency extra to include in the env (repeatable).")
-        parser.add_argument("--bundle", action="store_true",
-                            help="Bundle the dependency closure as wheels (zero-PyPI install).")
-        parser.add_argument("--mode", default="auto", choices=["auto", "append", "overwrite"],
-                            help="Idempotency policy: overwrite (rebuild + update all), "
-                                 "append (add only what's missing), auto (get-or-create wheels, "
-                                 "overwrite env config files). Default: auto.")
+        parser.add_argument("--rebuild", action="store_true",
+                            help="Force a fresh build of the wheel closure + env config.")
         parser.add_argument("--no-cluster", dest="no_cluster", action="store_true",
                             help="Don't provision the project's default single-user cluster.")
         parser.add_argument("--no-warehouse", dest="no_warehouse", action="store_true",
@@ -56,24 +50,20 @@ class DeployCommand:
 
     @classmethod
     def _deploy(cls, args: Any, build_client: Any) -> int:
-        """Discover the project's ``pyproject.toml``, build its wheel +
-        environment, and provision the project's default warehouse and cluster
-        wired to that env config."""
+        """Build the project's base environment (wheel closure, zero-PyPI) and
+        provision its default warehouse and cluster wired to that env config."""
         from yggdrasil.cli import style
-        from yggdrasil.enums.mode import Mode
 
         client = build_client(args)
         extras = tuple(args.extra or ())
-        mode = Mode.from_(args.mode)
 
         with style.Spinner("building project wheel + environment…"):
-            env = client.environments.deploy_project(
-                args.path, extras=extras, bundle=args.bundle,
-                mode=mode, pypi_dir=args.workspace_dir or client.wheels.default_dir,
+            env = client.environments.create(
+                args.path or ".", extras=extras,
+                workspace_dir=args.workspace_dir, rebuild=args.rebuild,
             )
         project = env.project
         style.ok(f"deployed project {style.brand(project)} {env.version}")
-        style.out(f"    {style.dim('mode')}        {mode.name.lower()}\n")
         style.out(f"    {style.dim('env')}         {env.name}\n")
         style.out(f"    {style.dim('serverless')}  {env.serverless}\n")
         style.out(f"    {style.dim('cluster cfg')} {env.cluster}\n")
@@ -102,7 +92,7 @@ class DeployCommand:
             with style.Spinner(f"provisioning default cluster {project!r}…"):
                 existing = (
                     clusters.find_cluster(cluster_name=project, raise_error=False)
-                    if mode is Mode.OVERWRITE else None
+                    if args.rebuild else None
                 )
                 if existing is not None:
                     cluster = existing.update(

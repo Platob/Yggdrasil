@@ -58,7 +58,7 @@ class TestDeploy(unittest.TestCase):
 
     def test_deploy_creates_serverless_job(self):
         client = MagicMock()
-        client.environments.job_environment.return_value = "ENV"
+        client.environments.find.return_value.job_environment.return_value = "ENV"
         with patch("yggdrasil.databricks.loki.agent.read_session", return_value=_session()), \
              patch("yggdrasil.databricks.DatabricksClient", return_value=client):
             loki = DatabricksLoki()
@@ -74,7 +74,7 @@ class TestDeploy(unittest.TestCase):
 
     def test_deploy_behavior_routes_through_loki_run(self):
         client = MagicMock()
-        client.environments.job_environment.return_value = "ENV"
+        client.environments.find.return_value.job_environment.return_value = "ENV"
         with patch("yggdrasil.databricks.loki.agent.read_session", return_value=_session()), \
              patch("yggdrasil.databricks.DatabricksClient", return_value=client):
             loki = DatabricksLoki()

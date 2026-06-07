@@ -242,7 +242,7 @@ class TestRunNotebook:
         from yggdrasil.databricks.environments.service import (
             WORKSPACE_ENV_DIR,
             environment_folder,
-            ygg_base_environment_name,
+            environment_stem,
         )
 
         workspace.workspace.get_status.return_value = _file_status(1)  # seeded
@@ -256,7 +256,7 @@ class TestRunNotebook:
         # Project-folder layout: environment/<proj>/<proj>-<version>-py3XX.yml.
         # (Running inside the ygg repo, the client-project default resolves to the
         # same ygg image.)
-        name = ygg_base_environment_name()
+        name = environment_stem('ygg')
         assert (
             env.spec.base_environment
             == f"{WORKSPACE_ENV_DIR}/{environment_folder('ygg')}/{name}.yml"
