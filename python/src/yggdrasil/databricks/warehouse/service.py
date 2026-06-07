@@ -174,14 +174,14 @@ class Warehouses(DatabricksService):
     def default_names(self) -> tuple[str, str]:
         """``(classic, serverless)`` default-warehouse names.
 
-        Based on the **running client project** (:attr:`DatabricksClient.project`,
-        always lowercased): its nice display name
+        Based on the client **project** (:attr:`DatabricksClient.project` — an
+        alias of ``product``, always lowercased): its nice display name
         (:attr:`~DatabricksClient.project_name`) with a serverless sibling —
         ``("My App", "My App Serverless")`` — so each project gets its own default
-        warehouse pair. ``ygg`` (the library itself) and "no project" both fall
-        back to the workspace-wide ygg defaults
+        warehouse pair. The default ``ygg`` product (``ygg`` / ``yggdrasil``) and
+        "no project" both fall back to the workspace-wide ygg defaults
         (:data:`DEFAULT_ALL_PURPOSE_CLASSIC_NAME` / ``…_SERVERLESS_NAME``)."""
-        if self.client.project and self.client.project != "ygg":
+        if self.client.project and self.client.project not in ("ygg", "yggdrasil"):
             classic = self.client.project_name
             return classic, f"{classic} Serverless"
         return DEFAULT_ALL_PURPOSE_CLASSIC_NAME, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME

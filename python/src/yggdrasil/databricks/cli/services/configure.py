@@ -342,6 +342,7 @@ class ConfigureCommand:
             "auth_type": auth_type or kind,
             "user": user,
             "product": getattr(client, "product", None),
+            "project": getattr(client, "project", None),
             "product_version": getattr(client, "product_version", None),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }

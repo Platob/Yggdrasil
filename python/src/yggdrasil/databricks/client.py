@@ -1096,21 +1096,21 @@ class DatabricksClient(Singleton, URLBased):
 
     @property
     def project(self) -> Optional[str]:
-        """The running **client project** — the cwd ``pyproject.toml``'s
-        ``[project].name``, **always lowercased** (the canonical identifier) —
-        or ``None`` when there's no project on the way up. Best-effort."""
-        from yggdrasil.databricks.wheels.service import find_pyproject, read_pyproject
+        """The client **project** — an alias of :attr:`product`, **always
+        lowercased** (the canonical identifier). Defaults to ``"yggdrasil"``; set
+        it (or ``product``) to name a project and it persists with the client
+        (it is one of :data:`_INIT_NAMES`, so it rides through config, session
+        snapshots, and clones)."""
+        return self.product.strip().lower() if self.product else None
 
-        try:
-            pyproject = find_pyproject()
-            return str(read_pyproject(pyproject)["name"]).strip().lower() if pyproject is not None else None
-        except Exception:  # noqa: BLE001 — no/unreadable pyproject → no client project
-            return None
+    @project.setter
+    def project(self, value: Optional[str]) -> None:
+        self.product = str(value).strip().lower() if value else None
 
     @property
     def project_name(self) -> Optional[str]:
         """A nice, capitalized display name for the client :attr:`project`
-        (``my-app`` → ``My App``), or ``None`` when there's no project."""
+        (``my-app`` → ``My App``), or ``None`` when unset."""
         from yggdrasil.databricks.wheels.service import project_display_name
 
         project = self.project
