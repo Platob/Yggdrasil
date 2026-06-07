@@ -39,7 +39,16 @@ class TestReadHitsProjection:
         cache.tabular = _FakeHolder()
         SendConfig().read_hits(cache, [_req()])
 
-        cols = set(captured["options"].read_columns())
+        opts = captured["options"]
+        # ``column_names`` is the projection the source read pushes down — the
+        # SQL ``SELECT`` list (Databricks Table) / parquet column set (Delta). It
+        # must be exactly the rebuild columns, even after the backend binds the
+        # full table schema as the cast source (``with_source``).
+        projected = opts.with_source(source=RESPONSE_SCHEMA).column_names
+        assert set(projected) == set(RESPONSE_REBUILD_COLUMNS)
+        assert len(projected) < len(RESPONSE_SCHEMA.to_arrow_schema().names)
+
+        cols = set(opts.read_columns())
         # Every rebuild column is read (plus, at most, the predicate's own cheap
         # pruning keys like partition_key) …
         assert set(RESPONSE_REBUILD_COLUMNS) <= cols
