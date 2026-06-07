@@ -207,14 +207,14 @@ def _print_hardware(style: Any) -> None:
 
     snap = resources.snapshot()
     accel = {"cuda": "NVIDIA GPU (cuda)", "xpu": "Intel GPU (xpu)",
-             "mps": "Apple GPU (mps)"}.get(snap.get("accelerator") or "", None)
+             "mps": "Apple GPU (mps)"}.get(snap.accelerator or "", None)
     if accel is None:
         # Present but torch can't drive it yet — name it and point at the fix,
         # so the GPU shows instead of a flat "CPU only".
         accel = (style.brand("Intel GPU") + style.dim(" (present · pip install intel-extension-for-pytorch to use)")
-                 if snap.get("intel_gpu") else "CPU only")
-    bits = [f"{snap['cpu']} cores", f"{snap['ram_gb']:g} GB", accel]
-    if snap.get("npu"):
+                 if snap.intel_gpu else "CPU only")
+    bits = [f"{snap.cpu} cores", f"{snap.ram_gb:g} GB", accel]
+    if snap.npu:
         bits.append(style.brand("Intel NPU"))
     style.out(f"  {style.cyan('compute')} {style.dim(' · '.join(str(b) for b in bits))}\n")
 
@@ -837,25 +837,25 @@ def _fleet_lines(style: Any, agents: list, frame: str) -> list[str]:
 def _fleet_kpi_line(style: Any, fleet: Any) -> str:
     """A one-line KPI footer for the live fleet dashboard."""
     k = fleet.kpis()
-    bits = [f"{style.good(str(k['done']) + ' done')}"]
-    if k["failed"]:
-        bits.append(style.bad(f"{k['failed']} failed"))
-    if k["running"]:
-        bits.append(style.brand(f"{k['running']} running"))
-    if k["queued"]:
-        bits.append(style.dim(f"{k['queued']} queued"))
-    if k.get("validated"):
-        bits.append(style.good(f"{k['validated']} tested"))
-    cost = f"${k['cost']:.4f}" + (f"/${fleet.cost_cap:.2f}" if fleet.cost_cap else "")
-    tail = f"{k['steps']} steps · {k['tokens']:,} tok · {cost} · {k['elapsed']:.1f}s"
+    bits = [style.good(f"{k.done} done")]
+    if k.failed:
+        bits.append(style.bad(f"{k.failed} failed"))
+    if k.running:
+        bits.append(style.brand(f"{k.running} running"))
+    if k.queued:
+        bits.append(style.dim(f"{k.queued} queued"))
+    if k.validated:
+        bits.append(style.good(f"{k.validated} tested"))
+    cost = f"${k.cost:.4f}" + (f"/${fleet.cost_cap:.2f}" if fleet.cost_cap else "")
+    tail = f"{k.steps} steps · {k.tokens:,} tok · {cost} · {k.elapsed:.1f}s"
     return f"  {style.dim('agents')} {'  '.join(bits)}  {style.dim('· ' + tail)}"
 
 
-def _fleet_cap_prompt(style: Any, kpis: dict) -> "float | None":
+def _fleet_cap_prompt(style: Any, kpis: Any) -> "float | None":
     """The fleet hit its cost cap with work queued — raise it, or stop. Returns
     the new cap, or ``None`` to stop launching and let runners finish."""
-    style.warn(f"fleet cost ${kpis['cost']:.4f} reached the cap — "
-               f"{kpis['done']} done, {kpis['queued']} still queued")
+    style.warn(f"fleet cost ${kpis.cost:.4f} reached the cap — "
+               f"{kpis.done} done, {kpis.queued} still queued")
     try:
         ans = input("  go further? raise cap to $N · Enter for +$1 · stop [s]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -863,7 +863,7 @@ def _fleet_cap_prompt(style: Any, kpis: dict) -> "float | None":
     if ans in ("s", "stop", "n", "no"):
         return None
     amt = _usd(ans)
-    return amt if amt is not None else round(kpis["cost"] + 1.0, 2)
+    return amt if amt is not None else round(kpis.cost + 1.0, 2)
 
 
 def _run_fleet(loki: Any, style: Any, state: dict, tasks: list, *,

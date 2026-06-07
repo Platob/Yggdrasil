@@ -83,6 +83,7 @@ class TestHardwareLine(unittest.TestCase):
         from yggdrasil.loki import resources
 
         buf = io.StringIO()
+        snap = resources.Resources(**snap)          # typed snapshot, not a loose dict
         with patch.object(resources, "snapshot", return_value=snap), redirect_stdout(buf):
             cli._print_hardware(style)
         return style.strip(buf.getvalue())

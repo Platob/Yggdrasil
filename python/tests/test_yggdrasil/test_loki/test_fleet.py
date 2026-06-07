@@ -88,10 +88,10 @@ class TestFleet(unittest.TestCase):
         fleet.spawn("two", cmd=_ok_cmd(tokens=500, cost=0.02))
         fleet.monitor(interval=0.02)
         k = fleet.kpis()
-        self.assertEqual(k["done"], 2)
-        self.assertEqual(k["steps"], 4)              # 2 each
-        self.assertEqual(k["tokens"], 1500)
-        self.assertAlmostEqual(k["cost"], 0.03)
+        self.assertEqual(k.done, 2)
+        self.assertEqual(k.steps, 4)              # 2 each
+        self.assertEqual(k.tokens, 1500)
+        self.assertAlmostEqual(k.cost, 0.03)
 
     def test_max_parallel_queues_extra_tasks(self):
         fleet = Fleet(max_parallel=2)
@@ -140,7 +140,7 @@ class TestFleet(unittest.TestCase):
         asked = []
 
         def on_cap(kpis):
-            asked.append(kpis["cost"])
+            asked.append(kpis.cost)
             return 0.10                                  # go further
 
         fleet.monitor(interval=0.02, on_cap=on_cap)
@@ -155,6 +155,17 @@ class TestFleet(unittest.TestCase):
         self.assertEqual(fleet.queued(), 0)               # queue dropped
         self.assertEqual(len(fleet.agents), 1)            # only the first ever launched
 
+    def test_kpis_is_a_typed_slots_dataclass(self):
+        from yggdrasil.loki.fleet import FleetKPIs
+
+        fleet = Fleet()
+        fleet.spawn("one", cmd=_ok_cmd(tokens=200, cost=0.01))
+        fleet.monitor(interval=0.02)
+        k = fleet.kpis()
+        self.assertIsInstance(k, FleetKPIs)
+        self.assertFalse(hasattr(k, "__dict__"))        # slots → no per-instance dict
+        self.assertEqual(k.to_dict()["done"], 1)        # still serializable for mesh.json
+
     def test_validated_reflects_smoke_checkpoint(self):
         fleet = Fleet()
         fleet.spawn("passed", cmd=_smoke_cmd(passed=True))
@@ -165,7 +176,7 @@ class TestFleet(unittest.TestCase):
         self.assertIs(passed.validated, True)
         self.assertIs(failed.validated, False)
         self.assertIsNone(untested.validated)
-        self.assertEqual(fleet.kpis()["validated"], 1)   # only the green smoke counts
+        self.assertEqual(fleet.kpis().validated, 1)   # only the green smoke counts
 
     def test_mesh_json_written_to_shared_dir(self):
         import json as _json

@@ -17,12 +17,34 @@ import glob
 import importlib.util
 import os
 import sys
-from typing import Any, Optional
+from dataclasses import asdict, dataclass
+from typing import Optional
 
 __all__ = [
-    "snapshot", "size_tier", "can_run_local",
+    "Resources", "snapshot", "size_tier", "can_run_local",
     "accelerator", "intel_gpu_present", "has_npu", "XPU_TORCH_INDEX",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class Resources:
+    """A workstation's compute, as typed fields instead of a loose dict.
+
+    ``gpu`` is the CUDA flag that drives the ``xlarge`` tier; ``accelerator`` is
+    the best torch-usable device (cuda/xpu/mps, or ``None``); ``intel_gpu`` flags
+    an Intel GPU physically present even when torch can't target it; ``npu`` an
+    Intel NPU.
+    """
+
+    cpu: int = 1
+    ram_gb: float = 0.0
+    gpu: bool = False
+    accelerator: Optional[str] = None
+    intel_gpu: bool = False
+    npu: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 #: The dedicated PyTorch wheel index that ships **Intel GPU (XPU)** support —
 #: ``pip install --index-url <this> torch`` turns a *detected* Intel GPU into a
@@ -172,8 +194,8 @@ def _win_devices(cim_class: str) -> str:
     return ""
 
 
-def snapshot() -> dict[str, Any]:
-    """Current ``{cpu, ram_gb, gpu, accelerator, intel_gpu, npu}`` for this box.
+def snapshot() -> Resources:
+    """Current :class:`Resources` for this box (typed, not a loose dict).
 
     ``accelerator`` is the best **torch-usable** device (see :func:`accelerator`);
     ``gpu`` stays the CUDA flag that drives the ``xlarge`` tier (a discrete
@@ -187,39 +209,38 @@ def snapshot() -> dict[str, Any]:
         ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
     except (ValueError, OSError, AttributeError):
         pass
-    return {
-        "cpu": os.cpu_count() or 1,
-        "ram_gb": round(ram_gb, 1),
-        "gpu": accel == "cuda",
-        "accelerator": accel,
+    return Resources(
+        cpu=os.cpu_count() or 1,
+        ram_gb=round(ram_gb, 1),
+        gpu=accel == "cuda",
+        accelerator=accel,
         # Present even on a stock CPU torch wheel (where ``accelerator`` is None);
         # short-circuit when torch already reports the usable xpu device.
-        "intel_gpu": accel == "xpu" or intel_gpu_present(),
-        "npu": has_npu(),
-    }
+        intel_gpu=accel == "xpu" or intel_gpu_present(),
+        npu=has_npu(),
+    )
 
 
-def size_tier(snap: Optional[dict[str, Any]] = None) -> str:
+def size_tier(snap: Optional[Resources] = None) -> str:
     """Model size tier for this box: ``small`` / ``medium`` / ``large`` / ``xlarge``.
 
     A CUDA GPU is ``xlarge``; otherwise RAM decides (≥ 32 GB large, ≥ 16 GB
     medium, else small). Local engines map this to a concrete model.
     """
     s = snap or snapshot()
-    if s["gpu"]:
+    if s.gpu:
         return "xlarge"
-    ram = s["ram_gb"]
-    if ram >= _RAM_LARGE:
+    if s.ram_gb >= _RAM_LARGE:
         return "large"
-    if ram >= _RAM_MEDIUM:
+    if s.ram_gb >= _RAM_MEDIUM:
         return "medium"
     return "small"
 
 
-def can_run_local(snap: Optional[dict[str, Any]] = None) -> bool:
+def can_run_local(snap: Optional[Resources] = None) -> bool:
     """True when this box can comfortably host a local model (any GPU
     accelerator, or ≥ 4 cores + ≥ 8 GB RAM) — the gate for keeping light work
     local instead of remote. An Intel GPU (``xpu``) counts as much as CUDA."""
     s = snap or snapshot()
-    return (s["gpu"] or s.get("accelerator") is not None
-            or (s["cpu"] >= _CPU_MIN and s["ram_gb"] >= _RAM_MIN))
+    return (s.gpu or s.accelerator is not None
+            or (s.cpu >= _CPU_MIN and s.ram_gb >= _RAM_MIN))

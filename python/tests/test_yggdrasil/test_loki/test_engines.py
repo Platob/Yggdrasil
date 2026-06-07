@@ -334,11 +334,11 @@ class TestTransformersEngine(unittest.TestCase):
         eng = TransformersEngine()
         # Local models are bounded by the box → sized to resources, not the
         # remote fast/deep cost tier (which is ignored here).
-        with patch.object(resources, "snapshot", return_value={"cpu": 8, "ram_gb": 12, "gpu": False}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=8, ram_gb=12, gpu=False)):
             self.assertEqual(eng.resolve_model(tier="deep"), "Qwen/Qwen2.5-1.5B-Instruct")
-        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": False}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=16, ram_gb=64, gpu=False)):
             self.assertEqual(eng.resolve_model(tier="fast"), "Qwen/Qwen2.5-7B-Instruct")
-        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": True}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=16, ram_gb=64, gpu=True)):
             self.assertEqual(eng.bootstrap_model, "Qwen/Qwen2.5-14B-Instruct")
 
     def test_explicit_model_pin_overrides_resource_sizing(self):
@@ -627,11 +627,11 @@ class TestOllamaEngine(unittest.TestCase):
         from yggdrasil.loki import resources
 
         eng = OllamaEngine()
-        with patch.object(resources, "snapshot", return_value={"cpu": 8, "ram_gb": 12, "gpu": False}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=8, ram_gb=12, gpu=False)):
             self.assertEqual(eng.bootstrap_model, "qwen2.5:3b")    # modest box → small
-        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": False}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=16, ram_gb=64, gpu=False)):
             self.assertEqual(eng.bootstrap_model, "qwen2.5:14b")   # big box → larger
-        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": True}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=16, ram_gb=64, gpu=True)):
             self.assertEqual(eng.bootstrap_model, "qwen2.5:32b")   # GPU → xlarge
 
     def test_installed_models_and_has_model(self):
@@ -656,7 +656,7 @@ class TestOllamaEngine(unittest.TestCase):
         from yggdrasil.loki import resources
 
         eng = OllamaEngine()
-        with patch.object(resources, "snapshot", return_value={"cpu": 8, "ram_gb": 12, "gpu": False}), \
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=8, ram_gb=12, gpu=False)), \
              patch.object(OllamaEngine, "has_model", return_value=False), \
              patch.object(OllamaEngine, "pull", return_value="success") as pull:
             receipt = eng.ensure()
@@ -1129,16 +1129,19 @@ class TestResourceAccelerator(unittest.TestCase):
         with patch.object(resources, "accelerator", return_value="xpu"), \
                 patch.object(resources, "has_npu", return_value=True):
             snap = resources.snapshot()
-        self.assertEqual(snap["accelerator"], "xpu")
-        self.assertTrue(snap["npu"])
-        self.assertFalse(snap["gpu"])  # gpu stays the CUDA-only xlarge driver
+        self.assertEqual(snap.accelerator, "xpu")
+        self.assertTrue(snap.npu)
+        self.assertFalse(snap.gpu)  # gpu stays the CUDA-only xlarge driver
+        # snapshot() is a typed slots dataclass, not a loose dict.
+        self.assertIsInstance(snap, resources.Resources)
+        self.assertFalse(hasattr(snap, "__dict__"))
+        self.assertEqual(snap.to_dict()["accelerator"], "xpu")
 
     def test_intel_gpu_enables_local_without_big_ram(self):
         from yggdrasil.loki import resources
 
         # An Intel GPU box can host a local model even on modest CPU/RAM.
-        snap = {"cpu": 2, "ram_gb": 4, "gpu": False,
-                "accelerator": "xpu", "npu": False}
+        snap = resources.Resources(cpu=2, ram_gb=4, gpu=False, accelerator="xpu", npu=False)
         self.assertTrue(resources.can_run_local(snap))
 
     def test_has_npu_detects_intel_npu_via_openvino(self):
@@ -1201,9 +1204,9 @@ class TestResourceAccelerator(unittest.TestCase):
                 patch.object(resources, "intel_gpu_present", return_value=True), \
                 patch.object(resources, "has_npu", return_value=False):
             snap = resources.snapshot()
-        self.assertTrue(snap["intel_gpu"])
-        self.assertIsNone(snap["accelerator"])
-        self.assertFalse(snap["gpu"])
+        self.assertTrue(snap.intel_gpu)
+        self.assertIsNone(snap.accelerator)
+        self.assertFalse(snap.gpu)
 
 
 if __name__ == "__main__":

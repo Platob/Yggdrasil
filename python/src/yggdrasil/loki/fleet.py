@@ -20,9 +20,29 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Optional
 
-__all__ = ["AgentHandle", "Fleet", "LOCAL_ENGINES"]
+__all__ = ["AgentHandle", "Fleet", "FleetKPIs", "LOCAL_ENGINES"]
+
+
+@dataclass(frozen=True, slots=True)
+class FleetKPIs:
+    """A fleet's live rollup as typed fields (not a loose dict)."""
+
+    total: int = 0
+    running: int = 0
+    done: int = 0
+    failed: int = 0
+    queued: int = 0
+    validated: int = 0          # agents that passed a smoke checkpoint
+    steps: int = 0
+    tokens: int = 0
+    cost: float = 0.0
+    elapsed: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 #: Engines that run on the single local accelerator — only one such agent should
 #: run at a time (the GPU/NPU is one resource), while remote agents fan out.
@@ -270,7 +290,7 @@ class Fleet:
         try:
             os.makedirs(self.mesh_dir, exist_ok=True)
             with open(os.path.join(self.mesh_dir, "mesh.json"), "w", encoding="utf-8") as fh:
-                json.dump({"agents": self.summary(), "kpis": self.kpis()}, fh, indent=2)
+                json.dump({"agents": self.summary(), "kpis": self.kpis().to_dict()}, fh, indent=2)
         except OSError:
             pass
 
@@ -322,22 +342,20 @@ class Fleet:
         for h in self.running():
             h.cancel(status=status)
 
-    def kpis(self) -> dict[str, Any]:
+    def kpis(self) -> FleetKPIs:
         """Live rollup across the fleet — counts, steps, tokens, cost, wall time."""
-        done = sum(1 for h in self.agents if h.ok)
-        failed = sum(1 for h in self.agents if not h.running and not h.ok)
-        return {
-            "total": len(self.agents) + self.queued(),
-            "running": len(self.running()),
-            "done": done,
-            "failed": failed,
-            "queued": self.queued(),
-            "validated": sum(1 for h in self.agents if h.validated is True),
-            "steps": sum(h.steps for h in self.agents),
-            "tokens": sum(h.tokens for h in self.agents),
-            "cost": round(sum(h.cost for h in self.agents), 6),
-            "elapsed": round(max((h.elapsed for h in self.agents), default=0.0), 1),
-        }
+        return FleetKPIs(
+            total=len(self.agents) + self.queued(),
+            running=len(self.running()),
+            done=sum(1 for h in self.agents if h.ok),
+            failed=sum(1 for h in self.agents if not h.running and not h.ok),
+            queued=self.queued(),
+            validated=sum(1 for h in self.agents if h.validated is True),
+            steps=sum(h.steps for h in self.agents),
+            tokens=sum(h.tokens for h in self.agents),
+            cost=round(sum(h.cost for h in self.agents), 6),
+            elapsed=round(max((h.elapsed for h in self.agents), default=0.0), 1),
+        )
 
     def summary(self) -> list[dict[str, Any]]:
         """A JSON-able rollup — one row per agent (for ``--json`` / the skill)."""
