@@ -119,24 +119,57 @@ class TestStagingVolume:
         with patch.object(Table, "read_infos", return_value=None):
             assert tbl.staging_volume is None
 
-    def test_get_or_creates_per_table_volume_and_caches(self) -> None:
-        """With table info present, ``staging_volume`` builds the ``<table>``
-        volume, eagerly get-or-creates it (external when derivable), and caches
-        the handle on the instance."""
+    def test_external_when_a_location_covers_the_table_storage(self) -> None:
+        """An accessible external location covering the table's storage → an
+        EXTERNAL staging volume rooted *under* that location (unique per table),
+        cached on the instance."""
         from types import SimpleNamespace
+        from unittest.mock import PropertyMock
 
         tbl = _table("cat", "sch", "tbl")
         infos = SimpleNamespace(
-            storage_location="s3://bkt/unity_catalog/meta", table_id="tid-1",
+            storage_location="s3://bkt/apps/team/tbl", table_id="tid-1",
         )
+        ext = MagicMock()
+        type(ext).url = PropertyMock(return_value="s3://bkt/apps")
+        tbl.service.client.external_locations.find_url.return_value = ext
+
         with patch.object(Table, "read_infos", return_value=infos), \
                 patch.object(Volume, "get_or_create", return_value=None) as goc:
             vol = tbl.staging_volume
             again = tbl.staging_volume
+
         assert isinstance(vol, Volume)
-        assert vol.volume_name == "tbl"   # named after the table
-        assert again is vol               # cached on the instance
-        goc.assert_called()               # eagerly ensured present
+        assert vol.volume_name == "tbl"          # named after the table
+        assert again is vol                       # cached on the instance
+        # Looked the location up by the table's storage URL, then rooted the
+        # external volume under it (off the table's own data).
+        tbl.service.client.external_locations.find_url.assert_called_once_with(
+            "s3://bkt/apps/team/tbl")
+        loc = goc.call_args.kwargs["storage_location"]
+        assert loc == "s3://bkt/apps/_ygg_staging/volumes/tid-1"
+
+    def test_managed_fallback_with_warning_when_no_external_location(self) -> None:
+        """No external location covers the table → a MANAGED staging volume and a
+        warning (the direct-S3 fast path is unavailable)."""
+        from types import SimpleNamespace
+
+        tbl = _table("cat", "sch", "tbl")
+        infos = SimpleNamespace(
+            storage_location="s3://bkt/__unitystorage/x", table_id="tid-2",
+        )
+        tbl.service.client.external_locations.find_url.return_value = None
+
+        with patch.object(Table, "read_infos", return_value=infos), \
+                patch.object(Volume, "get_or_create", return_value=None) as goc, \
+                patch("yggdrasil.databricks.table.table.logger") as log:
+            vol = tbl.staging_volume
+
+        assert isinstance(vol, Volume)
+        # MANAGED → get_or_create called with **no** storage_location.
+        assert goc.call_args.kwargs == {}
+        log.warning.assert_called_once()
+        assert "MANAGED" in log.warning.call_args.args[0]
 
 
 # ---------------------------------------------------------------------------

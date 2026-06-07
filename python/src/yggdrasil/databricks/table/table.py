@@ -3367,13 +3367,6 @@ class Table(DatabricksPath):
             if not self.catalog_name or not self.schema_name or not self.table_name:
                 raise ValueError(f"Table {self} is missing required catalog, schema, or table name")
 
-            loc = infos.storage_location
-            storage_location = (
-                f"{loc.partition('/unity_catalog')[0]}/external_unity_catalog/volumes/{infos.table_id or uuid.uuid4()}"
-                if loc and "/unity_catalog" in loc
-                else None
-            )
-
             self._staging_volume = Volume(
                 service=self.service.volumes,
                 catalog_name=self.catalog_name,
@@ -3381,11 +3374,51 @@ class Table(DatabricksPath):
                 volume_name=self.client.safe_tag_value(self.table_name, repl="_").lower()
             )
 
-            # First try to create as external for best performances
-            try:
-                self._staging_volume.get_or_create(storage_location=storage_location)
-            except Exception:
-                self._staging_volume.get_or_create()
+            # Prefer an **EXTERNAL** staging volume so staged Parquet rides the
+            # direct cloud-storage fast path (no Files-API governance hop). An
+            # external volume needs a writable ``storage_location`` covered by a
+            # Unity Catalog **external location** the caller can reach — so we
+            # don't guess at a sibling prefix: list the external locations and
+            # take the most specific one whose URL the table's own storage sits
+            # under (:meth:`ExternalLocations.find_url`). When one is found we
+            # root the staging volume at ``<external-location>/_ygg_staging/
+            # volumes/<table-id>`` (unique per table, off the table's own data).
+            # If no external location covers the table — or creating the
+            # external volume is denied — fall back to a MANAGED staging volume
+            # (correct, just Files-API staging) and warn so the slower path is
+            # visible.
+            loc = infos.storage_location
+            ext = None
+            if loc:
+                try:
+                    ext = self.client.external_locations.find_url(loc)
+                except Exception as exc:  # noqa: BLE001 — listing is best-effort
+                    logger.debug("external-location lookup failed for %r: %s", self, exc)
+
+            if ext is not None and ext.url:
+                storage_location = (
+                    f"{ext.url.rstrip('/')}/_ygg_staging/volumes/{infos.table_id or uuid.uuid4()}"
+                )
+                try:
+                    self._staging_volume.get_or_create(storage_location=storage_location)
+                    return self._staging_volume
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not create EXTERNAL staging volume for %r at %s under "
+                        "external location %r (%s); falling back to a MANAGED staging "
+                        "volume (Files-API staging — slower, no direct cloud storage).",
+                        self, storage_location, ext.name, exc,
+                    )
+            else:
+                logger.warning(
+                    "No accessible Unity Catalog external location covers %r's storage "
+                    "(%s); using a MANAGED staging volume (Files-API staging — slower, "
+                    "no direct cloud storage). Register an external location over the "
+                    "table's storage to enable the direct-S3 staging fast path.",
+                    self, loc,
+                )
+
+            self._staging_volume.get_or_create()
 
         return self._staging_volume
 
