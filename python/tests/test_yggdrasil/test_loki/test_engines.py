@@ -461,6 +461,40 @@ class TestTransformersEngine(unittest.TestCase):
         self.assertIn("Could not load model X", str(first.exception))
         self.assertIs(first.exception, second.exception)
 
+    def test_gpu_failure_falls_back_to_cpu_without_redownload(self):
+        # The reported bug: a model on a GPU that torch can't actually drive
+        # failed, and the old code force-re-downloaded the whole model *every
+        # run*. Now a device error falls back to CPU and keeps the cached weights.
+        from yggdrasil.loki import resources
+
+        pipe = MagicMock(return_value=[{"generated_text": [
+            {"role": "assistant", "content": "ok"}]}])
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(side_effect=[RuntimeError("XPU backend not available"), pipe])
+        fake_torch = types.ModuleType("torch")
+        hub = self._fake_hub()
+        TransformersEngine._PIPES.clear()
+        TransformersEngine._FAILED.clear()
+        eng = TransformersEngine(model="m")
+        with patch.object(resources, "accelerator", return_value="xpu"), \
+                patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch,
+                                         "huggingface_hub": hub}):
+            out = eng.generate("hi")
+        self.assertEqual(out, "ok")
+        # First call targets the GPU, second falls back to CPU (device=None) …
+        self.assertEqual(fake.pipeline.call_args_list[0].kwargs["device"], "xpu")
+        self.assertIsNone(fake.pipeline.call_args_list[1].kwargs["device"])
+        # … and crucially the weights are NOT re-downloaded.
+        hub.snapshot_download.assert_not_called()
+
+    def test_device_error_is_not_mistaken_for_corruption(self):
+        from yggdrasil.loki.engines.transformers_engine import _looks_corrupt
+
+        self.assertFalse(_looks_corrupt(RuntimeError("XPU backend not available")))
+        self.assertFalse(_looks_corrupt(RuntimeError("CUDA out of memory")))
+        self.assertTrue(_looks_corrupt(OSError("truncated safetensors")))
+        self.assertTrue(_looks_corrupt(ValueError("Could not load model X")))
+
     def test_partial_download_is_repaired_and_retried(self):
         # The Windows failure mode: a truncated first download, then a clean
         # re-fetch loads. The engine repairs and recovers without the user
@@ -625,7 +659,7 @@ class TestOllamaEngine(unittest.TestCase):
              patch.object(OllamaEngine, "has_model", return_value=False), \
              patch.object(OllamaEngine, "pull", return_value="success") as pull:
             receipt = eng.ensure()
-        pull.assert_called_once_with("qwen2.5:3b")    # default = resource-sized model
+        pull.assert_called_once_with("qwen2.5:3b", on_progress=None)   # default = resource-sized model
         self.assertEqual((receipt["was_present"], receipt["status"]), (False, "success"))
 
     def test_pull_posts_and_returns_final_status(self):
@@ -636,6 +670,51 @@ class TestOllamaEngine(unittest.TestCase):
         # The pull rides HTTPSession.post with the non-streaming body.
         kwargs = sess.post.call_args.kwargs
         self.assertEqual(kwargs["json"], {"name": "qwen2.5:3b", "stream": False})
+
+    def test_streaming_pull_reports_progress_and_returns_status(self):
+        # With an on_progress callback the pull streams Ollama's NDJSON events;
+        # each tick is reported and the final status is returned.
+        events = [
+            b'{"status":"pulling manifest"}\n',
+            b'{"status":"downloading","total":100,"completed":40}\n{"status":"down',
+            b'loading","total":100,"completed":100}\n',
+            b'{"status":"success"}\n',
+        ]
+        resp = MagicMock()
+        resp.stream = MagicMock(return_value=iter(events))
+        sess = MagicMock()
+        sess.post.return_value = resp
+        ticks = []
+        with patch.object(OllamaEngine, "_session", return_value=sess):
+            status = OllamaEngine().pull("qwen2.5:3b", on_progress=ticks.append)
+        self.assertEqual(status, "success")
+        # The request opted into streaming (body un-preloaded) …
+        kwargs = sess.post.call_args.kwargs
+        self.assertEqual(kwargs["json"], {"name": "qwen2.5:3b", "stream": True})
+        self.assertEqual(kwargs["send_config"], {"stream": True})
+        # … and every event surfaced, including the one split across two chunks.
+        self.assertEqual([e.get("completed") for e in ticks if e.get("completed")], [40, 100])
+        self.assertEqual(ticks[-1]["status"], "success")
+
+    def test_streaming_pull_raises_on_error_event(self):
+        resp = MagicMock()
+        resp.stream = MagicMock(return_value=iter([b'{"error":"manifest not found"}\n']))
+        sess = MagicMock()
+        sess.post.return_value = resp
+        with patch.object(OllamaEngine, "_session", return_value=sess):
+            with self.assertRaises(RuntimeError) as ctx:
+                OllamaEngine().pull("nope", on_progress=lambda e: None)
+        self.assertIn("manifest not found", str(ctx.exception))
+
+    def test_iter_ndjson_buffers_across_chunks_and_skips_junk(self):
+        from yggdrasil.loki.engines.ollama_engine import _iter_ndjson
+
+        resp = MagicMock()
+        resp.stream = MagicMock(return_value=iter([
+            b'{"a":1}\n{"b":', b'2}\n\n', b'not json\n', b'{"c":3}',
+        ]))
+        out = list(_iter_ndjson(resp))
+        self.assertEqual(out, [{"a": 1}, {"b": 2}, {"c": 3}])
 
     def test_complete_posts_chat_and_records_provider_tokens(self):
         from yggdrasil.loki.usage import METER
@@ -794,7 +873,7 @@ class TestBootstrapLocal(unittest.TestCase):
             res = loki.bootstrap_local()
         self.assertEqual((res["engine"], res["ready"], res["model"]),
                          ("ollama", True, "qwen2.5:3b"))
-        fake.ensure.assert_called_once_with("qwen2.5:3b")
+        fake.ensure.assert_called_once_with("qwen2.5:3b", on_progress=None)
 
     def test_falls_back_to_transformers(self):
         loki = Loki()

@@ -425,7 +425,13 @@ class Loki:
                 chain.append(eng)
         return chain
 
-    def bootstrap_local(self, *, model: "Optional[str]" = None, pull: bool = True) -> dict[str, Any]:
+    def bootstrap_local(
+        self,
+        *,
+        model: "Optional[str]" = None,
+        pull: bool = True,
+        on_progress: "Optional[Callable[[dict[str, Any]], None]]" = None,
+    ) -> dict[str, Any]:
         """Ready a free **local** reasoning engine, lazily installing on demand.
 
         Prefers a reachable Ollama server — ensures the model **sized to this
@@ -441,7 +447,7 @@ class Loki:
         oll = OllamaEngine()
         if oll.available():
             target = model or oll.bootstrap_model
-            receipt = oll.ensure(target) if pull else {
+            receipt = oll.ensure(target, on_progress=on_progress) if pull else {
                 "model": target, "was_present": oll.has_model(target),
                 "status": "skipped (pull=False)",
             }

@@ -324,6 +324,18 @@ def progress_bar(current: int, total: int, width: int = 30, label: str = "") -> 
     return f"  [{bar}] {pct} {label}"
 
 
+def progress(current: int, total: int, label: str = "") -> None:
+    """Render/refresh a download-style progress bar **in place** on the current
+    line (TTY only — a redirected log would fill with ``\\r`` junk otherwise).
+
+    Drives long downloads (an Ollama ``pull``) so the bytes-so-far show live.
+    Call :func:`clear_line` (or print a newline) when the work finishes."""
+    if not _IS_TTY or total <= 0:
+        return
+    sys.stdout.write(f"{_CSI}2K\r" + progress_bar(current, total, label=label))
+    sys.stdout.flush()
+
+
 # -- typing animation ------------------------------------------------------
 
 def typing_dots(duration: float = 0.35, frames: int = 3) -> None:

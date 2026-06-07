@@ -229,6 +229,24 @@ def _engines(loki: Any, style: Any) -> int:
     return 0
 
 
+def _pull_bar(style: Any) -> Any:
+    """A progress callback for a model download → renders a live byte bar.
+
+    Ollama's pull streams ``{status, completed, total}`` events; show a filled
+    bar with a short byte readout while bytes flow, and just the status line
+    (manifest / verifying / writing) for the non-byte phases."""
+    def on_progress(ev: dict) -> None:
+        status = str(ev.get("status", "")).split()[0] if ev.get("status") else ""
+        total, completed = ev.get("total"), ev.get("completed")
+        if total and completed is not None:
+            mb = f"{completed / 1e6:.0f}/{total / 1e6:.0f} MB"
+            style.progress(int(completed), int(total), label=f"{status} {mb}")
+        elif status:
+            style.clear_line()
+            style.out(f"  {style.dim('▹ ' + status)}\r")
+    return on_progress
+
+
 def _setup(loki: Any, style: Any, arg: str) -> int:
     """Bootstrap a free local model — lazily install it on demand.
 
@@ -238,7 +256,8 @@ def _setup(loki: Any, style: Any, arg: str) -> int:
     """
     model = arg.strip() or None
     style.out(f"  {style.dim('readying a free local model — this may download on first run…')}\n")
-    res = loki.bootstrap_local(model=model)
+    res = loki.bootstrap_local(model=model, on_progress=_pull_bar(style))
+    style.clear_line()
     if res.get("ready"):
         was = res.get("was_present")
         verb = "already installed" if was else "installed"
@@ -478,6 +497,94 @@ def _select_engine(loki: Any, style: Any, state: dict) -> None:
     elif ans and any(e.name == ans for e in available):
         state["engine"] = ans
     style.ok(f"engine → {state['engine']}")
+
+
+def _choose_model(loki: Any, style: Any, state: dict, arg: str = "") -> None:
+    """Pick the model for the session's engine — pin it for every later turn.
+
+    ``/model <id>`` pins directly. With no argument it lists the engine's preset
+    models (the resource-sized ladder for a local engine, the fast/deep tiers
+    for a remote one) plus any already-pulled Ollama models, marks the current
+    and recommended ones, and lets you pick by number or type a custom id. For a
+    local engine it then offers to download the choice now, with a progress bar.
+    """
+    name = state.get("engine")
+    if not name:
+        style.warn("no engine selected — pick one with /engine first")
+        return
+    eng = loki.engine(name)
+    if arg:
+        eng.model = arg
+        state["model"] = arg
+        style.ok(f"model → {style.brand(arg)} {style.dim('(' + name + ')')}")
+        return
+
+    current = None
+    try:
+        current = eng.resolve_model()
+    except Exception:
+        pass
+    # The engine's preset ids (resource ladder or tier map), then any models the
+    # local Ollama server has already pulled — deduped, first note wins.
+    notes: dict[str, str] = {}
+    for tier, mid in {**getattr(eng, "RESOURCE_MODELS", {}), **getattr(eng, "MODELS", {})}.items():
+        notes.setdefault(mid, tier)
+    if hasattr(eng, "installed_models"):
+        try:
+            for mid in eng.installed_models():
+                notes.setdefault(mid, "installed")
+        except Exception:
+            pass
+    options = list(notes.items())
+    if not options:
+        style.out(f"  {style.dim(f'engine {name} has no presets — pin one with /model <id>')}\n")
+        return
+
+    recommended = eng.bootstrap_model if eng.local else (getattr(eng, "MODELS", {}) or {}).get("deep")
+    style.out(f"  {style.bold('models')} {style.dim('· ' + name + ' · current ' + (current or 'auto'))}\n")
+    for i, (mid, note) in enumerate(options, 1):
+        marks = [m for m, on in (("current", mid == current), ("recommended", mid == recommended)) if on]
+        tail = style.dim(" (" + ", ".join(marks) + ")") if marks else ""
+        style.out(f"    {style.brand(str(i))}  {mid.ljust(28)} {style.dim(note)}{tail}\n")
+    try:
+        ans = input(f"  pick [1-{len(options)}], type an id, or Enter to keep: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not ans:
+        return
+    chosen = options[int(ans) - 1][0] if ans.isdigit() and 1 <= int(ans) <= len(options) else ans
+    eng.model = chosen
+    state["model"] = chosen
+    style.ok(f"model → {style.brand(chosen)} {style.dim('(' + name + ')')}")
+    if eng.local:
+        try:
+            go = input("  download / ready it now? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            go = ""
+        if go in ("y", "yes"):
+            _ready_model(loki, style, name, chosen)
+
+
+def _ready_model(loki: Any, style: Any, engine: str, model: str) -> None:
+    """Download/ready *model* now, with a progress bar — Ollama streams a byte
+    bar; the HF transformers engine shows its own download bar as it fetches."""
+    if engine == "ollama":
+        res = loki.bootstrap_local(model=model, on_progress=_pull_bar(style))
+        style.clear_line()
+        if res.get("ready"):
+            style.ok(f"{res['engine']} ready · {res['model']} ({res.get('status', 'ok')})")
+        else:
+            style.warn("could not ready it — see /setup")
+        return
+    # transformers: warm() builds the pipeline, downloading weights on first use
+    # (HF prints the download progress); it swallows errors, so confirm after.
+    style.out(f"  {style.dim('downloading ' + model + ' — progress below…')}\n")
+    eng = loki.engine(engine)
+    eng.warm(model)
+    if getattr(eng, "ready", lambda _m: False)(model):
+        style.ok(f"{engine} ready · {model}")
+    else:
+        style.warn(f"could not ready {model} — check the log above or try /setup")
 
 
 def _local_load_notice(agent: Any, style: Any, engine: "str | None") -> None:
@@ -850,6 +957,7 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
         style.out(
             f"  {style.bold('commands')}\n"
             f"    {style.brand('/engine')}   pick the session base engine (claude/databricks/openai/ollama/auto)\n"
+            f"    {style.brand('/model')}    pick the model for this engine (lists presets · downloads with a bar)\n"
             f"    {style.brand('/engines')}  reasoning engines and adaptive models\n"
             f"    {style.brand('/setup')}    bootstrap a free local model (lazy-install on demand)\n"
             f"    {style.brand('/status')}   identity + backends + engines + skills\n"
@@ -877,6 +985,8 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
                 style.ok(f"engine → {arg}")
         else:
             style.warn(f"unknown engine {arg!r} — see /engines")
+    elif cmd == "model":
+        _choose_model(loki, style, state, arg)
     elif cmd == "status":
         loki.load_specialists()   # ensure the specialist fleet is listed even
         _status(loki, style)      # if the background warmer hasn't finished yet

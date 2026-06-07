@@ -12,9 +12,10 @@ shared pool.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
-from typing import Any, ClassVar, Optional
+from typing import Any, Callable, ClassVar, Iterator, Optional
 
 from yggdrasil.dataclasses.waiting import WaitingConfig
 
@@ -122,29 +123,50 @@ class OllamaEngine(LocalEngine):
             n.split(":")[0] == model for n in names
         )
 
-    def pull(self, model: Optional[str] = None, *, timeout: float = 1800.0) -> str:
+    def pull(self, model: Optional[str] = None, *, timeout: float = 1800.0,
+             on_progress: "Optional[Callable[[dict[str, Any]], None]]" = None) -> str:
         """Download *model* onto the Ollama server (lazy — the heavy bit).
 
-        Uses the non-streaming pull so the server replies with a single final
-        status object. Defaults to :attr:`bootstrap_model`, the lightweight brain.
+        Defaults to :attr:`bootstrap_model`, the lightweight brain. Without
+        *on_progress* this does the non-streaming pull (one final status object).
+        With *on_progress* it **streams** Ollama's NDJSON progress events —
+        ``{"status", "completed", "total"}`` per chunk — so a caller can render a
+        live download bar; the final status string is returned either way.
         """
         model = model or self.bootstrap_model
+        wait = WaitingConfig(timeout=timeout, retries=0, max_attempts=1)
+        if on_progress is None:
+            resp = self._session().post(
+                f"{self.host}/api/pull", json={"name": model, "stream": False}, wait=wait,
+            )
+            return resp.json().get("status", "unknown")
+        # Streamed pull: leave the body un-preloaded (``send_config`` stream) and
+        # parse the NDJSON event log as it arrives, reporting each progress tick.
         resp = self._session().post(
-            f"{self.host}/api/pull", json={"name": model, "stream": False},
-            wait=WaitingConfig(timeout=timeout, retries=0, max_attempts=1),
+            f"{self.host}/api/pull", json={"name": model, "stream": True},
+            send_config={"stream": True}, wait=wait,
         )
-        return resp.json().get("status", "unknown")
+        status = "unknown"
+        for event in _iter_ndjson(resp):
+            if event.get("error"):
+                raise RuntimeError(str(event["error"]))
+            status = event.get("status", status)
+            on_progress(event)
+        return status
 
-    def ensure(self, model: Optional[str] = None) -> dict[str, Any]:
+    def ensure(self, model: Optional[str] = None,
+               on_progress: "Optional[Callable[[dict[str, Any]], None]]" = None) -> dict[str, Any]:
         """Make sure *model* is available, pulling it only if missing.
 
         Returns ``{"model", "was_present", "status"}`` — the lazy-install
-        receipt so a caller (the ``setup`` skill) can report what it did.
+        receipt so a caller (the ``setup`` skill) can report what it did. An
+        *on_progress* callback streams the pull's download progress.
         """
         model = model or self.bootstrap_model
         if self.has_model(model):
             return {"model": model, "was_present": True, "status": "already installed"}
-        return {"model": model, "was_present": False, "status": self.pull(model)}
+        return {"model": model, "was_present": False,
+                "status": self.pull(model, on_progress=on_progress)}
 
     def complete(
         self,
@@ -170,3 +192,31 @@ class OllamaEngine(LocalEngine):
                      output_tokens=data.get("eval_count"),
                      messages=messages, system=system, text=text)
         return Completion(text=text, model=model, raw=data)
+
+
+def _iter_ndjson(resp: Any) -> "Iterator[dict[str, Any]]":
+    """Yield JSON objects from a newline-delimited streaming response body.
+
+    Ollama's ``/api/pull`` (and ``/api/generate``) emit one JSON object per
+    line as the download proceeds. Reads the body incrementally through the
+    response's ``.stream()`` chunks, buffering across chunk boundaries, and
+    skips any blank or partial-trailing fragment that doesn't parse.
+    """
+    buffer = b""
+    for chunk in resp.stream():
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    tail = buffer.strip()
+    if tail:
+        try:
+            yield json.loads(tail)
+        except json.JSONDecodeError:
+            pass

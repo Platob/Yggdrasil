@@ -173,6 +173,100 @@ class TestIntelGpuEnable(unittest.TestCase):
         inp.assert_not_called()
 
 
+class TestModelChooser(unittest.TestCase):
+    """``/model`` pins the engine's model for the session (interactive picker)."""
+
+    def _engine(self, *, local=True, resource=None, models=None, installed=None, current="cur"):
+        from unittest.mock import MagicMock
+        eng = MagicMock()
+        eng.local = local
+        eng.model = None
+        eng.RESOURCE_MODELS = resource or {}
+        eng.MODELS = models or {}
+        eng.bootstrap_model = "rec"
+        eng.resolve_model.return_value = current
+        if installed is not None:
+            eng.installed_models.return_value = installed
+        else:
+            del eng.installed_models   # remote engine: no such method
+        return eng
+
+    def _run(self, eng, *, arg="", answer=""):
+        import io
+        from contextlib import redirect_stdout
+        from unittest.mock import MagicMock, patch
+
+        from yggdrasil.cli import style
+        style.force_color(False)
+        loki = MagicMock()
+        loki.engine.return_value = eng
+        state = {"engine": "ollama"}
+        buf = io.StringIO()
+        with patch("builtins.input", return_value=answer), redirect_stdout(buf):
+            cli._choose_model(loki, style, state, arg)
+        return state, style.strip(buf.getvalue())
+
+    def test_explicit_arg_pins_directly(self):
+        eng = self._engine()
+        state, out = self._run(eng, arg="my/model")
+        self.assertEqual(eng.model, "my/model")
+        self.assertEqual(state["model"], "my/model")
+
+    def test_lists_presets_and_picks_by_number(self):
+        eng = self._engine(local=False, models={"fast": "f-model", "deep": "d-model"},
+                           current="f-model")
+        # The remote engine has no installed_models; pick #2 → the deep model.
+        state, out = self._run(eng, answer="2")
+        self.assertIn("f-model", out)
+        self.assertIn("d-model", out)
+        self.assertIn("recommended", out)          # deep is the remote recommendation
+        self.assertEqual(eng.model, "d-model")
+
+    def test_ollama_lists_installed_and_keeps_on_blank(self):
+        eng = self._engine(local=True, resource={"small": "qwen:3b"},
+                           installed=["qwen:3b", "mistral:7b"], current="qwen:3b")
+        state, out = self._run(eng, answer="")     # Enter → keep current
+        self.assertIn("mistral:7b", out)           # an already-pulled model is offered
+        self.assertIn("installed", out)
+        self.assertIsNone(eng.model)               # nothing pinned on blank
+        self.assertNotIn("model", state)
+
+    def test_no_engine_warns(self):
+        from unittest.mock import MagicMock, patch
+        import io
+        from contextlib import redirect_stdout
+        from yggdrasil.cli import style
+        style.force_color(False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli._choose_model(MagicMock(), style, {"engine": None}, "")
+        self.assertIn("no engine", style.strip(buf.getvalue()))
+
+
+class TestPullBar(unittest.TestCase):
+    """The Ollama download progress callback renders a byte bar."""
+
+    def test_renders_bar_on_byte_events(self):
+        from unittest.mock import patch
+        from yggdrasil.cli import style
+
+        calls = []
+        with patch.object(style, "progress", side_effect=lambda c, t, label="": calls.append((c, t, label))):
+            cb = cli._pull_bar(style)
+            cb({"status": "downloading abc", "completed": 50, "total": 200})
+        self.assertEqual(calls[0][0], 50)
+        self.assertEqual(calls[0][1], 200)
+        self.assertIn("MB", calls[0][2])
+
+    def test_status_only_event_does_not_call_bar(self):
+        from unittest.mock import patch
+        from yggdrasil.cli import style
+        with patch.object(style, "progress") as prog, \
+                patch.object(style, "clear_line"), patch.object(style, "out"):
+            cli._pull_bar(style)({"status": "verifying sha256 digest"})
+        prog.assert_not_called()
+
+
 class TestActMonitor(unittest.TestCase):
     """The live cumulative step view for the autonomous ``act`` loop."""
 
