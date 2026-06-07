@@ -212,6 +212,23 @@ class TestAgentAct(unittest.TestCase):
         self.assertEqual(len(result["steps"]), 1)
         self.assertEqual((pathlib.Path(self.dir) / "hi.txt").read_text(), "hello loki")
 
+    def test_act_stops_when_over_budget(self):
+        import json
+        from unittest.mock import patch
+
+        from yggdrasil.loki.usage import METER
+
+        loki, eng = self._loki([
+            json.dumps({"tool": "list_dir", "args": {"path": "."}}),
+            json.dumps({"done": True, "answer": "should not reach"}),
+        ])
+        # Budget already exceeded → the loop stops before the first model call.
+        with patch.object(METER, "over_budget", return_value=True):
+            result = loki.act("do work", root=self.dir, max_steps=5)
+        self.assertFalse(result["completed"])
+        self.assertIn("budget", result["answer"])
+        self.assertEqual(eng.seen, [])                    # the engine was never called
+
     def test_act_feeds_observations_back(self):
         import json
 

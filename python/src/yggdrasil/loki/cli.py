@@ -57,6 +57,7 @@ def _build_parser() -> argparse.ArgumentParser:
     do.add_argument("--engine", default=None, help="Force an engine (claude/openai/databricks).")
     do.add_argument("--tier", default=None, choices=["fast", "deep"], help="Force a model tier (default: adaptive).")
     do.add_argument("--max-steps", type=int, default=12, help="Tool-call budget (default 12).")
+    do.add_argument("--budget", type=float, default=None, help="USD cost cap — stop before exceeding it.")
     do.add_argument("--read-only", action="store_true", help="Discovery only — no file writes.")
     do.add_argument("--allow-shell", action="store_true", help="Also give the agent a shell tool.")
     do.add_argument("--allow-web", action="store_true", help="Also give the agent web fetch/table/image tools.")
@@ -837,22 +838,38 @@ def _fleet_kpi_line(style: Any, fleet: Any) -> str:
         bits.append(style.brand(f"{k['running']} running"))
     if k["queued"]:
         bits.append(style.dim(f"{k['queued']} queued"))
-    tail = f"{k['steps']} steps · {k['tokens']:,} tok"
-    if k["cost"]:
-        tail += f" · ${k['cost']:.4f}"
-    tail += f" · {k['elapsed']:.1f}s"
+    cost = f"${k['cost']:.4f}" + (f"/${fleet.cost_cap:.2f}" if fleet.cost_cap else "")
+    tail = f"{k['steps']} steps · {k['tokens']:,} tok · {cost} · {k['elapsed']:.1f}s"
     return f"  {style.dim('agents')} {'  '.join(bits)}  {style.dim('· ' + tail)}"
+
+
+def _fleet_cap_prompt(style: Any, kpis: dict) -> "float | None":
+    """The fleet hit its cost cap with work queued — raise it, or stop. Returns
+    the new cap, or ``None`` to stop launching and let runners finish."""
+    style.warn(f"fleet cost ${kpis['cost']:.4f} reached the cap — "
+               f"{kpis['done']} done, {kpis['queued']} still queued")
+    try:
+        ans = input("  go further? raise cap to $N · Enter for +$1 · stop [s]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if ans in ("s", "stop", "n", "no"):
+        return None
+    amt = _usd(ans)
+    return amt if amt is not None else round(kpis["cost"] + 1.0, 2)
 
 
 def _run_fleet(loki: Any, style: Any, state: dict, tasks: list, *,
                max_parallel: "int | None" = None) -> Any:
-    """Spawn a process agent per task and live-monitor the fleet to completion."""
+    """Spawn a process agent per task and live-monitor the mesh to completion."""
     from yggdrasil.loki.fleet import Fleet
+    from yggdrasil.loki.usage import METER
 
-    cap = f" · ≤{max_parallel} at once" if max_parallel else ""
-    style.out(f"  {style.brand('⛓ delegating')} {style.dim(str(len(tasks)) + ' parallel agents')} "
-              f"{style.dim('· ' + (state.get('engine') or 'auto') + ' · root ' + state['root'] + cap)}\n")
-    fleet = Fleet(max_parallel=max_parallel)
+    note = (f" · ≤{max_parallel} at once" if max_parallel else "") + " · local×1"
+    style.out(f"  {style.brand('⛓ delegating')} {style.dim(str(len(tasks)) + ' mesh agents')} "
+              f"{style.dim('· ' + (state.get('engine') or 'auto') + ' · root ' + state['root'] + note)}\n")
+    # Shared workspace (mesh files + mesh.json roster); aggregate cost cap from the
+    # session budget — the fleet asks before going past it.
+    fleet = Fleet(max_parallel=max_parallel, cost_cap=METER.cost_limit, mesh_dir=state["root"])
     fleet.spawn_all(tasks, root=state["root"], engine=state.get("engine"),
                     tier=state["tier"], allow_web=True)
     live = style.LiveDisplay()
@@ -864,7 +881,7 @@ def _run_fleet(loki: Any, style: Any, state: dict, tasks: list, *,
         live.update(_fleet_lines(style, agents, frame) + [_fleet_kpi_line(style, fleet)])
 
     try:
-        fleet.monitor(render, interval=0.12)
+        fleet.monitor(render, interval=0.12, on_cap=lambda k: _fleet_cap_prompt(style, k))
     except KeyboardInterrupt:
         fleet.cancel_all()
         render(fleet.agents)
@@ -883,15 +900,22 @@ def _run_fleet(loki: Any, style: Any, state: dict, tasks: list, *,
 
 
 def _scaffold_args(text: str) -> dict:
-    """Extract scaffold kwargs (name + languages) from a free-text request."""
+    """Extract scaffold kwargs (name, languages, preset, cloud) from free text."""
     from yggdrasil.loki import scaffold
 
-    langs = scaffold.resolve_languages(text)
-    m = re.search(r"\b(?:called|named|name[d]?|project|repo|app)\s+['\"]?([A-Za-z][\w.-]{1,40})['\"]?", text)
+    # "called X" / "named X" are reliable; "project"/"app"/"repo" are usually
+    # nouns ("a python project"), so they don't introduce the name.
+    m = re.search(r"\b(?:called|named)\s+['\"]?([A-Za-z][\w.-]{1,40})['\"]?", text)
     if not m:
         m = re.search(r"['\"]([A-Za-z][\w .-]{1,40})['\"]", text)        # a quoted name
     name = (m.group(1).strip().replace(" ", "-") if m else "new-project")
-    return {"name": name, "languages": langs or ["python"], "description": text.strip()}
+    return {
+        "name": name,
+        "languages": scaffold.resolve_languages(text) or ["python"],
+        "preset": scaffold.resolve_preset(text),
+        "cloud": scaffold.resolve_cloud(text),
+        "description": text.strip(),
+    }
 
 
 def _delegate_tasks(agent: Any, style: Any, state: dict, text: str) -> list:
@@ -909,8 +933,9 @@ def _delegate_tasks(agent: Any, style: Any, state: dict, text: str) -> list:
 
 
 def _print_scaffold(style: Any, res: dict) -> None:
-    style.out(f"  {style.good('✦')} {style.bold(res['name'])} "
-              f"{style.dim('· ' + ', '.join(res['languages']))}\n")
+    kind = res["preset"] if res["preset"] != "lib" else ", ".join(res["languages"])
+    cloud = (" · cloud " + ", ".join(res["cloud"])) if res.get("cloud") else ""
+    style.out(f"  {style.good('✦')} {style.bold(res['name'])} {style.dim('· ' + kind + cloud)}\n")
     style.out(f"  {style.dim('at ' + res['path'])}\n")
     for f in res["files"][:14]:
         style.out(f"    {style.good('+')} {style.dim(f)}\n")
@@ -965,7 +990,8 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
                 style.out(f"  {style.good('✎')} {', '.join(res['files_changed'])}\n")
         elif plan["action"] == "scaffold":
             args = _scaffold_args(line)
-            with style.Spinner(f"scaffolding {args['name']} ({', '.join(args['languages'])})…"):
+            kind = args["preset"] if args["preset"] != "lib" else ", ".join(args["languages"])
+            with style.Spinner(f"scaffolding {args['name']} ({kind})…"):
                 res = agent.run("scaffold", **args)
             _print_scaffold(style, res)
             reply = f"Scaffolded {res['name']} ({', '.join(res['languages'])}) → {res['path']}"
@@ -1367,6 +1393,11 @@ def _do(loki: Any, style: Any, args: Any) -> int:
     if args.allow_web:
         mode += "+web"
     style.out(f"  {style.dim('root ' + args.root + '  ·  ' + mode)}\n\n")
+
+    if args.budget is not None:                       # self-cap this agent's spend
+        from yggdrasil.loki.usage import METER
+
+        METER.set_limit(args.budget)
 
     mon = _ActMonitor(style, args.max_steps, verbose=True)
     try:

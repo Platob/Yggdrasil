@@ -96,6 +96,66 @@ class TestFleet(unittest.TestCase):
         self.assertTrue(all(a.ok for a in fleet.agents))
         self.assertEqual(fleet.queued(), 0)
 
+    def test_do_command_includes_per_agent_budget_and_mesh_root(self):
+        fleet = Fleet(per_agent_budget=0.25, mesh_dir="/mesh")
+        cmd = fleet.do_command("task", root="/ignored")
+        self.assertEqual(cmd[cmd.index("--budget") + 1], "0.25")
+        self.assertEqual(cmd[cmd.index("--root") + 1], "/mesh")   # shared workspace
+
+    def test_local_engine_agents_are_serialized(self):
+        # max_local=1 → only one local-model agent runs at a time; remotes fan out.
+        fleet = Fleet(max_local=1)
+        for t in ("a", "b", "c"):
+            fleet._pending.append((t, {"cmd": _slow_cmd(), "engine": "openvino"}))
+        fleet._launch_pending()
+        self.assertEqual(sum(1 for h in fleet.running() if h.local), 1)   # just one local
+        self.assertEqual(fleet.queued(), 2)
+        fleet.cancel_all()
+
+    def test_remote_agents_not_serialized(self):
+        fleet = Fleet(max_local=1, max_parallel=4)
+        for t in ("a", "b", "c"):
+            fleet._pending.append((t, {"cmd": _slow_cmd(), "engine": "claude"}))
+        fleet._launch_pending()
+        self.assertEqual(len(fleet.running()), 3)        # remotes all start
+        fleet.cancel_all()
+
+    def test_cost_cap_pauses_then_on_cap_can_go_further(self):
+        # Serialized spend (max_parallel=1): a→$0.02, b→$0.04 hits the $0.03 cap
+        # with c queued → on_cap raises it once and c then runs.
+        fleet = Fleet(cost_cap=0.03, max_parallel=1)
+        for t in ("a", "b", "c"):
+            fleet._pending.append((t, {"cmd": _ok_cmd(cost=0.02)}))
+        asked = []
+
+        def on_cap(kpis):
+            asked.append(kpis["cost"])
+            return 0.10                                  # go further
+
+        fleet.monitor(interval=0.02, on_cap=on_cap)
+        self.assertTrue(asked)                            # the cap was hit and we were asked
+        self.assertEqual(len(fleet.agents), 3)            # all three ultimately ran
+
+    def test_cost_cap_stop_drops_the_queue(self):
+        fleet = Fleet(cost_cap=0.01, max_parallel=1)
+        for t in ("a", "b"):
+            fleet._pending.append((t, {"cmd": _ok_cmd(cost=0.02)}))
+        fleet.monitor(interval=0.02, on_cap=lambda k: None)   # decline to go further
+        self.assertEqual(fleet.queued(), 0)               # queue dropped
+        self.assertEqual(len(fleet.agents), 1)            # only the first ever launched
+
+    def test_mesh_json_written_to_shared_dir(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            fleet = Fleet(mesh_dir=d)
+            fleet.spawn("one", cmd=_ok_cmd())
+            fleet.monitor(interval=0.02)
+            with open(f"{d}/mesh.json") as fh:
+                mesh = _json.load(fh)
+            self.assertIn("agents", mesh)
+            self.assertIn("kpis", mesh)
+
     def test_non_json_output_still_completes(self):
         fleet = Fleet()
         fleet.spawn("noisy", cmd=[sys.executable, "-c", "print('hello, not json')"])

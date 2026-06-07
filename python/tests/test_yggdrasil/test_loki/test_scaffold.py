@@ -80,6 +80,56 @@ class TestScaffoldProject(unittest.TestCase):
             self.assertIn("Initial scaffold", log)
 
 
+class TestPresets(unittest.TestCase):
+    def test_resolve_preset_and_cloud(self):
+        self.assertEqual(scaffold.resolve_preset("build a realtime full-stack app"),
+                         "fullstack-realtime")
+        self.assertEqual(scaffold.resolve_preset("a python library"), "lib")
+        self.assertEqual(scaffold.resolve_cloud("deploy on aws and databricks"),
+                         ["aws", "databricks"])
+
+    def test_fullstack_realtime_tree_is_runnable(self):
+        import ast
+        with tempfile.TemporaryDirectory() as d:
+            res = scaffold.scaffold_project("pulse", preset="fullstack-realtime",
+                                            cloud=["aws", "databricks"], base_dir=d, git=False)
+            root = Path(res["path"])
+            self.assertEqual(res["preset"], "fullstack-realtime")
+            self.assertEqual(res["cloud"], ["aws", "databricks"])
+            for rel in ("backend/src/app/main.py", "backend/tests/test_app.py",
+                        "frontend/index.html", "frontend/app.js", "Dockerfile",
+                        ".github/workflows/ci.yml", "deploy/aws.md", "deploy/databricks.md"):
+                self.assertTrue((root / rel).is_file(), rel)
+            main = (root / "backend" / "src" / "app" / "main.py").read_text()
+            ast.parse(main)                              # valid Python
+            self.assertNotIn("{{", main)                 # no leaked format braces
+            self.assertIn('f"data: {json.dumps(_tick())}', main)   # real SSE f-string
+            # No leaked braces in the JS / YAML either.
+            self.assertNotIn("{{", (root / "frontend" / "app.js").read_text())
+            self.assertNotIn("{{", (root / ".github" / "workflows" / "ci.yml").read_text())
+
+    def test_repl_scaffold_args_infer_name_preset_cloud(self):
+        from yggdrasil.loki import cli
+
+        args = cli._scaffold_args("build a realtime full-stack app called pulse on aws and databricks")
+        self.assertEqual(args["name"], "pulse")
+        self.assertEqual(args["preset"], "fullstack-realtime")
+        self.assertEqual(args["cloud"], ["aws", "databricks"])
+
+    def test_repl_scaffold_args_name_from_called(self):
+        from yggdrasil.loki import cli
+
+        # "project" is a noun here, not the name — only "called X" names it.
+        self.assertEqual(cli._scaffold_args("create a new python project called acme")["name"], "acme")
+        self.assertEqual(cli._scaffold_args("a new go service repo")["name"], "new-project")
+
+    def test_unknown_cloud_target_dropped(self):
+        with tempfile.TemporaryDirectory() as d:
+            res = scaffold.scaffold_project("x", preset="fullstack-realtime",
+                                            cloud=["aws", "gcp"], base_dir=d, git=False)
+            self.assertEqual(res["cloud"], ["aws"])
+
+
 class TestScaffoldSkill(unittest.TestCase):
     def test_run_via_loki_with_name_kwarg(self):
         # Regression: Loki.run reserved `name`, clashing with scaffold(name=…).

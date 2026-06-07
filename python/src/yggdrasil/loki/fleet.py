@@ -22,17 +22,24 @@ import tempfile
 import time
 from typing import Any, Callable, Optional
 
-__all__ = ["AgentHandle", "Fleet"]
+__all__ = ["AgentHandle", "Fleet", "LOCAL_ENGINES"]
+
+#: Engines that run on the single local accelerator — only one such agent should
+#: run at a time (the GPU/NPU is one resource), while remote agents fan out.
+LOCAL_ENGINES = frozenset({"ollama", "transformers", "openvino"})
 
 
 class AgentHandle:
     """One spawned process agent — its task, process, and (when done) result."""
 
     def __init__(self, agent_id: int, task: str, cmd: list[str],
-                 proc: subprocess.Popen, out_path: str, err_path: str) -> None:
+                 proc: subprocess.Popen, out_path: str, err_path: str,
+                 engine: Optional[str] = None) -> None:
         self.id = agent_id
         self.task = task
         self.cmd = cmd
+        self.engine = engine          # resolved engine name (for local-concurrency)
+        self.local = engine in LOCAL_ENGINES
         self.proc = proc
         self._out_path = out_path
         self._err_path = err_path
@@ -116,13 +123,27 @@ class AgentHandle:
 class Fleet:
     """Spawn and monitor a set of background process agents."""
 
-    def __init__(self, *, python: Optional[str] = None, max_parallel: Optional[int] = None) -> None:
+    def __init__(self, *, python: Optional[str] = None, max_parallel: Optional[int] = None,
+                 max_local: int = 1, cost_cap: Optional[float] = None,
+                 per_agent_budget: Optional[float] = None, mesh_dir: Optional[str] = None) -> None:
         self.agents: list[AgentHandle] = []
         self._python = python or sys.executable
         #: Cap on concurrently-running agents (``None`` = unbounded). Extra tasks
         #: queue and launch as running slots free — so a big swarm doesn't
         #: fork-bomb the box.
         self.max_parallel = max_parallel
+        #: Concurrent **local-model** agents (the GPU/NPU is one resource): keep
+        #: them serialized while remote agents fan out — the mesh's local-model
+        #: optimization. 1 = one local agent at a time.
+        self.max_local = max_local
+        #: Aggregate USD cap across the fleet; when reached with work still queued
+        #: the monitor asks (``on_cap``) before going further.
+        self.cost_cap = cost_cap
+        #: Per-agent USD budget passed through as ``ygg loki do --budget``.
+        self.per_agent_budget = per_agent_budget
+        #: Shared workspace the agents read/write — the mesh's shared files. The
+        #: live roster is mirrored to ``mesh.json`` there so agents can see peers.
+        self.mesh_dir = mesh_dir
         self._pending: list[tuple[str, dict]] = []
 
     def do_command(
@@ -139,11 +160,13 @@ class Fleet:
     ) -> list[str]:
         """The ``ygg loki do`` argv for *task* — one isolated autonomous agent."""
         cmd = [self._python, "-m", "yggdrasil.loki.cli", "do", task,
-               "--root", root, "--json", "--max-steps", str(max_steps)]
+               "--root", self.mesh_dir or root, "--json", "--max-steps", str(max_steps)]
         if engine:
             cmd += ["--engine", engine]
         if tier:
             cmd += ["--tier", tier]
+        if self.per_agent_budget is not None:
+            cmd += ["--budget", str(self.per_agent_budget)]
         if read_only:
             cmd.append("--read-only")
         if allow_shell:
@@ -170,8 +193,10 @@ class Fleet:
             stderr=open(err.name, "w", encoding="utf-8"),
             env={**os.environ, **(env or {})},
         )
-        handle = AgentHandle(len(self.agents) + 1, task, command, proc, out.name, err.name)
+        handle = AgentHandle(len(self.agents) + 1, task, command, proc, out.name, err.name,
+                             engine=kw.get("engine"))
         self.agents.append(handle)
+        self._write_mesh()
         return handle
 
     def spawn_all(self, tasks: list[str], **kw: Any) -> list[AgentHandle]:
@@ -184,23 +209,59 @@ class Fleet:
         return self._launch_pending()
 
     def _launch_pending(self) -> list[AgentHandle]:
+        """Launch queued tasks that pass every gate: overall concurrency,
+        local-model concurrency (one accelerator), and the aggregate cost cap."""
         started: list[AgentHandle] = []
-        while self._pending and (self.max_parallel is None
-                                 or len(self.running()) < self.max_parallel):
-            task, kw = self._pending.pop(0)
+        while self._pending:
+            if self.cost_cap is not None and self.spent() >= self.cost_cap:
+                break                                    # paused — monitor asks via on_cap
+            if self.max_parallel is not None and len(self.running()) >= self.max_parallel:
+                break
+            idx = self._next_launchable()
+            if idx is None:
+                break
+            task, kw = self._pending.pop(idx)
             started.append(self.spawn(task, **kw))
         return started
+
+    def _next_launchable(self) -> Optional[int]:
+        """Index of the next queued task allowed to start now — skipping local
+        tasks while the local-model slot(s) are busy."""
+        local_busy = sum(1 for h in self.running() if h.local) >= self.max_local
+        for i, (_, kw) in enumerate(self._pending):
+            if local_busy and kw.get("engine") in LOCAL_ENGINES:
+                continue
+            return i
+        return None
+
+    def spent(self) -> float:
+        return round(sum(h.cost for h in self.agents), 6)
 
     def queued(self) -> int:
         return len(self._pending)
 
     def poll(self) -> list[AgentHandle]:
         """Refresh statuses: finalize exited agents, then fill freed slots."""
+        changed = False
         for h in self.agents:
             if h.running and h.proc.poll() is not None:
                 h._finish()
+                changed = True
         self._launch_pending()
+        if changed:
+            self._write_mesh()
         return self.agents
+
+    def _write_mesh(self) -> None:
+        """Mirror the live roster into ``mesh.json`` in the shared workspace."""
+        if not self.mesh_dir:
+            return
+        try:
+            os.makedirs(self.mesh_dir, exist_ok=True)
+            with open(os.path.join(self.mesh_dir, "mesh.json"), "w", encoding="utf-8") as fh:
+                json.dump({"agents": self.summary(), "kpis": self.kpis()}, fh, indent=2)
+        except OSError:
+            pass
 
     def running(self) -> list[AgentHandle]:
         return [h for h in self.agents if h.running]
@@ -214,18 +275,28 @@ class Fleet:
         *,
         interval: float = 0.2,
         timeout: Optional[float] = None,
+        on_cap: Optional[Callable[[dict[str, Any]], Optional[float]]] = None,
     ) -> list[AgentHandle]:
         """Drive the fleet to completion, calling *on_update* each tick.
 
         Returns when every agent has finished (or *timeout* elapses — survivors
-        are cancelled and marked ``timeout``). *on_update* receives the full
-        agent list so a caller can render a live dashboard.
+        are cancelled and marked ``timeout``). When the aggregate cost cap is hit
+        with work still queued, ``on_cap(kpis)`` is asked for a **new cap** to go
+        further; returning ``None`` drops the queue and finishes the running ones.
         """
         start = time.monotonic()
         while True:
             self.poll()
             if on_update is not None:
                 on_update(self.agents)
+            # Cost cap reached but tasks still waiting → ask whether to go further.
+            if self.cost_cap is not None and self._pending and self.spent() >= self.cost_cap:
+                new_cap = on_cap(self.kpis()) if on_cap is not None else None
+                if new_cap is not None:
+                    self.cost_cap = float(new_cap)
+                    self._launch_pending()
+                else:
+                    self._pending.clear()              # stop here; let runners finish
             if self.all_done():
                 break
             if timeout is not None and time.monotonic() - start > timeout:

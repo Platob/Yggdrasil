@@ -19,7 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-__all__ = ["LANGUAGES", "scaffold_project", "resolve_languages"]
+__all__ = ["LANGUAGES", "PRESETS", "CLOUD", "scaffold_project",
+           "resolve_languages", "resolve_preset", "resolve_cloud"]
 
 _PYPROJECT = """\
 [project]
@@ -142,6 +143,192 @@ LANGUAGES: dict[str, dict[str, Any]] = {
     },
 }
 
+_BACKEND_MAIN = '''\
+"""{name} — real-time FastAPI backend (WebSocket + SSE)."""
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import time
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, StreamingResponse
+
+app = FastAPI(title="{name}")
+
+
+def _tick() -> dict:
+    """One real-time sample — swap for your Kafka/Kinesis/Delta stream source."""
+    return {"ts": time.time(), "value": round(random.uniform(0, 100), 2)}
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "service": "{name}"}
+
+
+@app.websocket("/ws")
+async def ws(sock: WebSocket) -> None:
+    await sock.accept()
+    try:
+        while True:
+            await sock.send_json(_tick())
+            await asyncio.sleep(1.0)
+    except WebSocketDisconnect:
+        return
+
+
+@app.get("/stream")
+async def stream() -> StreamingResponse:
+    async def gen():
+        while True:
+            yield f"data: {json.dumps(_tick())}\\n\\n"
+            await asyncio.sleep(1.0)
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/")
+def index() -> HTMLResponse:
+    return HTMLResponse("<h1>{name}</h1><p>WS at /ws · SSE at /stream · health at /health</p>")
+'''
+
+_BACKEND_TEST = '''\
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+def test_health() -> None:
+    r = TestClient(app).get("/health")
+    assert r.status_code == 200 and r.json()["status"] == "ok"
+
+
+def test_ws_streams_a_tick() -> None:
+    with TestClient(app).websocket_connect("/ws") as ws:
+        msg = ws.receive_json()
+        assert "ts" in msg and "value" in msg
+'''
+
+_BACKEND_PYPROJECT = '''\
+[project]
+name = "{pkg}-backend"
+version = "0.1.0"
+description = "{description}"
+requires-python = ">=3.10"
+dependencies = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "websockets>=12"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+'''
+
+_FRONTEND_HTML = '''\
+<!doctype html>
+<html><head><meta charset="utf-8"><title>{name}</title>
+<style>body{font-family:system-ui;margin:2rem}#v{font-size:3rem}</style></head>
+<body><h1>{name}</h1><div>live value: <span id="v">—</span></div>
+<script src="app.js"></script></body></html>
+'''
+
+_FRONTEND_JS = '''\
+const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+const ws = new WebSocket(url);
+ws.onmessage = (e) => { document.getElementById("v").textContent = JSON.parse(e.data).value; };
+ws.onclose = () => setTimeout(() => location.reload(), 2000);
+'''
+
+_DOCKERFILE = '''\
+FROM python:3.11-slim
+WORKDIR /app
+COPY backend/ /app/backend/
+RUN pip install --no-cache-dir -e /app/backend
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--app-dir", "backend/src", "--host", "0.0.0.0", "--port", "8000"]
+'''
+
+_COMPOSE = '''\
+services:
+  {pkg}:
+    build: .
+    ports: ["8000:8000"]
+    restart: unless-stopped
+'''
+
+_CI = '''\
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -e backend && pip install pytest httpx
+      - run: pytest backend/tests
+'''
+
+#: Full-app presets — a coherent runnable tree, not just a library skeleton.
+PRESETS: dict[str, dict[str, Any]] = {
+    "fullstack-realtime": {
+        "summary": "real-time FastAPI backend (WebSocket + SSE) + live frontend + Docker/CI",
+        "files": {
+            "backend/pyproject.toml": _BACKEND_PYPROJECT,
+            "backend/src/app/__init__.py": '__version__ = "0.1.0"\n',
+            "backend/src/app/main.py": _BACKEND_MAIN,
+            "backend/tests/test_app.py": _BACKEND_TEST,
+            "frontend/index.html": _FRONTEND_HTML,
+            "frontend/app.js": _FRONTEND_JS,
+            "Dockerfile": _DOCKERFILE,
+            "docker-compose.yml": _COMPOSE,
+            ".github/workflows/ci.yml": _CI,
+        },
+        "ignore": ("__pycache__/", "*.py[cod]", ".venv/", "dist/", "*.egg-info/",
+                   ".pytest_cache/", "node_modules/", ".env"),
+    },
+}
+
+#: Cloud deploy add-ons — real-time-aware notes/specs per target.
+CLOUD: dict[str, dict[str, str]] = {
+    "aws": {
+        "deploy/aws.md": (
+            "# Deploy to AWS\n\n"
+            "Real-time path: API on **ECS Fargate** (or App Runner) behind an ALB; "
+            "stream source on **Kinesis** / **MSK (Kafka)**.\n\n"
+            "```bash\n"
+            "aws ecr create-repository --repository-name {pkg}\n"
+            "docker build -t {pkg} . && docker tag {pkg} <acct>.dkr.ecr.<region>.amazonaws.com/{pkg}\n"
+            "docker push <acct>.dkr.ecr.<region>.amazonaws.com/{pkg}\n"
+            "# then: ECS service (Fargate) + ALB target group on :8000\n"
+            "```\n\nLoki: `ygg loki run aws-ecs` / `aws-s3` to inspect the account.\n"
+        ),
+    },
+    "databricks": {
+        "deploy/databricks.md": (
+            "# Deploy on Databricks\n\n"
+            "Real-time path: **Structured Streaming** (Kafka/Auto Loader → Delta) on a "
+            "job cluster; serve features/metrics via **Model Serving** or a SQL warehouse.\n\n"
+            "```bash\n"
+            "ygg databricks deploy            # build + upload the ygg wheel env\n"
+            "ygg databricks jobs              # manage the streaming job\n"
+            "```\n\nThe backend reads the live Delta table (or a serving endpoint) for {name}.\n"
+        ),
+        "databricks.yml": (
+            "# Databricks Asset Bundle (skeleton)\n"
+            "bundle:\n  name: {pkg}\n\nresources:\n  jobs:\n    {pkg}_stream:\n"
+            "      name: {pkg}-stream\n      tasks:\n        - task_key: ingest\n"
+            "          notebook_task:\n            notebook_path: ./ingest\n"
+        ),
+    },
+}
+
 #: NL aliases → canonical language key (for autonomous routing from a prompt).
 _ALIASES: dict[str, str] = {
     "python": "python", "py": "python",
@@ -167,6 +354,34 @@ def resolve_languages(text: str) -> list[str]:
     return found
 
 
+#: Phrasing → a full-app preset (else the per-language library layout).
+_PRESET_SIGNALS: dict[str, tuple[str, ...]] = {
+    "fullstack-realtime": ("real-time", "realtime", "real time", "full-stack", "full stack",
+                           "fullstack", "web app", "webapp", "websocket", "streaming app",
+                           "dashboard app", "live app", "api + frontend", "backend and frontend"),
+}
+
+
+def resolve_preset(text: str) -> str:
+    """The app preset named in *text*, or ``"lib"`` (per-language skeleton)."""
+    low = text.lower()
+    for preset, signals in _PRESET_SIGNALS.items():
+        if any(s in low for s in signals):
+            return preset
+    return "lib"
+
+
+def resolve_cloud(text: str) -> list[str]:
+    """Cloud deploy targets named in *text* (``aws`` / ``databricks``)."""
+    low = text.lower()
+    targets = []
+    if re.search(r"\b(aws|amazon|ecs|fargate|lambda|kinesis|s3)\b", low):
+        targets.append("aws")
+    if re.search(r"\b(databricks|delta|unity catalog|spark|lakehouse)\b", low):
+        targets.append("databricks")
+    return targets
+
+
 def _pkg(name: str) -> str:
     """A project name → an identifier-safe package/module name."""
     pkg = re.sub(r"[^0-9A-Za-z]+", "_", name).strip("_").lower()
@@ -184,65 +399,89 @@ def _render(template: str, fields: dict[str, str]) -> str:
 
 def scaffold_project(
     name: str,
-    languages: list[str],
+    languages: Optional[list[str]] = None,
     *,
+    preset: str = "lib",
+    cloud: Optional[list[str]] = None,
     base_dir: Optional[str] = None,
     description: Optional[str] = None,
     git: bool = True,
 ) -> dict[str, Any]:
-    """Create a ready-to-push project tree, one ``src``/``tests`` folder per language.
+    """Create a ready-to-push project tree, then ``git init`` + initial commit.
 
-    Lays down ``README.md`` + a composed ``.gitignore`` at the root and a
-    ``<language>/`` folder per requested language (manifest + starter ``src`` and
-    ``tests``). With ``git`` it ``git init``s and makes the initial commit, so the
-    repo only needs a remote + ``git push``. Returns the path, the file list, the
-    languages used, and the push hint.
+    ``preset="lib"`` (default) lays down one ``<language>/`` folder per language
+    (``src``/``tests`` + manifest). A full-app preset
+    (e.g. ``"fullstack-realtime"``) lays down a coherent runnable app instead —
+    a real-time FastAPI backend (WebSocket + SSE), a live frontend, Docker + CI —
+    and ``cloud=["aws","databricks"]`` adds the matching deploy add-ons. Returns
+    the path, file list, languages/preset/cloud used, and the push hint.
     """
     import tempfile
 
-    langs = [lang for lang in dict.fromkeys(languages) if lang in LANGUAGES] or ["python"]
-    unknown = [lang for lang in languages if lang not in LANGUAGES]
+    languages = languages or ["python"]
+    cloud = [c for c in (cloud or []) if c in CLOUD]
     description = description or f"{name} — scaffolded by Loki."
     pkg = _pkg(name)
+    fields = {"name": name, "pkg": pkg, "description": description}
 
     root = Path(base_dir) if base_dir else Path(tempfile.mkdtemp(prefix="ygg-scaffold-"))
     root = root / name
     root.mkdir(parents=True, exist_ok=True)
 
-    fields = {"name": name, "pkg": pkg, "description": description}
     written: list[str] = []
-    for lang in langs:
-        for rel, template in LANGUAGES[lang]["files"].items():
-            path = root / lang / _render(rel, fields)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(_render(template, fields))
-            written.append(str(path.relative_to(root)))
+    langs: list[str] = []
+    unknown: list[str] = []
 
-    # Composed .gitignore — common lines + each language's block.
-    ignore = [f"# {name} — .gitignore", *_COMMON_IGNORE, ""]
-    for lang in langs:
-        ignore += [f"# {lang}", *LANGUAGES[lang]["ignore"], ""]
+    def _write(rel: str, template: str) -> None:
+        path = root / _render(rel, fields)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_render(template, fields))
+        written.append(str(path.relative_to(root)))
+
+    if preset in PRESETS:
+        for rel, template in PRESETS[preset]["files"].items():
+            _write(rel, template)
+        ignore_lines = list(PRESETS[preset]["ignore"])
+        layout = PRESETS[preset]["summary"]
+        develop = "docker compose up --build   # or: uvicorn app.main:app --app-dir backend/src --reload"
+    else:                                            # per-language library layout
+        preset = "lib"
+        langs = [lang for lang in dict.fromkeys(languages) if lang in LANGUAGES] or ["python"]
+        unknown = [lang for lang in languages if lang not in LANGUAGES]
+        for lang in langs:
+            for rel, template in LANGUAGES[lang]["files"].items():
+                _write(f"{lang}/{rel}", template)
+        ignore_lines = []
+        for lang in langs:
+            ignore_lines += [f"# {lang}", *LANGUAGES[lang]["ignore"], ""]
+        layout = "\n".join(f"- `{lang}/` — {lang} (`src/`, `tests/`, `{_manifest(lang)}`)"
+                           for lang in langs)
+        develop = _develop_hint(langs)
+
+    for target in cloud:                             # cloud deploy add-ons
+        for rel, template in CLOUD[target].items():
+            _write(rel, template)
+
+    ignore = [f"# {name} — .gitignore", *_COMMON_IGNORE, "", *ignore_lines]
     (root / ".gitignore").write_text("\n".join(ignore).rstrip() + "\n")
 
-    layout = "\n".join(
-        f"- `{lang}/` — {lang} (`src/`, `tests/`, `{_manifest(lang)}`)" for lang in langs
-    )
+    deploy = ("\n## Deploy\n\n" + "\n".join(f"- `{target}/` — see `deploy/{target}.md`"
+                                            for target in cloud)) if cloud else ""
     (root / "README.md").write_text(
         f"# {name}\n\n{description}\n\n## Layout\n\n{layout}\n\n"
-        f"## Develop\n\n```bash\n{_develop_hint(langs)}\n```\n\n"
-        f"## Push\n\n```bash\ngit remote add origin <your-repo-url>\n"
+        f"## Develop\n\n```bash\n{develop}\n```\n{deploy}\n"
+        f"\n## Push\n\n```bash\ngit remote add origin <your-repo-url>\n"
         f"git push -u origin main\n```\n"
     )
     written += [".gitignore", "README.md"]
 
-    committed = False
-    if git:
-        committed = _git_init(root)
-
+    committed = _git_init(root) if git else False
     return {
         "name": name,
         "path": str(root),
+        "preset": preset,
         "languages": langs,
+        "cloud": cloud,
         "unknown_languages": unknown,
         "files": sorted(written),
         "git": committed,

@@ -531,6 +531,8 @@ class ScaffoldSkill(LokiSkill):
         *,
         name: str = "new-project",
         languages: Optional[list] = None,
+        preset: str = "lib",
+        cloud: Optional[list] = None,
         base_dir: Optional[str] = None,
         description: Optional[str] = None,
         git: bool = True,
@@ -540,6 +542,7 @@ class ScaffoldSkill(LokiSkill):
 
         return scaffold.scaffold_project(
             name, list(languages) if languages else ["python"],
+            preset=preset, cloud=list(cloud) if cloud else None,
             base_dir=base_dir, description=description, git=git,
         )
 

@@ -643,7 +643,14 @@ class Loki:
         steps: list[dict[str, Any]] = []
         answer, completed = "", False
 
+        from .usage import METER
+
         for n in range(1, max_steps + 1):
+            # Cost cap (set via the meter, e.g. `ygg loki do --budget`) — stop
+            # before the next paid turn rather than blowing through it.
+            if METER.over_budget():
+                answer = f"stopped: cost budget reached (${METER.total_cost:.4f})"
+                break
             if on_think:
                 on_think(n)
             reply = eng.complete(messages, system=system, max_tokens=4000, tier=tier).text
