@@ -44,6 +44,19 @@ CACHE_MAP: dict[str, ExpiringDict[str, "SQLWarehouse"]] = {}
 # ---------------------------------------------------------------------------
 
 
+def _client_project_name() -> Optional[str]:
+    """The running client project's ``[project].name`` (from the cwd
+    ``pyproject.toml``), or ``None`` when there's no project on the way up.
+    Best-effort — any read failure yields ``None``."""
+    from yggdrasil.databricks.wheels.service import find_pyproject, read_pyproject
+
+    try:
+        pyproject = find_pyproject()
+        return read_pyproject(pyproject)["name"] if pyproject is not None else None
+    except Exception:  # noqa: BLE001 — no/unreadable pyproject → no client project
+        return None
+
+
 def set_cached_warehouse(
     client: DatabricksClient,
     warehouse: "SQLWarehouse",
@@ -171,9 +184,27 @@ class Warehouses(DatabricksService):
             raise ResourceDoesNotExist("Cannot find SQL warehouse, no parameters given")
         return default
 
+    def default_names(self) -> tuple[str, str]:
+        """``(classic, serverless)`` default-warehouse names.
+
+        Based on the **running client project**: the capitalized
+        ``[project].name`` (from the cwd ``pyproject.toml``) with its serverless
+        sibling — ``("My-App", "My-App Serverless")`` — so each project gets its
+        own default warehouse pair. ``ygg`` (the library itself) and "no project"
+        both fall back to the workspace-wide ygg defaults
+        (:data:`DEFAULT_ALL_PURPOSE_CLASSIC_NAME` / ``…_SERVERLESS_NAME``)."""
+        project = _client_project_name()
+        if project and project.strip().lower() != "ygg":
+            classic = project.strip().capitalize()
+            return classic, f"{classic} Serverless"
+        return DEFAULT_ALL_PURPOSE_CLASSIC_NAME, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
+
     def find_default(self, raise_error: bool = True) -> Optional["SQLWarehouse"]:
         """
-        Resolve (or create) the workspace's default SQL warehouse.
+        Resolve (or create) the default SQL warehouse — named for the running
+        **client project** (capitalized) with its serverless sibling, falling
+        back to the workspace ygg defaults for ``ygg`` / no project (see
+        :meth:`default_names`).
 
         Resolution order:
         1. Cached classic warehouse  (starts it if stopped)
@@ -185,9 +216,10 @@ class Warehouses(DatabricksService):
         7. Returns the first found warehouse
         8. Raises / creates a new serverless warehouse as a last resort
         """
+        classic_name, serverless_name = self.default_names()
         classic = get_cached_warehouse(
             client=self.client,
-            warehouse_name=DEFAULT_ALL_PURPOSE_CLASSIC_NAME,
+            warehouse_name=classic_name,
         )
         if classic is not None:
             if classic.state not in {State.RUNNING, State.STARTING, State.STOPPING}:
@@ -197,7 +229,7 @@ class Warehouses(DatabricksService):
 
         serverless = get_cached_warehouse(
             client=self.client,
-            warehouse_name=DEFAULT_ALL_PURPOSE_SERVERLESS_NAME,
+            warehouse_name=serverless_name,
         )
         if serverless is not None:
             return serverless
@@ -208,7 +240,7 @@ class Warehouses(DatabricksService):
             if first_found is None:
                 first_found = warehouse
 
-            if warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_CLASSIC_NAME:
+            if warehouse.warehouse_name == classic_name:
                 classic = warehouse
                 set_cached_warehouse(client=self.client, warehouse=classic)
 
@@ -221,7 +253,7 @@ class Warehouses(DatabricksService):
                 if serverless is not None:
                     return serverless
 
-            elif warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
+            elif warehouse.warehouse_name == serverless_name:
                 serverless = warehouse
                 set_cached_warehouse(client=self.client, warehouse=serverless)
 
@@ -231,7 +263,7 @@ class Warehouses(DatabricksService):
         if serverless is None:
             try:
                 created = self.create(
-                    name=DEFAULT_ALL_PURPOSE_SERVERLESS_NAME,
+                    name=serverless_name,
                     permissions=["users"],
                 )
                 set_cached_warehouse(client=self.client, warehouse=created)
@@ -242,7 +274,7 @@ class Warehouses(DatabricksService):
         if classic is None:
             Job.make(
                 self.create,
-                name=DEFAULT_ALL_PURPOSE_CLASSIC_NAME,
+                name=classic_name,
                 permissions=["users"],
             ).fire_and_forget()
 
@@ -258,7 +290,7 @@ class Warehouses(DatabricksService):
             )
 
         return self.create_or_update(
-            name=DEFAULT_ALL_PURPOSE_SERVERLESS_NAME,
+            name=serverless_name,
             permissions=["users"],
         )
 

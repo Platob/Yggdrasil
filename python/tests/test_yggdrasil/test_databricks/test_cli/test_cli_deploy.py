@@ -49,7 +49,7 @@ class TestDeployProject(unittest.TestCase):
         # default serverless warehouse named for the project
         wh = client.warehouses.create_or_update
         wh.assert_called_once()
-        self.assertEqual(wh.call_args.kwargs["name"], "myproj")
+        self.assertEqual(wh.call_args.kwargs["name"], "Myproj")  # capitalized project
         self.assertTrue(wh.call_args.kwargs["enable_serverless_compute"])
         # default cluster, named for the project, installing its env config
         cl = client.compute.clusters.all_purpose_cluster

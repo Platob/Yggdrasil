@@ -35,7 +35,6 @@ from yggdrasil.databricks.warehouse import (
     WarehousePreparedStatement,
     WarehouseStatementResult,
 )
-from yggdrasil.databricks.warehouse.wh_utils import DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 from yggdrasil.dataclasses import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import Mode
 from yggdrasil.spark.statement import SparkPreparedStatement, SparkStatementResult
@@ -320,8 +319,10 @@ class SQLEngine(DatabricksService, StatementExecutor):
                 warehouse_name=warehouse_name,
             )
 
-        # Periodic re-check for the all-purpose default warehouse.
-        if self.default_warehouse.warehouse_name == DEFAULT_ALL_PURPOSE_SERVERLESS_NAME:
+        # Periodic re-check while on a *serverless default* warehouse (the ygg or
+        # a per-project serverless sibling, both named ``"… Serverless"``) — a
+        # running classic sibling, once available, is preferred.
+        if (self.default_warehouse.warehouse_name or "").endswith(" Serverless"):
             now_s = time.time()
             if (now_s - self._last_default_wh_check) > _DEFAULT_WAREHOUSE_RECHECK_S:
                 self.default_warehouse = self.warehouses.find_default()

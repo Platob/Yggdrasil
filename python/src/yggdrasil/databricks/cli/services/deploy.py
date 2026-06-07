@@ -70,12 +70,14 @@ class DeployCommand:
         style.out(f"    {style.dim('deps')}        {len(env.dependencies)} entr(y/ies)\n")
 
         if not args.no_warehouse:
-            # A default serverless SQL warehouse named for the project — its
-            # entry point for SQL/Genie work. (Warehouses run SQL, not wheels;
-            # the env config wheels go on the cluster below.)
-            with style.Spinner(f"provisioning default warehouse {project!r}…"):
+            # The project's **default SQL warehouse** — the capitalized project
+            # name (serverless), the same name `find_default` resolves to when
+            # this project is the running client project. (Warehouses run SQL,
+            # not wheels; the env config wheels go on the cluster below.)
+            warehouse_name = project.capitalize()
+            with style.Spinner(f"provisioning default warehouse {warehouse_name!r}…"):
                 wh = client.warehouses.create_or_update(
-                    name=project, enable_serverless_compute=True,
+                    name=warehouse_name, enable_serverless_compute=True,
                 )
             style.ok(f"default warehouse {wh.warehouse_name!r} ready (serverless)")
 
