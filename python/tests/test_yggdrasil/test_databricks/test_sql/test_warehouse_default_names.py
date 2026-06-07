@@ -1,7 +1,8 @@
-"""``DatabricksClient.project`` is the canonical *distribution* name for
-``product`` — resolved through the deploy alias map (``yggdrasil`` → ``ygg``) and
-always lowercased — and persists with the client; ``product_name`` /
-``project_name`` are its nice display. The default SQL warehouse is named for it,
+"""``DatabricksClient.project`` is an alias of ``product`` (always lowercased) and
+persists with the client; ``product_name`` / ``project_name`` are its nice
+display. ``yggdrasil`` and ``ygg`` are the same project — ``yggdrasil`` is the
+name, ``ygg`` only its PyPI distribution alias (mapped in the wheel/environment
+layer, not on the client). The default SQL warehouse is named for the project,
 falling back to the workspace ygg defaults for the default ``ygg`` / ``yggdrasil``
 product (or no project)."""
 from __future__ import annotations
@@ -27,10 +28,10 @@ class TestClientProjectAliasesProduct(unittest.TestCase):
         client.product = product
         return client
 
-    def test_project_is_canonical_distribution(self):
+    def test_project_is_lowercased_product(self):
         self.assertEqual(self._client("My-App").project, "my-app")
-        # The ``yggdrasil`` product resolves to its distribution ``ygg``.
-        self.assertEqual(self._client("yggdrasil").project, "ygg")
+        # ``yggdrasil`` stays the project name; ``ygg`` is only the PyPI alias.
+        self.assertEqual(self._client("yggdrasil").project, "yggdrasil")
         self.assertEqual(self._client("ygg").project, "ygg")
         self.assertIsNone(self._client(None).project)
 

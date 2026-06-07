@@ -1096,20 +1096,17 @@ class DatabricksClient(Singleton, URLBased):
 
     @property
     def project(self) -> Optional[str]:
-        """The client **project** — the canonical *distribution* identifier for
-        :attr:`product`, resolved through the deploy alias map (``yggdrasil`` →
-        ``ygg``) and **always lowercased**. This is the name the deployed base
-        environment, the wheel registry, and the project's default resources are
-        all keyed by, so ``client.project`` lines up with what
-        ``ygg databricks deploy`` writes — ``dbc.environments.default()`` /
-        ``warehouses.default()`` / ``compute.clusters.default()`` resolve against
-        it. Defaults to ``"ygg"`` (the ``yggdrasil`` product's distribution); set
-        it (or ``product``) to name a project and it persists with the client
-        (``product`` is one of :data:`_INIT_NAMES`, so it rides through config,
-        session snapshots, and clones)."""
-        from yggdrasil.databricks.wheels.service import _norm, distribution_for
-
-        return _norm(distribution_for(self.product)) if self.product else None
+        """The client **project** — an alias of :attr:`product`, **always
+        lowercased** (the canonical project identifier). ``yggdrasil`` and ``ygg``
+        are the same project: ``yggdrasil`` is the name (and the import package),
+        ``ygg`` is only its **PyPI distribution alias**. That distribution mapping
+        lives in the wheel / environment layer (:func:`~yggdrasil.databricks.wheels.service.distribution_for`),
+        not here — so ``client.project`` stays the human project name while the
+        deployed wheels / base environment land under the ``ygg`` distribution
+        folder. Defaults to ``"yggdrasil"``; set it (or ``product``) to name a
+        project and it persists with the client (``product`` is one of
+        :data:`_INIT_NAMES`, so it rides config, session snapshots, and clones)."""
+        return self.product.strip().lower() if self.product else None
 
     @project.setter
     def project(self, value: Optional[str]) -> None:
@@ -1118,8 +1115,8 @@ class DatabricksClient(Singleton, URLBased):
     @property
     def product_name(self) -> Optional[str]:
         """A nice, capitalized display name for the client :attr:`project`
-        (``my-app`` → ``My App``), or ``None`` when unset. The project's default
-        warehouse and cluster are named for this."""
+        (``my-app`` → ``My App``, ``yggdrasil`` → ``Yggdrasil``), or ``None`` when
+        unset. The project's default warehouse and cluster are named for this."""
         from yggdrasil.databricks.wheels.service import project_display_name
 
         project = self.project
