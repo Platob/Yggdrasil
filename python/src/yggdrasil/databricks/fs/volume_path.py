@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.catalog.catalog import UCCatalog
     from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.databricks.volume.volume import Volume
+    from yggdrasil.path import Path
 
 from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
 
@@ -828,7 +829,7 @@ class VolumePath(DatabricksPath):
         write: bool = False,
         region: Optional[str] = None,
         refresh: bool = False,
-    ) -> "Any | None":
+    ) -> Path | None:
         """**This path's** cloud-storage :class:`Path` (an :class:`S3Path`
         today) — the single entry point for direct external-storage access.
 

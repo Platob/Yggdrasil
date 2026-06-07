@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from databricks.sdk.service.catalog import VolumeType
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.catalog.catalog import UCCatalog
+    from yggdrasil.databricks.external.location.resource import ExternalLocation
     from yggdrasil.databricks.fs.volume_path import VolumePath
     from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.databricks.volume.volumes import Volumes
@@ -302,7 +303,7 @@ class Volume(DatabricksPath):
 
     # ── access precheck (external-location governed) ────────────────────────────
 
-    def external_location(self, *, refresh: bool = False) -> "Any | None":
+    def external_location(self, *, refresh: bool = False) -> ExternalLocation | None:
         """The Unity Catalog **external location** governing this volume's
         backing storage — the most specific one whose URL the volume's
         ``storage_location`` sits under (longest-prefix match over the cached

@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
+    from yggdrasil.databricks.external.location.resource import ExternalLocation
     from yggdrasil.data.statement import StatementBatch
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
@@ -3751,7 +3752,7 @@ class Table(DatabricksPath):
 
         return infos.storage_location
 
-    def external_location(self, *, refresh: bool = False) -> "Any | None":
+    def external_location(self, *, refresh: bool = False) -> ExternalLocation | None:
         """The Unity Catalog **external location** governing this table's
         backing storage — the most specific one whose URL the table's
         ``storage_location`` sits under (longest-prefix match over the cached
