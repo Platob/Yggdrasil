@@ -56,8 +56,6 @@ class TestReadHitsProjection:
         for heavy in ("request_headers", "request_body", "request_params",
                       "receiver", "_pkl", "hash", "body_hash"):
             assert heavy not in cols
-        # ``received_at`` is not fetched — it is stamped on retrieve instead.
-        assert "received_at" not in cols
 
     def test_rebuild_columns_list_is_minimal_and_present(self):
         names = set(RESPONSE_SCHEMA.to_arrow_schema().names)
@@ -95,38 +93,10 @@ class TestRebuildColumnsAreSufficient:
         assert rebuilt.request.method == req.method
 
 
-class TestRetrieveStampsReceivedAt:
-    def test_received_at_is_stamped_now_on_retrieve(self):
-        from yggdrasil.arrow.tabular import ArrowTabular
-        from yggdrasil.http_.response_batch import HTTPResponseBatch
-
-        req = _req()
-        # A cached response captured "yesterday" — the stored received_at is not
-        # fetched, so it must not survive onto the retrieved response.
-        resp = _resp(req, body=b"HELLO")
-        resp.received_at = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
-        full = pa.Table.from_batches([Response.values_to_arrow_batch([resp])])
-        light = full.select(list(RESPONSE_REBUILD_COLUMNS))
-
-        class _FakeCfg:                              # stand-in SendConfig
-            def read_hits(self, cache, requests, *, session=None):
-                return ArrowTabular(light.to_batches(), schema=light.schema)
-
-        batch = HTTPResponseBatch(send_config=_FakeCfg(), requests=[req])
-        before = dt.datetime.now(dt.timezone.utc)
-        out = batch._read_cache_hits(CacheConfig(), {req.match_value("public_hash")})
-        after = dt.datetime.now(dt.timezone.utc)
-
-        (got,) = list(Response.from_arrow_tabular(out.read_arrow_batches()))
-        assert before <= got.received_at <= after        # stamped now, not 2020
-        assert got.content == b"HELLO"
-        assert got.request.url == req.url                 # full request reattached
-
-
 class TestTabularAccessorsConsistent:
     """Every ``Tabular`` accessor on the batch agrees on row count + content after
-    the light cache read — a remote hit (reattached request, stamped received_at)
-    plus a freshly-fetched response."""
+    the light cache read — a remote hit (reattached request) plus a
+    freshly-fetched response."""
 
     def _batch(self):
         from yggdrasil.arrow.tabular import ArrowTabular
@@ -164,12 +134,12 @@ class TestTabularAccessorsConsistent:
         assert len(list(b.read_records())) == 2
         assert b.read_arrow_table().num_rows == 2
 
-    def test_accessors_carry_reattached_request_and_stamped_time(self):
+    def test_accessors_carry_reattached_request_and_received_at(self):
         b = self._batch()
         by_url = {r.request.url.to_string(): r for r in b.responses()}
         hit = by_url["https://e.com/a"]
         new = by_url["https://e.com/b"]
         assert hit.content == b"HIT"
-        assert hit.received_at.year != 2020          # stamped on retrieve, not the stored 2020
+        assert hit.received_at.year == 2020          # fetched from the cache row
         assert new.content == b"NEW"
         assert new.received_at.year == 2021          # a fresh response is untouched
