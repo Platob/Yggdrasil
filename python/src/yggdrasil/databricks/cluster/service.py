@@ -105,27 +105,16 @@ class Clusters(DatabricksService):
     # Singletons
     # ------------------------------------------------------------------ #
     def _default_ygg_layer(self, python: str | None = None) -> str:
-        """The default ygg library for a cluster: the seeded **generic
-        environment** requirements file (zero-PyPI) for the ygg image matching
-        the cluster's **Python** —
-        ``environment/ygg/ygg-<version>-py3XX.requirements.txt`` — installed via
-        ``Library(requirements=…)``. It lists wheels in the shared pypi registry,
-        so a cluster installs from those rather than ``pip install``-ing ygg from
-        PyPI.
+        """The default ygg library for a cluster: the **base environment**'s
+        classic-cluster ``requirements.txt`` (zero-PyPI) for the ygg image
+        matching the cluster's **Python**, installed via ``Library(requirements=…)``
+        — resolved (and get-or-created on a miss) through ``dbc.environments``.
 
         *python* is the cluster's ``"3.X"`` runtime Python (derived from its DBR
         in :meth:`all_purpose_cluster`); ``None`` falls back to the local
-        interpreter. Provisioned by ``ygg databricks deploy``; an explicit
-        ``environment`` / ``libraries`` argument overrides it (and may be a PyPI
-        spec to opt back into a pip resolve)."""
-        from yggdrasil.databricks.environments.service import (
-            WORKSPACE_ENV_DIR,
-            environment_folder,
-            environment_stem,
-        )
-
-        stem = environment_stem("ygg", python=python)
-        return f"{WORKSPACE_ENV_DIR}/{environment_folder('ygg')}/{stem}.requirements.txt"
+        interpreter. An explicit ``environment`` / ``libraries`` argument
+        overrides it (and may be a PyPI spec to opt back into a pip resolve)."""
+        return self.client.environments.find("ygg", python=python).cluster
 
     def _cluster_python(self, cluster_spec: MutableMapping[str, Any]) -> str | None:
         """The ``"3.X"`` Python the cluster-to-be will run, so its ygg layer can

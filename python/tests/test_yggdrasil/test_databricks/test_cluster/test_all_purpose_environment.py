@@ -31,6 +31,10 @@ class TestAllPurposeClusterEnvironment(DatabricksTestCase):
         created = MagicMock()
         created.cluster_name = "test-cluster"
         clusters.create = MagicMock(return_value=created)
+        # The default ygg layer is resolved through ``dbc.environments`` — stub it
+        # to the seeded requirements path.
+        env = MagicMock(); env.cluster = _seeded_env_requirements()
+        clusters.client.environments.find = MagicMock(return_value=env)
         return clusters
 
     def test_environment_replaces_pypi_ygg_with_generic_env(self):

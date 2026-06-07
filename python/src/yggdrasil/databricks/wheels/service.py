@@ -1,7 +1,8 @@
 """Wheel registry — uniform CRUD over the workspace PyPI-like index.
 
 A wheel is identified by ``(project, version)``. The registry is a PEP 503-style
-layout under ``/Workspace/Shared/pypi/<dist>/`` holding one ``.whl`` per version.
+layout under ``/Workspace/Shared/pypi/<dist>/<version>/`` — distribution and
+version are folder levels — holding the ``.whl`` files.
 Every project — ``ygg`` included — is handled identically; there is no special
 casing.
 
@@ -61,7 +62,7 @@ __all__ = [
 ]
 
 #: Root of the workspace's PyPI-like wheel registry — one ``<dist>/`` folder per
-#: distribution, versions side by side (``pypi/<dist>/<dist>-<version>-…whl``).
+#: distribution + version folder levels (``pypi/<dist>/<version>/<dist>-<version>-…whl``).
 WORKSPACE_PYPI_DIR = "/Workspace/Shared/pypi"
 #: Where reusable base environments live (one ``<proj>/`` folder per project).
 WORKSPACE_ENV_DIR = "/Workspace/Shared/environment"
@@ -384,12 +385,15 @@ def fetch_wheels(
 
 def registry_upload(client: Any, wheel: "str | Path", *, workspace_dir: str = WORKSPACE_PYPI_DIR,
                     overwrite: bool = False) -> str:
-    """Upload *wheel* to ``<workspace_dir>/<dist>/<wheel>`` and return the path.
-    An already-present, immutable wheel is reused unless *overwrite*."""
+    """Upload *wheel* to ``<workspace_dir>/<dist>/<version>/<wheel>`` and return
+    the path — distribution **and** version are folder levels, so the registry
+    browses like a PEP 503 index. An already-present, immutable wheel is reused
+    unless *overwrite*."""
     from ..path import DatabricksPath
 
     wheel = Path(wheel)
-    dest = f"{workspace_dir.rstrip('/')}/{wheel_parts(wheel)[0]}/{wheel.name}"
+    dist, version, _ = wheel_parts(wheel)
+    dest = f"{workspace_dir.rstrip('/')}/{dist}/{version or 'unknown'}/{wheel.name}"
     path = DatabricksPath.from_(dest, client=client)
     if not overwrite and path.exists():
         logger.info("reusing deployed wheel %s", dest)
@@ -466,8 +470,14 @@ class Wheels(DatabricksService):
             folder = DatabricksPath.from_(f"{root}/{_norm(distribution_for(str(project)))}", client=self.client)
             if not folder.exists():
                 return []
-            return [self._wheel(c.full_path()) for c in folder.iterdir()
-                    if str(c.name).endswith(".whl")]
+            wheels: "list[Wheel]" = []
+            for child in folder.iterdir():
+                if str(child.name).endswith(".whl"):           # loose (legacy layout)
+                    wheels.append(self._wheel(child.full_path()))
+                elif child.is_dir():                           # <version>/ folder
+                    wheels += [self._wheel(w.full_path()) for w in child.iterdir()
+                               if str(w.name).endswith(".whl")]
+            return wheels
         registry = DatabricksPath.from_(root, client=self.client)
         if not registry.exists():
             return []
@@ -478,9 +488,13 @@ class Wheels(DatabricksService):
         wheels = [w for w in self.list(project, workspace_dir=workspace_dir) if isinstance(w, Wheel)]
         if version is not None:
             wheels = [w for w in wheels if w.version == version]
-        elif wheels:                                   # no pin → the newest version present
-            latest = max((w.version for w in wheels if w.version is not None),
-                         default=None)
+        if python is not None:                         # keep only wheels that run on *python*
+            tag = "cp" + _py_minor(python).replace(".", "")
+            compat = [w for w in wheels if (not w.tag) or "py3-none-any" in w.tag or tag in w.tag]
+            if compat:
+                wheels = compat
+        if version is None and wheels:                 # no pin → the newest version present
+            latest = max((w.version for w in wheels if w.version is not None), default=None)
             if latest is not None:
                 wheels = [w for w in wheels if w.version == latest]
         if not wheels:

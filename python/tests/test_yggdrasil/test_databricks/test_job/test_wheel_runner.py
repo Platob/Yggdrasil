@@ -51,7 +51,7 @@ class TestHelpers:
         dbp = MagicMock(); dbp.from_.return_value = node
         with patch("yggdrasil.databricks.path.DatabricksPath", dbp):
             dest = registry_upload(MagicMock(), local, workspace_dir="/ws/pypi")
-        assert dest == "/ws/pypi/ygg/ygg-1.0-py3-none-any.whl"
+        assert dest == "/ws/pypi/ygg/1.0.0/ygg-1.0-py3-none-any.whl"
         node.write_bytes.assert_called_once()
 
     def test_registry_upload_reuses_existing(self, tmp_path):

@@ -621,7 +621,8 @@ ygg databricks fs mv /Workspace/Shared/old.csv /Volumes/main/default/archive/old
 ## Wheels (`wheel`)
 
 Uniform **CRUD** over the workspace's PyPI-like wheel registry
-(`/Workspace/Shared/pypi/<dist>/...`). A wheel is keyed by `(project, version)`.
+(`/Workspace/Shared/pypi/<dist>/<version>/...` — distribution **and** version are
+folder levels). A wheel is keyed by `(project, version)`.
 `create`/`find` **fetch** it — a local path (with a `pyproject.toml`) is built
 from source (`uv build`), anything else is a **PyPI** project downloaded by
 name (`pip download`) — and upload it. Fetches use a local on-disk cache so
@@ -662,7 +663,7 @@ ygg databricks wheel list ygg                         # the ygg distribution's w
 ## Environments (`environment`)
 
 Uniform **CRUD** over reusable base environments under
-`/Workspace/Shared/environment/<proj>/`. An environment is keyed by
+`/Workspace/Shared/environment/<proj>/<version>/`. An environment is keyed by
 `(project, version)`. `create`/`find` fetch the project + its **whole dependency
 closure as wheels** (zero-PyPI — the runtime never resolves from a live index)
 and write the serverless `<stem>.yml` + cluster `<stem>.requirements.txt`. Same

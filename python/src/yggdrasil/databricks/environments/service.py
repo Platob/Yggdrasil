@@ -128,19 +128,24 @@ def ensure_cluster_requirements(client: Any, name: str, *, dependencies,
 
 
 def deployed_environments(client: Any, *, workspace_dir: str = WORKSPACE_ENV_DIR) -> "list[str]":
-    """Workspace paths of persisted environment files (``*.yml`` / ``*.requirements.txt``)."""
+    """Workspace paths of persisted environment files (``*.yml`` /
+    ``*.requirements.txt``), walking the ``<proj>/<version>/`` layout (and the
+    looser legacy ones)."""
     from ..path import DatabricksPath
 
-    folder = DatabricksPath.from_(workspace_dir, client=client)
-    if not folder.exists():
-        return []
     suffixes = (".env.yaml", ".yml", ".requirements.txt")
     found: "list[str]" = []
-    for child in folder.iterdir():
-        if str(child.name).endswith(suffixes):
-            found.append(child.full_path())
-        elif child.is_dir():
-            found += [s.full_path() for s in child.iterdir() if str(s.name).endswith(suffixes)]
+
+    def _walk(node: Any, depth: int) -> None:
+        for child in node.iterdir():
+            if str(child.name).endswith(suffixes):
+                found.append(child.full_path())
+            elif depth and child.is_dir():
+                _walk(child, depth - 1)
+
+    folder = DatabricksPath.from_(workspace_dir, client=client)
+    if folder.exists():
+        _walk(folder, depth=2)            # root → <proj>/ → <version>/ → files
     return found
 
 
@@ -154,11 +159,6 @@ class Environments(DatabricksService):
     """
 
     default_dir: ClassVar[str] = WORKSPACE_ENV_DIR
-
-    def _environment(self, *, name, project, version, python, serverless, cluster, dependencies) -> Environment:
-        return Environment(self, name=name, project=project, version=version, python=python,
-                           env_dir=f"{self.default_dir.rstrip('/')}/{environment_folder(project)}",
-                           serverless=serverless, cluster=cluster, dependencies=list(dependencies))
 
     # -- create / update ---------------------------------------------------
     def create(
@@ -196,17 +196,20 @@ class Environments(DatabricksService):
 
         folder = environment_folder(name)
         stem = f"{folder}-{ver}-{environment_key_for(python)}"
+        # ``<proj>/<version>/`` folder levels, mirroring the wheel registry.
+        subdir = f"{folder}/{ver}"
         serverless = ensure_named_environment(
-            self.client, folder, dependencies=dependencies,
+            self.client, subdir, dependencies=dependencies,
             environment_version=serverless_environment_version(python),
             workspace_dir=root, filename=f"{stem}.yml",
         )
         cluster = ensure_cluster_requirements(
-            self.client, folder, dependencies=dependencies,
+            self.client, subdir, dependencies=dependencies,
             workspace_dir=root, filename=f"{stem}.requirements.txt",
         )
-        return self._environment(name=stem, project=name, version=ver, python=python,
-                                serverless=serverless, cluster=cluster, dependencies=dependencies)
+        return Environment(self, name=stem, project=name, version=ver, python=python,
+                          env_dir=serverless.rsplit("/", 1)[0],
+                          serverless=serverless, cluster=cluster, dependencies=dependencies)
 
     def update(self, project: "str | Path" = "ygg", version=None, **kwargs: Any) -> Environment:
         """Re-fetch and overwrite *project*'s environment."""
@@ -254,14 +257,15 @@ class Environments(DatabricksService):
         extras: "tuple[str, ...] | list[str]" = (),
         workspace_dir: "str | None" = None,
     ) -> "Optional[Environment]":
-        """Find *project*'s base environment; build + write it (from a local
+        """Find *project*'s base environment **for a Python** (its ``py3XX`` tag,
+        defaulting to the local interpreter); build + write it (from a local
         pyproject or PyPI) when missing and *install* (the default)."""
         name = _project_name(project)
         ver = parse_version(version)
-        stem = environment_stem(name, python=python, version=ver) if ver is not None else None
+        key = environment_key_for(python)              # py3XX — the env's Python tag
         envs = [e for e in self.list(workspace_dir=workspace_dir)
                 if environment_folder_of(e.name) == environment_folder(name)
-                and (stem is None or e.name == stem)
+                and e.name.endswith(f"-{key}")
                 and (ver is None or e.version == ver)]
         if envs:
             return max(envs, key=lambda e: e.version or VersionInfo(0, 0, 0))
