@@ -615,16 +615,17 @@ class VolumePath(DatabricksPath):
                     mtime=st.st_mtime,
                 )
         # Direct-storage fast path (EXTERNAL volume + EXTERNAL USE SCHEMA):
-        # stat straight off the cloud storage — one S3 HEAD (plus a prefix
-        # probe for a directory) instead of the Files-API file/dir probe pair,
-        # and the S3 ``Content-Length`` is authoritative for size. A positive
-        # (FILE / DIRECTORY) result is returned as-is; MISSING falls through to
-        # the Files API, which also recognises the empty / implicit directories
-        # a bare object store can't.
-        sf = self._external_storage_file(write=False)
+        # stat straight off the cloud storage and treat it as **authoritative**.
+        # ``S3Path._stat_uncached`` does one HEAD (file) plus a prefix probe
+        # (directory), so it already recognises files, explicit *and* implicit
+        # directories, and genuine absence — the object store holds the bytes.
+        # Returning its result as-is, MISSING included, means an external
+        # volume never pays the Files-API HEAD/HEAD + LIST probe triplet below
+        # (the dominant governance cost of an ``exists()`` before a write).
+        sf = self.storage_path(write=False)
         if sf is not None:
             try:
-                stats = sf._stat_uncached()
+                return sf._stat_uncached()
             except Exception as exc:  # vend / HEAD failure → fall back
                 logger.warning(
                     "external storage stat failed for %r (%s: %s); "
@@ -632,9 +633,6 @@ class VolumePath(DatabricksPath):
                 )
                 if _looks_like_permission_denied(exc):
                     self.volume.mark_external_denied(write=False)
-            else:
-                if stats.kind is not IOKind.MISSING:
-                    return stats
         # Off-cluster: probe via the Files REST API. Heuristic: a leaf
         # with a ``.`` is almost always a file (``foo.parquet`` /
         # ``part-….json``); a bare leaf is almost always a directory
@@ -805,43 +803,53 @@ class VolumePath(DatabricksPath):
         """
         return self.volume.read_info(refresh=refresh)
 
-    def storage_location(self, refresh: bool = False) -> str:
-        """Volume's backing storage URL string. Delegates to
-        :meth:`Volume.storage_location`."""
-        return self.volume.storage_location(refresh=refresh)
+    @property
+    def _storage_rel(self) -> str:
+        """This entry's location *under* the volume root — the URL segments
+        past ``/<cat>/<sch>/<vol>`` rejoined with ``/`` (``""`` at the root)."""
+        return "/".join(
+            p for p in (self.url.path or "").lstrip("/").split("/")[3:] if p
+        )
+
+    @property
+    def storage_location(self) -> str:
+        """**This path's** backing cloud-storage URL string — the volume's
+        :attr:`Volume.storage_location` root with *this path's* suffix appended
+        (``s3://bkt/root/sub/file.bin``), not the bare volume root. Raises
+        :class:`ValueError` when the volume has no resolvable storage location.
+        """
+        root = self.volume.storage_location.rstrip("/")
+        rel = self._storage_rel
+        return f"{root}/{rel}" if rel else root
 
     def storage_path(
         self,
         *,
-        mode: ModeLike = Mode.AUTO,
+        write: bool = False,
         region: Optional[str] = None,
         refresh: bool = False,
-    ) -> Any:
-        """Return the volume's root storage :class:`Path`. Delegates to
-        :meth:`Volume.storage_path` — see there for the semantics."""
-        return self.volume.storage_path(mode=mode, region=region, refresh=refresh)
+    ) -> "Any | None":
+        """**This path's** cloud-storage :class:`Path` (an :class:`S3Path`
+        today) — the single entry point for direct external-storage access.
 
-    def _external_storage_file(self, *, write: bool) -> "Any | None":
-        """The cloud storage :class:`Path` for *this* file when direct storage
-        access is permitted for the backing volume — else ``None`` (caller uses
-        the Files API).
-
-        Eligibility + the volume-root resolution (external type +
-        ``EXTERNAL USE SCHEMA`` grant + ``s3://`` location + write gate, decided
-        once per mode and cached on the :class:`Volume` singleton) live on
-        :meth:`Volume.external_storage_root`. When it returns a root, only the
-        per-file Path (``root / rel``) is resolved here; ``None`` means stay on
-        the Files API. Never raises into the I/O flow.
+        Resolves the volume's directly-reachable storage root
+        (:meth:`Volume.external_storage_root` — gated on EXTERNAL +
+        ``EXTERNAL USE SCHEMA`` + ``s3://`` + (for a write) not a
+        ``__unitystorage`` layout, the verdict cached per mode) and appends
+        *this path's* suffix, so the byte / stat / list / remove primitives hit
+        the object store directly — no Files-API hop, no Unity Catalog quota
+        burn. Returns ``None`` when the volume isn't directly reachable for the
+        requested *write* / read mode (managed volume, no grant, non-s3): the
+        caller then uses the Files API. Never raises into the I/O flow.
         """
         if self._split_volume() is None:
             return None  # path too shallow to address a volume
-        root = self.volume.external_storage_root(write=write)
+        root = self.volume.external_storage_root(
+            write=write, region=region, refresh=refresh,
+        )
         if root is None:
             return None
-        # Path of this entry *under* the volume root (segments past cat/sch/vol).
-        rel = "/".join(
-            p for p in (self.url.path or "").lstrip("/").split("/")[3:] if p
-        )
+        rel = self._storage_rel
         return (root / rel) if rel else root
 
     def temporary_credentials(
@@ -1175,7 +1183,7 @@ class VolumePath(DatabricksPath):
             return
         # Direct-storage fast path: ``DeleteObject`` straight off the cloud
         # storage instead of a Files-API DELETE.
-        sf = self._external_storage_file(write=True)
+        sf = self.storage_path(write=True)
         if sf is not None:
             try:
                 sf._remove_file(missing_ok=missing_ok, wait=wait)
@@ -1233,7 +1241,7 @@ class VolumePath(DatabricksPath):
         # storage — recursive is one ``ListObjectsV2`` + batched
         # ``DeleteObjects`` (S3Bucket.delete_prefix) instead of the Files-API
         # per-leaf DELETE fan-out below.
-        sf = self._external_storage_file(write=True)
+        sf = self.storage_path(write=True)
         if sf is not None:
             try:
                 sf._remove_dir(recursive=recursive, missing_ok=missing_ok, wait=wait)
@@ -1364,7 +1372,7 @@ class VolumePath(DatabricksPath):
         # read straight off the cloud storage path, skipping the Files API.
         # ``S3Path._read_mv`` honours the same (n, pos) range contract and
         # raises ``FileNotFoundError`` for a missing key.
-        sf = self._external_storage_file(write=False)
+        sf = self.storage_path(write=False)
         if sf is not None:
             try:
                 mv = sf._read_mv(n, pos)
@@ -1581,7 +1589,7 @@ class VolumePath(DatabricksPath):
         # PUT straight to the cloud storage path, skipping the Files API.
         # Materialise to bytes once so a failure can replay the same body
         # through the Files API fallback (``content`` is rebound to them).
-        sf = self._external_storage_file(write=True)
+        sf = self.storage_path(write=True)
         if sf is not None:
             if hasattr(content, "read"):
                 if hasattr(content, "seek"):
@@ -1686,7 +1694,7 @@ class VolumePath(DatabricksPath):
         # Direct-storage fast path (EXTERNAL volume + EXTERNAL USE SCHEMA):
         # stream straight to the cloud storage path. ``S3Path._upload_stream``
         # reads the holder in bounded chunks (multipart past its threshold).
-        sf = self._external_storage_file(write=True)
+        sf = self.storage_path(write=True)
         if sf is not None:
             try:
                 sf._upload_stream(source)

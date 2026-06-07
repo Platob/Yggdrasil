@@ -5,12 +5,13 @@ prefix and times the VolumePath operations both ways:
 
 * **direct** — the volume is external-usable (``EXTERNAL USE SCHEMA``), so the
   Holder primitives + stat/delete short-circuit straight to the backing S3
-  bucket (``_external_storage_file``).
+  bucket (``VolumePath.storage_path``).
 * **files** — the same ops forced through the Databricks Files REST API
   (``volume.mark_external_denied`` disables the fast path).
 
-Same bytes, same paths — the delta is the transport. Reports per-op wall time
-and the direct/files speedup.
+Same bytes, same paths — the delta is the transport. Reports per-op wall time,
+the direct/files speedup, **and the number of Databricks Files-API (governance)
+round trips each mode makes** — the direct path should drive that toward zero.
 
 Requires the ``aws`` extra (botocore, for the credential refresher) and a
 live workspace whose identity can ``CREATE EXTERNAL VOLUME`` + be granted
@@ -34,7 +35,23 @@ import statistics
 import time
 
 from yggdrasil.databricks.client import DatabricksClient
+from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.enums import Mode
+
+# ── Files-API (governance) round-trip counter ───────────────────────────────
+# Wrap ``VolumePath._fs_request`` so every Databricks Files REST call (HEAD /
+# GET / PUT / DELETE / list) bumps a counter. The direct-S3 path should make
+# *zero*; the Files path pays one or more per op.
+_FS_CALLS = {"n": 0}
+_ORIG_FS_REQUEST = VolumePath._fs_request
+
+
+def _counting_fs_request(self, *a, **kw):
+    _FS_CALLS["n"] += 1
+    return _ORIG_FS_REQUEST(self, *a, **kw)
+
+
+VolumePath._fs_request = _counting_fs_request
 
 
 def _timed(fn, repeat: int) -> float:
@@ -45,6 +62,21 @@ def _timed(fn, repeat: int) -> float:
         fn()
         best = min(best, time.perf_counter() - t0)
     return best * 1000.0
+
+
+def _timed_counted(fn, repeat: int) -> "tuple[float, int]":
+    """``(best wall ms, Files-API calls on the first run)`` for *fn*."""
+    _FS_CALLS["n"] = 0
+    t0 = time.perf_counter()
+    fn()
+    first_ms = (time.perf_counter() - t0) * 1000.0
+    calls = _FS_CALLS["n"]
+    best = first_ms
+    for _ in range(repeat - 1):
+        t0 = time.perf_counter()
+        fn()
+        best = min(best, (time.perf_counter() - t0) * 1000.0)
+    return best, calls
 
 
 def _set_mode(volume, *, direct: bool) -> None:
@@ -93,12 +125,20 @@ def main() -> None:
 
     # Confirm the direct path is actually reachable before benchmarking it.
     probe = volume.path("_probe.bin")
-    if probe._external_storage_file(write=True) is None:
+    if probe.storage_path(write=True) is None:
         print("DIRECT storage path unavailable (no grant / non-s3 / no botocore) — abort.")
         _cleanup(volume)
         return
 
+    # Suffix correctness: the per-path accessors must address *this file* under
+    # the volume root, not the bare volume root.
+    sub_probe = volume.path("sub/dir/leaf.bin")
+    print(f"\nstorage_location: {sub_probe.storage_location}")
+    print(f"storage_path:     {sub_probe.storage_path(write=True).full_path()}")
+    assert sub_probe.storage_location.endswith("/sub/dir/leaf.bin"), "suffix not appended!"
+
     results: "dict[str, dict[str, float]]" = {}
+    calls: "dict[str, dict[str, int]]" = {}
     try:
         for direct in (False, True):
             label = "direct" if direct else "files"
@@ -107,17 +147,21 @@ def main() -> None:
 
             _set_mode(volume, direct=direct)
             row: "dict[str, float]" = {}
-            row["write"] = _timed(
+            crow: "dict[str, int]" = {}
+            row["write"], crow["write"] = _timed_counted(
                 lambda: [p.write_bytes(payload) for p in paths], args.repeat)
-            row["read"] = _timed(
+            row["read"], crow["read"] = _timed_counted(
                 lambda: [p.read_bytes() for p in paths], args.repeat)
-            row["stat"] = _timed(
+            # stat is the ``exists()``-before-write hot path: count the
+            # governance round trips it costs each transport.
+            row["stat"], crow["stat"] = _timed_counted(
                 lambda: [p._stat_uncached().size for p in paths], args.repeat)
-            row["ls"] = _timed(
+            row["ls"], crow["ls"] = _timed_counted(
                 lambda: list(volume.path(sub).iterdir()), args.repeat)
-            row["delete"] = _timed(
+            row["delete"], crow["delete"] = _timed_counted(
                 lambda: [p.remove(missing_ok=True) for p in paths], 1)
             results[label] = row
+            calls[label] = crow
     finally:
         _cleanup(volume)
 
@@ -126,17 +170,24 @@ def main() -> None:
     print(
         f"\nVolumePath direct-S3 vs Files-API — {args.files} files x "
         f"{args.size_kib} KiB, best of {args.repeat}\n"
-        f"{'op':<8}{'files (ms)':>14}{'direct (ms)':>14}{'speedup':>10}")
-    print("-" * 46)
+        f"{'op':<8}{'files (ms)':>12}{'direct (ms)':>12}{'speedup':>9}"
+        f"{'files API':>11}{'direct API':>11}")
+    print("-" * 66)
     for op in ops:
         f = results["files"][op]
         d = results["direct"][op]
         speed = f / d if d else float("inf")
-        print(f"{op:<8}{f:>14.1f}{d:>14.1f}{speed:>9.2f}x")
+        print(f"{op:<8}{f:>12.1f}{d:>12.1f}{speed:>8.2f}x"
+              f"{calls['files'][op]:>11}{calls['direct'][op]:>11}")
     tot_f = statistics.fsum(results["files"].values())
     tot_d = statistics.fsum(results["direct"].values())
-    print("-" * 46)
-    print(f"{'total':<8}{tot_f:>14.1f}{tot_d:>14.1f}{(tot_f / tot_d if tot_d else 0):>9.2f}x")
+    cf = sum(calls["files"].values())
+    cd = sum(calls["direct"].values())
+    print("-" * 66)
+    print(f"{'total':<8}{tot_f:>12.1f}{tot_d:>12.1f}{(tot_f / tot_d if tot_d else 0):>8.2f}x"
+          f"{cf:>11}{cd:>11}")
+    print(f"\nGovernance (Files-API) round trips: files={cf}  direct={cd}  "
+          f"(direct eliminates {cf - cd} of {cf}).")
 
 
 def _cleanup(volume) -> None:

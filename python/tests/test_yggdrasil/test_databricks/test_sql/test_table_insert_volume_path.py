@@ -67,8 +67,8 @@ class TestInsertVolumePath:
         assert isinstance(path, VolumePath)
         full = path.full_path()
         # ``staging_volume`` is ``<table>`` under the table's
-        # catalog / schema; staging files land in ``.sql/tmp/``.
-        assert full.startswith("/Volumes/cat/sch/tbl/.sql/tmp/")
+        # catalog / schema; staging files land in ``tmp/``.
+        assert full.startswith("/Volumes/cat/sch/tbl/tmp/")
         assert full.endswith(".parquet")
         # Default keeps the staged Parquet temporary so the holder
         # cleans up after itself.
@@ -86,7 +86,7 @@ class TestInsertVolumePath:
         other = _table("cat2", "sch2", "extra")
         path = tbl.insert_volume_path(other)
         full = path.full_path()
-        assert "/Volumes/cat2/sch2/extra/.sql/tmp/" in full
+        assert "/Volumes/cat2/sch2/extra/tmp/" in full
 
     def test_unique_per_call(self) -> None:
         tbl = _table()
@@ -106,31 +106,37 @@ class TestInsertVolumePath:
 
 
 # ---------------------------------------------------------------------------
-# staging_volume — the cheap, lazily-created staging handle
+# staging_volume — the per-table staging volume, derived + get-or-created
 # ---------------------------------------------------------------------------
 
 
 class TestStagingVolume:
 
-    def test_property_is_a_cheap_handle(self) -> None:
-        """Reading ``staging_volume`` never resolves infos or creates a
-        volume — it just mints the handle (creation is deferred to
-        :meth:`Table.ensure_staging_volume`)."""
+    def test_none_when_table_has_no_infos(self) -> None:
+        """The staging volume is isolated *under the table's own identity* — with
+        no table info to derive it from, the property is ``None``."""
         tbl = _table("cat", "sch", "tbl")
-        with patch.object(Volume, "get_or_create") as goc:
-            vol = tbl.staging_volume
-            assert tbl.staging_volume is vol  # singleton
-        assert isinstance(vol, Volume)
-        goc.assert_not_called()
+        with patch.object(Table, "read_infos", return_value=None):
+            assert tbl.staging_volume is None
 
-    def test_ensure_get_or_creates_the_staging_volume(self) -> None:
-        """``ensure_staging_volume`` is a plain idempotent get-or-create on the
-        staging volume (managed by default) and returns the volume handle."""
+    def test_get_or_creates_per_table_volume_and_caches(self) -> None:
+        """With table info present, ``staging_volume`` builds the ``<table>``
+        volume, eagerly get-or-creates it (external when derivable), and caches
+        the handle on the instance."""
+        from types import SimpleNamespace
+
         tbl = _table("cat", "sch", "tbl")
-        sentinel = object()
-        with patch.object(Volume, "get_or_create", return_value=sentinel) as goc:
-            assert tbl.staging_volume.get_or_create() is sentinel
-        goc.assert_called_once_with()
+        infos = SimpleNamespace(
+            storage_location="s3://bkt/unity_catalog/meta", table_id="tid-1",
+        )
+        with patch.object(Table, "read_infos", return_value=infos), \
+                patch.object(Volume, "get_or_create", return_value=None) as goc:
+            vol = tbl.staging_volume
+            again = tbl.staging_volume
+        assert isinstance(vol, Volume)
+        assert vol.volume_name == "tbl"   # named after the table
+        assert again is vol               # cached on the instance
+        goc.assert_called()               # eagerly ensured present
 
 
 # ---------------------------------------------------------------------------

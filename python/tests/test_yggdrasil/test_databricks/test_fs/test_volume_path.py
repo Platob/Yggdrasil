@@ -1405,14 +1405,25 @@ class TestVolumeInfoCaching:
         p.volume_info(refresh=True)
         assert workspace.volumes.read.call_count == 2
 
-    def test_storage_location_resolves_from_volume_info(
+    def test_storage_location_appends_this_paths_suffix(
         self, workspace, client, service
     ) -> None:
         workspace.volumes.read.return_value = _volume_info(
-            storage_location="s3://bkt/__unitystorage/c/s/v",
+            storage_location="s3://bkt/ext/c/s/v_loc",
         )
-        p = VolumePath("/Volumes/c/s/v/sub/y.parquet", service=service)
-        assert p.storage_location == "s3://bkt/__unitystorage/c/s/v"
+        # ``storage_location`` is *this path's* backing URL — the volume root
+        # with the path's suffix appended, not the bare volume root.
+        p = VolumePath("/Volumes/c/s/v_loc/sub/y.parquet", service=service)
+        assert p.storage_location == "s3://bkt/ext/c/s/v_loc/sub/y.parquet"
+
+    def test_storage_location_is_root_at_volume_root(
+        self, workspace, client, service
+    ) -> None:
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="s3://bkt/ext/c/s/v_root2",
+        )
+        p = VolumePath("/Volumes/c/s/v_root2", service=service)
+        assert p.storage_location == "s3://bkt/ext/c/s/v_root2"
 
     def test_storage_location_caches_independently_of_volume_info(
         self,
@@ -1421,17 +1432,17 @@ class TestVolumeInfoCaching:
         service,
     ) -> None:
         workspace.volumes.read.return_value = _volume_info()
-        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
+        p = VolumePath("/Volumes/cat/sch/v_indep/x", service=service)
         p.storage_location
         p.storage_location
-        # One read call drives both — the value is snapshotted onto
-        # ``_storage_location`` and the second call returns the cached
-        # string without re-touching ``VolumeInfo``.
+        # One read call drives both — the value is snapshotted onto the
+        # volume's ``VolumeInfo`` and the second call returns the cached
+        # string without re-touching the SDK.
         workspace.volumes.read.assert_called_once()
 
     def test_storage_location_missing_raises(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(storage_location=None)
-        p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
+        p = VolumePath("/Volumes/cat/sch/v_missing/x", service=service)
         with pytest.raises(ValueError, match="storage_location"):
             p.storage_location
 
@@ -1745,62 +1756,88 @@ class TestVolumeInfoNotFoundRecovery:
 
 class TestStoragePath:
 
-    def test_returns_s3_path_for_s3_volume(self, workspace, client, service) -> None:
+    def test_storage_path_appends_this_paths_suffix_to_external_root(self) -> None:
+        from yggdrasil.aws.fs.path import S3Path
+
+        # ``VolumePath.storage_path`` is the central direct-storage accessor: it
+        # returns the volume's reachable storage root with *this path's* suffix
+        # appended — not the bare volume root.
+        p = VolumePath("/Volumes/cat/sch/vol/sub/x.parquet", service=MagicMock(spec=Volumes))
+        vol = MagicMock()
+        vol.external_storage_root.return_value = S3Path("s3://my-bucket/root")
+        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
+            out = p.storage_path(write=False)
+        assert isinstance(out, S3Path)
+        assert out.full_path() == "s3://my-bucket/root/sub/x.parquet"
+
+    def test_storage_path_none_for_unreachable_volume(self) -> None:
+        # A managed volume (no direct storage access) → ``None``, caller uses
+        # the Files API.
+        p = VolumePath("/Volumes/cat/sch/vol/sub/x.parquet", service=MagicMock(spec=Volumes))
+        vol = MagicMock()
+        vol.external_storage_root.return_value = None
+        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
+            assert p.storage_path(write=True) is None
+
+    def test_volume_resolver_returns_root_s3_path(self, workspace, client, service) -> None:
         from yggdrasil.aws.fs.path import S3Path
 
         workspace.volumes.read.return_value = _volume_info(
-            storage_location="s3://my-bucket/__unitystorage/cat/sch/vol",
+            storage_location="s3://my-bucket/ext/cat/sch/v_root",
         )
         gen = (
             workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         )
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/cat/sch/vol/x.parquet", service=service)
-        root = p.storage_path(region="us-east-1")
+        # ``Volume.storage_path`` is the cloud-storage *resolver* (root, no
+        # suffix) the gated accessors build on.
+        vol = VolumePath("/Volumes/cat/sch/v_root/x.parquet", service=service).volume
+        root = vol.storage_path(region="us-east-1")
         assert isinstance(root, S3Path)
-        assert root.full_path() == "s3://my-bucket/__unitystorage/cat/sch/vol"
+        assert root.full_path() == "s3://my-bucket/ext/cat/sch/v_root"
 
     def test_caches_path_on_instance(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(
-            storage_location="s3://bkt/u/c/s/v",
+            storage_location="s3://bkt/u/c/s/v_cache",
         )
         gen = (
             workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         )
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/c/s/v/x", service=service)
-        first = p.storage_path()
-        second = p.storage_path()
-        # Same Path instance — no rebuild on subsequent calls.
+        vol = VolumePath("/Volumes/c/s/v_cache/x", service=service).volume
+        first = vol.storage_path()
+        second = vol.storage_path()
+        # Same Path instance for the same credential scope — no rebuild.
         assert first is second
 
     def test_refresh_drops_instance_cache(self, workspace, client, service) -> None:
-        workspace.volumes.read.side_effect = [
-            _volume_info(storage_location="s3://bkt/u/c/s/v"),
-            _volume_info(storage_location="s3://bkt/u/c/s/v"),
-        ]
+        workspace.volumes.read.return_value = _volume_info(
+            storage_location="s3://bkt/u/c/s/v_refresh",
+        )
         gen = (
             workspace.temporary_volume_credentials.generate_temporary_volume_credentials
         )
         gen.return_value = _aws_creds_response()
 
-        p = VolumePath("/Volumes/c/s/v/x", service=service)
-        p.storage_path()
-        p.storage_path(refresh=True)
-        # ``refresh=True`` forces a fresh ``volumes.read``; the
-        # rebuilt :class:`S3Path` happens to collapse to the
-        # singleton-by-URL instance, but the SDK was hit twice.
-        assert workspace.volumes.read.call_count == 2
+        vol = VolumePath("/Volumes/c/s/v_refresh/x", service=service).volume
+        vol.storage_path()
+        # Poison the per-mode cache; ``refresh=True`` must bypass + rebuild it
+        # (AUTO resolves to a write/non-read-only scope → key ``False``).
+        vol._storage_paths[False] = "STALE"
+        rebuilt = vol.storage_path(refresh=True)
+        assert rebuilt != "STALE"
+        # The rebuilt path is now what the cache serves on the next read.
+        assert vol.storage_path() is rebuilt
 
     def test_unsupported_scheme_raises(self, workspace, client, service) -> None:
         workspace.volumes.read.return_value = _volume_info(
             storage_location="ftp://nope/no",
         )
-        p = VolumePath("/Volumes/c/s/v/x", service=service)
+        vol = VolumePath("/Volumes/c/s/v_ftp/x", service=service).volume
         with pytest.raises(ValueError, match="Unknown scheme"):
-            p.storage_path()
+            vol.storage_path()
 
 
 class TestVolumeArrowFilesystem:
@@ -2228,9 +2265,14 @@ class TestExternalStorageGating:
             volume_type="EXTERNAL" if external else "MANAGED",
         )
         vol._infos_fetched_at = time.time()
-        # Pre-seed the per-mode access cache (``None`` = undetermined).
+        # Pre-seed the per-mode access cache (``None`` = undetermined). Drop the
+        # per-mode Storage Path cache too: ``Volume`` is interned per
+        # (client, cat, sch, vol) and a spec'd mock service resolves ``client``
+        # to ``None``, so successive ``_volume()`` calls share one singleton —
+        # a stale cached path would otherwise leak between tests.
         vol._external_writable = access
         vol._external_readable = access
+        vol._storage_paths = {}
         schema = MagicMock()
         schema.can_use_external.return_value = can_use
         vol._schema = schema
@@ -2294,9 +2336,9 @@ class TestExternalStorageGating:
         vol.external_storage_root(write=False)
         assert vol.aws.call_args.kwargs["mode"] == Mode.READ_ONLY
 
-    def test_external_storage_file_joins_rel_under_root(self) -> None:
-        # The VolumePath helper delegates eligibility to the Volume and only
-        # joins this entry's path *under* the resolved root.
+    def test_storage_path_joins_rel_under_root(self) -> None:
+        # ``VolumePath.storage_path`` delegates eligibility to the Volume and
+        # appends *this entry's* suffix under the resolved root.
         p = VolumePath("/Volumes/cat/sch/vol/sub/file.bin", service=MagicMock(spec=Volumes))
         vol = MagicMock()
         joined = object()
@@ -2304,16 +2346,26 @@ class TestExternalStorageGating:
         root.__truediv__.return_value = joined
         vol.external_storage_root.return_value = root
         with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            assert p._external_storage_file(write=True) is joined
-        vol.external_storage_root.assert_called_once_with(write=True)
+            assert p.storage_path(write=True) is joined
+        vol.external_storage_root.assert_called_once_with(write=True, region=None, refresh=False)
         root.__truediv__.assert_called_once_with("sub/file.bin")
 
-    def test_external_storage_file_none_when_root_unavailable(self) -> None:
+    def test_storage_path_none_when_root_unavailable(self) -> None:
         p = VolumePath("/Volumes/cat/sch/vol/sub/file.bin", service=MagicMock(spec=Volumes))
         vol = MagicMock()
         vol.external_storage_root.return_value = None
         with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            assert p._external_storage_file(write=False) is None
+            assert p.storage_path(write=False) is None
+
+    def test_storage_path_root_when_no_suffix(self) -> None:
+        # At the volume root (no suffix) ``storage_path`` returns the root as-is.
+        p = VolumePath("/Volumes/cat/sch/vol", service=MagicMock(spec=Volumes))
+        vol = MagicMock()
+        root = MagicMock()
+        vol.external_storage_root.return_value = root
+        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
+            assert p.storage_path(write=True) is root
+        root.__truediv__.assert_not_called()
 
 
 class TestVolumeExternalAccessFlags:
@@ -2380,7 +2432,7 @@ class TestExternalStorageFallbackFlagsVolume:
         sf = MagicMock()
         sf._read_mv.side_effect = S3Error(403, "AccessDenied", "denied", "key")
         vol = MagicMock()
-        with patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+        with patch.object(VolumePath, "storage_path", return_value=sf), \
                 patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol), \
                 patch.object(VolumePath, "_fs_request",
                              side_effect=FileNotFoundError("→ files api")):
@@ -2395,7 +2447,7 @@ class TestExternalStorageFallbackFlagsVolume:
         sf = MagicMock()
         sf._read_mv.side_effect = ConnectionError("blip")
         vol = MagicMock()
-        with patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+        with patch.object(VolumePath, "storage_path", return_value=sf), \
                 patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol), \
                 patch.object(VolumePath, "_fs_request",
                              side_effect=FileNotFoundError("→ files api")):
@@ -2427,24 +2479,28 @@ class TestStorageStrategyDelegation:
         sf = MagicMock()
         sf._stat_uncached.return_value = IOStats(kind=IOKind.FILE, size=42, mtime=1.0)
         with self._no_mount(), \
-                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "storage_path", return_value=sf), \
                 patch.object(VolumePath, "_fs_request") as fs:
             out = p._stat_uncached()
         assert out.kind is IOKind.FILE and out.size == 42
         fs.assert_not_called()  # never touched the Files API
 
-    def test_stat_missing_falls_through_to_files_api(self):
+    def test_stat_missing_is_authoritative_no_files_api(self):
         from yggdrasil.io.io_stats import IOStats
         p = self._vp()
         sf = MagicMock()
         sf._stat_uncached.return_value = IOStats(kind=IOKind.MISSING, size=0, mtime=0.0)
         with self._no_mount(), \
-                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
-                patch.object(VolumePath, "_fs_request", side_effect=Exception("probe")), \
-                patch.object(VolumePath, "_list_directory", return_value=iter(())):
+                patch.object(VolumePath, "storage_path", return_value=sf), \
+                patch.object(VolumePath, "_fs_request") as fs, \
+                patch.object(VolumePath, "_list_directory") as ls:
             out = p._stat_uncached()
-        assert out.kind is IOKind.MISSING  # S3 MISSING → Files-API confirmed missing
+        # For a reachable external volume the object store is authoritative —
+        # MISSING is returned as-is, never paying the Files-API HEAD/HEAD+LIST.
+        assert out.kind is IOKind.MISSING
         sf._stat_uncached.assert_called_once()
+        fs.assert_not_called()
+        ls.assert_not_called()
 
     def test_stat_permission_error_flags_volume_and_falls_back(self):
         from yggdrasil.aws.fs.s3_http import S3Error
@@ -2453,7 +2509,7 @@ class TestStorageStrategyDelegation:
         sf._stat_uncached.side_effect = S3Error(403, "AccessDenied", "x", "k")
         vol = MagicMock()
         with self._no_mount(), \
-                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "storage_path", return_value=sf), \
                 patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol), \
                 patch.object(VolumePath, "_fs_request", side_effect=Exception("probe")), \
                 patch.object(VolumePath, "_list_directory", return_value=iter(())):
@@ -2467,7 +2523,7 @@ class TestStorageStrategyDelegation:
         p = self._vp()
         sf = MagicMock()
         with self._no_mount(), \
-                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "storage_path", return_value=sf), \
                 patch.object(VolumePath, "_delete_path") as files_delete:
             p._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
         sf._remove_file.assert_called_once()
@@ -2481,7 +2537,7 @@ class TestStorageStrategyDelegation:
         sf._remove_file.side_effect = S3Error(403, "AccessDenied", "x", "k")
         vol = MagicMock()
         with self._no_mount(), \
-                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "storage_path", return_value=sf), \
                 patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol), \
                 patch.object(VolumePath, "_delete_path") as files_delete:
             p._remove_file(missing_ok=True, wait=WaitingConfig.from_(True))
@@ -2494,7 +2550,7 @@ class TestStorageStrategyDelegation:
         p = VolumePath("/Volumes/cat/sch/vol/tmp", service=MagicMock(spec=Volumes))
         sf = MagicMock()
         with self._no_mount(), \
-                patch.object(VolumePath, "_external_storage_file", return_value=sf), \
+                patch.object(VolumePath, "storage_path", return_value=sf), \
                 patch.object(VolumePath, "_ls") as ls, \
                 patch.object(VolumePath, "_delete_path") as files_delete:
             p._remove_dir(recursive=True, missing_ok=True, wait=WaitingConfig.from_(True))

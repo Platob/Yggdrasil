@@ -199,7 +199,11 @@ class Volume(DatabricksPath):
             infos_fetched_at if (infos is not None and infos_fetched_at is not None)
             else (time.time() if infos is not None else None)
         )
-        self._storage_path: Any = None
+        # Storage Path cached **per credential scope** (read-only vs
+        # write): a write-scoped :class:`S3Path` carries WRITE_VOLUME creds, a
+        # read-scoped one READ_VOLUME — so a stat (read) must not hand its
+        # read-only session to a later write on the same volume.
+        self._storage_paths: dict[bool, Any] = {}
         self._catalog: Any = None
         self._schema: Any = None
         # Per-mode direct-storage access state, **cached** so the eligibility
@@ -238,7 +242,13 @@ class Volume(DatabricksPath):
         else:
             self._external_readable = False
 
-    def external_storage_root(self, *, write: bool) -> Path | None:
+    def external_storage_root(
+        self,
+        *,
+        write: bool,
+        region: Optional[str] = None,
+        refresh: bool = False,
+    ) -> Path | None:
         """The volume's backing cloud-storage root :class:`Path` (an
         :class:`S3Path` today) when this volume is **directly reachable** for
         *write* / read — else ``None`` (the caller stays on the Files-API
@@ -250,17 +260,25 @@ class Volume(DatabricksPath):
         ``__unitycatalog`` layout (where direct ``PutObject`` is denied) — is
         decided **once per mode** and cached on this singleton via
         :meth:`external_access`, so the check doesn't re-run on every path
-        build / I/O. When eligible the backing object store is reachable
-        directly, skipping the Files-API hop and the UC quota burn. Never
-        raises into the caller — any metadata / vend / credential failure
-        resolves to ``None`` and the Files-API path takes over.
+        build / I/O. The root itself is resolved through :meth:`storage_path`
+        (the single cloud-storage resolution point). Never raises into the
+        caller — any metadata / vend / credential failure resolves to ``None``
+        and the Files-API path takes over.
         """
         try:
             cached = self.external_access(write=write)
             if cached is False:
                 return None
             raw = self.storage_location
-            if cached is None:
+            # A UC-managed ``__unitystorage`` / ``__unitycatalog`` layout never
+            # accepts a direct ``PutObject`` — mark the volume write-denied up
+            # front (even when we arrived here on a read) so a later write check
+            # short-circuits without re-deriving, then bail for the write case.
+            if "__unitystorage" in raw or "__unitycatalog" in raw:
+                self.mark_external_denied(write=True)
+                if write:
+                    return None
+            if self.external_access(write=write) is None:
                 # First time for this mode — run the eligibility check + cache
                 # the verdict so later path builds / ops skip straight to the
                 # root resolution below.
@@ -268,12 +286,15 @@ class Volume(DatabricksPath):
                     (self.volume_type or "").upper() == "EXTERNAL"
                     and self.schema.can_use_external()
                     and (URL.from_str(raw).scheme or "").startswith("s3")
-                    and not (write and ("__unitystorage" in raw or "__unitycatalog" in raw))
                 )
                 self.mark_external_ok(write=write) if eligible else self.mark_external_denied(write=write)
                 if not eligible:
                     return None
-            return self.aws(mode=Mode.AUTO if write else Mode.READ_ONLY).s3.path(raw)
+            return self.storage_path(
+                mode=Mode.AUTO if write else Mode.READ_ONLY,
+                region=region,
+                refresh=refresh,
+            )
         except Exception as exc:  # type / location / credential resolution
             logger.debug("external storage root unavailable for %r: %s", self, exc)
             return None
@@ -439,7 +460,7 @@ class Volume(DatabricksPath):
         self._infos_ttl = state.get("_infos_ttl", self.DEFAULT_INFO_TTL)
         self._infos = state.get("_infos")
         self._infos_fetched_at = state.get("_infos_fetched_at")
-        self._storage_path = None
+        self._storage_paths = {}
         self._catalog = None
         self._schema = None
         self._initialized = True
@@ -463,7 +484,7 @@ class Volume(DatabricksPath):
         # Storage location may have shifted (external volume rebind);
         # drop the cached Path so the next call resolves against the
         # fresh URL.
-        self._storage_path = None
+        self._storage_paths = {}
         # A successful info fetch proves the volume exists — seed the stat
         # cache (a volume is directory-like) in the same beat so a follow-up
         # ``exists`` / ``stat`` / ``is_dir`` reuses it instead of re-probing.
@@ -477,7 +498,7 @@ class Volume(DatabricksPath):
     def _reset_cache(self) -> None:
         self._infos = None
         self._infos_fetched_at = None
-        self._storage_path = None
+        self._storage_paths = {}
         self._catalog = None
         self._schema = None
         # The info and the stat snapshot describe the same object — drop
@@ -617,11 +638,14 @@ class Volume(DatabricksPath):
         Dispatches to the right :class:`URLBased` subclass —
         :class:`S3Path` for ``s3://``, generic Path registry for
         anything else. The returned Path is cached on the instance
-        and (for S3) carries the auto-refreshing :class:`AWSClient`
-        session minted via :meth:`credentials_refresher`.
+        **per credential scope** (read-only vs write) and (for S3)
+        carries the auto-refreshing :class:`AWSClient` session minted
+        via :meth:`credentials_refresher`.
         """
-        if self._storage_path is not None and not refresh:
-            return self._storage_path
+        read_only = Mode.from_(mode, default=Mode.AUTO) is Mode.READ_ONLY
+        cached = self._storage_paths.get(read_only)
+        if cached is not None and not refresh:
+            return cached
 
         raw = self.storage_location
 
@@ -636,7 +660,7 @@ class Volume(DatabricksPath):
             storage_path = self.aws(mode=mode, region=region).s3.path(raw)
         else:
             storage_path = Path.from_url(raw)
-        self._storage_path = storage_path
+        self._storage_paths[read_only] = storage_path
         return storage_path
 
     def temporary_credentials(self, *, mode: ModeLike = Mode.AUTO) -> Any:
