@@ -101,7 +101,7 @@ class Loki:
     #: capable remote APIs first, then free local engines as a fallback.
     #: :meth:`select` overrides this for simple work on a capable workstation.
     ENGINE_PREFERENCE: tuple[str, ...] = (
-        "claude", "openai", "databricks", "ollama", "transformers",
+        "claude", "openai", "databricks", "ollama", "openvino", "transformers",
     )
 
     _CURRENT: "Optional[Loki]" = None
@@ -254,6 +254,7 @@ class Loki:
                 DatabricksServingEngine,
                 OllamaEngine,
                 OpenAIEngine,
+                OpenVINOEngine,
                 TransformersEngine,
             )
 
@@ -265,6 +266,8 @@ class Loki:
                 # the heavy load is deferred to an actual serving completion.
                 "databricks": DatabricksServingEngine(available=self.has("databricks")),
                 "ollama": OllamaEngine(),
+                # Intel NPU (AI Boost) via OpenVINO/optimum-intel, else GPU/CPU.
+                "openvino": OpenVINOEngine(),
                 "transformers": TransformersEngine(),
             }
         return self._engines

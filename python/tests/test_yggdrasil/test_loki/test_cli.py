@@ -135,16 +135,10 @@ class TestIntelGpuEnable(unittest.TestCase):
             cli._enable_intel_gpu(style)
         return style.strip(buf.getvalue()), inp, run
 
-    def test_silent_without_intel_hardware(self):
-        out, inp, run = self._run(gpu=False, npu=False)
+    def test_silent_without_intel_gpu(self):
+        out, inp, run = self._run(gpu=False)
         self.assertEqual(out, "")
         inp.assert_not_called()
-        run.assert_not_called()
-
-    def test_reports_npu_without_offering_gpu_install(self):
-        out, inp, run = self._run(gpu=False, npu=True)
-        self.assertIn("Intel NPU", out)
-        inp.assert_not_called()                 # NPU is informational, no install
         run.assert_not_called()
 
     def test_offers_install_when_gpu_present_but_unusable(self):
@@ -170,7 +164,63 @@ class TestIntelGpuEnable(unittest.TestCase):
     def test_skips_when_gpu_already_usable(self):
         out, inp, run = self._run(gpu=True, accel="xpu")
         self.assertEqual(out, "")               # already xpu → nothing to do
+
+
+class TestIntelNpuEnable(unittest.TestCase):
+    """``ygg loki setup`` enables the NPU (openvino) engine when the NPU is present."""
+
+    def _run(self, *, npu=True, packages=False, answer="n", rc=0):
+        import io
+        import subprocess
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        from yggdrasil.cli import style
+        from yggdrasil.loki import resources
+
+        style.force_color(False)
+        buf = io.StringIO()
+        proc = subprocess.CompletedProcess([], rc, stdout="", stderr="pip\nthe real error")
+        # packages present → find_spec returns an object; missing → None.
+        spec = object() if packages else None
+        with patch.object(resources, "has_npu", return_value=npu), \
+                patch("importlib.util.find_spec", return_value=spec), \
+                patch("builtins.input", return_value=answer) as inp, \
+                patch("subprocess.run", return_value=proc) as run, \
+                redirect_stdout(buf):
+            cli._enable_intel_npu(style)
+        return style.strip(buf.getvalue()), inp, run
+
+    def test_silent_without_npu(self):
+        out, inp, run = self._run(npu=False)
+        self.assertEqual(out, "")
         inp.assert_not_called()
+        run.assert_not_called()
+
+    def test_points_at_engine_when_already_installed(self):
+        out, inp, run = self._run(npu=True, packages=True)
+        self.assertIn("Intel NPU", out)
+        self.assertIn("/engine openvino", out)
+        inp.assert_not_called()                 # nothing to install
+        run.assert_not_called()
+
+    def test_offers_install_when_packages_missing(self):
+        out, inp, run = self._run(npu=True, packages=False, answer="n")
+        self.assertIn("optimum[openvino]", out)
+        inp.assert_called_once()                # prompted…
+        run.assert_not_called()                 # …declined → no install
+
+    def test_runs_optimum_install_on_yes(self):
+        out, inp, run = self._run(npu=True, packages=False, answer="y", rc=0)
+        run.assert_called_once()
+        argv = run.call_args.args[0]
+        self.assertIn("optimum[openvino]", argv)
+        self.assertIn("/engine openvino", out)
+
+    def test_install_failure_surfaces_error_tail(self):
+        out, inp, run = self._run(npu=True, packages=False, answer="y", rc=1)
+        self.assertIn("failed", out)
+        self.assertIn("the real error", out)
 
 
 class TestModelChooser(unittest.TestCase):

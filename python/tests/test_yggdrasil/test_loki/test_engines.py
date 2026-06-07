@@ -16,6 +16,7 @@ from yggdrasil.loki.engines import (
     DatabricksServingEngine,
     OllamaEngine,
     OpenAIEngine,
+    OpenVINOEngine,
     TransformersEngine,
 )
 
@@ -952,6 +953,136 @@ class TestEngineSelection(unittest.TestCase):
         with patch.object(Loki, "_engine_instances",
                           return_value={"boom": boom, "good": good}):
             self.assertEqual(set(loki.available_engines()), {"good"})
+
+
+class TestOpenVINOEngine(unittest.TestCase):
+    """The local OpenVINO engine — a model on the Intel NPU (else GPU/CPU)."""
+
+    def setUp(self):
+        OpenVINOEngine._PIPES.clear()
+        OpenVINOEngine._FAILED.clear()
+
+    @staticmethod
+    def _stub_pipe():
+        return MagicMock(return_value=[{"generated_text": [
+            {"role": "assistant", "content": "ov reply"}]}])
+
+    def _fakes(self, *, devices=("NPU", "CPU"), from_pretrained=None, pipe=None):
+        ov = types.ModuleType("openvino")
+        ov.Core = lambda: types.SimpleNamespace(available_devices=list(devices))
+        optimum_parent = types.ModuleType("optimum")
+        optimum = types.ModuleType("optimum.intel")
+        optimum.OVModelForCausalLM = types.SimpleNamespace(
+            from_pretrained=from_pretrained or MagicMock(return_value="ovmodel"))
+        transformers = types.ModuleType("transformers")
+        transformers.AutoTokenizer = types.SimpleNamespace(
+            from_pretrained=MagicMock(return_value="tok"))
+        transformers.logging = types.SimpleNamespace(set_verbosity_error=MagicMock())
+        transformers.pipeline = MagicMock(return_value=pipe or self._stub_pipe())
+        return {"openvino": ov, "optimum": optimum_parent, "optimum.intel": optimum,
+                "transformers": transformers}
+
+    def test_is_local(self):
+        self.assertTrue(OpenVINOEngine.local)
+        self.assertEqual(OpenVINOEngine.name, "openvino")
+
+    def test_available_needs_packages_and_an_accelerator(self):
+        eng = OpenVINOEngine()
+        with patch("importlib.util.find_spec", return_value=object()), \
+                patch.object(eng, "_devices", return_value=["NPU", "CPU"]):
+            self.assertTrue(eng.available())                 # NPU present → offer it
+        with patch("importlib.util.find_spec", return_value=object()), \
+                patch.object(eng, "_devices", return_value=["GPU.0", "CPU"]):
+            self.assertTrue(eng.available())                 # an Intel GPU counts too
+        with patch("importlib.util.find_spec", return_value=object()), \
+                patch.object(eng, "_devices", return_value=["CPU"]):
+            self.assertFalse(eng.available())                # CPU-only → leave to others
+        with patch("importlib.util.find_spec", return_value=None), \
+                patch.object(eng, "_devices", return_value=["NPU"]):
+            self.assertFalse(eng.available())                # packages missing
+
+    def test_devices_lists_openvino_core_and_memoizes(self):
+        ov = types.ModuleType("openvino")
+        calls = []
+        ov.Core = lambda: (calls.append(1), types.SimpleNamespace(
+            available_devices=["NPU", "GPU", "CPU"]))[1]
+        eng = OpenVINOEngine()
+        with patch.dict(sys.modules, {"openvino": ov}):
+            self.assertEqual(eng._devices(), ["NPU", "GPU", "CPU"])
+            eng._devices()                                   # memoized — no second Core()
+        self.assertEqual(len(calls), 1)
+
+    def test_device_chain_prefers_npu_then_gpu_then_cpu(self):
+        eng = OpenVINOEngine()
+        with patch.object(eng, "_devices", return_value=["GPU.0", "CPU"]):
+            self.assertEqual(eng._device_chain(), ["GPU", "CPU"])
+        with patch.object(eng, "_devices", return_value=["NPU", "GPU.0", "CPU"]):
+            self.assertEqual(eng._device_chain(), ["NPU", "GPU", "CPU"])
+            self.assertEqual(eng.resolve_device(), "NPU")     # NPU is the whole point
+        self.assertEqual(OpenVINOEngine(device="CPU")._device_chain(), ["CPU"])  # pin wins
+
+    def test_pipeline_loads_on_npu_without_converting_an_ov_model(self):
+        fakes = self._fakes(devices=("NPU", "CPU"))
+        eng = OpenVINOEngine(model="OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov")
+        with patch.dict(sys.modules, fakes):
+            eng.generate("hi")
+        load = fakes["optimum.intel"].OVModelForCausalLM.from_pretrained
+        self.assertEqual(load.call_args.kwargs["device"], "NPU")
+        self.assertFalse(load.call_args.kwargs["export"])    # already OpenVINO IR
+
+    def test_pipeline_converts_a_plain_hf_model(self):
+        fakes = self._fakes(devices=("NPU", "CPU"))
+        eng = OpenVINOEngine(model="Qwen/Qwen2.5-1.5B-Instruct")
+        with patch.dict(sys.modules, fakes):
+            eng.generate("hi")
+        load = fakes["optimum.intel"].OVModelForCausalLM.from_pretrained
+        self.assertTrue(load.call_args.kwargs["export"])     # convert to OV IR
+
+    def test_pipeline_falls_back_npu_to_gpu_to_cpu(self):
+        from_pretrained = MagicMock(side_effect=[
+            RuntimeError("NPU compile failed"),
+            RuntimeError("GPU out of memory"),
+            "ovmodel",                                       # CPU succeeds
+        ])
+        fakes = self._fakes(devices=("NPU", "GPU", "CPU"), from_pretrained=from_pretrained)
+        eng = OpenVINOEngine(model="OpenVINO/m-int4-ov")
+        with patch.dict(sys.modules, fakes):
+            out = eng.generate("hi")
+        self.assertEqual(out, "ov reply")
+        tried = [c.kwargs["device"] for c in from_pretrained.call_args_list]
+        self.assertEqual(tried, ["NPU", "GPU", "CPU"])       # walked the chain
+        fakes["transformers"].pipeline.assert_called_once()  # built once, on CPU
+
+    def test_failed_load_is_remembered_not_retried(self):
+        from_pretrained = MagicMock(side_effect=RuntimeError("boom"))
+        fakes = self._fakes(devices=("NPU", "CPU"), from_pretrained=from_pretrained)
+        eng = OpenVINOEngine(model="OpenVINO/m-int4-ov")
+        with patch.dict(sys.modules, fakes):
+            with self.assertRaises(RuntimeError):
+                eng.generate("hi")
+            calls_after_first = from_pretrained.call_count
+            with self.assertRaises(RuntimeError):
+                eng.generate("again")
+        # The second turn fast-fails on the remembered error — no new load attempts.
+        self.assertEqual(from_pretrained.call_count, calls_after_first)
+
+    def test_complete_is_free(self):
+        from yggdrasil.loki.usage import METER
+
+        METER.reset()
+        fakes = self._fakes(devices=("NPU", "CPU"))
+        with patch.dict(sys.modules, fakes):
+            out = OpenVINOEngine(model="OpenVINO/m-int4-ov").generate("hi", system="s")
+        self.assertEqual(out, "ov reply")
+        self.assertGreater(METER.total_tokens, 0)
+        self.assertEqual(METER.total_cost, 0.0)              # local → free
+
+    def test_env_overrides_model_and_device(self):
+        with patch.dict(os.environ, {"YGG_LOKI_OV_MODEL": "my/ov-model",
+                                     "YGG_LOKI_OV_DEVICE": "GPU"}):
+            eng = OpenVINOEngine()
+        self.assertEqual(eng.resolve_model(), "my/ov-model")
+        self.assertEqual(eng.resolve_device(), "GPU")        # pin wins over autodetect
 
 
 class TestResourceAccelerator(unittest.TestCase):

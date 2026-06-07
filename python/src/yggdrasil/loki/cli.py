@@ -268,27 +268,64 @@ def _setup(loki: Any, style: Any, arg: str) -> int:
         style.warn("no local engine yet — install one of:")
         for hint in res.get("install", []):
             style.out(f"    {style.brand('›')} {style.dim(hint)}\n")
+    _enable_intel_npu(style)
     _enable_intel_gpu(style)
     return 0
+
+
+def _enable_intel_npu(style: Any) -> None:
+    """Turn a *detected* Intel NPU into a *usable* one — the ``openvino`` engine.
+
+    The NPU (AI Boost) runs LLMs through OpenVINO / optimum-intel, not torch.
+    When the NPU is present but those packages aren't installed, offer to install
+    ``optimum[openvino]`` so ``/engine openvino`` can run a model on it; when they
+    are, just point at the engine.
+    """
+    import importlib.util
+    import subprocess
+    import sys
+
+    from yggdrasil.loki import resources
+
+    if not resources.has_npu():
+        return
+    if (importlib.util.find_spec("openvino") is not None
+            and importlib.util.find_spec("optimum") is not None):
+        style.out(f"  {style.brand('▸ Intel NPU')} {style.dim('detected — run a model on it with')} "
+                  f"{style.brand('/engine openvino')}\n")
+        return
+    cmd = [sys.executable, "-m", "pip", "install", "optimum[openvino]"]
+    style.out(f"  {style.brand('▸ Intel NPU')} {style.dim('detected — enable the NPU (openvino) engine:')}\n")
+    style.out(f"    {style.brand(' '.join(cmd))}\n")
+    try:
+        ans = input("  install the NPU engine now? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if ans not in ("y", "yes"):
+        return
+    with style.Spinner("installing optimum[openvino] for the NPU…"):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "see pip output"
+        style.fail(f"NPU engine install failed — {_short(tail)}")
+        return
+    style.ok("NPU engine installed — use /engine openvino (restart `ygg loki` if it's not listed yet)")
 
 
 def _enable_intel_gpu(style: Any) -> None:
     """Turn a *detected* Intel GPU into a *usable* one.
 
     The Intel GPU shows in ``status`` as soon as the OS sees it, but a local
-    model only runs on it once torch can target the XPU backend — which the
-    stock CPU/CUDA wheel can't. When the GPU is present but not yet usable, offer
-    to install the GPU (XPU) torch build from the dedicated PyTorch index. The
-    Intel NPU is reported too, but the HF pipeline can't target it (that path is
-    OpenVINO / optimum-intel), so it's informational only.
+    model only runs on it (through torch) once torch can target the XPU backend —
+    which the stock CPU/CUDA wheel can't. When the GPU is present but not yet
+    usable, offer to install the GPU (XPU) torch build from the dedicated PyTorch
+    index. (The NPU is handled by :func:`_enable_intel_npu`.)
     """
     import subprocess
     import sys
 
     from yggdrasil.loki import resources
 
-    if resources.has_npu():
-        style.out(f"  {style.brand('▸ Intel NPU')} {style.dim('detected — offload via optimum-intel + openvino (the HF pipeline runs on GPU/CPU)')}\n")
     if not resources.intel_gpu_present() or resources.accelerator() == "xpu":
         return                                   # no Intel GPU, or it's already usable
     cmd = [sys.executable, "-m", "pip", "install", "--index-url",
@@ -588,27 +625,29 @@ def _ready_model(loki: Any, style: Any, engine: str, model: str) -> None:
 
 
 def _local_load_notice(agent: Any, style: Any, engine: "str | None") -> None:
-    """Warn that a local transformers model is about to load (slow + silent).
+    """Warn that a local model is about to load (slow + silent on a first run).
 
     The first turn on a fresh box downloads weights and builds the pipeline
     before a single token streams; say so up front so the wait isn't a black
-    box (the engine then logs the load itself via the routed loki logger)."""
-    if engine != "transformers":
+    box (the engine then logs the load itself via the routed loki logger). Covers
+    both local pipeline engines — ``transformers`` (torch) and ``openvino``."""
+    if engine not in ("transformers", "openvino"):
         return
-    eng = agent.engine("transformers")
+    eng = agent.engine(engine)
     model = eng.resolve_model()
     if not eng.ready(model):
-        # Name the device it'll actually load on (auto-detected Intel GPU / cuda
-        # / mps, else CPU) so the user sees the accelerator is in play.
+        # Name the device it'll actually load on so the accelerator is visible:
+        # torch's cuda/xpu/mps, or OpenVINO's NPU/GPU/CPU.
         device = None
         try:
             device = eng.resolve_device()
         except Exception:
             pass
-        where = {"cuda": "the NVIDIA GPU", "xpu": "the Intel GPU",
-                 "mps": "the Apple GPU"}.get(device or "", "CPU")
+        where = {"cuda": "the NVIDIA GPU", "xpu": "the Intel GPU", "mps": "the Apple GPU",
+                 "NPU": "the Intel NPU", "GPU": "the Intel GPU", "CPU": "CPU"}.get(device or "", "CPU")
+        extra = " (and converts to OpenVINO IR)" if engine == "openvino" else ""
         style.out(f"  {style.dim('▹ loading local model')} {style.brand(model)} "
-                  f"{style.dim(f'· first run downloads weights, then runs on {where} — this can take a while')}\n")
+                  f"{style.dim(f'· first run downloads weights{extra}, then runs on {where} — this can take a while')}\n")
 
 
 def _stream_reply(agent: Any, style: Any, line: str, state: dict,
