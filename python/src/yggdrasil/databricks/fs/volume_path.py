@@ -92,6 +92,7 @@ from ..path import DatabricksPath
 if TYPE_CHECKING:
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.catalog.catalog import UCCatalog
+    from yggdrasil.databricks.external.location.resource import ExternalLocation
     from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.databricks.volume.volume import Volume
     from yggdrasil.path import Path
@@ -852,6 +853,31 @@ class VolumePath(DatabricksPath):
             return None
         rel = self._storage_rel
         return (root / rel) if rel else root
+
+    def external_location(self, *, refresh: bool = False) -> ExternalLocation | None:
+        """The Unity Catalog **external location** governing this path's backing
+        storage (delegates to :meth:`Volume.external_location`), or ``None`` when
+        the path doesn't address a volume, no accessible location covers it, or
+        listing isn't permitted. Never raises."""
+        if self._split_volume() is None:
+            return None
+        return self.volume.external_location(refresh=refresh)
+
+    def can_read(self, *, refresh: bool = False) -> bool:
+        """Global precheck — can this path's storage be **read** directly at the
+        cloud layer? Delegates to :meth:`Volume.can_read`; ``False`` when the
+        path doesn't address a volume. Cheap + cached, never raises."""
+        if self._split_volume() is None:
+            return False
+        return self.volume.can_read(refresh=refresh)
+
+    def can_write(self, *, refresh: bool = False) -> bool:
+        """Global precheck — can this path's storage be **written** directly at
+        the cloud layer? Delegates to :meth:`Volume.can_write`; ``False`` when
+        the path doesn't address a volume. Cheap + cached, never raises."""
+        if self._split_volume() is None:
+            return False
+        return self.volume.can_write(refresh=refresh)
 
     def temporary_credentials(
         self,

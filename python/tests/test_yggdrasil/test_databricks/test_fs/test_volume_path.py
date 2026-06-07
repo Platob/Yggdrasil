@@ -2496,6 +2496,35 @@ class TestVolumeAccessPrecheck:
         svc.client.external_locations.find_url.assert_not_called()
 
 
+class TestVolumePathAccessPrecheckDelegation:
+    """``VolumePath`` surfaces the volume's external-location precheck."""
+
+    def _vp(self):
+        return VolumePath("/Volumes/cat/sch/vol/sub/f.bin", service=MagicMock(spec=Volumes))
+
+    def test_delegates_to_volume(self) -> None:
+        p = self._vp()
+        vol = MagicMock()
+        sentinel = object()
+        vol.external_location.return_value = sentinel
+        vol.can_read.return_value = True
+        vol.can_write.return_value = False
+        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
+            assert p.external_location(refresh=True) is sentinel
+            assert p.can_read() is True
+            assert p.can_write() is False
+        vol.external_location.assert_called_once_with(refresh=True)
+
+    def test_too_shallow_path_is_safe(self) -> None:
+        # ``/Volumes`` doesn't address a volume — no delegation, safe defaults.
+        p = VolumePath("/Volumes", service=MagicMock(spec=Volumes))
+        with patch.object(VolumePath, "volume", new_callable=PropertyMock) as vol:
+            assert p.external_location() is None
+            assert p.can_read() is False
+            assert p.can_write() is False
+        vol.assert_not_called()
+
+
 class TestLooksLikePermissionDenied:
     def test_stdlib_permission_error(self) -> None:
         from yggdrasil.databricks.fs.volume_path import _looks_like_permission_denied
