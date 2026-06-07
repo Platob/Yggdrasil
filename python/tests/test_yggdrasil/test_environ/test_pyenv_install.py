@@ -130,11 +130,16 @@ class TestPyEnvInstallIntegration(unittest.TestCase):
 
         Sanity check — every install routes through ``python_path``,
         which must match ``sys.executable`` so the install lands in
-        the same venv the test is reading from.
+        the same venv the test is reading from. Compared *without*
+        ``.resolve()`` on either side: inside a venv ``sys.executable``
+        is a symlink to the base interpreter, and ``python_path`` must
+        preserve that venv path rather than collapse to the base — else
+        ``uv pip install --python <python_path>`` would install into the
+        base interpreter, invisible to the running venv.
         """
-        env = PyEnv.current()
         from pathlib import Path
-        self.assertEqual(env.python_path.resolve(), Path(sys.executable).resolve())
+        env = PyEnv.current()
+        self.assertEqual(env.python_path, Path(sys.executable).absolute())
 
 
 if __name__ == "__main__":

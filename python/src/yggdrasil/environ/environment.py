@@ -123,7 +123,14 @@ class PyEnv:
     _SPARK_SESSION: ClassVar[object] = MISSING
 
     def __post_init__(self) -> None:
-        self.python_path = Path(self.python_path).expanduser().resolve()
+        # ``.absolute()`` (not ``.resolve()``) for the interpreter: inside a
+        # venv ``python_path`` is ``<venv>/bin/python``, a symlink to the
+        # base interpreter. Resolving it collapses back to
+        # ``/usr/bin/python3.x`` and escapes the venv, so a subsequent
+        # ``uv pip install --python <python_path>`` would land the package
+        # in the base interpreter — invisible to the running venv. ``cwd``
+        # is a plain directory; resolving it is fine.
+        self.python_path = Path(self.python_path).expanduser().absolute()
         self.cwd = Path(self.cwd).expanduser().resolve()
 
     def __getstate__(self) -> dict[str, Any]:
@@ -134,7 +141,7 @@ class PyEnv:
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        object.__setattr__(self, "python_path", Path(state["python_path"]).expanduser().resolve())
+        object.__setattr__(self, "python_path", Path(state["python_path"]).expanduser().absolute())
         object.__setattr__(self, "cwd", Path(state["cwd"]).expanduser().resolve())
         object.__setattr__(self, "prefer_uv", bool(state["prefer_uv"]))
         object.__setattr__(self, "_version_info", None)
@@ -157,15 +164,23 @@ class PyEnv:
         * raw executable paths
         """
         if python is None or python == "":
-            return Path(sys.executable).resolve()
+            # ``sys.executable`` is already absolute and, inside a venv,
+            # points at ``<venv>/bin/python`` — a symlink to the base
+            # interpreter. Do NOT ``.resolve()`` it: collapsing that
+            # symlink escapes the venv (back to ``/usr/bin/python3.x``),
+            # so a later ``uv pip install --python <python_path>`` would
+            # target the system interpreter instead of the running venv
+            # and the freshly-installed package would be invisible to the
+            # process that asked for it.
+            return Path(sys.executable).absolute()
 
         p = Path(python).expanduser()
 
         if p.is_file() and "python" in p.name.lower():
-            return p.resolve()
+            return p.absolute()
 
         if p.is_dir():
-            return PyEnv._find_python_in_dir(p).resolve()
+            return PyEnv._find_python_in_dir(p).absolute()
 
         s = str(python).strip()
         if s and s[0].isdigit():
@@ -182,7 +197,11 @@ class PyEnv:
         """
         Search *folder* for a Python executable, preferring standard venv layouts.
         """
-        folder = folder.expanduser().resolve()
+        # ``.absolute()`` (not ``.resolve()``) throughout — a venv's
+        # ``bin/python`` is a symlink to the base interpreter; resolving it
+        # would collapse the path back out of the venv, defeating
+        # ``uv pip install --python <venv-python>``.
+        folder = folder.expanduser().absolute()
 
         candidates = [
             folder / "bin" / "python",
@@ -192,14 +211,14 @@ class PyEnv:
         ]
         for candidate in candidates:
             if candidate.is_file():
-                return candidate.resolve()
+                return candidate.absolute()
 
         patterns = ["**/python", "**/python3", "**/python3.*", "**/python.exe"]
         found: list[Path] = []
         for pattern in patterns:
             for match in folder.glob(pattern):
                 if match.is_file() and os.access(match, os.X_OK):
-                    found.append(match.resolve())
+                    found.append(match.absolute())
 
         if not found:
             raise FileNotFoundError(f"No Python executable found under directory: {folder}")
@@ -225,7 +244,10 @@ class PyEnv:
         packages: list[str] | None = None,
     ) -> PyEnv:
         env = cls(
-            python_path=Path(python_path).expanduser().resolve(),
+            # ``.absolute()`` keeps a venv's ``bin/python`` symlink intact;
+            # ``.resolve()`` would collapse it to the base interpreter and
+            # route installs out of the venv.
+            python_path=Path(python_path).expanduser().absolute(),
             cwd=(cwd or Path.cwd()).expanduser().resolve(),
             prefer_uv=prefer_uv,
         )
@@ -1530,7 +1552,10 @@ class PyEnv:
         ``<p>`` directly.
         """
         prefer_uv = self.prefer_uv if prefer_uv is None else prefer_uv
-        p = Path(python).expanduser().resolve() if python is not None else self.python_path
+        # ``.absolute()`` keeps a venv's ``bin/python`` symlink intact —
+        # ``.resolve()`` would collapse it to the base interpreter and aim
+        # the install/run at the wrong environment.
+        p = Path(python).expanduser().absolute() if python is not None else self.python_path
 
         if prefer_uv:
             try:
@@ -1548,7 +1573,10 @@ class PyEnv:
         """
         Return the ``uv run --python <path>`` prefix for subprocess execution.
         """
-        p = Path(python).expanduser().resolve() if python is not None else self.python_path
+        # ``.absolute()`` keeps a venv's ``bin/python`` symlink intact —
+        # ``.resolve()`` would collapse it to the base interpreter and aim
+        # the install/run at the wrong environment.
+        p = Path(python).expanduser().absolute() if python is not None else self.python_path
         return [*self._uv_base_cmd(install_runtime=True), "run", "--python", str(p)]
 
     @staticmethod
@@ -1571,7 +1599,9 @@ class PyEnv:
 
         for candidate in candidates:
             if candidate.exists() and candidate.is_file():
-                return candidate.resolve()
+                # ``.absolute()`` — never collapse the venv's ``bin/python``
+                # symlink back out to the base interpreter.
+                return candidate.absolute()
 
         if raise_error:
             raise ValueError(f"No Python executable found inside venv: {venv_dir}")

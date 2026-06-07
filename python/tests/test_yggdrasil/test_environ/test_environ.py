@@ -249,11 +249,13 @@ class TestResolvePython:
     def test_none_returns_sys_executable(self, monkeypatch):
         monkeypatch.setattr(sys, "executable", "/usr/bin/python-real")
         path = PyEnv.resolve_python_executable(None)
-        assert path == Path("/usr/bin/python-real").resolve()
+        # ``.absolute()`` semantics — the venv's ``bin/python`` symlink must
+        # NOT be collapsed to the base interpreter (escaping the venv).
+        assert path == Path("/usr/bin/python-real").absolute()
 
     def test_empty_string_returns_sys_executable(self, monkeypatch):
         monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
-        assert PyEnv.resolve_python_executable("") == Path("/usr/bin/python3").resolve()
+        assert PyEnv.resolve_python_executable("") == Path("/usr/bin/python3").absolute()
 
     def test_existing_file(self, tmp_path):
         py = tmp_path / "python3.12"
