@@ -18,31 +18,34 @@ class TestDeployHelp(unittest.TestCase):
 
 
 class TestDeployYgg(unittest.TestCase):
-    def test_ygg_builds_and_uploads(self):
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure:
-            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
-            rc = main(["deploy", "ygg"])
-        self.assertEqual(rc, 0)
-        ensure.assert_called_once()
-        self.assertFalse(ensure.call_args.kwargs["rebuild"])
-
-    def test_ygg_all_versions_uses_matrix_builder(self):
+    def test_ygg_default_uses_matrix_builder(self):
+        # Default builds every supported Python (matrix builder).
         with patch("yggdrasil.databricks.client.DatabricksClient"), \
              patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels") as ensure:
             ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
-            rc = main(["deploy", "ygg", "--all-versions", "--rebuild"])
+            rc = main(["deploy", "ygg", "--rebuild"])
         self.assertEqual(rc, 0)
         ensure.assert_called_once()
         self.assertTrue(ensure.call_args.kwargs["rebuild"])
 
+    def test_ygg_current_uses_single_builder(self):
+        # ``--current`` narrows to the local interpreter's Python.
+        with patch("yggdrasil.databricks.client.DatabricksClient"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure:
+            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
+            rc = main(["deploy", "ygg", "--current"])
+        self.assertEqual(rc, 0)
+        ensure.assert_called_once()
+        self.assertFalse(ensure.call_args.kwargs["rebuild"])
+
 
 class TestDeployWheel(unittest.TestCase):
-    def test_wheel_builds_and_uploads_package(self):
+    def test_wheel_current_uses_single_builder(self):
+        # ``--current`` builds the local Python only and honors --no-deps/--extra.
         with patch("yggdrasil.databricks.client.DatabricksClient"), \
              patch("yggdrasil.databricks.job.wheel.ensure_wheel") as ensure:
             ensure.return_value = ["/Workspace/Shared/pypi/pkg/pkg-1.0-py3-none-any.whl"]
-            rc = main(["deploy", "wheel", "mypkg", "--no-deps", "--extra", "databricks"])
+            rc = main(["deploy", "wheel", "mypkg", "--current", "--no-deps", "--extra", "databricks"])
         self.assertEqual(rc, 0)
         ensure.assert_called_once()
         args, kwargs = ensure.call_args
@@ -50,18 +53,19 @@ class TestDeployWheel(unittest.TestCase):
         self.assertTrue(kwargs["no_deps"])
         self.assertEqual(kwargs["extras"], ("databricks",))
 
-    def test_wheel_all_versions_uses_matrix_builder(self):
+    def test_wheel_default_uses_matrix_builder(self):
+        # Default builds every supported Python (matrix builder).
         with patch("yggdrasil.databricks.client.DatabricksClient"), \
              patch("yggdrasil.databricks.job.wheel.ensure_wheels") as ensure:
             ensure.return_value = ["/Workspace/Shared/pypi/pkg/pkg-1.0-py3-none-any.whl"]
-            rc = main(["deploy", "wheel", "mypkg", "--all-versions"])
+            rc = main(["deploy", "wheel", "mypkg"])
         self.assertEqual(rc, 0)
         ensure.assert_called_once()
         self.assertEqual(ensure.call_args.args[1], "mypkg")
 
 
 class TestDeployEnvironment(unittest.TestCase):
-    def test_environment_prints_job_environment_json(self):
+    def test_environment_current_prints_job_environment_json(self):
         env = MagicMock()
         env.as_dict.return_value = {"environment_key": "default", "spec": {"environment_version": "5"}}
         buf = io.StringIO()
@@ -69,13 +73,13 @@ class TestDeployEnvironment(unittest.TestCase):
              patch("yggdrasil.cli.style.print_logo"), \
              patch("yggdrasil.databricks.job.wheel.ygg_environment", return_value=env) as build, \
              contextlib.redirect_stdout(buf):
-            rc = main(["deploy", "environment", "--key", "default"])
+            rc = main(["deploy", "environment", "--current", "--key", "default"])
         self.assertEqual(rc, 0)
         build.assert_called_once()
         self.assertEqual(build.call_args.kwargs["environment_key"], "default")
         self.assertEqual(json.loads(buf.getvalue())["environment_key"], "default")
 
-    def test_environment_all_versions_lists_configs(self):
+    def test_environment_default_lists_configs(self):
         e1, e2 = MagicMock(), MagicMock()
         e1.as_dict.return_value = {"environment_key": "default"}
         e2.as_dict.return_value = {"environment_key": "py311"}
@@ -84,7 +88,7 @@ class TestDeployEnvironment(unittest.TestCase):
              patch("yggdrasil.cli.style.print_logo"), \
              patch("yggdrasil.databricks.job.wheel.ygg_environments", return_value=[e1, e2]) as build, \
              contextlib.redirect_stdout(buf):
-            rc = main(["deploy", "environment", "--all-versions"])
+            rc = main(["deploy", "environment"])
         self.assertEqual(rc, 0)
         build.assert_called_once()
         self.assertEqual([e["environment_key"] for e in json.loads(buf.getvalue())], ["default", "py311"])
@@ -94,11 +98,11 @@ class TestDeployProject(unittest.TestCase):
     def _info(self):
         return {
             "name": "myproj", "version": "0.1.0",
-            "env_name": "myproj-0-1-0", "env_dir": "/Workspace/Shared/environments/myproj-0-1-0",
+            "env_name": "myproj-0.1.0-py311", "env_dir": "/Workspace/Shared/environment/myproj",
             "dependencies": ["/Workspace/Shared/pypi/myproj/myproj-0.1.0-py3-none-any.whl", "polars"],
             "n_wheels": 2,
-            "serverless": "/Workspace/Shared/environments/myproj-0-1-0/myproj-0-1-0.yml",
-            "cluster": "/Workspace/Shared/environments/myproj-0-1-0/myproj-0-1-0.requirements.txt",
+            "serverless": "/Workspace/Shared/environment/myproj/myproj-0.1.0-py311.yml",
+            "cluster": "/Workspace/Shared/environment/myproj/myproj-0.1.0-py311.requirements.txt",
             "requires_python": ">=3.10",
         }
 
@@ -122,7 +126,7 @@ class TestDeployProject(unittest.TestCase):
         self.assertEqual(create.call_args.kwargs["single_user_name"], "me@co.com")
         self.assertEqual(
             create.call_args.kwargs["environment"],
-            "/Workspace/Shared/environments/myproj-0-1-0/myproj-0-1-0.requirements.txt",
+            "/Workspace/Shared/environment/myproj/myproj-0.1.0-py311.requirements.txt",
         )
 
     def test_project_no_cluster_skips_cluster_creation(self):
@@ -174,13 +178,14 @@ class TestDeployProject(unittest.TestCase):
 
 
 class TestDeployDefault(unittest.TestCase):
-    def test_bare_deploy_ships_wheel_then_environment(self):
-        env = MagicMock()
-        env.as_dict.return_value = {"environment_key": "default"}
+    def test_bare_deploy_ships_wheels_then_environments(self):
+        # Default bare deploy ships every supported Python: matrix wheel builder
+        # then matrix JobEnvironments.
+        e1 = MagicMock(); e1.as_dict.return_value = {"environment_key": "default"}
         with patch("yggdrasil.databricks.client.DatabricksClient"), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure, \
-             patch("yggdrasil.databricks.job.wheel.ygg_environment", return_value=env) as build, \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels") as ensure, \
+             patch("yggdrasil.databricks.job.wheel.ygg_environments", return_value=[e1]) as build, \
              contextlib.redirect_stdout(io.StringIO()):
             ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
             rc = main(["deploy"])
@@ -188,6 +193,20 @@ class TestDeployDefault(unittest.TestCase):
         ensure.assert_called_once()
         build.assert_called_once()
         # The wheel was just built; the environment step must not rebuild it again.
+        self.assertFalse(build.call_args.kwargs["rebuild"])
+
+    def test_current_deploy_ships_single_wheel_then_environment(self):
+        env = MagicMock(); env.as_dict.return_value = {"environment_key": "default"}
+        with patch("yggdrasil.databricks.client.DatabricksClient"), \
+             patch("yggdrasil.cli.style.print_logo"), \
+             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure, \
+             patch("yggdrasil.databricks.job.wheel.ygg_environment", return_value=env) as build, \
+             contextlib.redirect_stdout(io.StringIO()):
+            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
+            rc = main(["deploy", "--current"])
+        self.assertEqual(rc, 0)
+        ensure.assert_called_once()
+        build.assert_called_once()
         self.assertFalse(build.call_args.kwargs["rebuild"])
 
 

@@ -3,17 +3,17 @@ environment(s) from wheels in the workspace.
 
 The environment machinery in :mod:`yggdrasil.databricks.job.wheel` builds ygg's
 whole transitive dependency closure as wheels and persists, **per Python**, a
-self-contained base environment under ``/Workspace/Shared/environments``::
+base environment under ``/Workspace/Shared/environment``::
 
-    <env>/<env>.yml               serverless base_environment
-    <env>/<env>.requirements.txt   classic-cluster requirements
-    <env>/binaries/…              the zero-PyPI wheel closure
+    <proj>/<proj>-<version>-py3XX.yml               serverless base_environment
+    <proj>/<proj>-<version>-py3XX.requirements.txt   classic-cluster requirements
 
-so ygg jobs and clusters install with zero PyPI access. This command surfaces
+listing wheels from the shared pypi registry (``/Workspace/Shared/pypi``), so
+ygg jobs and clusters install with zero PyPI access. This command surfaces
 that on its own — the same step ``ygg databricks seed`` runs::
 
-    ygg databricks environment                 # get-or-install for the local Python
-    ygg databricks environment --all-versions  # one per supported Python (3.10–3.13)
+    ygg databricks environment                 # all supported Pythons (3.10–3.13)
+    ygg databricks environment --current       # only the local interpreter's Python
     ygg databricks environment --rebuild       # force a fresh wheel-closure build
     ygg databricks environment list            # list the deployed environment files
 
@@ -34,16 +34,16 @@ class EnvironmentCommand:
             help="Build / get-or-install the reusable ygg base environment(s) from wheels.",
         )
         parser.add_argument("--workspace-dir", dest="workspace_dir", default=None,
-                            help="Environment root (default: /Workspace/Shared/environments).")
+                            help="Environment root (default: /Workspace/Shared/environment).")
         parser.add_argument("--rebuild", action="store_true",
                             help="Force a fresh wheel-closure build + rewrite even if present.")
-        parser.add_argument("--all-versions", dest="all_versions", action="store_true",
-                            help="One environment per supported Python (3.10–3.13).")
+        parser.add_argument("--current", dest="current", action="store_true",
+                            help="Only the local interpreter's Python (default: all supported, 3.10–3.13).")
         sub = parser.add_subparsers(dest="environment_action")
 
         ls = sub.add_parser("list", help="List the deployed base environment files.")
         ls.add_argument("--workspace-dir", dest="workspace_dir", default=None,
-                        help="Environment root (default: /Workspace/Shared/environments).")
+                        help="Environment root (default: /Workspace/Shared/environment).")
         ls.set_defaults(handler=cls._list)
 
         parser.set_defaults(handler=cls._ensure)
@@ -58,10 +58,10 @@ class EnvironmentCommand:
 
         client = build_client(args)
         workspace_dir = args.workspace_dir or whl.WORKSPACE_ENV_DIR
-        pythons = list(whl.SUPPORTED_PYTHONS) if args.all_versions else [None]
+        pythons = [None] if args.current else list(whl.SUPPORTED_PYTHONS)
         plural = "s" if len(pythons) > 1 else ""
         with style.Spinner(
-            f"building {len(pythons)} base environment{plural} (wheel closure + binaries)…"
+            f"building {len(pythons)} base environment{plural} (wheel closure into shared pypi)…"
         ):
             envs = whl.ensure_environments(
                 client, versions=pythons, workspace_dir=workspace_dir, rebuild=args.rebuild,

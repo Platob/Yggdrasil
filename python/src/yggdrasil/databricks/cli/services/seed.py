@@ -24,7 +24,7 @@ It walks six areas:
 - **config**      — connectivity, host, current user, default catalog/schema.
 - **wheels**      — the versioned ygg image wheel in the workspace registry.
 - **environments**— the version-pinned base environments ygg jobs run under,
-  persisted under ``/Workspace/Shared/environments`` — **one pair per Python**:
+  persisted under ``/Workspace/Shared/environment/ygg`` — **one pair per Python**:
   ``ygg-<version>-py3XX.yml`` (serverless ``base_environment``) and
   ``ygg-<version>-py3XX.requirements.txt`` (classic-cluster
   ``Library(requirements=...)``). Both list only **built wheels in the workspace
@@ -60,6 +60,7 @@ focused "rebuild the image from scratch" command).
 """
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 
@@ -182,24 +183,25 @@ class SeedCommand:
                     style.warn(f"no base environment files under {whl.WORKSPACE_ENV_DIR}")
                     ok = False
             else:
-                # Persist the version-pinned base environments under
-                # /Workspace/Shared/environments. Each Python gets its own
-                # self-contained folder — ``ygg-<version>-py3XX/`` holding a
-                # serverless ``ygg-<version>-py3XX.yml`` (referenced by path via
-                # ``base_environment``), a classic-cluster
-                # ``ygg-<version>-py3XX.requirements.txt``, and a ``binaries/``
-                # closure of that Python's whole transitive dependency set built
-                # as wheels under the env itself — so the runtime installs with
-                # zero PyPI access and the env is self-describing. With
+                # Persist the version-pinned base environments under the project
+                # folder /Workspace/Shared/environment/ygg. Each Python gets a
+                # version-tagged pair in that one folder — a serverless
+                # ``ygg-<version>-py3XX.yml`` (referenced by path via
+                # ``base_environment``) and a classic-cluster
+                # ``ygg-<version>-py3XX.requirements.txt``. Both list that
+                # Python's whole transitive dependency set as wheels in the
+                # shared pypi registry (/Workspace/Shared/pypi) — so the runtime
+                # installs with zero PyPI access and the env is self-describing. With
                 # --all-versions/--overwrite this covers every supported Python
                 # (3.10–3.13); otherwise just the local one.
                 pythons = list(whl.SUPPORTED_PYTHONS) if all_versions else [None]
-                # Each Python's environment is a self-contained folder with its
-                # own wheel binaries, so they share nothing and build in parallel.
+                # Each Python gets a version-tagged spec pair in the shared ygg
+                # project folder; their wheel closures land in the shared pypi
+                # registry, so the per-Python builds overlap on a thread pool.
                 plural = "s" if len(pythons) > 1 else ""
                 with style.Spinner(
                     f"building {len(pythons)} base environment{plural} "
-                    f"(parallel, wheel bundle + binaries)…"
+                    f"(parallel, wheel bundle into shared pypi)…"
                 ):
                     envs = whl.ensure_environments(
                         client, versions=pythons,
@@ -215,7 +217,7 @@ class SeedCommand:
                     style.out(f"          {style.dim('cluster')}    {env['cluster']}\n")
                 style.ok(
                     f"base environments written for {len(envs)} Python version(s) "
-                    f"(serverless + cluster, binaries under each)"
+                    f"(serverless + cluster, wheels in shared pypi)"
                 )
         except Exception as exc:
             style.fail(f"environment step failed: {exc}")
@@ -342,20 +344,27 @@ class SeedCommand:
                     # Install the seeded **generic environment** (the classic-cluster
                     # ``requirements.txt`` written by the environments step above) so
                     # the cluster runs the same zero-PyPI ygg image as the jobs,
-                    # instead of resolving ``ygg[…]`` from PyPI.
+                    # instead of resolving ``ygg[…]`` from PyPI. The cluster is pinned
+                    # to the **local** interpreter's Python (the env that was just
+                    # seeded), so its requirements file — selected by Python version —
+                    # matches the runtime it lands on.
+                    local_python = f"3.{sys.version_info.minor}"
                     env_name = whl.ygg_base_environment_name()
                     env_requirements = (
-                        f"{whl.WORKSPACE_ENV_DIR}/{env_name}/{env_name}.requirements.txt"
+                        f"{whl.WORKSPACE_ENV_DIR}/{whl.environment_folder('ygg')}/"
+                        f"{env_name}.requirements.txt"
                     )
                     with style.Spinner("provisioning default single-user cluster…"):
                         # ``single_user_name`` flips the cluster to dedicated
                         # (single-user) access mode for the current user;
                         # ``instance_pool_id`` attaches it to the Light pool;
-                        # ``environment`` installs the generic env (zero-PyPI);
-                        # ``wait=False`` returns without blocking on start-up.
+                        # ``python_version`` pins the DBR to the seeded Python;
+                        # ``environment`` installs the matching generic env
+                        # (zero-PyPI); ``wait=False`` returns without blocking.
                         cluster = clusters_svc.all_purpose_cluster(
                             single_user_name=user,
                             instance_pool_id=pool_id,
+                            python_version=local_python,
                             environment=env_requirements,
                             wait=False,
                         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -35,17 +36,21 @@ def _client_with(*, user="me@co.com", warehouses=None, default_wh=...):
 
 def _env_requirements():
     """The seeded generic-environment requirements path for the local Python."""
-    from yggdrasil.databricks.job.wheel import WORKSPACE_ENV_DIR, ygg_base_environment_name
+    from yggdrasil.databricks.job.wheel import (
+        WORKSPACE_ENV_DIR,
+        environment_folder,
+        ygg_base_environment_name,
+    )
 
     name = ygg_base_environment_name()
-    return f"{WORKSPACE_ENV_DIR}/{name}/{name}.requirements.txt"
+    return f"{WORKSPACE_ENV_DIR}/{environment_folder('ygg')}/{name}.requirements.txt"
 
 
 def _env(python):
     """A fake ``ensure_environment`` descriptor for one Python version."""
     key = "py" + (python or "3X").replace(".", "")
     name = f"ygg-1.0-{key}"
-    env_dir = f"/Workspace/Shared/environments/{name}"
+    env_dir = "/Workspace/Shared/environment/ygg"
     return {
         "python": python, "key": key, "env_name": name, "env_dir": env_dir,
         "n_wheels": 2,
@@ -188,6 +193,7 @@ class TestSeedProvision(unittest.TestCase):
         client.compute.instance_pools.find.assert_any_call(name="Yggdrasil Light")
         client.compute.clusters.all_purpose_cluster.assert_called_once_with(
             single_user_name="alice@co.com", instance_pool_id="pool-light",
+            python_version=f"3.{sys.version_info.minor}",
             environment=_env_requirements(), wait=False,
         )
 
@@ -208,6 +214,7 @@ class TestSeedProvision(unittest.TestCase):
         # still running the seeded generic environment.
         client.compute.clusters.all_purpose_cluster.assert_called_once_with(
             single_user_name="bob@co.com", instance_pool_id=None,
+            python_version=f"3.{sys.version_info.minor}",
             environment=_env_requirements(), wait=False,
         )
 

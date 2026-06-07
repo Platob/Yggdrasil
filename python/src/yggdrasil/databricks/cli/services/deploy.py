@@ -12,8 +12,9 @@ the **live** package on disk, uploads it into the workspace's PyPI-like registry
     ygg databricks deploy project [path]  # discover a pyproject.toml → wheel +
                                           # environment + a default cluster
 
-``--all-versions`` builds/keys a wheel + environment for every supported Python
-(3.10–3.13); without it the deploy targets the local interpreter's Python.
+By default the deploy builds/keys a wheel + environment for **every supported
+Python** (3.10–3.13) so jobs and clusters on any runtime find their image;
+``--current`` narrows it to the local interpreter's Python.
 
 ``project`` discovers the nearest ``pyproject.toml`` (from *path* or the cwd),
 builds the **project's own wheel**, writes a serverless base environment +
@@ -43,8 +44,8 @@ class DeployCommand:
                             help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
         parser.add_argument("--rebuild", action="store_true",
                             help="Force a fresh build even if the version is already deployed.")
-        parser.add_argument("--all-versions", dest="all_versions", action="store_true",
-                            help="A wheel + environment for every supported Python (3.10–3.13).")
+        parser.add_argument("--current", dest="current", action="store_true",
+                            help="Only the local interpreter's Python (default: all supported, 3.10–3.13).")
         sub = parser.add_subparsers(dest="deploy_action")
 
         ygg = sub.add_parser("ygg", help="Build + upload the versioned ygg image wheel(s).")
@@ -52,8 +53,8 @@ class DeployCommand:
                          help="PyPI-like registry root (default: /Workspace/Shared/pypi).")
         ygg.add_argument("--rebuild", action="store_true",
                          help="Force a fresh build even if the version is already deployed.")
-        ygg.add_argument("--all-versions", dest="all_versions", action="store_true",
-                         help="A wheel for every supported Python (3.10–3.13).")
+        ygg.add_argument("--current", dest="current", action="store_true",
+                         help="Only the local interpreter's Python (default: all supported, 3.10–3.13).")
         ygg.set_defaults(handler=cls._ygg)
 
         wheel = sub.add_parser("wheel", help="Build + upload an arbitrary package's wheel(s).")
@@ -63,11 +64,11 @@ class DeployCommand:
         wheel.add_argument("--extra", action="append", default=None,
                            help="Optional-dependency extra to fold in (repeatable).")
         wheel.add_argument("-r", "--requirement", dest="requirement", action="append", default=None,
-                           help="Extra requirement to bundle alongside the package (repeatable).")
+                           help="Extra requirement to bundle alongside the package (--current only, repeatable).")
         wheel.add_argument("--no-deps", dest="no_deps", action="store_true",
-                           help="Pure-python project wheel only; deps resolve on the cluster.")
-        wheel.add_argument("--all-versions", dest="all_versions", action="store_true",
-                           help="A wheel for every supported Python (3.10–3.13).")
+                           help="Pure-python project wheel only; deps resolve on the cluster (--current only).")
+        wheel.add_argument("--current", dest="current", action="store_true",
+                           help="Only the local interpreter's Python (default: all supported, 3.10–3.13).")
         wheel.set_defaults(handler=cls._wheel)
 
         env = sub.add_parser("environment", aliases=["env"],
@@ -80,8 +81,8 @@ class DeployCommand:
                          help="Serverless environment version (default: matched to the local Python).")
         env.add_argument("--rebuild", action="store_true",
                          help="Force a fresh wheel build before assembling the environment.")
-        env.add_argument("--all-versions", dest="all_versions", action="store_true",
-                         help="One JobEnvironment per supported Python (3.10–3.13) plus a default.")
+        env.add_argument("--current", dest="current", action="store_true",
+                         help="Only the local interpreter's Python (default: all supported, 3.10–3.13).")
         env.set_defaults(handler=cls._environment)
 
         proj = sub.add_parser(
@@ -118,10 +119,11 @@ class DeployCommand:
 
         client = build_client(args)
         workspace_dir = args.workspace_dir or WORKSPACE_PYPI_DIR
-        if args.all_versions:
-            paths = ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
-        else:
+        # Default: every supported Python; ``--current`` narrows to the local one.
+        if args.current:
             paths = ensure_ygg_wheel(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
+        else:
+            paths = ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
         for path in paths:
             style.ok(f"deployed {style.brand(path)}")
         return 0
@@ -136,9 +138,9 @@ class DeployCommand:
         client = build_client(args)
         workspace_dir = args.workspace_dir or WORKSPACE_PYPI_DIR
         extras = tuple(args.extra or ())
-        if args.all_versions:
-            paths = ensure_wheels(client, args.package, workspace_dir=workspace_dir, extras=extras)
-        else:
+        # Default: every supported Python; ``--current`` narrows to the local one
+        # (the only mode honoring --requirement / --no-deps).
+        if args.current:
             paths = ensure_wheel(
                 client, args.package,
                 workspace_dir=workspace_dir,
@@ -146,6 +148,8 @@ class DeployCommand:
                 requirements=tuple(args.requirement or ()),
                 no_deps=args.no_deps,
             )
+        else:
+            paths = ensure_wheels(client, args.package, workspace_dir=workspace_dir, extras=extras)
         for path in paths:
             style.ok(f"deployed {style.brand(path)}")
         return 0
@@ -158,10 +162,8 @@ class DeployCommand:
 
         client = build_client(args)
         workspace_dir = args.workspace_dir or WORKSPACE_PYPI_DIR
-        if args.all_versions:
-            envs = ygg_environments(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
-            payload: Any = [env.as_dict() for env in envs]
-        else:
+        # Default: one JobEnvironment per supported Python; ``--current`` narrows.
+        if args.current:
             env = ygg_environment(
                 client,
                 environment_key=args.environment_key,
@@ -169,7 +171,10 @@ class DeployCommand:
                 rebuild=args.rebuild,
                 workspace_dir=workspace_dir,
             )
-            payload = env.as_dict()
+            payload: Any = env.as_dict()
+        else:
+            envs = ygg_environments(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
+            payload = [env.as_dict() for env in envs]
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
         return 0
 
@@ -245,18 +250,19 @@ class DeployCommand:
         client = build_client(args)
         workspace_dir = args.workspace_dir or WORKSPACE_PYPI_DIR
         # Build (and possibly rebuild) the wheel once, then assemble the
-        # environment off that fresh build — no second rebuild.
-        if args.all_versions:
-            paths = ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
-            for path in paths:
-                style.ok(f"deployed {style.brand(path)}")
-            envs = ygg_environments(client, workspace_dir=workspace_dir, rebuild=False)
-            payload: Any = [env.as_dict() for env in envs]
-        else:
+        # environment off that fresh build — no second rebuild. Default: every
+        # supported Python; ``--current`` narrows to the local interpreter.
+        if args.current:
             paths = ensure_ygg_wheel(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
             for path in paths:
                 style.ok(f"deployed {style.brand(path)}")
             env = ygg_environment(client, workspace_dir=workspace_dir, rebuild=False)
-            payload = env.as_dict()
+            payload: Any = env.as_dict()
+        else:
+            paths = ensure_ygg_wheels(client, workspace_dir=workspace_dir, rebuild=args.rebuild)
+            for path in paths:
+                style.ok(f"deployed {style.brand(path)}")
+            envs = ygg_environments(client, workspace_dir=workspace_dir, rebuild=False)
+            payload = [env.as_dict() for env in envs]
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
         return 0
