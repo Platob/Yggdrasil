@@ -44,19 +44,6 @@ CACHE_MAP: dict[str, ExpiringDict[str, "SQLWarehouse"]] = {}
 # ---------------------------------------------------------------------------
 
 
-def _client_project_name() -> Optional[str]:
-    """The running client project's ``[project].name`` (from the cwd
-    ``pyproject.toml``), or ``None`` when there's no project on the way up.
-    Best-effort — any read failure yields ``None``."""
-    from yggdrasil.databricks.wheels.service import find_pyproject, read_pyproject
-
-    try:
-        pyproject = find_pyproject()
-        return read_pyproject(pyproject)["name"] if pyproject is not None else None
-    except Exception:  # noqa: BLE001 — no/unreadable pyproject → no client project
-        return None
-
-
 def set_cached_warehouse(
     client: DatabricksClient,
     warehouse: "SQLWarehouse",
@@ -187,15 +174,15 @@ class Warehouses(DatabricksService):
     def default_names(self) -> tuple[str, str]:
         """``(classic, serverless)`` default-warehouse names.
 
-        Based on the **running client project**: the capitalized
-        ``[project].name`` (from the cwd ``pyproject.toml``) with its serverless
-        sibling — ``("My-App", "My-App Serverless")`` — so each project gets its
-        own default warehouse pair. ``ygg`` (the library itself) and "no project"
-        both fall back to the workspace-wide ygg defaults
+        Based on the **running client project** (:attr:`DatabricksClient.project`,
+        always lowercased): its nice display name
+        (:attr:`~DatabricksClient.project_name`) with a serverless sibling —
+        ``("My App", "My App Serverless")`` — so each project gets its own default
+        warehouse pair. ``ygg`` (the library itself) and "no project" both fall
+        back to the workspace-wide ygg defaults
         (:data:`DEFAULT_ALL_PURPOSE_CLASSIC_NAME` / ``…_SERVERLESS_NAME``)."""
-        project = _client_project_name()
-        if project and project.strip().lower() != "ygg":
-            classic = project.strip().capitalize()
+        if self.client.project and self.client.project != "ygg":
+            classic = self.client.project_name
             return classic, f"{classic} Serverless"
         return DEFAULT_ALL_PURPOSE_CLASSIC_NAME, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
 

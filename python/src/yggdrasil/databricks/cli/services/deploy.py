@@ -70,11 +70,13 @@ class DeployCommand:
         style.out(f"    {style.dim('deps')}        {len(env.dependencies)} entr(y/ies)\n")
 
         if not args.no_warehouse:
-            # The project's **default SQL warehouse** — the capitalized project
+            # The project's **default SQL warehouse** — the project's nice display
             # name (serverless), the same name `find_default` resolves to when
             # this project is the running client project. (Warehouses run SQL,
             # not wheels; the env config wheels go on the cluster below.)
-            warehouse_name = project.capitalize()
+            from yggdrasil.databricks.wheels.service import project_display_name
+
+            warehouse_name = project_display_name(project)
             with style.Spinner(f"provisioning default warehouse {warehouse_name!r}…"):
                 wh = client.warehouses.create_or_update(
                     name=warehouse_name, enable_serverless_compute=True,

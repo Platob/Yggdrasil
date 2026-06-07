@@ -1095,6 +1095,28 @@ class DatabricksClient(Singleton, URLBased):
         return Path.home() / ".config" / "databricks-sdk-py"
 
     @property
+    def project(self) -> Optional[str]:
+        """The running **client project** — the cwd ``pyproject.toml``'s
+        ``[project].name``, **always lowercased** (the canonical identifier) —
+        or ``None`` when there's no project on the way up. Best-effort."""
+        from yggdrasil.databricks.wheels.service import find_pyproject, read_pyproject
+
+        try:
+            pyproject = find_pyproject()
+            return str(read_pyproject(pyproject)["name"]).strip().lower() if pyproject is not None else None
+        except Exception:  # noqa: BLE001 — no/unreadable pyproject → no client project
+            return None
+
+    @property
+    def project_name(self) -> Optional[str]:
+        """A nice, capitalized display name for the client :attr:`project`
+        (``my-app`` → ``My App``), or ``None`` when there's no project."""
+        from yggdrasil.databricks.wheels.service import project_display_name
+
+        project = self.project
+        return project_display_name(project) if project else None
+
+    @property
     def connected(self) -> bool:
         return self._workspace_client is not None or self._account_client is not None
 

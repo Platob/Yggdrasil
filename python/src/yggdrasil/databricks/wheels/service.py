@@ -56,6 +56,7 @@ __all__ = [
     "runtime_dependencies",
     "find_pyproject",
     "read_pyproject",
+    "project_display_name",
     "fetch_wheels",
     "registry_upload",
     "Wheels",
@@ -224,6 +225,13 @@ def find_pyproject(start: "str | Path | None" = None) -> "Optional[Path]":
         if candidate.exists():
             return candidate
     return None
+
+
+def project_display_name(name: str) -> str:
+    """A nice, capitalized display name for a project — each word capitalized
+    (``my-app`` → ``My App``, ``meteologica`` → ``Meteologica``)."""
+    words = [w for w in re.split(r"[^0-9A-Za-z]+", str(name)) if w]
+    return " ".join(w.capitalize() for w in words) or str(name)
 
 
 def read_pyproject(path: "str | Path") -> "dict[str, Any]":
