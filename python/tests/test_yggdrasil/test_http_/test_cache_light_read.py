@@ -121,3 +121,55 @@ class TestRetrieveStampsReceivedAt:
         assert before <= got.received_at <= after        # stamped now, not 2020
         assert got.content == b"HELLO"
         assert got.request.url == req.url                 # full request reattached
+
+
+class TestTabularAccessorsConsistent:
+    """Every ``Tabular`` accessor on the batch agrees on row count + content after
+    the light cache read — a remote hit (reattached request, stamped received_at)
+    plus a freshly-fetched response."""
+
+    def _batch(self):
+        from yggdrasil.arrow.tabular import ArrowTabular
+        from yggdrasil.http_.response_batch import HTTPResponseBatch
+
+        hit_req, new_req = _req("https://e.com/a"), _req("https://e.com/b")
+        hit = _resp(hit_req, body=b"HIT")
+        hit.received_at = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+        light = pa.Table.from_batches(
+            [Response.values_to_arrow_batch([hit])]
+        ).select(list(RESPONSE_REBUILD_COLUMNS))
+
+        class _Cfg:
+            local_cache = None
+            remote_cache = CacheConfig()
+
+            def read_hits(self, cache, requests, *, session=None):
+                return ArrowTabular(light.to_batches(), schema=light.schema)
+
+        b = HTTPResponseBatch(send_config=_Cfg(), requests=[hit_req])
+        b._remote_hashes = {hit_req.match_value("public_hash")}
+        b._split_done = True
+        b._misses = []
+        new = _resp(new_req, body=b"NEW")
+        new.received_at = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)
+        b.new_tabular = [new]
+        return b
+
+    def test_all_accessors_agree_on_count(self):
+        b = self._batch()
+        assert b.counts == {"local": 0, "remote": 1, "new": 1}
+        assert len(b) == 2
+        assert b.count() == 2
+        assert len(list(b.responses())) == 2
+        assert len(list(b.read_records())) == 2
+        assert b.read_arrow_table().num_rows == 2
+
+    def test_accessors_carry_reattached_request_and_stamped_time(self):
+        b = self._batch()
+        by_url = {r.request.url.to_string(): r for r in b.responses()}
+        hit = by_url["https://e.com/a"]
+        new = by_url["https://e.com/b"]
+        assert hit.content == b"HIT"
+        assert hit.received_at.year != 2020          # stamped on retrieve, not the stored 2020
+        assert new.content == b"NEW"
+        assert new.received_at.year == 2021          # a fresh response is untouched
