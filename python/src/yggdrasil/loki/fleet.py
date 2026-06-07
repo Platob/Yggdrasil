@@ -68,6 +68,14 @@ class AgentHandle:
     def steps(self) -> int:
         return len((self.result or {}).get("steps", []))
 
+    @property
+    def tokens(self) -> int:
+        return int((self.result or {}).get("usage", {}).get("total_tokens", 0)) if self.result else 0
+
+    @property
+    def cost(self) -> float:
+        return float((self.result or {}).get("usage", {}).get("cost_usd", 0.0)) if self.result else 0.0
+
     def _finish(self) -> None:
         """The process exited — read its output, parse the JSON, set the status."""
         self.returncode = self.proc.returncode
@@ -108,9 +116,14 @@ class AgentHandle:
 class Fleet:
     """Spawn and monitor a set of background process agents."""
 
-    def __init__(self, *, python: Optional[str] = None) -> None:
+    def __init__(self, *, python: Optional[str] = None, max_parallel: Optional[int] = None) -> None:
         self.agents: list[AgentHandle] = []
         self._python = python or sys.executable
+        #: Cap on concurrently-running agents (``None`` = unbounded). Extra tasks
+        #: queue and launch as running slots free — so a big swarm doesn't
+        #: fork-bomb the box.
+        self.max_parallel = max_parallel
+        self._pending: list[tuple[str, dict]] = []
 
     def do_command(
         self,
@@ -162,20 +175,38 @@ class Fleet:
         return handle
 
     def spawn_all(self, tasks: list[str], **kw: Any) -> list[AgentHandle]:
-        return [self.spawn(t, **kw) for t in tasks]
+        """Queue *tasks* and launch up to ``max_parallel`` of them now.
+
+        Returns the handles started immediately; the rest launch from
+        :meth:`poll` as running slots free.
+        """
+        self._pending.extend((t, kw) for t in tasks)
+        return self._launch_pending()
+
+    def _launch_pending(self) -> list[AgentHandle]:
+        started: list[AgentHandle] = []
+        while self._pending and (self.max_parallel is None
+                                 or len(self.running()) < self.max_parallel):
+            task, kw = self._pending.pop(0)
+            started.append(self.spawn(task, **kw))
+        return started
+
+    def queued(self) -> int:
+        return len(self._pending)
 
     def poll(self) -> list[AgentHandle]:
-        """Refresh statuses: finalize any agent whose process has exited."""
+        """Refresh statuses: finalize exited agents, then fill freed slots."""
         for h in self.agents:
             if h.running and h.proc.poll() is not None:
                 h._finish()
+        self._launch_pending()
         return self.agents
 
     def running(self) -> list[AgentHandle]:
         return [h for h in self.agents if h.running]
 
     def all_done(self) -> bool:
-        return not self.running()
+        return not self.running() and not self._pending
 
     def monitor(
         self,
@@ -208,6 +239,22 @@ class Fleet:
     def cancel_all(self, *, status: str = "cancelled") -> None:
         for h in self.running():
             h.cancel(status=status)
+
+    def kpis(self) -> dict[str, Any]:
+        """Live rollup across the fleet — counts, steps, tokens, cost, wall time."""
+        done = sum(1 for h in self.agents if h.ok)
+        failed = sum(1 for h in self.agents if not h.running and not h.ok)
+        return {
+            "total": len(self.agents) + self.queued(),
+            "running": len(self.running()),
+            "done": done,
+            "failed": failed,
+            "queued": self.queued(),
+            "steps": sum(h.steps for h in self.agents),
+            "tokens": sum(h.tokens for h in self.agents),
+            "cost": round(sum(h.cost for h in self.agents), 6),
+            "elapsed": round(max((h.elapsed for h in self.agents), default=0.0), 1),
+        }
 
     def summary(self) -> list[dict[str, Any]]:
         """A JSON-able rollup — one row per agent (for ``--json`` / the skill)."""

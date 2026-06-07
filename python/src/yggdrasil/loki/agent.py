@@ -70,6 +70,30 @@ ROUTES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+#: "Make me a new project" phrasing → the ``scaffold`` action (no slash command
+#: needed — Loki routes it itself).
+SCAFFOLD_SIGNALS: tuple[str, ...] = (
+    "scaffold", "new project", "create a project", "create a repo", "new repo",
+    "bootstrap a project", "from scratch", "starter project", "boilerplate",
+    "project template", "set up a repo", "set up a project", "ready to push",
+    "new app", "spin up a project",
+)
+
+#: "Run these in parallel" phrasing → the ``delegate`` action (a monitored fleet
+#: of background process agents).
+DELEGATE_SIGNALS: tuple[str, ...] = (
+    "in parallel", "delegate", "swarm", "spawn agents", "concurrently",
+    "at the same time", "simultaneously", "fan out", "parallel agents",
+    "multiple agents", "several agents", "background agents",
+)
+
+#: Power-market phrasing → the ``entsoe`` skill (autonomous energy-data path).
+ENERGY_SIGNALS: tuple[str, ...] = (
+    "entso", "electricity price", "power price", "power prices", "electricity",
+    "day-ahead", "day ahead", "spot price", "power market", "energy market",
+    "grid load", "power generation", "power demand", "megawatt", "mwh", "bidding zone",
+)
+
 #: Meta/advice phrasing that asks *how to build* something rather than to do it
 #: now — routed to the ``guide`` skill when paired with a yggdrasil mention.
 GUIDE_SIGNALS: tuple[str, ...] = (
@@ -756,6 +780,33 @@ class Loki:
             return made("guide", "guide",
                         why="how-to: the optimized yggdrasil implementation path")
 
+        # Autonomy: route "make a new project" / "do these in parallel" to the
+        # scaffold / delegate actions directly — no slash command needed.
+        if any(s in low for s in DELEGATE_SIGNALS):
+            return made("files", "delegate",
+                        why="delegate independent tasks to a monitored parallel agent fleet")
+        # Scaffold: an explicit signal, or a "<create-verb> … <project-noun>" phrase
+        # (so "create a new python project" routes even with words in between).
+        if any(s in low for s in SCAFFOLD_SIGNALS) or (
+            re.search(r"\b(new|create|start|bootstrap|scaffold|generate|spin up|set up)\b", low)
+            and re.search(r"\b(project|repo|repository|app|package|library|service|cli|tool)\b", low)
+        ):
+            return made("files", "scaffold",
+                        why="scaffold a ready-to-push project from scratch")
+        # Power-market data → the entsoe skill, with series/zone inferred. Gate on
+        # a data word (or an explicit ENTSO-E mention) so "what is electricity"
+        # stays a plain question.
+        if (not re.search(r"https?://", text) and any(s in low for s in ENERGY_SIGNALS)
+                and ("entso" in low or any(w in low for w in (
+                    "price", "load", "demand", "consumption", "generation",
+                    "production", "spot", "market")))):
+            from .entsoe import infer_query
+
+            p = made("data", "skill", why="ENTSO-E power-market data → entsoe skill")
+            p.skill = "entsoe"
+            p.skill_kwargs = infer_query(text)
+            return p
+
         # With a live Databricks session, a precise NL request ("list catalogs",
         # "tables in cat.sch", "describe cat.sch.tbl", "who am i") dispatches the
         # specialized databricks-* skill directly rather than just reasoning.
@@ -858,15 +909,20 @@ class Loki:
         return _skill.get(name)
 
 
-    def run(self, name: str, **kwargs: Any) -> Any:
-        """Dispatch skill *name* with *kwargs*, using self as the provider."""
-        s = self.skill(name)
+    def run(self, skill_name: str, **kwargs: Any) -> Any:
+        """Dispatch skill *skill_name* with *kwargs*, using self as the provider.
+
+        The first parameter is ``skill_name`` (not ``name``) so a skill that
+        itself takes a ``name=`` kwarg — e.g. ``scaffold(name=…)`` — can be
+        dispatched as ``loki.run("scaffold", name="acme")`` without a clash.
+        """
+        s = self.skill(skill_name)
         if s is None:
             known = ", ".join(x.name for x in self.skills()) or "(none)"
-            raise KeyError(f"unknown skill {name!r}; registered: {known}")
+            raise KeyError(f"unknown skill {skill_name!r}; registered: {known}")
         if not s.available(self):
             raise RuntimeError(
-                f"skill {name!r} needs backend {s.requires!r}, "
+                f"skill {skill_name!r} needs backend {s.requires!r}, "
                 f"which is not available here"
             )
         return s.run(self, **kwargs)

@@ -167,6 +167,29 @@ class TestFetchFrame(unittest.TestCase):
         self.assertEqual(call.kwargs["params"]["securityToken"], "tok")
 
 
+class TestInferAndRouting(unittest.TestCase):
+    def test_infer_series_and_zone(self):
+        self.assertEqual(entsoe.infer_query("german day-ahead power prices"),
+                         {"series": "day_ahead_prices", "zone": "DE_LU"})
+        self.assertEqual(entsoe.infer_query("french electricity demand")["series"], "load")
+        self.assertEqual(entsoe.infer_query("spanish power generation"),
+                         {"series": "generation", "zone": "ES"})
+
+    def test_two_letter_alias_not_matched_in_words(self):
+        # "es" in "prices" must NOT resolve to Spain (word-boundary matching).
+        self.assertEqual(entsoe.infer_query("power prices please")["zone"], "DE_LU")
+
+    def test_autonomous_routing_to_entsoe_skill(self):
+        from yggdrasil.loki import Loki
+
+        loki = Loki()
+        p = loki.plan("german day-ahead power prices for last week")
+        self.assertEqual((p.action, p.skill), ("skill", "entsoe"))
+        self.assertEqual(p.skill_kwargs["zone"], "DE_LU")
+        # A definitional question is not a data ask → plain reasoning.
+        self.assertEqual(loki.plan("what is electricity").action, "reason")
+
+
 class TestEntsoeSkill(unittest.TestCase):
     def test_offline_safe_without_token(self):
         from yggdrasil.loki import Loki

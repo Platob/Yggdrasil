@@ -8,11 +8,12 @@ from unittest.mock import MagicMock, patch
 from yggdrasil.loki.fleet import Fleet
 
 
-def _ok_cmd(answer: str = "did it", files=("a.py",)) -> list[str]:
+def _ok_cmd(answer: str = "did it", files=("a.py",), tokens=1000, cost=0.01) -> list[str]:
     """A stand-in agent that prints a ``do --json`` transcript and exits 0."""
     import json
     payload = json.dumps({"completed": True, "answer": answer,
-                          "files_changed": list(files), "steps": [1, 2]})
+                          "files_changed": list(files), "steps": [1, 2],
+                          "usage": {"total_tokens": tokens, "cost_usd": cost}})
     return [sys.executable, "-c", f"print({payload!r})"]
 
 
@@ -69,6 +70,31 @@ class TestFleet(unittest.TestCase):
         fleet.monitor(interval=0.05, timeout=0.3)
         self.assertEqual(fleet.agents[0].status, "timeout")
         self.assertFalse(fleet.agents[0].running)
+
+    def test_kpis_aggregate_steps_tokens_cost(self):
+        fleet = Fleet()
+        fleet.spawn("one", cmd=_ok_cmd(tokens=1000, cost=0.01))
+        fleet.spawn("two", cmd=_ok_cmd(tokens=500, cost=0.02))
+        fleet.monitor(interval=0.02)
+        k = fleet.kpis()
+        self.assertEqual(k["done"], 2)
+        self.assertEqual(k["steps"], 4)              # 2 each
+        self.assertEqual(k["tokens"], 1500)
+        self.assertAlmostEqual(k["cost"], 0.03)
+
+    def test_max_parallel_queues_extra_tasks(self):
+        fleet = Fleet(max_parallel=2)
+        # spawn_all builds real ygg commands; inject fast stand-ins via _pending
+        # so the cap behaviour is what's exercised, not a live agent.
+        for t in ("a", "b", "c", "d"):
+            fleet._pending.append((t, {"cmd": _ok_cmd()}))
+        fleet._launch_pending()
+        self.assertLessEqual(len(fleet.running()), 2)   # only the cap runs at once
+        self.assertEqual(fleet.queued(), 2)             # the rest wait
+        fleet.monitor(interval=0.02)
+        self.assertEqual(len(fleet.agents), 4)          # all eventually launched
+        self.assertTrue(all(a.ok for a in fleet.agents))
+        self.assertEqual(fleet.queued(), 0)
 
     def test_non_json_output_still_completes(self):
         fleet = Fleet()

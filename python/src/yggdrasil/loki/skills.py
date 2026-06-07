@@ -7,6 +7,9 @@ These run anywhere Loki runs (no cloud session required):
   source into a frame through the io handlers, cache it, reshape it.
 - :class:`EntsoeSkill` — the energy-data path: pull ENTSO-E power-market series
   (prices / load / generation) for a bidding zone into a cached frame.
+- :class:`ScaffoldSkill` — create a ready-to-push project from scratch (README,
+  .gitignore, per-language ``src``/``tests``, manifest, git-init).
+- :class:`DelegateSkill` — fan independent tasks out to parallel process agents.
 - :class:`PythonProjectSkill` — scaffold a Python project, write code into it
   (provided, or reasoned from a task via the agent's engine), and run it.
 - :class:`SetupSkill` — bootstrap a free local model on demand.
@@ -31,7 +34,7 @@ if TYPE_CHECKING:
     from .agent import Loki
 
 __all__ = ["AgentSkill", "DelegateSkill", "EntsoeSkill", "PythonProjectSkill",
-           "SetupSkill", "WebSkill", "TabularSkill", "TransformSkill"]
+           "ScaffoldSkill", "SetupSkill", "WebSkill", "TabularSkill", "TransformSkill"]
 
 
 @register
@@ -504,6 +507,41 @@ class EntsoeSkill(LokiSkill):
                 f"zone={zone!r}, store='out.parquet')",
             ],
         }
+
+
+@register
+class ScaffoldSkill(LokiSkill):
+    """Create a ready-to-push project from scratch — README, .gitignore, per-language tree.
+
+    Lays down a clean git-initialised repo: a ``README``, a composed
+    ``.gitignore``, and one ``<language>/`` folder per language (each with
+    ``src/`` + ``tests/`` and a pre-built manifest — ``pyproject.toml`` for
+    Python, ``package.json`` for TypeScript, ``Cargo.toml`` for Rust, ``go.mod``
+    for Go) — then makes the initial commit so it only needs a remote +
+    ``git push``. Runs anywhere (no engine/backend). Polyglot: pass
+    ``languages=["python","rust"]``; defaults to Python.
+    """
+
+    name = "scaffold"
+    description = "Create a ready-to-push project from scratch (README, .gitignore, per-language src/tests, manifest, git-init)."
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        name: str = "new-project",
+        languages: Optional[list] = None,
+        base_dir: Optional[str] = None,
+        description: Optional[str] = None,
+        git: bool = True,
+        **_: Any,
+    ) -> dict[str, Any]:
+        from . import scaffold
+
+        return scaffold.scaffold_project(
+            name, list(languages) if languages else ["python"],
+            base_dir=base_dir, description=description, git=git,
+        )
 
 
 @register

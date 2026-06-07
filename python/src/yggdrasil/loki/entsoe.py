@@ -30,7 +30,7 @@ from typing import Any, Optional
 __all__ = [
     "ENTSOE_API", "DOCUMENT_TYPES", "ZONES",
     "resolve_zone", "build_query", "parse_timeseries_xml", "to_frame",
-    "fetch_frame", "token",
+    "fetch_frame", "token", "infer_query",
 ]
 
 #: The Transparency Platform REST endpoint (XML).
@@ -71,6 +71,49 @@ _RESOLUTION_MIN: dict[str, int] = {
 def token() -> Optional[str]:
     """The Transparency Platform security token, or ``None`` (offline-safe)."""
     return os.getenv("ENTSOE_API_TOKEN") or os.getenv("ENTSOE_SECURITY_TOKEN")
+
+
+#: Country / region words (noun + adjective forms) → bidding-zone alias, for
+#: autonomous NL routing — all matched on word boundaries (so "es" in "prices"
+#: never resolves to Spain).
+_COUNTRY_ZONES: dict[str, str] = {
+    "germany": "DE_LU", "german": "DE_LU", "deutschland": "DE_LU",
+    "france": "FR", "french": "FR", "netherlands": "NL", "dutch": "NL", "holland": "NL",
+    "belgium": "BE", "belgian": "BE", "spain": "ES", "spanish": "ES",
+    "portugal": "PT", "portuguese": "PT", "austria": "AT", "austrian": "AT",
+    "switzerland": "CH", "swiss": "CH", "poland": "PL", "polish": "PL",
+    "czech": "CZ", "denmark": "DK_1", "danish": "DK_1", "norway": "NO_2",
+    "norwegian": "NO_2", "sweden": "SE_3", "swedish": "SE_3", "finland": "FI",
+    "finnish": "FI", "britain": "GB", "british": "GB", "uk": "GB", "england": "GB",
+    "italy": "IT_NORD", "italian": "IT_NORD", "ireland": "IE_SEM", "irish": "IE_SEM",
+    "hungary": "HU", "hungarian": "HU", "romania": "RO", "romanian": "RO",
+    "greece": "GR", "greek": "GR",
+}
+
+
+def infer_query(text: str) -> dict[str, str]:
+    """Infer ``{series, zone}`` from a free-text energy request (for NL routing).
+
+    Maps demand words → ``load``, production words → ``generation``, else
+    ``day_ahead_prices``; and a country/zone mention → its EIC alias (default
+    ``DE_LU``). Country names and zone aliases are matched on **word boundaries**
+    so a 2-letter alias never matches a substring of an ordinary word.
+    """
+    low = text.lower()
+    if any(w in low for w in ("load", "demand", "consumption")):
+        series = "load"
+    elif any(w in low for w in ("generation", "production", "generation mix")):
+        series = "generation"
+    else:
+        series = "day_ahead_prices"
+    zone = "DE_LU"
+    for word, z in _COUNTRY_ZONES.items():
+        if re.search(rf"\b{word}\b", low):
+            return {"series": series, "zone": z}
+    for alias in ZONES:                                   # explicit zone code / alias
+        if re.search(rf"\b{re.escape(alias.lower())}\b", low):
+            return {"series": series, "zone": alias}
+    return {"series": series, "zone": zone}
 
 
 def resolve_zone(zone: str) -> str:

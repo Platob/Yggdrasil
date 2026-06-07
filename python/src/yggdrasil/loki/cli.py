@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from typing import Any, Sequence
 
 #: Tool-call budget for an autonomous turn inside the interactive session (the
@@ -826,13 +827,32 @@ def _fleet_lines(style: Any, agents: list, frame: str) -> list[str]:
     return lines
 
 
-def _run_fleet(loki: Any, style: Any, state: dict, tasks: list) -> Any:
+def _fleet_kpi_line(style: Any, fleet: Any) -> str:
+    """A one-line KPI footer for the live fleet dashboard."""
+    k = fleet.kpis()
+    bits = [f"{style.good(str(k['done']) + ' done')}"]
+    if k["failed"]:
+        bits.append(style.bad(f"{k['failed']} failed"))
+    if k["running"]:
+        bits.append(style.brand(f"{k['running']} running"))
+    if k["queued"]:
+        bits.append(style.dim(f"{k['queued']} queued"))
+    tail = f"{k['steps']} steps · {k['tokens']:,} tok"
+    if k["cost"]:
+        tail += f" · ${k['cost']:.4f}"
+    tail += f" · {k['elapsed']:.1f}s"
+    return f"  {style.dim('agents')} {'  '.join(bits)}  {style.dim('· ' + tail)}"
+
+
+def _run_fleet(loki: Any, style: Any, state: dict, tasks: list, *,
+               max_parallel: "int | None" = None) -> Any:
     """Spawn a process agent per task and live-monitor the fleet to completion."""
     from yggdrasil.loki.fleet import Fleet
 
+    cap = f" · ≤{max_parallel} at once" if max_parallel else ""
     style.out(f"  {style.brand('⛓ delegating')} {style.dim(str(len(tasks)) + ' parallel agents')} "
-              f"{style.dim('· ' + (state.get('engine') or 'auto') + ' · root ' + state['root'])}\n")
-    fleet = Fleet()
+              f"{style.dim('· ' + (state.get('engine') or 'auto') + ' · root ' + state['root'] + cap)}\n")
+    fleet = Fleet(max_parallel=max_parallel)
     fleet.spawn_all(tasks, root=state["root"], engine=state.get("engine"),
                     tier=state["tier"], allow_web=True)
     live = style.LiveDisplay()
@@ -840,7 +860,8 @@ def _run_fleet(loki: Any, style: Any, state: dict, tasks: list) -> Any:
 
     def render(agents: list) -> None:
         tick["i"] += 1
-        live.update(_fleet_lines(style, agents, _FLEET_FRAMES[tick["i"] % len(_FLEET_FRAMES)]))
+        frame = _FLEET_FRAMES[tick["i"] % len(_FLEET_FRAMES)]
+        live.update(_fleet_lines(style, agents, frame) + [_fleet_kpi_line(style, fleet)])
 
     try:
         fleet.monitor(render, interval=0.12)
@@ -859,6 +880,46 @@ def _run_fleet(loki: Any, style: Any, state: dict, tasks: list) -> Any:
     if changed:
         style.out(f"  {style.good('✎')} {', '.join(changed)}\n")
     return fleet
+
+
+def _scaffold_args(text: str) -> dict:
+    """Extract scaffold kwargs (name + languages) from a free-text request."""
+    from yggdrasil.loki import scaffold
+
+    langs = scaffold.resolve_languages(text)
+    m = re.search(r"\b(?:called|named|name[d]?|project|repo|app)\s+['\"]?([A-Za-z][\w.-]{1,40})['\"]?", text)
+    if not m:
+        m = re.search(r"['\"]([A-Za-z][\w .-]{1,40})['\"]", text)        # a quoted name
+    name = (m.group(1).strip().replace(" ", "-") if m else "new-project")
+    return {"name": name, "languages": langs or ["python"], "description": text.strip()}
+
+
+def _delegate_tasks(agent: Any, style: Any, state: dict, text: str) -> list:
+    """Turn a delegate/swarm request into a task list — split an explicit list,
+    else let the engine decompose a single high-level goal."""
+    body = re.sub(r"^\s*(please\s+)?(delegate|swarm|spawn|launch|run|do)\b[:,]?\s*", "", text, flags=re.I)
+    body = re.sub(r"\b(in parallel|concurrently|at the same time|simultaneously|"
+                  r"as (parallel|multiple|several|background) agents|fan out)\b", "", body, flags=re.I)
+    body = body.strip(" .,;:")
+    parts = [p.strip(" .,;:") for p in re.split(r"\s*;\s*|\s+and\s+|\s*,\s*", body) if p.strip(" .,;:")]
+    if len(parts) >= 2:
+        return parts
+    with style.Spinner("decomposing into parallel subtasks…"):
+        return agent.decompose(body or text, engine=state.get("engine"), tier=state["tier"])
+
+
+def _print_scaffold(style: Any, res: dict) -> None:
+    style.out(f"  {style.good('✦')} {style.bold(res['name'])} "
+              f"{style.dim('· ' + ', '.join(res['languages']))}\n")
+    style.out(f"  {style.dim('at ' + res['path'])}\n")
+    for f in res["files"][:14]:
+        style.out(f"    {style.good('+')} {style.dim(f)}\n")
+    if len(res["files"]) > 14:
+        style.out(f"    {style.dim('… +' + str(len(res['files']) - 14) + ' more')}\n")
+    git = (style.good("git ✓ initial commit on main") if res["git"]
+           else style.amber("git not initialised — commit when ready"))
+    style.out(f"  {git}\n")
+    style.out(f"  {style.brand('→ push')} {style.dim(res['push'])}\n")
 
 
 def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
@@ -902,6 +963,25 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
                 style.out(f"  {style.dim(f'· {mon.count} step' + ('s' if mon.count != 1 else ''))}\n")
             if res.get("files_changed"):
                 style.out(f"  {style.good('✎')} {', '.join(res['files_changed'])}\n")
+        elif plan["action"] == "scaffold":
+            args = _scaffold_args(line)
+            with style.Spinner(f"scaffolding {args['name']} ({', '.join(args['languages'])})…"):
+                res = agent.run("scaffold", **args)
+            _print_scaffold(style, res)
+            reply = f"Scaffolded {res['name']} ({', '.join(res['languages'])}) → {res['path']}"
+            streamed = True
+        elif plan["action"] == "delegate":
+            tasks = _delegate_tasks(agent, style, state, line)
+            if not tasks:
+                reply = style.dim("nothing to delegate")
+            else:
+                style.out(f"  {style.bold('plan')} {style.dim(str(len(tasks)) + ' parallel subtasks')}\n")
+                for t in tasks:
+                    style.out(f"    {style.brand('•')} {style.dim(_short_text(t, 70))}\n")
+                fleet = _run_fleet(loki, style, state, tasks)
+                done = sum(1 for a in fleet.agents if a.ok)
+                reply = f"{done}/{len(fleet.agents)} agents completed"
+            streamed = True
         elif plan["action"] == "genie":
             with style.Spinner("asking Genie…"):
                 res = agent.run("genie", question=line)
@@ -1303,6 +1383,13 @@ def _do(loki: Any, style: Any, args: Any) -> int:
         mon.close()
 
     if args.json:
+        # Attach this agent's token/cost usage so a parent fleet can aggregate
+        # live KPIs across the agents it delegated to.
+        from yggdrasil.loki.usage import METER
+
+        t = METER.total()
+        result["usage"] = {"input_tokens": t.input_tokens, "output_tokens": t.output_tokens,
+                           "total_tokens": t.total_tokens, "cost_usd": round(METER.total_cost, 6)}
         style.out(_json(result) + "\n")
         return 0
 
