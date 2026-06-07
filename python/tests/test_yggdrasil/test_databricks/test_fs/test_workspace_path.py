@@ -229,9 +229,10 @@ class TestRunNotebook:
 
         kwargs = workspace.jobs.submit.call_args.kwargs
         (env,) = kwargs["environments"]
+        # A bare named env (no version/py tag) keeps the <name>/<name>.yml layout.
         assert (
             env.spec.base_environment
-            == "/Workspace/Shared/environments/meteologica/meteologica.yml"
+            == "/Workspace/Shared/environment/meteologica/meteologica.yml"
         )
         # The task is wired to the resolved environment's key.
         (task,) = kwargs["tasks"]
@@ -240,6 +241,7 @@ class TestRunNotebook:
     def test_auto_environment_uses_seeded_ygg_env(self, workspace, client, service) -> None:
         from yggdrasil.databricks.job.wheel import (
             WORKSPACE_ENV_DIR,
+            environment_folder,
             ygg_base_environment_name,
         )
 
@@ -251,9 +253,14 @@ class TestRunNotebook:
         p = WorkspacePath("/Workspace/Shared/etl", service=service)
         p.run_notebook(wait=False)
         (env,) = workspace.jobs.submit.call_args.kwargs["environments"]
-        # ygg follows the same environments/<name>/<name>.yml folder layout.
+        # Project-folder layout: environment/<proj>/<proj>-<version>-py3XX.yml.
+        # (Running inside the ygg repo, the client-project default resolves to the
+        # same ygg image.)
         name = ygg_base_environment_name()
-        assert env.spec.base_environment == f"{WORKSPACE_ENV_DIR}/{name}/{name}.yml"
+        assert (
+            env.spec.base_environment
+            == f"{WORKSPACE_ENV_DIR}/{environment_folder('ygg')}/{name}.yml"
+        )
 
 
 class TestWrite:

@@ -24,7 +24,7 @@ It walks six areas:
 - **config**      — connectivity, host, current user, default catalog/schema.
 - **wheels**      — the versioned ygg image wheel in the workspace registry.
 - **environments**— the version-pinned base environments ygg jobs run under,
-  persisted under ``/Workspace/Shared/environments`` — **one pair per Python**:
+  persisted under ``/Workspace/Shared/environment/ygg`` — **one pair per Python**:
   ``ygg-<version>-py3XX.yml`` (serverless ``base_environment``) and
   ``ygg-<version>-py3XX.requirements.txt`` (classic-cluster
   ``Library(requirements=...)``). Both list only **built wheels in the workspace
@@ -182,12 +182,12 @@ class SeedCommand:
                     style.warn(f"no base environment files under {whl.WORKSPACE_ENV_DIR}")
                     ok = False
             else:
-                # Persist the version-pinned base environments under
-                # /Workspace/Shared/environments. Each Python gets its own
-                # self-contained folder — ``ygg-<version>-py3XX/`` holding a
-                # serverless ``ygg-<version>-py3XX.yml`` (referenced by path via
+                # Persist the version-pinned base environments under the project
+                # folder /Workspace/Shared/environment/ygg. Each Python gets a
+                # version-tagged pair in that one folder — a serverless
+                # ``ygg-<version>-py3XX.yml`` (referenced by path via
                 # ``base_environment``), a classic-cluster
-                # ``ygg-<version>-py3XX.requirements.txt``, and a ``binaries/``
+                # ``ygg-<version>-py3XX.requirements.txt``, and a shared ``binaries/``
                 # closure of that Python's whole transitive dependency set built
                 # as wheels under the env itself — so the runtime installs with
                 # zero PyPI access and the env is self-describing. With
@@ -345,7 +345,8 @@ class SeedCommand:
                     # instead of resolving ``ygg[…]`` from PyPI.
                     env_name = whl.ygg_base_environment_name()
                     env_requirements = (
-                        f"{whl.WORKSPACE_ENV_DIR}/{env_name}/{env_name}.requirements.txt"
+                        f"{whl.WORKSPACE_ENV_DIR}/{whl.environment_folder('ygg')}/"
+                        f"{env_name}.requirements.txt"
                     )
                     with style.Spinner("provisioning default single-user cluster…"):
                         # ``single_user_name`` flips the cluster to dedicated

@@ -361,13 +361,14 @@ class _Runnable:
         if self.base_environment_name and not self.all_environments:
             try:
                 self._base_environment_path = W.ensure_named_environment(
-                    client, self.base_environment_name,
+                    client, W.environment_folder_of(self.base_environment_name),
                     dependencies=ygg_base,
                     environment_version=self.environment_version,
-                    # Match the seed's ``<name>.yml`` convention so a job whose
-                    # base_environment_name is the canonical ``ygg-<version>-py3XX``
-                    # references the very file the seed writes (not a parallel
-                    # ``.env.yaml``).
+                    # Match the seed's project-folder layout: a job whose
+                    # base_environment_name is the canonical version-tagged stem
+                    # ``ygg-<version>-py3XX`` writes the very file the seed does —
+                    # ``environment/ygg/ygg-<version>-py3XX.yml`` — by folding the
+                    # stem to its project folder and keeping it as the filename.
                     filename=f"{self.base_environment_name}.yml",
                 )
                 self._user_layer = list(user_layer)

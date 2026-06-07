@@ -86,6 +86,9 @@ __all__ = [
     "build_project_wheel",
     "download_dependency_wheels",
     "ensure_project_environment",
+    "environment_folder",
+    "environment_stem",
+    "environment_folder_of",
     "ygg_base_environment_name",
     "deployed_environments",
     "ygg_runtime_dependencies",
@@ -106,21 +109,27 @@ WORKSPACE_PYPI_DIR = "/Workspace/Shared/pypi"
 #: Back-compat alias — the registry root (was an isolated ``.ygg/whl`` path).
 WORKSPACE_WHL_DIR = WORKSPACE_PYPI_DIR
 
-#: Where reusable serverless **base environments** live. Each named environment
-#: is a **self-contained folder** under this root — ``<env-name>/`` holding its
-#: spec files and its wheel binaries::
+#: Where reusable serverless **base environments** live. The layout mirrors the
+#: wheel registry (:data:`WORKSPACE_PYPI_DIR`): one folder **per project**, named
+#: for the project/dist (no version, no python tag), holding its *version-tagged*
+#: spec files + the zero-PyPI wheel closure::
 #:
-#:     /Workspace/Shared/environments/ygg-<version>-py3XX/
-#:         ygg-<version>-py3XX.yml             serverless base_environment
-#:         ygg-<version>-py3XX.requirements.txt  classic-cluster requirements
-#:         binaries/<dist>/<wheel>             the zero-PyPI wheel closure
+#:     /Workspace/Shared/environment/<proj>/
+#:         <proj>-<version>-py3XX.yml             serverless base_environment
+#:         <proj>-<version>-py3XX.requirements.txt   classic-cluster requirements
+#:         binaries/<dist>/<wheel>                the zero-PyPI wheel closure
+#:
+#: e.g. ``environment/ygg/ygg-0.8.57-py311.yml``. Every version / python lands in
+#: the **same** ``<proj>/`` folder (the filenames carry the version + ``py3XX``
+#: tag), exactly like ``pypi/<dist>/<dist>-<version>-…whl`` — uniform with the
+#: wheel creations.
 #:
 #: A job references the ``.yml`` by file path via ``Environment.base_environment``
 #: instead of inlining the whole dependency list (see
 #: :func:`ensure_named_environment`); its dependencies are the **wheels under the
-#: env's own ``binaries/`` folder** (:func:`ensure_environment`), so the env is
-#: self-describing and the runtime installs with zero PyPI access.
-WORKSPACE_ENV_DIR = "/Workspace/Shared/environments"
+#: project's own ``binaries/`` folder** (:func:`ensure_environment`), so the env
+#: is self-describing and the runtime installs with zero PyPI access.
+WORKSPACE_ENV_DIR = "/Workspace/Shared/environment"
 
 #: Latest serverless environment version — the fallback when the local Python
 #: isn't one we map to an older runtime.
@@ -206,23 +215,62 @@ def environment_key_for(python: str) -> str:
     return "py" + _py_minor(python).replace(".", "")
 
 
+def environment_folder(project: str = "ygg") -> str:
+    """The workspace **folder** an environment lives in: the project/dist name,
+    normalized (``yggdrasil`` / ``ygg`` → ``ygg``) — **no version, no python
+    tag**, mirroring the wheel registry's ``<dist>/`` folder. Accepts an import
+    package or a distribution name."""
+    return _norm(distribution_for(project))
+
+
+def environment_stem(
+    project: str = "ygg",
+    *,
+    python: "str | None" = None,
+    version: "str | None" = None,
+) -> str:
+    """The version-tagged **file stem** of an environment — ``<proj>-<version>-py3XX``
+    (e.g. ``ygg-0.8.57-py311``).
+
+    The ``.yml`` / ``.requirements.txt`` files inside the project folder carry
+    this stem, uniform with the wheel registry's ``<dist>-<version>-…whl``.
+    *version* defaults to the installed *project* version (falling back to the
+    in-tree ygg version), *python* to the local interpreter."""
+    dist = distribution_for(project)
+    if version is None:
+        try:
+            version = ilmd.version(dist)
+        except Exception:  # noqa: BLE001 — fall back to the in-tree version
+            from yggdrasil.version import __version__ as version
+    return f"{_norm(dist)}-{version}-{environment_key_for(python)}"
+
+
+def environment_folder_of(stem: str) -> str:
+    """The project folder a versioned environment *stem* belongs to: the stem with
+    its trailing ``-<version>-py3XX`` stripped (``ygg-0.8.57-py311`` → ``ygg``,
+    ``my-proj-1.2.3-py312`` → ``my-proj``).
+
+    A bare name with no ``py3XX`` python-tag suffix (a hand-written named env) is
+    returned unchanged, so the old ``<name>/<name>.yml`` layout still resolves."""
+    parts = stem.split("-")
+    if len(parts) >= 3 and re.fullmatch(r"py3\d+", parts[-1]):
+        return "-".join(parts[:-2])
+    return stem
+
+
 def ygg_base_environment_name(python: "str | None" = None) -> str:
-    """Canonical name of the reusable serverless **base environment** for the
-    running ygg image — ``ygg-<version>-py3XX``.
+    """Canonical name (version-tagged file stem) of the reusable serverless
+    **base environment** for the running ygg image — ``ygg-<version>-py3XX``.
 
     This is exactly the stem ``ygg databricks seed`` writes under
-    :data:`WORKSPACE_ENV_DIR` (``ygg-<version>-py3XX.yml``), so a job that points
-    its ``base_environment_name`` here reuses the seeded, wheel-built image when
-    the seed has run — and self-provisions the identical file (same wheel
-    closure, same path) when it hasn't. The version-pinned name is the single
-    source of truth for "the correct ygg environment", replacing the old static
+    :data:`WORKSPACE_ENV_DIR` in the project folder
+    (``environment/ygg/ygg-<version>-py3XX.yml``), so a job that points its
+    ``base_environment_name`` here reuses the seeded, wheel-built image when the
+    seed has run — and self-provisions the identical file (same wheel closure,
+    same path) when it hasn't. The version-pinned name is the single source of
+    truth for "the correct ygg environment", replacing the old static
     ``yellow`` env."""
-    try:
-        import importlib.metadata as _md
-        version = _md.version("ygg")
-    except Exception:  # noqa: BLE001 — fall back to the in-tree version
-        from yggdrasil.version import __version__ as version
-    return f"ygg-{version}-{environment_key_for(python)}"
+    return environment_stem("ygg", python=python)
 
 
 def wheel_for_python(wheels: "list", python: "str | None" = None) -> str:
@@ -905,12 +953,13 @@ def ensure_named_environment(
           - /Workspace/Shared/pypi/ygg/ygg-0.8.54-py3-none-any.whl
           - /Workspace/Shared/pypi/pyarrow/pyarrow-...-cp312-...-.whl
 
-    The file is ``<name>.env.yaml`` unless *filename* overrides it — the seed
-    writes a version-pinned ``ygg-<version>.yml`` so jobs can point at an exact
-    image. Written (overwritten) on every call — upsert semantics, so redeploying
-    keeps the file pointing at the current image. *dependencies* are wheel
-    workspace paths (and/or pip requirement lines, when an index resolve is
-    wanted instead)."""
+    Here *name* is the **project folder** (e.g. ``ygg``); the file is
+    ``<name>.env.yaml`` unless *filename* overrides it — the seed writes a
+    version-pinned ``<proj>-<version>-py3XX.yml`` so jobs can point at an exact
+    image and every version coexists in the one project folder. Written
+    (overwritten) on every call — upsert semantics, so redeploying keeps the
+    file pointing at the current image. *dependencies* are wheel workspace paths
+    (and/or pip requirement lines, when an index resolve is wanted instead)."""
     from yggdrasil.databricks.path import DatabricksPath
 
     version = environment_version or serverless_environment_version()
@@ -918,9 +967,9 @@ def ensure_named_environment(
     lines += [f"  - {dep}" for dep in dependencies]
     body = "\n".join(lines) + "\n"
 
-    # Each named environment lives in its own ``<workspace_dir>/<name>/`` folder
-    # (alongside its requirements file + ``binaries/`` closure) so the env is a
-    # self-contained, browsable unit rather than a loose file in a flat directory.
+    # The environment lives under the project's ``<workspace_dir>/<name>/`` folder
+    # (mirroring the wheel registry's ``<dist>/``); *filename* carries the version
+    # + ``py3XX`` tag so every build coexists rather than overwriting a flat file.
     dest = f"{workspace_dir.rstrip('/')}/{name}/{filename or f'{name}.env.yaml'}"
     path = DatabricksPath.from_(dest, client=client)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -938,6 +987,7 @@ def ensure_cluster_requirements(
     *,
     dependencies: "list[str] | tuple[str, ...]",
     workspace_dir: str = WORKSPACE_ENV_DIR,
+    filename: "str | None" = None,
 ) -> str:
     """Create-or-update a plain ``<name>.requirements.txt`` in the workspace and
     return its path — the **classic-cluster** counterpart of
@@ -959,8 +1009,10 @@ def ensure_cluster_requirements(
     from yggdrasil.databricks.path import DatabricksPath
 
     body = "\n".join(str(dep) for dep in dependencies) + "\n"
-    # Sits beside the serverless ``.yml`` in the env's own ``<name>/`` folder.
-    dest = f"{workspace_dir.rstrip('/')}/{name}/{name}.requirements.txt"
+    # Sits beside the serverless ``.yml`` in the project's ``<name>/`` folder;
+    # *filename* (a version-tagged ``<stem>.requirements.txt``) overrides the
+    # default flat name so every version coexists in the one project folder.
+    dest = f"{workspace_dir.rstrip('/')}/{name}/{filename or f'{name}.requirements.txt'}"
     path = DatabricksPath.from_(dest, client=client)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
@@ -983,35 +1035,38 @@ def ensure_environment(
     """Build + persist one **self-contained** ygg base environment for a single
     Python version, returning a small descriptor of what was written.
 
-    Lays the environment out as its own folder under *workspace_dir*::
+    Lays the environment out under the **project folder** (``ygg``), mirroring
+    the wheel registry — every version / python coexists in the one folder, the
+    filenames carry the ``<version>-py3XX`` tag::
 
-        <workspace_dir>/ygg-<version>-py3XX/
+        <workspace_dir>/ygg/
             ygg-<version>-py3XX.yml             serverless base_environment
             ygg-<version>-py3XX.requirements.txt   classic-cluster requirements
             binaries/<dist>/<wheel>             the zero-PyPI wheel closure
 
     The wheel closure is built (:func:`build_bundle`) and uploaded **under the
-    env's own ``binaries/`` folder** (:func:`ensure_bundle` with that folder as
+    project's ``binaries/`` folder** (:func:`ensure_bundle` with that folder as
     its root), so the env carries its binaries rather than pointing into the
-    shared pypi registry — every environment is independent (and so safely built
-    in parallel, see :func:`ensure_environments`). The serverless ``.yml`` and
-    cluster ``requirements.txt`` then list those wheel paths, so the runtime
-    installs with zero PyPI access.
+    shared pypi registry. The serverless ``.yml`` and cluster ``requirements.txt``
+    then list those wheel paths, so the runtime installs with zero PyPI access.
 
     *mode* sets the env-config-file policy (the wheel closure is **get-or-create**
     unless *rebuild*): :data:`Mode.APPEND` writes the ``.yml`` / ``.requirements.txt``
     only when they don't exist yet; :data:`Mode.AUTO` / :data:`Mode.OVERWRITE`
     (re)write them so they track the current closure.
 
-    Returns ``{python, key, env_name, env_dir, n_wheels, serverless, cluster}``.
+    Returns ``{python, key, env_name, env_dir, n_wheels, serverless, cluster}``
+    where ``env_name`` is the version-tagged stem and ``env_dir`` the project
+    folder.
     """
     from yggdrasil.databricks.path import DatabricksPath
 
     overwrite_env = Mode.from_(mode) is not Mode.APPEND
     version = version or ilmd.version("ygg")
     key = environment_key_for(python)
-    env_name = f"ygg-{version}-{key}"
-    env_dir = f"{workspace_dir.rstrip('/')}/{env_name}"
+    folder = environment_folder("ygg")                     # project folder: ``ygg``
+    env_name = f"{folder}-{version}-{key}"                 # versioned file stem
+    env_dir = f"{workspace_dir.rstrip('/')}/{folder}"
 
     bundle = ensure_bundle(
         client, "ygg", python=python, workspace_dir=f"{env_dir}/binaries", rebuild=rebuild,
@@ -1020,7 +1075,7 @@ def ensure_environment(
     cluster_dest = f"{env_dir}/{env_name}.requirements.txt"
     if overwrite_env or not DatabricksPath.from_(serverless_dest, client=client).exists():
         serverless = ensure_named_environment(
-            client, env_name, dependencies=bundle,
+            client, folder, dependencies=bundle,
             environment_version=serverless_environment_version(python),
             workspace_dir=workspace_dir, filename=f"{env_name}.yml",
         )
@@ -1028,7 +1083,8 @@ def ensure_environment(
         serverless = serverless_dest
     if overwrite_env or not DatabricksPath.from_(cluster_dest, client=client).exists():
         cluster = ensure_cluster_requirements(
-            client, env_name, dependencies=bundle, workspace_dir=workspace_dir,
+            client, folder, dependencies=bundle, workspace_dir=workspace_dir,
+            filename=f"{env_name}.requirements.txt",
         )
     else:
         cluster = cluster_dest
@@ -1250,8 +1306,11 @@ def ensure_project_environment(
     meta = read_pyproject(find_pyproject(pyproject))
     name, version = meta["name"], meta["version"]
     proj = _norm(name)
-    env_name = f"{proj}-{_norm_version(version)}"
-    env_dir = f"{workspace_dir.rstrip('/')}/{env_name}"
+    # Folder = project name (mirrors the wheel registry's ``<dist>/``); the env
+    # files carry the version + ``py3XX`` tag, so versions coexist in the folder.
+    key = environment_key_for(python)
+    env_name = f"{proj}-{version}-{key}"
+    env_dir = f"{workspace_dir.rstrip('/')}/{proj}"
 
     # The project's declared deps, with any requested extras flattened in.
     deps = list(meta["dependencies"])
@@ -1306,7 +1365,7 @@ def ensure_project_environment(
     cluster_dest = f"{env_dir}/{env_name}.requirements.txt"
     if overwrite_env or not DatabricksPath.from_(serverless_dest, client=client).exists():
         serverless = ensure_named_environment(
-            client, env_name, dependencies=dependencies,
+            client, proj, dependencies=dependencies,
             environment_version=serverless_environment_version(python),
             workspace_dir=workspace_dir, filename=f"{env_name}.yml",
         )
@@ -1314,7 +1373,8 @@ def ensure_project_environment(
         serverless = serverless_dest
     if overwrite_env or not DatabricksPath.from_(cluster_dest, client=client).exists():
         cluster = ensure_cluster_requirements(
-            client, env_name, dependencies=dependencies, workspace_dir=workspace_dir,
+            client, proj, dependencies=dependencies, workspace_dir=workspace_dir,
+            filename=f"{env_name}.requirements.txt",
         )
     else:
         cluster = cluster_dest

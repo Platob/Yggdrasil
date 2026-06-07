@@ -95,7 +95,8 @@ def test_non_bundle_lists_wheel_then_index_deps(tmp_path):
         info = W.ensure_project_environment(client, tmp_path, extras=("extra",))
 
     assert info["name"] == "demo"
-    assert info["env_name"] == "demo-0-1-0"
+    assert info["env_name"] == f"demo-0.1.0-{W.environment_key_for(None)}"
+    assert info["env_dir"] == "/Workspace/Shared/environment/demo"
     assert info["mode"] == "AUTO"
     assert info["dependencies"] == [
         "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl", "polars", "httpx",
@@ -191,5 +192,7 @@ def test_append_writes_env_files_only_when_missing(tmp_path):
         info = W.ensure_project_environment(client, tmp_path, mode=Mode.APPEND)
     named.assert_not_called()                         # yml exists → left alone
     req.assert_called_once()                          # requirements missing → written
-    assert info["serverless"].endswith("demo-0-1-0.yml")   # reported existing path
+    assert info["serverless"].endswith(                    # reported existing path
+        f"demo-0.1.0-{W.environment_key_for(None)}.yml"
+    )
     assert info["mode"] == "APPEND"

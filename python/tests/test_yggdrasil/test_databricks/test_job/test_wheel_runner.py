@@ -255,8 +255,8 @@ class TestWheel:
                 client, "yellow",
                 dependencies=["/ws/pypi/ygg-1.0-py3-none-any.whl", "pyarrow==1"],
             )
-        # Each env now lives in its own ``<name>/`` folder.
-        assert dest == "/Workspace/Shared/environments/yellow/yellow.env.yaml"
+        # Each env lives under its project ``<name>/`` folder.
+        assert dest == "/Workspace/Shared/environment/yellow/yellow.env.yaml"
         DP.from_.assert_called_once_with(dest, client=client)
         path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
         body = path.write_text.call_args.args[0]
@@ -279,7 +279,7 @@ class TestWheel:
                 dependencies=["/ws/pypi/ygg/ygg-1.2.3-py3-none-any.whl"],
                 filename="ygg-1.2.3.yml",
             )
-        assert dest == "/Workspace/Shared/environments/ygg-1.2.3/ygg-1.2.3.yml"
+        assert dest == "/Workspace/Shared/environment/ygg-1.2.3/ygg-1.2.3.yml"
         DP.from_.assert_called_once_with(dest, client=client)
 
     def test_ensure_cluster_requirements_writes_flat_requirements_txt(self):
@@ -291,7 +291,7 @@ class TestWheel:
                 client, "yellow",
                 dependencies=["/ws/pypi/ygg-1.0-py3-none-any.whl", "pyarrow==1"],
             )
-        assert dest == "/Workspace/Shared/environments/yellow/yellow.requirements.txt"
+        assert dest == "/Workspace/Shared/environment/yellow/yellow.requirements.txt"
         DP.from_.assert_called_once_with(dest, client=client)
         path.parent.mkdir.assert_called_once_with(parents=True, exist_ok=True)
         body = path.write_text.call_args.args[0]
@@ -355,16 +355,18 @@ class TestWheel:
                    return_value="/ws/env/ygg-9.9-py312/ygg-9.9-py312.requirements.txt") as ecr:
             out = wheel.ensure_environment(client, python="3.12")
 
-        # Bundle uploaded under the env's own binaries folder.
-        assert eb.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/environments/ygg-9.9-py312/binaries"
+        # Bundle uploaded under the project folder's binaries/ closure.
+        assert eb.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/environment/ygg/binaries"
         assert eb.call_args.kwargs["python"] == "3.12"
-        # Spec files written into the env folder, referencing the closure.
+        # Spec files written into the project folder, version-tagged, referencing
+        # the closure.
         assert ene.call_args.kwargs["dependencies"] == bundle
         assert ene.call_args.kwargs["filename"] == "ygg-9.9-py312.yml"
         assert ecr.call_args.kwargs["dependencies"] == bundle
+        assert ecr.call_args.kwargs["filename"] == "ygg-9.9-py312.requirements.txt"
         assert out == {
             "python": "3.12", "key": "py312", "env_name": "ygg-9.9-py312",
-            "env_dir": "/Workspace/Shared/environments/ygg-9.9-py312",
+            "env_dir": "/Workspace/Shared/environment/ygg",
             "n_wheels": 2,
             "serverless": "/ws/env/ygg-9.9-py312/ygg-9.9-py312.yml",
             "cluster": "/ws/env/ygg-9.9-py312/ygg-9.9-py312.requirements.txt",

@@ -566,10 +566,11 @@ caught by `SystemParameters` (the union of `dbutils.widgets` and
 Compute is defaulted for you: `--cluster <id>` pins existing compute,
 otherwise the run goes **serverless**. The serverless environment is
 resolved automatically — `--environment <name>` selects a seeded base
-environment (or a `.yml` path) from the shared environments path, and the
-default picks up the seeded **ygg** base environment present there
-(`/Workspace/Shared/environments/ygg-<version>-py3XX`), falling back to the
-workspace default serverless compute when none is seeded. Blocks until the
+environment (or a `.yml` path) from the shared environment path, and the
+default picks up the **running client project's** environment when deployed,
+else the seeded **ygg** base environment
+(`/Workspace/Shared/environment/ygg/ygg-<version>-py3XX.yml`), falling back to
+the workspace default serverless compute when none is seeded. Blocks until the
 run finishes (`--timeout` seconds) unless `--no-wait` is given.
 
 ```bash

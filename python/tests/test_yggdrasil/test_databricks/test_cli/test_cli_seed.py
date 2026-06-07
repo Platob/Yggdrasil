@@ -35,17 +35,21 @@ def _client_with(*, user="me@co.com", warehouses=None, default_wh=...):
 
 def _env_requirements():
     """The seeded generic-environment requirements path for the local Python."""
-    from yggdrasil.databricks.job.wheel import WORKSPACE_ENV_DIR, ygg_base_environment_name
+    from yggdrasil.databricks.job.wheel import (
+        WORKSPACE_ENV_DIR,
+        environment_folder,
+        ygg_base_environment_name,
+    )
 
     name = ygg_base_environment_name()
-    return f"{WORKSPACE_ENV_DIR}/{name}/{name}.requirements.txt"
+    return f"{WORKSPACE_ENV_DIR}/{environment_folder('ygg')}/{name}.requirements.txt"
 
 
 def _env(python):
     """A fake ``ensure_environment`` descriptor for one Python version."""
     key = "py" + (python or "3X").replace(".", "")
     name = f"ygg-1.0-{key}"
-    env_dir = f"/Workspace/Shared/environments/{name}"
+    env_dir = "/Workspace/Shared/environment/ygg"
     return {
         "python": python, "key": key, "env_name": name, "env_dir": env_dir,
         "n_wheels": 2,

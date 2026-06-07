@@ -3,11 +3,11 @@ environment(s) from wheels in the workspace.
 
 The environment machinery in :mod:`yggdrasil.databricks.job.wheel` builds ygg's
 whole transitive dependency closure as wheels and persists, **per Python**, a
-self-contained base environment under ``/Workspace/Shared/environments``::
+self-contained base environment under ``/Workspace/Shared/environment``::
 
-    <env>/<env>.yml               serverless base_environment
-    <env>/<env>.requirements.txt   classic-cluster requirements
-    <env>/binaries/…              the zero-PyPI wheel closure
+    <proj>/<proj>-<version>-py3XX.yml               serverless base_environment
+    <proj>/<proj>-<version>-py3XX.requirements.txt   classic-cluster requirements
+    <proj>/binaries/…                              the zero-PyPI wheel closure
 
 so ygg jobs and clusters install with zero PyPI access. This command surfaces
 that on its own — the same step ``ygg databricks seed`` runs::
@@ -34,7 +34,7 @@ class EnvironmentCommand:
             help="Build / get-or-install the reusable ygg base environment(s) from wheels.",
         )
         parser.add_argument("--workspace-dir", dest="workspace_dir", default=None,
-                            help="Environment root (default: /Workspace/Shared/environments).")
+                            help="Environment root (default: /Workspace/Shared/environment).")
         parser.add_argument("--rebuild", action="store_true",
                             help="Force a fresh wheel-closure build + rewrite even if present.")
         parser.add_argument("--all-versions", dest="all_versions", action="store_true",
@@ -43,7 +43,7 @@ class EnvironmentCommand:
 
         ls = sub.add_parser("list", help="List the deployed base environment files.")
         ls.add_argument("--workspace-dir", dest="workspace_dir", default=None,
-                        help="Environment root (default: /Workspace/Shared/environments).")
+                        help="Environment root (default: /Workspace/Shared/environment).")
         ls.set_defaults(handler=cls._list)
 
         parser.set_defaults(handler=cls._ensure)

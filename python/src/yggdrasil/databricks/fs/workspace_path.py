@@ -813,11 +813,12 @@ class WorkspacePath(DatabricksPath):
         - otherwise the run goes **serverless**, and the *environment* is
           resolved automatically — an explicit :class:`JobEnvironment` or a
           seeded base-environment name / ``.yml`` path is used as given,
-          while the default (``None``) picks up the seeded **ygg base
-          environment present in the shared workspace path**
-          (``/Workspace/Shared/environments/ygg-<version>-py3XX``), falling
-          back to the workspace's default serverless compute when none is
-          seeded.
+          while the default (``None``) picks up the **running client project's**
+          deployed environment when present, else the seeded **ygg base
+          environment** under the shared project folder
+          (``/Workspace/Shared/environment/ygg/ygg-<version>-py3XX.yml``),
+          falling back to the workspace's default serverless compute when none
+          is seeded.
 
         This collapses the verbose ``dbc.jobs.submit(tasks=[SubmitTask(
         environment_key=…, notebook_task=NotebookTask(…))],
