@@ -351,25 +351,54 @@ class TestTransformersEngine(unittest.TestCase):
         self.assertEqual(METER.rows_for("transformers")[0].calls, 1)
         self.assertEqual(METER.total_cost, 0.0)  # local is free
 
+    @staticmethod
+    def _fake_hub():
+        hub = types.ModuleType("huggingface_hub")
+        hub.snapshot_download = MagicMock(return_value="/cache/m")
+        return hub
+
     def test_failed_load_is_cached_not_retried_and_surfaces_cause(self):
         # A local load is slow and can fail late (corrupt download, torch
-        # mismatch). The build must run once: a remembered failure fast-fails
-        # the next turn instead of re-downloading weights every chat.
+        # mismatch). It tries once, repairs the cache and retries once, then
+        # gives up — and a remembered failure fast-fails the *next* turn instead
+        # of re-downloading weights on every chat.
         fake = types.ModuleType("transformers")
         fake.pipeline = MagicMock(side_effect=ValueError("Could not load model X"))
         fake_torch = types.ModuleType("torch")
+        hub = self._fake_hub()
         eng = TransformersEngine(model="m")
-        with patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch}):
+        with patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch,
+                                      "huggingface_hub": hub}):
             with self.assertRaises(RuntimeError) as first:
                 eng.generate("hi")
             with self.assertRaises(RuntimeError) as second:
                 eng.generate("hi again")
-        # The pipeline build ran exactly once — the second turn reused the cache.
-        fake.pipeline.assert_called_once()
+        # First turn: initial build + one repair retry. Second turn: neither —
+        # the remembered failure fast-fails without touching the network.
+        self.assertEqual(fake.pipeline.call_count, 2)
+        hub.snapshot_download.assert_called_once_with("m", force_download=True)
         # The surfaced error names the model and the underlying cause.
         self.assertIn("m", str(first.exception))
         self.assertIn("Could not load model X", str(first.exception))
         self.assertIs(first.exception, second.exception)
+
+    def test_partial_download_is_repaired_and_retried(self):
+        # The Windows failure mode: a truncated first download, then a clean
+        # re-fetch loads. The engine repairs and recovers without the user
+        # clearing the cache by hand.
+        pipe = MagicMock(return_value=[{"generated_text": [
+            {"role": "assistant", "content": "ok"}]}])
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(side_effect=[OSError("truncated safetensors"), pipe])
+        fake_torch = types.ModuleType("torch")
+        hub = self._fake_hub()
+        eng = TransformersEngine(model="m")
+        with patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch,
+                                      "huggingface_hub": hub}):
+            out = eng.generate("hi")
+        self.assertEqual(out, "ok")
+        hub.snapshot_download.assert_called_once_with("m", force_download=True)
+        self.assertTrue(eng.ready("m"))   # repaired pipeline is now cached
 
     def test_warm_preloads_pipeline_and_swallows_failure(self):
         pipe = MagicMock()
@@ -728,6 +757,43 @@ class TestEngineSelection(unittest.TestCase):
         self.assertEqual(loki.engine("openai").name, "openai")
         with self.assertRaises(KeyError):
             loki.engine("nope")
+
+    def test_available_engines_probes_in_parallel_and_filters(self):
+        import threading
+
+        loki = Loki()
+        seen: list[str] = []
+        barrier = threading.Barrier(2, timeout=5)
+
+        def mk(name, ok, *, blocks=False):
+            e = MagicMock(); e.name = name
+
+            def available():
+                seen.append(name)
+                if blocks:            # both blockers must be in-flight at once
+                    barrier.wait()    # → only passes if probed concurrently
+                return ok
+
+            e.available.side_effect = available
+            return e
+
+        engines = {"claude": mk("claude", True, blocks=True),
+                   "ollama": mk("ollama", True, blocks=True),
+                   "openai": mk("openai", False)}
+        with patch.object(Loki, "_engine_instances", return_value=engines):
+            avail = loki.available_engines()
+        # Only the reachable engines come back, keyed by name.
+        self.assertEqual(set(avail), {"claude", "ollama"})
+        self.assertEqual(set(seen), {"claude", "ollama", "openai"})
+
+    def test_available_engines_guards_a_raising_probe(self):
+        # A probe that raises must not sink the whole parallel sweep.
+        loki = Loki()
+        boom = MagicMock(); boom.name = "boom"; boom.available.side_effect = OSError("x")
+        good = MagicMock(); good.name = "good"; good.available.return_value = True
+        with patch.object(Loki, "_engine_instances",
+                          return_value={"boom": boom, "good": good}):
+            self.assertEqual(set(loki.available_engines()), {"good"})
 
 
 if __name__ == "__main__":

@@ -369,7 +369,12 @@ def _select_engine(loki: Any, style: Any, state: dict) -> None:
     (Claude key/login, a Databricks session, OpenAI key, …) it lists them and
     lets the user choose. ``/engine`` switches mid-session.
     """
-    available = [e for e in loki.engines() if e.available()]
+    # Probe all engines' availability in parallel — several gate on a network
+    # round-trip (Ollama liveness, Databricks), so a serial scan stacks their
+    # latencies onto the startup path. (The probes are memoized, so the
+    # `loki.engine()` best-pick just below reuses these results.)
+    avail = loki.available_engines()
+    available = list(avail.values())
     if not available:
         style.warn("no engine configured — set ANTHROPIC_API_KEY, log into Claude Code, "
                    "or run with a Databricks session")
