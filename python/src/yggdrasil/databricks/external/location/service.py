@@ -41,7 +41,7 @@ class ExternalLocations(SecurableMapping):
     """
 
     #: TTL for the cached ``list()`` of external locations (seconds).
-    LIST_TTL: ClassVar[float] = 300.0
+    LIST_TTL: ClassVar[float] = 900.0
 
     @property
     def _api(self):
