@@ -103,6 +103,38 @@ class TestFSDispatch(unittest.TestCase):
         self.assertEqual(rc, 1)
         path.create_notebook.assert_not_called()
 
+    def test_run_notebook_submits_with_params(self):
+        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
+
+        path = MagicMock(spec=WorkspacePath)
+        path.full_path.return_value = "/Workspace/Shared/etl"
+        run = MagicMock()
+        run.run_id = 99
+        run.is_succeeded = True
+        path.run_notebook.return_value = run
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.client.DatabricksClient"):
+            DP.from_.return_value = path
+            rc = main([
+                "fs", "run-notebook", "/Workspace/Shared/etl",
+                "--param", "date=2024-01-01", "--param", "n=5", "--no-wait",
+            ])
+        self.assertEqual(rc, 0)
+        path.run_notebook.assert_called_once_with(
+            {"date": "2024-01-01", "n": "5"},
+            cluster=None, environment=None, wait=False, raise_error=False,
+        )
+
+    def test_run_notebook_rejects_non_workspace(self):
+        path = MagicMock()  # not a WorkspacePath
+        path.full_path.return_value = "/Volumes/cat/sch/vol/nb"
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.client.DatabricksClient"):
+            DP.from_.return_value = path
+            rc = main(["fs", "run-notebook", "/Volumes/cat/sch/vol/nb"])
+        self.assertEqual(rc, 1)
+        path.run_notebook.assert_not_called()
+
     def test_rm_recursive(self):
         path = MagicMock()
         with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \

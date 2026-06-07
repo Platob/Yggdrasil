@@ -555,6 +555,37 @@ ygg databricks fs create-notebook /Workspace/Shared/etl \
   --file ./etl.py --overwrite
 ```
 
+### `fs run-notebook`
+
+Submit a **`/Workspace`** notebook as a one-time job run (a `run_id` with
+no persisted job). `--param k=v` (repeatable) passes notebook parameters —
+they land on the run's widget bindings, so inside the notebook they're
+caught by `SystemParameters` (the union of `dbutils.widgets` and
+`{{job.parameters.*}}`) or `dbutils.widgets.get(<name>)`.
+
+Compute is defaulted for you: `--cluster <id>` pins existing compute,
+otherwise the run goes **serverless**. The serverless environment is
+resolved automatically — `--environment <name>` selects a seeded base
+environment (or a `.yml` path) from the shared environments path, and the
+default picks up the seeded **ygg** base environment present there
+(`/Workspace/Shared/environments/ygg-<version>-py3XX`), falling back to the
+workspace default serverless compute when none is seeded. Blocks until the
+run finishes (`--timeout` seconds) unless `--no-wait` is given.
+
+```bash
+# run on serverless (auto ygg env), waiting for the result
+ygg databricks fs run-notebook /Workspace/Shared/etl \
+  --param date=2024-01-01 --param region=eu
+
+# run on a named, seeded serverless environment
+ygg databricks fs run-notebook /Workspace/Shared/Meteologica/databricks/espark_category.py \
+  --environment meteologica --param category=wind
+
+# fire-and-forget on a specific cluster
+ygg databricks fs run-notebook /Workspace/Shared/etl \
+  --cluster 0123-456789-abcde --no-wait
+```
+
 ### `fs rm`
 
 Remove a file, or a directory with `-r`.

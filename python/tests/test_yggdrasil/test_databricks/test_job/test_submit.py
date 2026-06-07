@@ -92,3 +92,44 @@ class TestJobsSubmit(DatabricksTestCase):
     def test_submit_rejects_bad_task_type(self):
         with self.assertRaises(TypeError):
             self.client.jobs.submit(tasks=[object()])
+
+    def test_submit_no_environment_by_default(self):
+        # Backward compatible: without an explicit ``environment``, submit
+        # attaches nothing (no auto-resolution on the generic path).
+        self.client.jobs.submit(tasks=[SubmitTask(task_key="t")])
+        _, kwargs = self.workspace_client.jobs.submit.call_args
+        self.assertIsNone(kwargs["environments"])
+        self.assertIsNone(kwargs["tasks"][0].environment_key)
+
+    def test_submit_attaches_explicit_job_environment(self):
+        from databricks.sdk.service.compute import Environment
+        from databricks.sdk.service.jobs import JobEnvironment
+
+        env = JobEnvironment(
+            environment_key="meteologica",
+            spec=Environment(environment_version="5", dependencies=["ygg"]),
+        )
+        self.client.jobs.submit(
+            tasks=[SubmitTask(task_key="t", notebook_task=NotebookTask(notebook_path="/x"))],
+            environment=env,
+        )
+        _, kwargs = self.workspace_client.jobs.submit.call_args
+        self.assertEqual(kwargs["environments"], [env])
+        # Key backfilled onto the cluster-less, key-less task.
+        self.assertEqual(kwargs["tasks"][0].environment_key, "meteologica")
+
+    def test_submit_pinned_cluster_skips_environment_backfill(self):
+        from databricks.sdk.service.compute import Environment
+        from databricks.sdk.service.jobs import JobEnvironment
+
+        env = JobEnvironment(
+            environment_key="e", spec=Environment(environment_version="5"),
+        )
+        self.client.jobs.submit(
+            tasks=[SubmitTask(task_key="t", existing_cluster_id="pinned")],
+            environment=env,
+        )
+        _, kwargs = self.workspace_client.jobs.submit.call_args
+        # The env is still attached, but a cluster-pinned task isn't rekeyed.
+        self.assertEqual(kwargs["environments"], [env])
+        self.assertIsNone(kwargs["tasks"][0].environment_key)

@@ -28,7 +28,7 @@ import logging
 import os
 import stat as _stat
 import time
-from typing import Any, ClassVar, Iterator
+from typing import Any, ClassVar, Iterator, Mapping, TYPE_CHECKING
 
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Scheme
@@ -39,6 +39,11 @@ from yggdrasil.url import URL
 
 from ..path import DatabricksPath
 from ..workspaces.service import Workspaces
+
+if TYPE_CHECKING:
+    from yggdrasil.dataclasses.waiting import WaitingConfigArg
+    from ..cluster import Cluster
+    from ..job.run import JobRun
 
 __all__ = ["WorkspacePath"]
 
@@ -771,6 +776,106 @@ class WorkspacePath(DatabricksPath):
         return self
 
     # ==================================================================
+    # Notebook execution — submit a one-time job run
+    # ==================================================================
+
+    def run_notebook(
+        self,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        cluster: "Cluster | str | None" = None,
+        environment: Any | str | None = None,
+        run_name: str | None = None,
+        timeout_seconds: int | None = None,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        **submit_kwargs: Any,
+    ) -> "JobRun":
+        """Submit this notebook as a one-time job run.
+
+        Wraps the notebook in a single ``SubmitTask`` / ``NotebookTask``
+        and fires it through :meth:`Jobs.submit` — a one-shot run that has
+        a ``run_id`` but no persisted ``job_id``. *parameters* are passed
+        as the notebook task's ``base_parameters``, so inside the run they
+        land on the notebook's **widget bindings**: catchable by
+        :class:`yggdrasil.environ.SystemParameters` (which reads the union
+        of widgets + ``{{job.parameters.*}}`` via
+        ``dbutils.notebook.entry_point.getCurrentBindings()``) or directly
+        with ``dbutils.widgets.get("<name>")``. Values are stringified —
+        the Databricks parameter channel is string-typed, and
+        :class:`SystemParameters` casts them back to the declared field
+        types on the way out.
+
+        Compute is defaulted for you:
+
+        - pass a *cluster* (:class:`Cluster` or cluster-id string) to pin
+          existing compute;
+        - otherwise the run goes **serverless**, and the *environment* is
+          resolved automatically — an explicit :class:`JobEnvironment` or a
+          seeded base-environment name / ``.yml`` path is used as given,
+          while the default (``None``) picks up the seeded **ygg base
+          environment present in the shared workspace path**
+          (``/Workspace/Shared/environments/ygg-<version>-py3XX``), falling
+          back to the workspace's default serverless compute when none is
+          seeded.
+
+        This collapses the verbose ``dbc.jobs.submit(tasks=[SubmitTask(
+        environment_key=…, notebook_task=NotebookTask(…))],
+        environments=[…])`` boilerplate into one call.
+
+        ``wait`` defaults to ``True`` (block until terminal) — a notebook
+        run is usually awaited for its ``dbutils.notebook.exit`` result;
+        pass ``wait=False`` to fire-and-forget, or a number for a timeout
+        in seconds. ``raise_error`` raises on terminal failure when
+        waiting. Returns the :class:`JobRun`.
+
+        Example::
+
+            nb = WorkspacePath("/Workspace/Shared/etl")
+            run = nb.run_notebook({"date": "2024-01-01"})
+            out = run.task_output("etl").notebook_output.result
+
+            # pin a named, seeded serverless environment
+            nb.run_notebook({"category": "wind"}, environment="meteologica")
+        """
+        from databricks.sdk.service.jobs import NotebookTask, SubmitTask
+
+        from ..job.service import Jobs, _resolve_submit_environment
+
+        base_parameters = (
+            {str(k): str(v) for k, v in parameters.items()} if parameters else None
+        )
+        task = SubmitTask(
+            task_key=_notebook_task_key(self.name),
+            notebook_task=NotebookTask(
+                notebook_path=self.api_path,
+                base_parameters=base_parameters,
+            ),
+        )
+        # Serverless (no cluster): resolve the environment now — ``None`` here
+        # means "auto-default to the seeded ygg base env present in the shared
+        # workspace path". With a cluster, leave the environment unset.
+        resolved_environment = (
+            None if cluster is not None
+            else _resolve_submit_environment(self.client, environment)
+        )
+        logger.info(
+            "Submitting notebook run for %r (%d parameter(s))",
+            self,
+            len(base_parameters) if base_parameters else 0,
+        )
+        return Jobs(client=self.client).submit(
+            run_name=run_name or f"run-notebook:{self.name}",
+            tasks=[task],
+            cluster=cluster,
+            environment=resolved_environment,
+            timeout_seconds=timeout_seconds,
+            wait=wait,
+            raise_error=raise_error,
+            **submit_kwargs,
+        )
+
+    # ==================================================================
     # Module upload — stream directly through ``workspace.upload``
     # ==================================================================
 
@@ -909,6 +1014,17 @@ _NOTEBOOK_HEADERS: dict[str, str] = {
     "SQL": "-- Databricks notebook source",
     "SCALA": "// Databricks notebook source",
 }
+
+
+def _notebook_task_key(name: str) -> str:
+    """Sanitize a notebook name into a valid Databricks task key.
+
+    Task keys allow alphanumerics, ``_`` and ``-`` only; every other
+    character (dots, spaces, …) collapses to ``_``. Falls back to
+    ``notebook`` when the result is empty.
+    """
+    key = "".join(c if (c.isalnum() or c in "_-") else "_" for c in name).strip("_")
+    return key or "notebook"
 
 
 def _notebook_language(language: Any) -> Any:

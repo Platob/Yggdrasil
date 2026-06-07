@@ -139,6 +139,91 @@ def _resolve_cluster_id(cluster: "Cluster | str | None") -> str | None:
     return cluster.cluster_id
 
 
+def _environment_spec_path(client: DatabricksClient, name: str) -> str | None:
+    """Resolve a base-environment *name* (or direct path) to its spec file.
+
+    A value carrying a ``/`` or a ``.yml`` / ``.yaml`` suffix is taken as a
+    direct workspace path to the serverless base-environment spec. A bare
+    name is looked up under the shared environments root
+    (:data:`~yggdrasil.databricks.job.wheel.WORKSPACE_ENV_DIR`) in the
+    self-contained ``<name>/<name>.yml`` layout the seed writes (with the
+    legacy flat / ``.env.yaml`` spellings as fallbacks). Returns the first
+    existing path, or ``None`` when nothing matches.
+    """
+    from yggdrasil.databricks.job import wheel as W
+    from yggdrasil.databricks.path import DatabricksPath
+
+    if "/" in name or name.endswith((".yml", ".yaml")):
+        path = DatabricksPath.from_(name, client=client)
+        return path.full_path() if path.exists() else None
+
+    root = W.WORKSPACE_ENV_DIR.rstrip("/")
+    for rel in (
+        f"{name}/{name}.yml",
+        f"{name}/{name}.env.yaml",
+        f"{name}.yml",
+        f"{name}.env.yaml",
+    ):
+        candidate = f"{root}/{rel}"
+        if DatabricksPath.from_(candidate, client=client).exists():
+            return candidate
+    return None
+
+
+def _resolve_submit_environment(client: DatabricksClient, environment: Any) -> Any:
+    """Resolve a one-time-run *environment* argument into a ``JobEnvironment``.
+
+    Accepts:
+
+    - a :class:`JobEnvironment` — returned as-is;
+    - a ``str`` — a seeded serverless **base-environment** name (or a direct
+      workspace path to its ``.yml`` spec), referenced via
+      ``Environment.base_environment`` so the run reuses the shared, cached
+      image present in the workspace;
+    - ``None`` — **auto**: the seeded ygg base environment for the current
+      Python (``ygg-<version>-py3XX``) when its spec is present under the
+      shared environments path, else ``None`` (the run falls back to the
+      workspace's default serverless compute).
+
+    A named environment that can't be found raises :class:`FileNotFoundError`
+    — the miss is loud because the caller asked for a specific image.
+    """
+    from databricks.sdk.service.compute import Environment
+    from databricks.sdk.service.jobs import JobEnvironment
+
+    if isinstance(environment, JobEnvironment):
+        return environment
+
+    from yggdrasil.databricks.job import wheel as W
+
+    if isinstance(environment, str):
+        spec_path = _environment_spec_path(client, environment)
+        if spec_path is None:
+            raise FileNotFoundError(
+                f"no serverless base environment {environment!r} found under "
+                f"{W.WORKSPACE_ENV_DIR} (seed one with `ygg databricks seed`, "
+                f"pass a workspace path to its .yml, or a JobEnvironment)."
+            )
+        return JobEnvironment(
+            environment_key="default",
+            spec=Environment(base_environment=spec_path),
+        )
+
+    # ``None`` → auto-default to the seeded ygg base environment when present.
+    name = W.ygg_base_environment_name()
+    spec_path = _environment_spec_path(client, name)
+    if spec_path is None:
+        LOGGER.debug(
+            "no seeded ygg base environment (%s) under %s — submitting on the "
+            "workspace default serverless compute", name, W.WORKSPACE_ENV_DIR,
+        )
+        return None
+    return JobEnvironment(
+        environment_key="default",
+        spec=Environment(base_environment=spec_path),
+    )
+
+
 def _check_permission(
     permission: str | JobAccessControlRequest,
 ) -> JobAccessControlRequest:
@@ -419,6 +504,7 @@ class Jobs(DatabricksService):
         run_name: str | None = None,
         tasks: list["SubmitTask | dict"] | None = None,
         cluster: "Cluster | str | None" = None,
+        environment: "Any | str | None" = None,
         timeout_seconds: int | None = None,
         wait: WaitingConfigArg = False,
         raise_error: bool = True,
@@ -444,6 +530,16 @@ class Jobs(DatabricksService):
             List of :class:`SubmitTask` or dicts.
         cluster:
             Default cluster for tasks that don't specify their own.
+        environment:
+            **Serverless** environment for tasks that don't pin a cluster.
+            A :class:`JobEnvironment` is used directly; a ``str`` names a
+            seeded serverless base environment (or a workspace path to its
+            ``.yml`` spec) present in the shared environments path. When
+            given, it's attached to the run's ``environments`` and its key
+            is backfilled onto every cluster-less, key-less task — so the
+            verbose ``environments=[…]`` + per-task ``environment_key``
+            boilerplate collapses to one argument. ``None`` (default)
+            leaves submit behaviour unchanged.
         timeout_seconds:
             Overall run timeout.
         wait:
@@ -471,11 +567,31 @@ class Jobs(DatabricksService):
                     t.existing_cluster_id = cid
                 checked_tasks.append(t)
 
+        # Serverless environment defaulting: resolve an explicit ``environment``
+        # (a JobEnvironment, or a seeded base-environment name/path) and attach
+        # it to the run, backfilling its key onto every cluster-less, key-less
+        # task. Caller-supplied ``environments=[…]`` still wins.
+        environments = submit_kwargs.pop("environments", None)
+        if environment is not None and environments is None:
+            resolved = _resolve_submit_environment(self.client, environment)
+            if resolved is not None:
+                environments = [resolved]
+        if environments:
+            env_key = environments[0].environment_key
+            for t in checked_tasks or []:
+                if (
+                    t.existing_cluster_id is None
+                    and t.new_cluster is None
+                    and getattr(t, "environment_key", None) is None
+                ):
+                    t.environment_key = env_key
+
         LOGGER.debug("Submitting one-time run %r", run_name)
         response = sdk.submit(
             run_name=run_name,
             tasks=checked_tasks,
             timeout_seconds=timeout_seconds,
+            environments=environments,
             **submit_kwargs,
         )
 

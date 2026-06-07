@@ -166,6 +166,96 @@ class TestCreateNotebook:
         assert kwargs["overwrite"] is True
 
 
+class TestRunNotebook:
+
+    def test_submits_notebook_task_with_string_params(self, workspace, client, service) -> None:
+        # No seeded environment present → auto-resolution finds nothing.
+        workspace.workspace.get_status.side_effect = NotFound()
+        submitted = SimpleNamespace(run_id=555)
+        workspace.jobs.submit.return_value = submitted
+        workspace.jobs.get_run.return_value = SimpleNamespace(
+            run_id=555, job_id=None, run_page_url=None, state=None,
+        )
+        p = WorkspacePath("/Workspace/Shared/etl", service=service)
+        run = p.run_notebook({"date": "2024-01-01", "n": 5}, wait=False)
+
+        assert run.run_id == 555
+        kwargs = workspace.jobs.submit.call_args.kwargs
+        assert kwargs["run_name"] == "run-notebook:etl"
+        (task,) = kwargs["tasks"]
+        assert task.notebook_task.notebook_path == "/Workspace/Shared/etl"
+        # Parameters are stringified so SystemParameters can cast them back.
+        assert task.notebook_task.base_parameters == {"date": "2024-01-01", "n": "5"}
+        assert task.task_key == "etl"
+        # No seeded env → no environments attached (workspace serverless default).
+        assert kwargs["environments"] is None
+
+    def test_no_params_sends_none(self, workspace, client, service) -> None:
+        workspace.workspace.get_status.side_effect = NotFound()
+        workspace.jobs.submit.return_value = SimpleNamespace(run_id=1)
+        workspace.jobs.get_run.return_value = SimpleNamespace(
+            run_id=1, job_id=None, run_page_url=None, state=None,
+        )
+        p = WorkspacePath("/Workspace/Shared/etl", service=service)
+        p.run_notebook(wait=False)
+        (task,) = workspace.jobs.submit.call_args.kwargs["tasks"]
+        assert task.notebook_task.base_parameters is None
+
+    def test_cluster_backfills_existing_cluster_id(self, workspace, client, service) -> None:
+        workspace.jobs.submit.return_value = SimpleNamespace(run_id=2)
+        workspace.jobs.get_run.return_value = SimpleNamespace(
+            run_id=2, job_id=None, run_page_url=None, state=None,
+        )
+        p = WorkspacePath("/Workspace/Shared/etl", service=service)
+        p.run_notebook(cluster="0123-clusterid", wait=False)
+        kwargs = workspace.jobs.submit.call_args.kwargs
+        (task,) = kwargs["tasks"]
+        assert task.existing_cluster_id == "0123-clusterid"
+        # A cluster pins compute — no serverless environment is attached.
+        assert kwargs["environments"] is None
+
+    def test_named_environment_resolves_base_environment(self, workspace, client, service) -> None:
+        # Every workspace path "exists" → the named env's .yml resolves.
+        workspace.workspace.get_status.return_value = _file_status(1)
+        workspace.jobs.submit.return_value = SimpleNamespace(run_id=7)
+        workspace.jobs.get_run.return_value = SimpleNamespace(
+            run_id=7, job_id=None, run_page_url=None, state=None,
+        )
+        p = WorkspacePath(
+            "/Workspace/Shared/Meteologica/databricks/espark_category.py",
+            service=service,
+        )
+        p.run_notebook({"category": "wind"}, environment="meteologica", wait=False)
+
+        kwargs = workspace.jobs.submit.call_args.kwargs
+        (env,) = kwargs["environments"]
+        assert (
+            env.spec.base_environment
+            == "/Workspace/Shared/environments/meteologica/meteologica.yml"
+        )
+        # The task is wired to the resolved environment's key.
+        (task,) = kwargs["tasks"]
+        assert task.environment_key == env.environment_key
+
+    def test_auto_environment_uses_seeded_ygg_env(self, workspace, client, service) -> None:
+        from yggdrasil.databricks.job.wheel import (
+            WORKSPACE_ENV_DIR,
+            ygg_base_environment_name,
+        )
+
+        workspace.workspace.get_status.return_value = _file_status(1)  # seeded
+        workspace.jobs.submit.return_value = SimpleNamespace(run_id=8)
+        workspace.jobs.get_run.return_value = SimpleNamespace(
+            run_id=8, job_id=None, run_page_url=None, state=None,
+        )
+        p = WorkspacePath("/Workspace/Shared/etl", service=service)
+        p.run_notebook(wait=False)
+        (env,) = workspace.jobs.submit.call_args.kwargs["environments"]
+        # ygg follows the same environments/<name>/<name>.yml folder layout.
+        name = ygg_base_environment_name()
+        assert env.spec.base_environment == f"{WORKSPACE_ENV_DIR}/{name}/{name}.yml"
+
+
 class TestWrite:
 
     def test_overwrite(self, workspace, client, service) -> None:
