@@ -62,9 +62,25 @@ class TestTableAutoLoader:
         with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
             tbl.auto_loader("s3://bkt/landing", file_arrival=True)
         trigger = Flow.call_args.kwargs["trigger"]
-        # A file-arrival trigger pointed at the source path.
+        # A file-arrival trigger pointed at the source path, with the 60s
+        # Databricks polling floor.
         assert trigger is not None
         assert trigger.file_arrival.url == "s3://bkt/landing/"
+        assert trigger.file_arrival.min_time_between_triggers_seconds == 60
+
+    def test_file_arrival_min_seconds_clamped_to_60(self):
+        tbl = _table()
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://bkt/landing", file_arrival_min_seconds=5)
+        trig = Flow.call_args.kwargs["trigger"]
+        assert trig.file_arrival.min_time_between_triggers_seconds == 60
+
+    def test_file_arrival_min_seconds_override(self):
+        tbl = _table()
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://bkt/landing", file_arrival_min_seconds=300)
+        trig = Flow.call_args.kwargs["trigger"]
+        assert trig.file_arrival.min_time_between_triggers_seconds == 300
 
     def test_file_arrival_disabled_deploys_without_trigger(self):
         tbl = _table()

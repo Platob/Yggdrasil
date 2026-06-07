@@ -3098,6 +3098,7 @@ class Table(DatabricksPath):
         checkpoint: "str | None" = None,
         available_now: bool = True,
         file_arrival: bool = True,
+        file_arrival_min_seconds: int = 60,
         trigger: "Any" = None,
         clean_source: bool = False,
         clean_source_retention: str = "8 days",
@@ -3139,10 +3140,17 @@ class Table(DatabricksPath):
                 continuous micro-batch.
             file_arrival: ``True`` (default) → attach a file-arrival trigger on
                 *source* so the job fires automatically when new files land —
-                the natural shape for an ingestion job watching a drop path.
+                the natural shape for an ingestion job watching a drop path. The
+                trigger establishes a **baseline when it's created** and only
+                fires for files arriving *after* that, so stage rows *after*
+                deploying (a file already present at creation won't trigger it).
                 ``False`` deploys the job with no trigger (run it on a schedule,
                 manually, or via ``.run()``). Ignored when an explicit *trigger*
                 is given.
+            file_arrival_min_seconds: Databricks polling floor for the
+                file-arrival trigger (``min_time_between_triggers_seconds``) — it
+                won't evaluate *source* more often than this. Databricks' minimum
+                is **60s**; smaller values are clamped up to it. Default ``60``.
             trigger: An explicit Databricks ``TriggerSettings`` (schedule /
                 file-arrival), passed through as-is. Takes precedence over
                 *file_arrival*.
@@ -3210,10 +3218,16 @@ class Table(DatabricksPath):
                 FileArrivalTriggerConfiguration, TriggerSettings,
             )
             # The file-arrival trigger URL must be a directory — Databricks
-            # rejects it unless it ends with '/'.
+            # rejects it unless it ends with '/'. ``min_time_between_triggers``
+            # is Databricks' polling floor (it won't evaluate the path more
+            # often than this); 60s is the minimum it accepts. Note the trigger
+            # establishes a **baseline at creation** and only fires for files
+            # that land *after* it's active — files already present (or staged
+            # before deploy) won't fire it, so stage after :meth:`auto_loader`.
             trigger = TriggerSettings(
                 file_arrival=FileArrivalTriggerConfiguration(
                     url=str(source).rstrip("/") + "/",
+                    min_time_between_triggers_seconds=max(60, int(file_arrival_min_seconds)),
                 ),
             )
 
