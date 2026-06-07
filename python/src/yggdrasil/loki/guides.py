@@ -132,9 +132,9 @@ GUIDES: tuple[Guide, ...] = (
                  "wheel", "seed", "deploy", "job", "dbu", "spark"),
         summary="Prefer serverless for inner Databricks I/O, a single-user cluster for "
                 "external-resource access, and always the pre-built ygg wheel "
-                "environments seeded by `ygg databricks seed`.",
+                "environments deployed by `ygg databricks deploy`.",
         use=("yggdrasil.databricks.DatabricksClient — `dbc.<service>` accessors",
-             "`ygg databricks seed` — pre-built wheel envs (no per-run pip install)",
+             "`ygg databricks deploy` — pre-built wheel envs (no per-run pip install)",
              "serverless for inner I/O; single-user cluster for external resources"),
         example="from yggdrasil.databricks import DatabricksClient\n"
                 "dbc = DatabricksClient.current()\n"

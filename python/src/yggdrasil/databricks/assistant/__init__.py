@@ -5,7 +5,7 @@ code in notebooks for the user — works best when it routes every operation
 through the ygg Python API instead of a terminal. Serverless notebooks and
 jobs cannot shell out (no ``%sh`` / ``!cmd`` / ``ygg``/``databricks`` CLI),
 and ygg is already on the **pre-built serverless image** seeded by
-``ygg databricks seed``. These files teach the Assistant exactly that.
+``ygg databricks deploy``. These files teach the Assistant exactly that.
 
 This package is the **single source of truth** for the three Assistant
 artifacts:
@@ -14,7 +14,7 @@ artifacts:
   and :func:`user_instructions` (per-user preferences),
 - **skills** — :func:`skills`, the per-task markdown the Assistant routes to.
 
-``ygg databricks seed`` deploys them into a workspace via :func:`deploy`:
+``ygg databricks deploy`` deploys them into a workspace via :func:`deploy`:
 the workspace bundle (guidance + skills) under ``/Workspace/Shared`` and a
 per-user bundle under ``/Workspace/Users/<me>``, plus a best-effort attempt
 at any live Assistant-settings API the SDK exposes.

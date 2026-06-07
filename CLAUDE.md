@@ -61,12 +61,13 @@ Treat a cross-language divergence as a bug.
 
 `yggdrasil.databricks` wraps the Databricks SDK behind `DatabricksClient` and
 its `dbc.<service>` accessors (`sql`, `tables`, `volumes`, `warehouses`,
-`compute`, `jobs`, `job_runs`, `secrets`, `iam`, `ai`, `genie`, …). Tabular
+`compute`, `jobs`, `job_runs`, `wheels`, `environments`, `secrets`, `iam`,
+`ai`, `genie`, …). Tabular
 data moves as Arrow; `Table` is itself a `Tabular`. See `docs/guides/databricks.md`
 and `docs/guides/databricks-cli.md`. Primary compute rules: prefer
 **serverless** for inner Databricks I/O, a **single-user cluster** for
 external-resource access, and always the **pre-built ygg wheel
-environments** seeded by `ygg databricks seed`.
+environments** deployed by `ygg databricks deploy`.
 
 ## Loki
 
@@ -91,9 +92,11 @@ python/src/yggdrasil/
   databricks/           Databricks SDK integrations
     client.py           DatabricksClient + dbc.<service> accessors
     sql/ table/ volume/ warehouse/ compute/ cluster/ job/ secrets/ iam/ ai/
+    wheels/             dbc.wheels — build/upload/deploy/browse the wheel registry
+    environments/       dbc.environments — assemble base envs + deploy projects
     genie/              dbc.genie — AI/BI Genie spaces
-    cli/                ygg databricks ... (configure/seed/deploy/sql/jobs/fs/…)
-    assistant/          Databricks Assistant skills + guidance (deployed by seed)
+    cli/                ygg databricks ... (configure/deploy/sql/jobs/fs/…)
+    assistant/          Databricks Assistant skills + guidance bundle
     loki/               specialized Loki Databricks agent
   loki/                 Loki — the global yggdrasil agent + TokenEngine + behaviors
   cli/                  ygg CLI (main → databricks, loki)
@@ -104,7 +107,7 @@ docs/                   mkdocs (Material) — guides + auto-generated API refere
 
 ## CLI
 
-`ygg databricks` — Databricks management CLI (configure, seed, deploy, sql, jobs, fs, …)
+`ygg databricks` — Databricks management CLI (configure, deploy, wheel, environment, sql, jobs, fs, …)
 `ygg loki` — global yggdrasil agent (status / capabilities / behaviors / engines / tools / reason / do / token / run)
 
 ## Environment

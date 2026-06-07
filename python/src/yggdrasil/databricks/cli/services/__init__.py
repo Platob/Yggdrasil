@@ -9,7 +9,6 @@ from .deploy import DeployCommand
 from .environment import EnvironmentCommand
 from .fs import FSCommand
 from .jobs import JobsCommand
-from .seed import SeedCommand
 from .sql import SQLCommand
 from .tables import TablesCommand
 from .warehouses import WarehousesCommand
@@ -22,7 +21,6 @@ __all__ = [
     "EnvironmentCommand",
     "FSCommand",
     "JobsCommand",
-    "SeedCommand",
     "SQLCommand",
     "TablesCommand",
     "WarehousesCommand",

@@ -231,7 +231,7 @@ class TestWorkspacePyPIRegistry:
     def test_default_base_is_shared_registry(self, serverless_client, monkeypatch):
         # No base_path → the shared workspace registry (same root the job image
         # uses), so Spark Connect and the job image share one index.
-        from yggdrasil.databricks.job.wheel import WORKSPACE_PYPI_DIR
+        from yggdrasil.databricks.wheels.service import WORKSPACE_PYPI_DIR
         monkeypatch.setattr(
             type(serverless_client), "workspaces",
             property(lambda self: MagicMock(name="Workspaces")),
@@ -399,7 +399,7 @@ class TestServerlessBranch:
         self, serverless_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
-        from yggdrasil.databricks.job.wheel import ygg_runtime_dependencies
+        from yggdrasil.databricks.wheels.service import runtime_dependencies
 
         builder, session, _env_cls, env_instances = mocked_builder
         result = serverless_client.spark()
@@ -410,7 +410,7 @@ class TestServerlessBranch:
         # and attaches it via ``local:``), NOT a pip ``ygg==version`` index spec
         # — so a private ygg installs on the cluster. Its runtime deps ride
         # along as index requirement names.
-        assert env._deps == [["ygg", *ygg_runtime_dependencies()]]
+        assert env._deps == [["ygg", *runtime_dependencies("ygg")]]
         assert not any("==" in d and d.startswith("ygg") for d in env._deps[0])
         builder.withEnvironment.assert_called_once_with(env)
         # The client is stashed on the session for downstream use.
@@ -420,12 +420,12 @@ class TestServerlessBranch:
         self, serverless_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
-        from yggdrasil.databricks.job.wheel import ygg_runtime_dependencies
+        from yggdrasil.databricks.wheels.service import runtime_dependencies
 
         _builder, _session, _env_cls, env_instances = mocked_builder
         serverless_client.spark("numpy==1.0")
         env = env_instances[0]
-        assert env._deps == [["ygg", *ygg_runtime_dependencies(), "numpy==1.0"]]
+        assert env._deps == [["ygg", *runtime_dependencies("ygg"), "numpy==1.0"]]
 
     def test_ygg_not_doubled_when_caller_passes_it(
         self, serverless_client, mocked_builder, stubbed_workspace_config,

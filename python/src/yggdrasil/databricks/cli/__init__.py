@@ -12,7 +12,6 @@ Subcommands::
     ygg databricks wheel [build/upload/deploy/list]  (build+upload ygg wheel; workspace PyPI-like registry)
     ygg databricks environment [list]  (build / get-or-install the base environment(s) from wheels)
     ygg databricks deploy [ygg|wheel <package>|environment]  (wheels + serverless env configs)
-    ygg databricks seed [--check]  (provision/verify wheels, environments, default warehouse, config)
 """
 from __future__ import annotations
 
@@ -28,7 +27,6 @@ from .services import (
     EnvironmentCommand,
     FSCommand,
     JobsCommand,
-    SeedCommand,
     SQLCommand,
     TablesCommand,
     WarehousesCommand,
@@ -75,7 +73,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     EnvironmentCommand.register(subparsers)
     FSCommand.register(subparsers)
     JobsCommand.register(subparsers)
-    SeedCommand.register(subparsers)
     SQLCommand.register(subparsers)
     TablesCommand.register(subparsers)
     WarehousesCommand.register(subparsers)

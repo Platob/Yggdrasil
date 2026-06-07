@@ -393,6 +393,7 @@ class TestReplCommands(unittest.TestCase):
         eng = MagicMock(name="claude"); eng.name = "claude"; eng.available.return_value = True
         eng.model_label = "claude-opus-4-8 (adaptive)"
         loki.engines = lambda: [eng]
+        loki.available_engines = lambda **kw: {"claude": eng}
         loki.engine = lambda name=None: eng
         state = {"tier": None, "root": ".", "engine": None}
         cli._select_engine(loki, style, state)

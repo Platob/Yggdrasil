@@ -58,9 +58,9 @@ class TestDeploy(unittest.TestCase):
 
     def test_deploy_creates_serverless_job(self):
         client = MagicMock()
+        client.environments.find.return_value.job_environment.return_value = "ENV"
         with patch("yggdrasil.databricks.loki.agent.read_session", return_value=_session()), \
-             patch("yggdrasil.databricks.DatabricksClient", return_value=client), \
-             patch("yggdrasil.databricks.job.wheel.ygg_environment", return_value="ENV"):
+             patch("yggdrasil.databricks.DatabricksClient", return_value=client):
             loki = DatabricksLoki()
             loki.deploy(name="loki-test", behavior="reason", prompt="hi")
         call = client.jobs.create_or_update.call_args
@@ -74,9 +74,9 @@ class TestDeploy(unittest.TestCase):
 
     def test_deploy_behavior_routes_through_loki_run(self):
         client = MagicMock()
+        client.environments.find.return_value.job_environment.return_value = "ENV"
         with patch("yggdrasil.databricks.loki.agent.read_session", return_value=_session()), \
-             patch("yggdrasil.databricks.DatabricksClient", return_value=client), \
-             patch("yggdrasil.databricks.job.wheel.ygg_environment", return_value="ENV"):
+             patch("yggdrasil.databricks.DatabricksClient", return_value=client):
             loki = DatabricksLoki()
             loki.deploy(name="loki-genie", behavior="genie", question="revenue?")
         task = client.jobs.create_or_update.call_args.kwargs["tasks"][0]

@@ -154,10 +154,10 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         # environment (written to /Workspace/Shared/environments as
         # ``ygg-<version>-py3XX.yml`` — the same file the seed writes) rather
         # than inlining the dependency list.
-        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+        from yggdrasil.databricks.environments.service import environment_stem
         env = settings.environments[0]
         assert env.spec.base_environment is not None
-        assert env.spec.base_environment.endswith(f"{ygg_base_environment_name()}.yml")
+        assert env.spec.base_environment.endswith(f"{environment_stem('ygg')}.yml")
         # base_environment carries the version → no inline version, and an
         # ygg-only job layers nothing on top.
         assert env.spec.environment_version is None
@@ -172,7 +172,7 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         through it lands on the backing S3, and the deployed job targets the
         volume source with the version-pinned ygg base environment. The actual
         serverless run is gated behind ``YGG_TEST_AUTOLOADER_RUN=1`` (minutes)."""
-        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+        from yggdrasil.databricks.environments.service import environment_stem
 
         # Volume-addressed staging: /Volumes/<cat>/<sch>/<vol>/.sql/tmp, backed by
         # the table's EXTERNAL S3 location (created in setUpClass).
@@ -198,7 +198,7 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
             assert vol_source in task.python_wheel_task.parameters
             assert settings.trigger.file_arrival.url == vol_source.rstrip("/") + "/"
             env = settings.environments[0]
-            assert env.spec.base_environment.endswith(f"{ygg_base_environment_name()}.yml")
+            assert env.spec.base_environment.endswith(f"{environment_stem('ygg')}.yml")
 
             if not os.environ.get("YGG_TEST_AUTOLOADER_RUN"):
                 self.skipTest("set YGG_TEST_AUTOLOADER_RUN=1 for the live volume ingestion run")

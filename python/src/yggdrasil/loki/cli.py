@@ -268,6 +268,20 @@ def _repl(loki: Any, style: Any) -> int:
               f"{style.dim('· ' + session.user)}\n")
     style.out(f"  {style.dim('workspace ' + str(session.workspace))}\n")
     _select_engine(loki, style, state)
+    # Pre-load the *chosen* engine in the background (the startup _warm thread
+    # only warms the best-by-preference one). For a local transformers model
+    # this overlaps the slow weights download with the capability probe and the
+    # user's first keystrokes, so the first turn isn't a multi-minute black box.
+    if state.get("engine"):
+        def _warm_chosen(name: str = state["engine"]) -> None:
+            try:
+                warm = getattr(loki.engine(name), "warm", None)
+                if callable(warm):
+                    warm()
+            except Exception:
+                pass
+
+        threading.Thread(target=_warm_chosen, daemon=True).start()
     # Warm the local-capability probe now (it imports torch the first time —
     # slow on a box that has it) so the first turn's engine selection doesn't
     # stall silently. Only matters when a local engine is actually reachable.
@@ -355,7 +369,12 @@ def _select_engine(loki: Any, style: Any, state: dict) -> None:
     (Claude key/login, a Databricks session, OpenAI key, …) it lists them and
     lets the user choose. ``/engine`` switches mid-session.
     """
-    available = [e for e in loki.engines() if e.available()]
+    # Probe all engines' availability in parallel — several gate on a network
+    # round-trip (Ollama liveness, Databricks), so a serial scan stacks their
+    # latencies onto the startup path. (The probes are memoized, so the
+    # `loki.engine()` best-pick just below reuses these results.)
+    avail = loki.available_engines()
+    available = list(avail.values())
     if not available:
         style.warn("no engine configured — set ANTHROPIC_API_KEY, log into Claude Code, "
                    "or run with a Databricks session")

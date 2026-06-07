@@ -26,9 +26,8 @@ ygg databricks <group> <action> [flags]
 | [`sql`](#sql) | Run SQL and export results — query/export (incl. `export --statement-id`) |
 | [`job`](#jobs) | Jobs & runs — list/get/run/runs/logs/cancel/repair/delete |
 | [`fs`](#filesystem-fs) | Files across Workspace / Volumes / DBFS — ls/cat/write/put/get/mkdir/rm/stat/cp/mv |
-| [`wheel`](#wheels-wheel) | Wheel registry — build/upload/deploy/list in the workspace PyPI-like index |
-| [`deploy`](#deploy) | Build + upload wheels and assemble serverless environments |
-| [`seed`](#seed) | One-shot readiness — check (and provision) wheels, environments, a default warehouse, instance pools, a cluster, and the Assistant bundle |
+| [`wheel`](#wheels-wheel) | Wheel registry CRUD — create/find/update/delete/list in the workspace index |
+| [`deploy`](#deploy) | Deploy the current project — environment + default warehouse + cluster |
 
 ---
 
@@ -565,12 +564,12 @@ caught by `SystemParameters` (the union of `dbutils.widgets` and
 
 Compute is defaulted for you: `--cluster <id>` pins existing compute,
 otherwise the run goes **serverless**. The serverless environment is
-resolved automatically — `--environment <name>` selects a seeded base
+resolved automatically — `--environment <name>` selects a deployed base
 environment (or a `.yml` path) from the shared environment path, and the
 default picks up the **running client project's** environment when deployed,
-else the seeded **ygg** base environment
+else the deployed **ygg** base environment
 (`/Workspace/Shared/environment/ygg/ygg-<version>-py3XX.yml`), falling back to
-the workspace default serverless compute when none is seeded. Blocks until the
+the workspace default serverless compute when none is deployed. Blocks until the
 run finishes (`--timeout` seconds) unless `--no-wait` is given.
 
 ```bash
@@ -578,7 +577,7 @@ run finishes (`--timeout` seconds) unless `--no-wait` is given.
 ygg databricks fs run-notebook /Workspace/Shared/etl \
   --param date=2024-01-01 --param region=eu
 
-# run on a named, seeded serverless environment
+# run on a named, deployed serverless environment
 ygg databricks fs run-notebook /Workspace/Shared/Meteologica/databricks/espark_category.py \
   --environment meteologica --param category=wind
 
@@ -621,288 +620,96 @@ ygg databricks fs mv /Workspace/Shared/old.csv /Volumes/main/default/archive/old
 
 ## Wheels (`wheel`)
 
-The wheel registry lifecycle on its own — building, uploading, and
-browsing the workspace's PyPI-like wheel index
-(`/Workspace/Shared/pypi/<dist>/...` by default). Where [`deploy`](#deploy)
-ships the whole ygg image in one shot (wheel **plus** the serverless
-`JobEnvironment`), `wheel` lets you drive each step.
+Uniform **CRUD** over the workspace's PyPI-like wheel registry
+(`/Workspace/Shared/pypi/<dist>/<version>/...` — distribution **and** version are
+folder levels). A wheel is keyed by `(project, version)`.
+`create`/`find` **fetch** it — a local path (with a `pyproject.toml`) is built
+from source (`uv build`), anything else is a **PyPI** project downloaded by
+name (`pip download`) — and upload it. Fetches use a local on-disk cache so
+repeated builds/downloads/uploads are cheap. Every project, `ygg` included, is
+handled the same way. Versions parse + compare via
+[`yggdrasil.version.VersionInfo`](../).
 
 ```bash
-ygg databricks wheel <action> [flags]
+ygg databricks wheel <action> <project> [version] [flags]
 ```
 
-Like `deploy`, the wheel is built from the **live package on disk**: the
-machinery synthesizes a buildable project from the *installed* package's
-own files + metadata, so the artifact runs exactly the code you have now —
-dev checkout or pip-installed.
-
-### `wheel build`
-
-Build wheel(s) locally from a package — **no workspace upload, no
-credentials needed** (it runs `uv`/`pip` locally). Prints the produced
-`.whl` paths to stdout.
-
-| Flag | Purpose |
+| Action | Purpose |
 |---|---|
-| `--out-dir` | Directory to write the `.whl`(s) into (default: a temp dir) |
-| `--extra` | Optional-dependency extra to fold in (repeatable) |
-| `-r`, `--requirement` | Extra requirement to bundle alongside (repeatable) |
-| `--no-deps` | Pure-python project wheel only; deps resolve at install time |
-| `--all-versions` | A wheel for every supported Python (3.10–3.13) |
+| `create <project> [version]` | Fetch (build/download) + upload the wheel(s) |
+| `find <project> [version]` | Get the wheel, **building it on a miss** (`--no-install` to skip) |
+| `get <project> [version]` | Get a deployed wheel, **never builds** |
+| `update <project> [version]` | Re-fetch + overwrite |
+| `delete <project> [version]` | Remove (a version, or all) |
+| `list [project]` | Browse: distributions, or a project's wheels |
+
+Common flags: `--python 3.11` (target a Python), `--extra <name>` (fold in an
+extra, repeatable), `--deps` (also upload the whole dependency closure),
+`--rebuild` (force a fresh fetch), `--workspace-dir`.
 
 ```bash
-ygg databricks wheel build yggdrasil --out-dir ./dist
-ygg databricks wheel build mypkg --no-deps --out-dir ./dist
-ygg databricks wheel build yggdrasil --extra databricks --all-versions
-```
-
-### `wheel upload`
-
-Upload one or more **prebuilt** `.whl` files into the registry. Prints
-each resulting workspace path.
-
-```bash
-ygg databricks wheel upload ./dist/mypkg-1.0-py3-none-any.whl
-ygg databricks wheel upload ./dist/*.whl --workspace-dir /Workspace/Shared/pypi
-```
-
-This pairs with `wheel build` for an air-gapped flow: build locally on a
-machine with the package, then upload the artifacts from one that has
-workspace access.
-
-### `wheel deploy`
-
-Build the live package **and** upload its wheel(s) in one step — the wheel
-half of `deploy` without the environment JSON. Prints the workspace
-path(s). Same build flags as `wheel build`.
-
-```bash
-ygg databricks wheel deploy yggdrasil --extra databricks
-ygg databricks wheel deploy mypkg -r "pandas>=2" --no-deps
-```
-
-### `wheel list`
-
-Browse the registry. With no package it lists the distribution folders;
-with a package (import or distribution name) it lists that distribution's
-deployed `.whl` files.
-
-```bash
-ygg databricks wheel list              # ygg/  mypkg/  ...
-ygg databricks wheel list ygg          # /Workspace/Shared/pypi/ygg/ygg-0.8.45-py3-none-any.whl
-ygg databricks wheel list --workspace-dir /Workspace/Users/me@co.com/pypi
+ygg databricks wheel create ./my-app                 # build the local project, upload
+ygg databricks wheel create polars 1.2.0 --deps      # mirror a PyPI release + closure
+ygg databricks wheel find ygg                         # get-or-build the ygg wheel
+ygg databricks wheel get mypkg 1.0                    # deployed lookup, no build
+ygg databricks wheel update ygg                       # re-fetch + overwrite
+ygg databricks wheel delete mypkg 0.9                 # remove one version
+ygg databricks wheel list                             # ygg/  mypkg/  ...
+ygg databricks wheel list ygg                         # the ygg distribution's wheels
 ```
 
 ---
+
+## Environments (`environment`)
+
+Uniform **CRUD** over reusable base environments under
+`/Workspace/Shared/environment/<proj>/<version>/`. An environment is keyed by
+`(project, version)`. `create`/`find` fetch the project + its **whole dependency
+closure as wheels** (zero-PyPI — the runtime never resolves from a live index)
+and write the serverless `<stem>.yml` + cluster `<stem>.requirements.txt`. Same
+local-path-or-PyPI rule and the same actions as `wheel`:
+
+```bash
+ygg databricks environment create <project> [version] [--python 3.11] [--extra <name>]
+ygg databricks environment find <project> [version]    # build on a miss
+ygg databricks environment get  <project> [version]    # never builds
+ygg databricks environment update <project> [version]  # re-build + overwrite
+ygg databricks environment delete <project> [version]
+ygg databricks environment list
+```
 
 ## Deploy
 
-Ship your Python code to Databricks serverless. The machinery in
-`yggdrasil.databricks.job.wheel` builds a wheel from the **live package on
-disk**, uploads it into the workspace's PyPI-like registry
-(`/Workspace/Shared/pypi/<dist>/` by default), and assembles the
-serverless `JobEnvironment` that installs it.
+Take **your own project** to Databricks in one command. `ygg databricks deploy
+[path]` builds the project's base environment (via
+[`environment create`](#environments-environment) — wheel closure, zero-PyPI),
+then provisions its **default serverless SQL warehouse** and **default
+single-user cluster** wired to that env config. The project is discovered from
+`path` (a dir or `pyproject.toml`) or the cwd.
 
 ```bash
-ygg databricks deploy [subcommand] [flags]
+ygg databricks deploy [path] [flags]
 ```
-
-Shared flags (accepted on `deploy` and most subcommands):
 
 | Flag | Purpose |
 |---|---|
-| `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`) |
-| `--rebuild` | Force a fresh build even if the version is already deployed |
-| `--current` | Only the local interpreter's Python (default: **all** supported, 3.10–3.13) |
-
-> By default the deploy builds a wheel + environment for **every** supported
-> Python (3.10–3.13), so jobs and clusters on any runtime find their image.
-> Pass `--current` to narrow it to the local interpreter's Python.
-
-### Bare `deploy`
-
-Ships the **ygg image**: builds/uploads the wheel(s), then prints the
-serverless `JobEnvironment` JSON assembled off that fresh build (no double
-build).
-
-```bash
-ygg databricks deploy              # all supported Pythons
-ygg databricks deploy --rebuild
-ygg databricks deploy --current    # only the local Python
-```
-
-### `deploy ygg`
-
-Build + upload only the versioned ygg image wheel(s); prints the deployed
-workspace path(s).
-
-```bash
-ygg databricks deploy ygg              # all supported Pythons
-ygg databricks deploy ygg --current
-```
-
-### `deploy wheel <package>`
-
-Build + upload **any** package's wheel(s) by import or distribution name.
-
-| Flag | Purpose |
-|---|---|
-| `--extra` | Optional-dependency extra to fold in (repeatable) |
-| `-r`, `--requirement` | Extra requirement to bundle alongside (`--current` only, repeatable) |
-| `--no-deps` | Project wheel only; deps resolve on the cluster (`--current` only) |
-| `--current` | Only the local interpreter's Python (default: all supported) |
-
-```bash
-ygg databricks deploy wheel yggdrasil --extra databricks   # all supported Pythons
-ygg databricks deploy wheel mypkg --current -r "pandas>=2" --no-deps
-```
-
-### `deploy environment`
-
-Build the ygg wheel(s) and print the serverless `JobEnvironment`(s) as
-JSON — ready to paste into a job's `environments` block. Aliased as
-`deploy env`.
-
-| Flag | Purpose |
-|---|---|
-| `--key` | `environment_key` for the config (`--current` only; default `default`) |
-| `--env-version` | Serverless environment version (`--current` only; default: matched to local Python) |
-| `--rebuild` | Force a fresh wheel build first |
-| `--current` | Only the local interpreter's Python (default: one per supported Python) |
-
-```bash
-ygg databricks deploy environment > environments.json   # all supported Pythons
-ygg databricks deploy env --current --key default
-```
-
-### `deploy project [path]`
-
-Take **your own project** to Databricks in one command. Discovers the nearest
-`pyproject.toml` (from `path` — a project dir or the file — or the current
-working directory), then:
-
-1. builds the **project's own wheel** from its source tree (`uv build --wheel`),
-2. writes a serverless **base environment** + classic-cluster **requirements**
-   named for the project — `<name>-<version>`, where `<name>` is the
-   `[project].name` from the `pyproject.toml`,
-3. get-or-creates a **default single-user cluster** named for the project that
-   installs the project's dependencies (the requirements file from step 2).
-
-| Flag | Purpose |
-|---|---|
-| `--mode` | Idempotency policy — `overwrite` / `append` / `auto` (default `auto`) |
 | `--extra` | optional-dependency extra to fold into the environment (repeatable) |
-| `--bundle` | Bundle the dependency closure as Linux wheels (zero-PyPI install) |
-| `--no-cluster` | Build the wheel + environment only; don't create the cluster |
+| `--rebuild` | Force a fresh build of the wheel closure + env config |
+| `--no-cluster` | Don't provision the default single-user cluster |
+| `--no-warehouse` | Don't provision the default serverless SQL warehouse |
 | `--single-user` | Single-user owner for the cluster (default: the current user) |
-| `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`) |
-
-`--mode` controls what gets rebuilt vs. reused:
-
-| Mode | Wheel(s) | Env config files | Cluster |
-|---|---|---|---|
-| `overwrite` | rebuilt + overwritten | overwritten | created **or updated** |
-| `append` | reused if present, else built | written only if **missing** | created if missing |
-| `auto` (default) | get-or-create (reused if present) | **always overwritten** | get-or-create |
+| `--workspace-dir` | Environment root (default `/Workspace/Shared/environment`) |
 
 ```bash
-ygg databricks deploy project                      # discover from the cwd (auto)
-ygg databricks deploy project ./my-app --extra databricks
-ygg databricks deploy project --mode overwrite        # rebuild + update everything
-ygg databricks deploy project --mode append           # only add what's missing
-ygg databricks deploy project --bundle --no-cluster   # zero-PyPI env, no cluster
+ygg databricks deploy                          # discover from the cwd
+ygg databricks deploy ./my-app --extra databricks
+ygg databricks deploy --rebuild                # force a fresh build of everything
+ygg databricks deploy --no-cluster             # env + warehouse only
 ```
 
----
-
-## Seed
-
-One command to answer *"is this workspace ready to run ygg, and if not,
-make it ready"*. `seed` walks seven areas and, by default, provisions
-anything missing:
-
-| Area | Checks | Provisions (default mode) |
-|---|---|---|
-| **config** | connectivity, host, current user, default catalog/schema, workspace id | — (read-only) |
-| **wheels** | the versioned ygg image wheel in the registry | builds + uploads it ([`deploy ygg`](#deploy)) |
-| **environments** | the version-pinned base environments (serverless + cluster) | assembles + writes them off the fresh wheel (zero-PyPI) |
-| **warehouses** | a SQL warehouse to execute against | ensures a default (creates a serverless one if none) |
-| **pools** | the default Light / Medium / Heavy instance pools | provisions them (lazy — no idle nodes); skip with `--no-pools` |
-| **cluster** | a default single-user (dedicated) all-purpose cluster | provisions it (pool-backed, generic env, autoterminating); skip with `--no-cluster` |
-| **assistant** | the Databricks Assistant skills + guidance bundle | deploys it to the workspace + user folders; skip with `--no-assistant` |
-
-```bash
-ygg databricks seed
-```
-
-| Flag | Purpose |
-|---|---|
-| `--check` | **Read-only**: report readiness, create/upload nothing. Exits `1` if anything is missing — use it as a CI gate. |
-| `--mode` | Idempotency policy — `auto` / `append` / `overwrite` (default `auto`). |
-| `--rebuild` | Force a fresh wheel build even if the version is already deployed. |
-| `--all-versions` | Seed a wheel + environment for every supported Python (3.10–3.13). |
-| `--no-pools` | Skip the default Light/Medium/Heavy instance pools step. |
-| `--no-cluster` | Skip the default single-user all-purpose cluster step. |
-| `--no-assistant` | Skip deploying the Databricks Assistant skills + guidance bundle. |
-| `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`). |
-
-`--mode` mirrors `deploy project` — what gets rebuilt vs. reused across the seed steps:
-
-| Mode | Wheels | Env config files / warehouse / pools / assistant | Cluster | Other steps |
-|---|---|---|---|---|
-| `overwrite` | rebuilt (all Pythons + bundle) | env files rewritten | — | **ends** after environments |
-| `append` | get-or-create | written / deployed **only if missing** | created if missing | run |
-| `auto` (default) | get-or-create | **create-or-update** (refreshed) | get-or-create | run |
-
-```bash
-ygg databricks seed                  # auto (the default)
-ygg databricks seed --mode append    # add only what's missing
-ygg databricks seed --mode overwrite # rebuild the image + rewrite envs, then end
-```
-
-### Assistant bundle
-
-The **assistant** step deploys the Databricks Assistant ("Genie")
-configuration packaged in `yggdrasil.databricks.assistant` — the workspace
-+ user guidance and the per-task Skills that teach the in-product Assistant
-to drive ygg **in Python on serverless, never via the CLI it can't run**.
-It uploads the bundle (and makes a best-effort attempt at any live
-Assistant-settings API):
-
-| Artifact | Lands at |
-|---|---|
-| Assistant guidance (workspace) | `/Workspace/Shared/.ygg/assistant/workspace_instructions.md` |
-| Workspace skills | `/Workspace/Shared/.ygg/assistant/skills/*.md` |
-| User guidance | `/Workspace/Users/<me>/.ygg/assistant/user_instructions.md` |
-| User skills | `/Workspace/Users/<me>/.ygg/assistant/skills/*.md` |
-
-The report is sectioned with status glyphs — `✓` ready, `▲` missing,
-`✗` errored:
-
-```text
-  ygg databricks seed  (check mode)
-  ●  config
-    host      https://ws.example.com
-    user      me@example.com
-    catalog   main
-  ✓  config reachable
-  ●  wheels
-  ▲  ygg 0.8.52 wheel not deployed under /Workspace/Shared/pypi/ygg
-  ●  environments
-  ✓  environment config resolvable
-  ●  warehouses
-  ✓  1 warehouse(s) available
-  ▲  prerequisites missing — run `ygg databricks seed` to provision
-```
-
-Connectivity is the gate: if the workspace can't be reached (bad host /
-token), `seed` reports the auth error and exits non-zero without touching
-anything else. Use it right after configuring a workspace, or in CI:
-
-```bash
-# fail the pipeline unless the workspace is fully provisioned
-ygg databricks --profile prod seed --check
-```
+> The lower-level wheel/environment CRUD lives under the dedicated
+> [`ygg databricks wheel`](#wheels-wheel) and
+> [`ygg databricks environment`](#environments-environment) commands.
 
 ---
 

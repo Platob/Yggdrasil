@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     from .schema.schemas import Schemas
     from .volume.volumes import Volumes
     from .warehouse.service import Warehouses
+    from .wheels.service import Wheels
+    from .environments.service import Environments
     from .compute.service import Compute
     from .cluster import Cluster
     from .secrets.service import Secrets
@@ -364,6 +366,8 @@ class DatabricksClient(Singleton, URLBased):
             "_sql",
             "_entity_tags",
             "_warehouses",
+            "_wheels",
+            "_environments",
             "_compute",
             "_secrets",
             "_iam",
@@ -1091,6 +1095,28 @@ class DatabricksClient(Singleton, URLBased):
         return Path.home() / ".config" / "databricks-sdk-py"
 
     @property
+    def project(self) -> Optional[str]:
+        """The client **project** — an alias of :attr:`product`, **always
+        lowercased** (the canonical identifier). Defaults to ``"yggdrasil"``; set
+        it (or ``product``) to name a project and it persists with the client
+        (it is one of :data:`_INIT_NAMES`, so it rides through config, session
+        snapshots, and clones)."""
+        return self.product.strip().lower() if self.product else None
+
+    @project.setter
+    def project(self, value: Optional[str]) -> None:
+        self.product = str(value).strip().lower() if value else None
+
+    @property
+    def project_name(self) -> Optional[str]:
+        """A nice, capitalized display name for the client :attr:`project`
+        (``my-app`` → ``My App``), or ``None`` when unset."""
+        from yggdrasil.databricks.wheels.service import project_display_name
+
+        project = self.project
+        return project_display_name(project) if project else None
+
+    @property
     def connected(self) -> bool:
         return self._workspace_client is not None or self._account_client is not None
 
@@ -1162,64 +1188,8 @@ class DatabricksClient(Singleton, URLBased):
         return header
 
     # -------------------------------------------------------------------------
-    # Serverless ygg image — versioned wheel bundle + environment
+    # Serverless image — wheels + environments live on dbc.wheels / dbc.environments
     # -------------------------------------------------------------------------
-
-    def ensure_ygg_wheel(
-        self,
-        *,
-        rebuild: bool = False,
-        workspace_dir: Optional[str] = None,
-    ) -> list[str]:
-        """Get-or-create the **versioned pure-python ygg wheel** in this workspace.
-
-        A pinned, per-version image of the ``ygg`` package (CLI included), built
-        ``--no-deps`` (via uv) as a ``py3-none-any`` wheel and deployed into the
-        workspace's PyPI-like registry under the distribution's folder
-        (``/Workspace/Shared/pypi/ygg/ygg-<version>-py3-none-any.whl``), alongside
-        any other versions. The first call for a version builds + uploads it;
-        later calls find and reuse it. Pass ``rebuild=True`` to force a fresh
-        build. Returns the wheel's workspace path — a serverless job installs it
-        by path while resolving the runtime dependencies from the index (see
-        :meth:`ygg_environment`), so they land as platform-correct builds rather
-        than wheels bundled from this host.
-        """
-        from yggdrasil.databricks.job.wheel import ensure_ygg_wheel, WORKSPACE_PYPI_DIR
-
-        return ensure_ygg_wheel(
-            self,
-            workspace_dir=workspace_dir or WORKSPACE_PYPI_DIR,
-            rebuild=rebuild,
-        )
-
-    def ygg_environment(
-        self,
-        *,
-        environment_key: str = "default",
-        environment_version: Optional[str] = None,
-        rebuild: bool = False,
-    ) -> Any:
-        """The serverless ``JobEnvironment`` for the versioned ygg image.
-
-        Pairs the serverless runtime — defaulting to
-        :func:`~yggdrasil.databricks.job.wheel.serverless_environment_version`
-        so the cluster Python matches the local interpreter — with the
-        get-or-created :meth:`ensure_ygg_wheel` bundle.
-        Drop it straight into a serverless job's ``environments=[...]`` so its
-        python-wheel tasks run the ``ygg`` CLI against a pinned, pre-installed
-        image.
-        """
-        from yggdrasil.databricks.job.wheel import (
-            ygg_environment,
-            serverless_environment_version,
-        )
-
-        return ygg_environment(
-            self,
-            environment_key=environment_key,
-            environment_version=environment_version or serverless_environment_version(),
-            rebuild=rebuild,
-        )
 
     def get_workspace_id(self) -> int:
         if self.workspace_id:
@@ -1766,6 +1736,30 @@ class DatabricksClient(Singleton, URLBased):
         return cached
 
     @property
+    def wheels(self) -> "Wheels":
+        """Wheel registry service — build/upload/deploy/browse wheels."""
+        cached = self.__dict__.get("_wheels")
+        if cached is not None:
+            return cached
+        from yggdrasil.databricks.wheels.service import Wheels
+
+        cached = Wheels(client=self)
+        self.__dict__["_wheels"] = cached
+        return cached
+
+    @property
+    def environments(self) -> "Environments":
+        """Base-environment service — assemble/deploy serverless + cluster images, deploy projects."""
+        cached = self.__dict__.get("_environments")
+        if cached is not None:
+            return cached
+        from yggdrasil.databricks.environments.service import Environments
+
+        cached = Environments(client=self)
+        self.__dict__["_environments"] = cached
+        return cached
+
+    @property
     def compute(self) -> "Compute":
         """Default cluster helper for this client."""
         cached = self.__dict__.get("_compute")
@@ -2128,9 +2122,9 @@ class DatabricksClient(Singleton, URLBased):
             # cluster without a public index (the same reason the loader job's
             # image uses a wheel). Its runtime dependencies ride along as index
             # requirement names so the cluster resolves platform-correct builds.
-            from yggdrasil.databricks.job.wheel import ygg_runtime_dependencies
+            from yggdrasil.databricks.wheels.service import runtime_dependencies
 
-            deps = ["ygg", *ygg_runtime_dependencies(), *deps]
+            deps = ["ygg", *runtime_dependencies("ygg"), *deps]
 
         # Compute target: an explicit cluster (arg or ``cluster_id``) → classic;
         # otherwise serverless (the modern default — Spark Connect serverless

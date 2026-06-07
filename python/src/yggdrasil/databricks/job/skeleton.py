@@ -178,11 +178,10 @@ class _Runnable:
     base_environment_name: "str | None" = None
 
     _wheel_paths: "tuple[str, ...]" = ()
-    _ygg_wheels: "list[str] | None" = None
-    _user_wheels: "list[str]" = ()
-    _user_deps: "list[str]" = ()
-    _base_environment_path: "str | None" = None
-    _user_layer: "list[str] | None" = None
+    #: The project base environment(s) built on :meth:`deploy` (default + the
+    #: per-Python matrix when :attr:`all_environments`), referenced by path.
+    _environment: "Any" = None
+    _environment_matrix: "dict[str, Any] | None" = None
     _runner_params: "list[str] | None" = None
     _client: Any = None
 
@@ -299,99 +298,41 @@ class _Runnable:
             base = [self._target_ref(), *self._scheduled_params()]
         return ["run", *base]
 
-    def _serverless_dependencies(self, client: Any) -> list[str]:
-        """Build + upload the serverless wheels **for every Python version** and
-        return the flat dependency list for the *matched* (default) environment.
+    def _project_spec(self) -> str:
+        """The deploy target for this task's package: its on-disk project dir when
+        discoverable (so it's built from source), else its distribution name (so
+        it's fetched from PyPI) — the same local-path-or-PyPI rule the wheel /
+        environment services use everywhere."""
+        import importlib
 
-        Ships the ygg runner image (wheel by path + runtime deps from the index)
-        plus — when this task/flow lives in a *different* package — that package's
-        wheel + its declared deps, so the runner target is importable on the
-        cluster. Editable installs build to a per-user folder and rebuild each
-        deploy; published ones reuse the shared registry. The per-Python wheel
-        sets are stashed for :meth:`environments` to compose the full matrix when
-        :attr:`all_environments` is set.
+        from yggdrasil.databricks.wheels.service import distribution_for, find_pyproject
 
-        Splits the result into the **ygg image** deps (the shared base) and the
-        **user-package layer** so :attr:`base_environment_name`, when set, can
-        write the (stable) image into a reusable named env and layer the user
-        package on top. Returns the flat union (the inline fallback)."""
-        from yggdrasil.databricks.job import wheel as W
-
-        editable_ygg = W.is_editable_install("ygg")
         pkg = self.wheel_package()
-        dist = W.distribution_for(pkg)
-        user_pkg = W._norm(dist) != "ygg"
+        try:
+            module = importlib.import_module(pkg)
+            source = Path(module.__file__).resolve().parent
+            pyproject = find_pyproject(source)
+            if pyproject is not None:
+                return str(pyproject.parent)
+        except Exception:  # noqa: BLE001 — not importable / no source tree → PyPI
+            pass
+        return distribution_for(pkg)
 
-        if self.bundle_dependencies:
-            # 0 pip install: ship the whole dependency closure as wheels — the
-            # env installs entirely from them, no PyPI. Bundle ygg + (when the
-            # target lives elsewhere) the user package, both with their deps.
-            base = W.user_pypi_dir(client) if editable_ygg else W.WORKSPACE_PYPI_DIR
-            ygg_base = W.ensure_bundle(client, "ygg", workspace_dir=base, rebuild=editable_ygg)
-            user_layer: list[str] = []
-            if user_pkg:
-                ud = W.is_editable_install(dist)
-                ubase = W.user_pypi_dir(client) if ud else W.WORKSPACE_PYPI_DIR
-                user_layer = W.ensure_bundle(
-                    client, pkg, extras=self.wheel_extras, workspace_dir=ubase, rebuild=ud)
-            self._ygg_wheels, self._user_wheels, self._user_deps = ygg_base, user_layer, []
-        else:
-            ygg_wheels = W.ensure_ygg_wheels(
-                client,
-                workspace_dir=(W.user_pypi_dir(client) if editable_ygg else W.WORKSPACE_PYPI_DIR),
-                rebuild=editable_ygg,
-            )
-            # The shared image is the local-matched ygg wheel + its runtime
-            # (index) deps; the user package (if any) is the layer on top.
-            ygg_base = [W.wheel_for_python(ygg_wheels)] + W.ygg_runtime_dependencies()
-            user_wheels: list[str] = []
-            user_deps: list[str] = []
-            if user_pkg:
-                editable = W.is_editable_install(dist)
-                base = W.user_pypi_dir(client) if editable else W.WORKSPACE_PYPI_DIR
-                user_wheels = W.ensure_wheels(client, pkg, workspace_dir=f"{base}/{_slug(dist)}")
-                user_deps = W._project_dependencies(dist, set(self.wheel_extras))
-            user_layer = ([W.wheel_for_python(user_wheels)] + user_deps) if user_wheels else []
-            self._ygg_wheels, self._user_wheels, self._user_deps = ygg_wheels, user_wheels, user_deps
+    def _serverless_dependencies(self, client: Any) -> list[str]:
+        """Build this task's project base environment(s) via ``dbc.environments``
+        and reference them. The environment bundles the project wheel + its whole
+        dependency closure as wheels (zero-PyPI); :attr:`all_environments` builds
+        one per supported Python. Returns the closure (the inline fallback)."""
+        from yggdrasil.databricks.wheels.service import SUPPORTED_PYTHONS
 
-        # Reusable named base environment: write the (stable) ygg image once and
-        # have the job reference it by path; the user package layers on inline.
-        # Falls back to the classic inline env if it can't be written.
-        self._base_environment_path, self._user_layer = None, None
-        if self.base_environment_name and not self.all_environments:
-            try:
-                self._base_environment_path = W.ensure_named_environment(
-                    client, W.environment_folder_of(self.base_environment_name),
-                    dependencies=ygg_base,
-                    environment_version=self.environment_version,
-                    # Match the seed's project-folder layout: a job whose
-                    # base_environment_name is the canonical version-tagged stem
-                    # ``ygg-<version>-py3XX`` writes the very file the seed does —
-                    # ``environment/ygg/ygg-<version>-py3XX.yml`` — by folding the
-                    # stem to its project folder and keeping it as the filename.
-                    filename=f"{self.base_environment_name}.yml",
-                )
-                self._user_layer = list(user_layer)
-            except Exception:  # noqa: BLE001 — degrade to inline deps on any failure
-                logger.warning(
-                    "could not write base environment %r — inlining dependencies",
-                    self.base_environment_name, exc_info=True,
-                )
-                self._base_environment_path = None
-
-        seen: set[str] = set()
-        return [d for d in (ygg_base + user_layer) if not (d in seen or seen.add(d))]
-
-    def _python_dependencies(self, python: str) -> list[str]:
-        """The dependency list for a specific *python* — the wheels matching it
-        (by path) + runtime/user index deps (composed from the stashed matrix)."""
-        from yggdrasil.databricks.job import wheel as W
-
-        deps = [W.wheel_for_python(self._ygg_wheels, python)] + W.ygg_runtime_dependencies()
-        if self._user_wheels:
-            deps += [W.wheel_for_python(self._user_wheels, python)] + list(self._user_deps)
-        seen: set[str] = set()
-        return [d for d in deps if not (d in seen or seen.add(d))]
+        spec = self._project_spec()
+        self._environment = client.environments.create(spec, extras=self.wheel_extras)
+        self._environment_matrix = (
+            {v: client.environments.create(spec, extras=self.wheel_extras, python=v)
+             for v in SUPPORTED_PYTHONS}
+            if self.all_environments else {}
+        )
+        return list(self._environment.dependencies)
 
     def effective_dependencies(self) -> list[str]:
         """Shipped wheels once :meth:`deploy` has composed them, else the
@@ -414,54 +355,36 @@ class _Runnable:
     def environments(self) -> Optional[list]:
         """Serverless environment list, or ``None`` when not serverless.
 
-        Always carries a ``"default"`` env (the local-matched runtime +
-        :meth:`effective_dependencies`). When :attr:`all_environments` is set and
-        the per-Python wheels have been built (post-:meth:`deploy`), also appends
-        one env per :data:`~yggdrasil.databricks.job.wheel.SUPPORTED_PYTHONS`
-        (keyed ``py3XX``) so a task can run under any Python by environment key.
-
-        When :meth:`_serverless_dependencies` wrote a reusable named base
-        environment (:attr:`base_environment_name`), the default env references
-        it by file path (``base_environment``) and only layers the user package
-        on top — one shared, cached env instead of an inlined dependency list."""
+        After :meth:`deploy` built the project's base environment(s), the default
+        env references the version-pinned ``.yml`` by path (``base_environment``);
+        with :attr:`all_environments` one env per supported Python (keyed
+        ``py3XX``) is appended so a task can run under any Python by key. Before a
+        deploy (or for a non-built job) it falls back to an inline
+        :meth:`effective_dependencies` list."""
         if not self.serverless:
             return None
         from databricks.sdk.service.compute import Environment
         from databricks.sdk.service.jobs import JobEnvironment
-        from yggdrasil.databricks.job import wheel as W
+        from yggdrasil.databricks.wheels.service import (
+            environment_key_for, serverless_environment_version,
+        )
 
-        def env(key: str, deps: list, python: "str | None") -> Any:
-            return JobEnvironment(
-                environment_key=key,
-                spec=Environment(
-                    environment_version=(
-                        self.environment_version or W.serverless_environment_version(python)
-                    ),
-                    dependencies=deps,
-                ),
-            )
+        env = getattr(self, "_environment", None)
+        if env is not None:
+            envs = [JobEnvironment(environment_key=self.environment_key,
+                                   spec=Environment(base_environment=env.serverless))]
+            for python, built in (getattr(self, "_environment_matrix", None) or {}).items():
+                envs.append(JobEnvironment(environment_key=environment_key_for(python),
+                                           spec=Environment(base_environment=built.serverless)))
+            return envs
 
-        if getattr(self, "_base_environment_path", None):
-            # Reference the shared, version-pinned ygg base env; layer the user
-            # package (empty for ygg-only jobs) on top. base_environment carries
-            # the environment_version, so it isn't set alongside it.
-            return [
-                JobEnvironment(
-                    environment_key=self.environment_key,
-                    spec=Environment(
-                        base_environment=self._base_environment_path,
-                        dependencies=(self._user_layer or None),
-                    ),
-                )
-            ]
-
-        envs = [env(self.environment_key, self.effective_dependencies(), None)]
-        if self.all_environments and getattr(self, "_ygg_wheels", None):
-            envs += [
-                env(W.environment_key_for(v), self._python_dependencies(v), v)
-                for v in W.SUPPORTED_PYTHONS
-            ]
-        return envs
+        return [JobEnvironment(
+            environment_key=self.environment_key,
+            spec=Environment(
+                environment_version=self.environment_version or serverless_environment_version(),
+                dependencies=self.effective_dependencies(),
+            ),
+        )]
 
     def tasks(self) -> list:
         """The single serverless python-wheel task that runs ``ygg run``."""

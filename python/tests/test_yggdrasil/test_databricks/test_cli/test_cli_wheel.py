@@ -1,166 +1,115 @@
-"""Dispatch tests for ``ygg databricks wheel`` (mocked wheel machinery)."""
+"""Dispatch tests for ``ygg databricks wheel`` — uniform CRUD via ``dbc.wheels``."""
 from __future__ import annotations
 
 import contextlib
 import io
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.cli import main
 
 
+def _wheel(path, dist="ygg", version="1.0"):
+    return types.SimpleNamespace(path=path, dist=dist, version=version)
+
+
+def _run(argv, client):
+    buf = io.StringIO()
+    with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
+         patch("yggdrasil.cli.style.print_logo"), \
+         contextlib.redirect_stdout(buf):
+        rc = main(argv)
+    return rc, buf.getvalue()
+
+
 class TestWheelHelp(unittest.TestCase):
-    def test_wheel_help_exits_zero(self):
+    def test_help_exits_zero(self):
         with self.assertRaises(SystemExit) as ctx:
             main(["wheel", "--help"])
         self.assertEqual(ctx.exception.code, 0)
 
-    def test_wheel_build_help_exits_zero(self):
-        with self.assertRaises(SystemExit) as ctx:
-            main(["wheel", "build", "--help"])
-        self.assertEqual(ctx.exception.code, 0)
 
-
-class TestWheelBuild(unittest.TestCase):
-    def test_build_is_offline_and_prints_paths(self):
-        buf = io.StringIO()
-        # build needs no client — patch the client to assert it is never built.
-        with patch("yggdrasil.databricks.client.DatabricksClient") as client, \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.build_wheel") as build, \
-             contextlib.redirect_stdout(buf):
-            build.return_value = ["/tmp/dist/mypkg-1.0-py3-none-any.whl"]
-            rc = main(["wheel", "build", "mypkg", "--no-deps", "--out-dir", "/tmp/dist"])
+class TestWheelCreate(unittest.TestCase):
+    def test_create_fetches_and_uploads(self):
+        client = MagicMock()
+        client.wheels.create.return_value = [_wheel("/Workspace/Shared/pypi/mypkg/mypkg-1.0-py3-none-any.whl")]
+        rc, out = _run(["wheel", "create", "mypkg", "1.0", "--deps", "--extra", "databricks"], client)
         self.assertEqual(rc, 0)
-        client.assert_not_called()
-        build.assert_called_once()
-        self.assertEqual(build.call_args.args[0], "mypkg")
-        self.assertTrue(build.call_args.kwargs["no_deps"])
-        self.assertEqual(build.call_args.kwargs["dest_dir"], "/tmp/dist")
-        self.assertIn("mypkg-1.0-py3-none-any.whl", buf.getvalue())
+        client.wheels.create.assert_called_once()
+        self.assertEqual(client.wheels.create.call_args.args[0], "mypkg")
+        self.assertEqual(client.wheels.create.call_args.args[1], "1.0")
+        self.assertTrue(client.wheels.create.call_args.kwargs["deps"])
+        self.assertEqual(client.wheels.create.call_args.kwargs["extras"], ("databricks",))
+        self.assertIn("mypkg-1.0-py3-none-any.whl", out)
 
-    def test_build_all_versions_uses_matrix_builder(self):
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.build_wheels_for_versions") as build, \
-             contextlib.redirect_stdout(io.StringIO()):
-            build.return_value = ["/tmp/dist/ygg-1.0-py3-none-any.whl"]
-            rc = main(["wheel", "build", "ygg", "--all-versions", "--extra", "databricks"])
+    def test_update_overwrites(self):
+        client = MagicMock()
+        client.wheels.update.return_value = [_wheel("/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl")]
+        rc, out = _run(["wheel", "update", "ygg"], client)
         self.assertEqual(rc, 0)
-        build.assert_called_once()
-        self.assertEqual(build.call_args.args[0], "ygg")
-        self.assertEqual(build.call_args.kwargs["extras"], ("databricks",))
+        client.wheels.update.assert_called_once()
+        self.assertIn("updated", out)
 
 
-class TestWheelUpload(unittest.TestCase):
-    def test_upload_pushes_each_wheel(self):
-        buf = io.StringIO()
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.upload_wheel") as upload, \
-             contextlib.redirect_stdout(buf):
-            upload.side_effect = lambda c, w, **k: f"/Workspace/Shared/pypi/{w.split('/')[-1]}"
-            rc = main(["wheel", "upload", "a.whl", "dir/b.whl"])
+class TestWheelFindGet(unittest.TestCase):
+    def test_find_builds_on_miss(self):
+        client = MagicMock()
+        client.wheels.find.return_value = _wheel("/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl")
+        rc, out = _run(["wheel", "find", "ygg"], client)
         self.assertEqual(rc, 0)
-        self.assertEqual(upload.call_count, 2)
-        out = buf.getvalue()
-        self.assertIn("/Workspace/Shared/pypi/a.whl", out)
-        self.assertIn("/Workspace/Shared/pypi/b.whl", out)
+        self.assertTrue(client.wheels.find.call_args.kwargs["install"])
+        self.assertIn("ygg-1.0-py3-none-any.whl", out)
 
+    def test_find_no_install(self):
+        client = MagicMock()
+        client.wheels.find.return_value = None
+        rc, _ = _run(["wheel", "find", "ygg", "--no-install"], client)
+        self.assertEqual(rc, 1)
+        self.assertFalse(client.wheels.find.call_args.kwargs["install"])
 
-class TestWheelDefault(unittest.TestCase):
-    def test_bare_wheel_builds_and_uploads_ygg(self):
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure, \
-             contextlib.redirect_stdout(io.StringIO()):
-            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
-            rc = main(["wheel"])
+    def test_get_never_builds(self):
+        client = MagicMock()
+        client.wheels.get.return_value = _wheel("/ws/ygg/ygg-1.0.whl")
+        rc, out = _run(["wheel", "get", "ygg"], client)
         self.assertEqual(rc, 0)
-        ensure.assert_called_once()
+        client.wheels.get.assert_called_once()
+        self.assertIn("ygg-1.0.whl", out)
 
-    def test_bare_wheel_all_versions(self):
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels") as ensure, \
-             contextlib.redirect_stdout(io.StringIO()):
-            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
-            rc = main(["wheel", "--all-versions"])
+
+class TestWheelDelete(unittest.TestCase):
+    def test_delete_removes(self):
+        client = MagicMock()
+        client.wheels.delete.return_value = [_wheel("/ws/ygg/ygg-1.0.whl")]
+        rc, out = _run(["wheel", "delete", "ygg", "1.0"], client)
         self.assertEqual(rc, 0)
-        ensure.assert_called_once()
+        self.assertEqual(client.wheels.delete.call_args.args[0], "ygg")
+        self.assertIn("deleted", out)
 
-    def test_deploy_defaults_package_to_ygg(self):
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_wheel") as ensure, \
-             contextlib.redirect_stdout(io.StringIO()):
-            ensure.return_value = ["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]
-            rc = main(["wheel", "deploy"])
-        self.assertEqual(rc, 0)
-        self.assertEqual(ensure.call_args.args[1], "ygg")
-
-
-class TestWheelDeploy(unittest.TestCase):
-    def test_deploy_builds_and_uploads_package(self):
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_wheel") as ensure, \
-             contextlib.redirect_stdout(io.StringIO()):
-            ensure.return_value = ["/Workspace/Shared/pypi/pkg/pkg-1.0-py3-none-any.whl"]
-            rc = main(["wheel", "deploy", "mypkg", "--no-deps", "--extra", "databricks"])
-        self.assertEqual(rc, 0)
-        ensure.assert_called_once()
-        self.assertEqual(ensure.call_args.args[1], "mypkg")
-        self.assertTrue(ensure.call_args.kwargs["no_deps"])
-        self.assertEqual(ensure.call_args.kwargs["extras"], ("databricks",))
-
-    def test_deploy_all_versions_uses_matrix_builder(self):
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_wheels") as ensure, \
-             contextlib.redirect_stdout(io.StringIO()):
-            ensure.return_value = ["/Workspace/Shared/pypi/pkg/pkg-1.0-py3-none-any.whl"]
-            rc = main(["wheel", "deploy", "mypkg", "--all-versions"])
-        self.assertEqual(rc, 0)
-        ensure.assert_called_once()
-        self.assertEqual(ensure.call_args.args[1], "mypkg")
+    def test_delete_nothing_returns_one(self):
+        client = MagicMock()
+        client.wheels.delete.return_value = []
+        rc, _ = _run(["wheel", "rm", "nope"], client)
+        self.assertEqual(rc, 1)
 
 
 class TestWheelList(unittest.TestCase):
-    def test_list_distributions_when_no_package(self):
-        root = MagicMock()
-        root.exists.return_value = True
-        dist_a = MagicMock(name="ygg"); dist_a.is_dir.return_value = True; dist_a.name = "ygg"
-        dist_b = MagicMock(name="pkg"); dist_b.is_dir.return_value = True; dist_b.name = "pkg"
-        root.iterdir.return_value = [dist_a, dist_b]
-        buf = io.StringIO()
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.path.DatabricksPath.from_", return_value=root), \
-             contextlib.redirect_stdout(buf):
-            rc = main(["wheel", "list"])
+    def test_list_distributions(self):
+        client = MagicMock()
+        client.wheels.list.return_value = ["ygg", "pkg"]
+        rc, out = _run(["wheel", "list"], client)
         self.assertEqual(rc, 0)
-        self.assertIn("ygg/", buf.getvalue())
-        self.assertIn("pkg/", buf.getvalue())
+        self.assertIsNone(client.wheels.list.call_args.args[0])
+        self.assertIn("ygg/", out)
+        self.assertIn("pkg/", out)
 
-    def test_list_wheels_for_a_package(self):
-        folder = MagicMock()
-        folder.exists.return_value = True
-        whl = MagicMock(); whl.name = "ygg-1.0-py3-none-any.whl"
-        whl.full_path.return_value = "/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"
-        other = MagicMock(); other.name = "README.md"
-        folder.iterdir.return_value = [whl, other]
-        buf = io.StringIO()
-        with patch("yggdrasil.databricks.client.DatabricksClient"), \
-             patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.distribution_for", return_value="ygg"), \
-             patch("yggdrasil.databricks.path.DatabricksPath.from_", return_value=folder), \
-             contextlib.redirect_stdout(buf):
-            rc = main(["wheel", "list", "yggdrasil"])
+    def test_list_wheels_for_project(self):
+        client = MagicMock()
+        client.wheels.list.return_value = [_wheel("/ws/ygg/ygg-1.0-py3-none-any.whl")]
+        rc, out = _run(["wheel", "list", "ygg"], client)
         self.assertEqual(rc, 0)
-        out = buf.getvalue()
-        self.assertIn("/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl", out)
-        self.assertNotIn("README.md", out)
+        self.assertEqual(client.wheels.list.call_args.args[0], "ygg")
+        self.assertIn("/ws/ygg/ygg-1.0-py3-none-any.whl", out)
 
 
 if __name__ == "__main__":

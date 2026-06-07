@@ -6,7 +6,7 @@ Two things matter:
 * the generated YAML is a valid Databricks serverless ``Environment`` spec
   (``environment_version`` + ``dependencies``, ygg wheel first); and
 * its ``python → environment_version`` mapping does not drift from the
-  package's :func:`yggdrasil.databricks.job.wheel.serverless_environment_version`,
+  package's :func:`yggdrasil.databricks.wheels.service.serverless_environment_version`,
   the runtime source of truth the deploy path uses.
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ class TestMappingParity:
     """The script mirrors the package's serverless-version mapping exactly."""
 
     def test_latest_constant_matches_package(self) -> None:
-        from yggdrasil.databricks.job import wheel
+        from yggdrasil.databricks.wheels import service as wheel
 
         assert (
             build_serverless_env.SERVERLESS_ENVIRONMENT_VERSION
@@ -38,7 +38,7 @@ class TestMappingParity:
 
     @pytest.mark.parametrize("minor", [10, 11, 12, 13])
     def test_version_for_minor_matches_package(self, minor, monkeypatch) -> None:
-        from yggdrasil.databricks.job import wheel
+        from yggdrasil.databricks.wheels import service as wheel
 
         # The package function keys off the live interpreter; pin it per minor.
         monkeypatch.setattr(sys, "version_info", (3, minor, 0, "final", 0))

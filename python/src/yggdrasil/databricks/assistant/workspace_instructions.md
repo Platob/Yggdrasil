@@ -15,7 +15,7 @@ pre-built ygg image**. Two hard rules follow from that:
    yourself reaching for `ygg databricks …`, stop and call the matching
    `dbc.<service>` method instead — see the table below.)
 2. **ygg is already installed** — the workspace seeds a pre-built ygg image
-   into the default serverless environment (`ygg databricks seed`). Just
+   into the default serverless environment (`ygg databricks deploy`). Just
    `import yggdrasil`. Only if the import fails, install into the **default
    environment** once:
 

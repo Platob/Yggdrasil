@@ -268,6 +268,26 @@ class Loki:
         """Every known reasoning engine (call ``.available()`` to filter)."""
         return list(self._engine_instances().values())
 
+    def available_engines(self, *, refresh: bool = False) -> "dict[str, TokenEngine]":
+        """Reachable engines (name → instance), availability probed **in parallel**.
+
+        Several engines gate on a *network* round-trip — the Ollama liveness
+        probe, the Databricks backend check — so probing them one after another
+        stacks up their latencies on the startup path. Fanning the
+        ``available()`` checks across a small thread pool collapses that to the
+        slowest single probe. Each engine memoizes its own result, so this also
+        warms the caches that later serial ``available()`` calls (the status
+        line, :meth:`engine`, :meth:`select`) reuse for free.
+        """
+        insts = self._engine_instances(refresh=refresh)
+        if not insts:
+            return {}
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(insts)) as pool:
+            oks = list(pool.map(_is_available, insts.values()))
+        return {n: e for (n, e), ok in zip(insts.items(), oks) if ok}
+
     def engine(self, name: "Optional[str]" = None) -> "Optional[TokenEngine]":
         """Resolve a reasoning engine by name, or the best available one."""
         insts = self._engine_instances()
@@ -275,10 +295,10 @@ class Loki:
             if name not in insts:
                 raise KeyError(f"unknown engine {name!r}; known: {', '.join(insts)}")
             return insts[name]
+        available = self.available_engines()
         for n in self.ENGINE_PREFERENCE:
-            eng = insts.get(n)
-            if eng is not None and eng.available():
-                return eng
+            if n in available:
+                return available[n]
         return None
 
     def select(
@@ -315,7 +335,7 @@ class Loki:
         engine carries even heavy work. Returns an available engine, or
         ``None`` when nothing is reachable.
         """
-        available = {n: e for n, e in self._engine_instances().items() if e.available()}
+        available = self.available_engines()
         if not available:
             return None
 
@@ -807,6 +827,16 @@ def _safe(fn) -> str:
         return fn()
     except Exception:
         return "unknown"
+
+
+def _is_available(eng) -> bool:
+    """An engine's ``available()``, guarded — capability detection must never
+    raise (offline is a normal answer), and this runs across threads where an
+    escaped exception would sink the whole parallel probe."""
+    try:
+        return bool(eng.available())
+    except Exception:
+        return False
 
 
 def _short_err(exc: Exception) -> str:
