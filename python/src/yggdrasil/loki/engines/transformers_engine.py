@@ -176,9 +176,9 @@ class TransformersEngine(LocalEngine):
                   "(cached for next time, with a progress bar), then runs locally…",
                   model, device or "cpu")
         if device is None and resources.has_npu():
-            _log.info("an Intel NPU (AI Boost) was detected but the HF pipeline "
-                      "runs on CPU — install optimum-intel + openvino to offload "
-                      "the model onto the NPU.")
+            _log.info("an Intel NPU (AI Boost) was detected but the torch pipeline "
+                      "runs on CPU — switch to the 'openvino' engine (ygg loki "
+                      "/engine openvino) to run the model on the NPU.")
         pipe = self._build(load, transformers, model, device)
         self._PIPES[model] = pipe
         _log.info("local model %s ready", model)
