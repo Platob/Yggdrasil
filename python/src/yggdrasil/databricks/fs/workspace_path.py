@@ -28,7 +28,7 @@ import logging
 import os
 import stat as _stat
 import time
-from typing import Any, ClassVar, Iterator
+from typing import Any, ClassVar, Iterator, Mapping, TYPE_CHECKING
 
 from yggdrasil.dataclasses import ExpiringDict, WaitingConfig
 from yggdrasil.enums import Scheme
@@ -39,6 +39,11 @@ from yggdrasil.url import URL
 
 from ..path import DatabricksPath
 from ..workspaces.service import Workspaces
+
+if TYPE_CHECKING:
+    from yggdrasil.dataclasses.waiting import WaitingConfigArg
+    from ..cluster import Cluster
+    from ..job.run import JobRun
 
 __all__ = ["WorkspacePath"]
 
@@ -699,6 +704,178 @@ class WorkspacePath(DatabricksPath):
         return size
 
     # ==================================================================
+    # Notebook creation — import a SOURCE-format notebook
+    # ==================================================================
+
+    def create_notebook(
+        self,
+        language: str = "PYTHON",
+        *,
+        content: str | bytes | None = None,
+        overwrite: bool = False,
+    ) -> "WorkspacePath":
+        """Create a notebook at this Workspace path via the import API.
+
+        Imports *content* (or an empty body) as a notebook in
+        *language* (``PYTHON`` / ``SQL`` / ``SCALA`` / ``R``) through
+        ``workspace.upload(format=SOURCE, language=…)`` — the import
+        endpoint that stores the object as a real notebook rather than a
+        plain workspace file. The language-specific
+        ``… Databricks notebook source`` magic header that Databricks
+        stamps on exported notebooks is prepended when the body doesn't
+        already carry it, so a hand-written ``.py`` / ``.sql`` body
+        round-trips as a clean notebook. Parent directories are created
+        as needed; ``overwrite`` replaces an existing object (otherwise a
+        pre-existing path raises :class:`FileExistsError`).
+        """
+        lang = _notebook_language(language)
+        text = (
+            ""
+            if content is None
+            else content.decode()
+            if isinstance(content, (bytes, bytearray))
+            else str(content)
+        )
+        header = _NOTEBOOK_HEADERS.get(
+            str(getattr(lang, "value", lang)).upper(),
+            "# Databricks notebook source",
+        )
+        if text.lstrip().startswith(header):
+            body = text.encode()
+        else:
+            body = (f"{header}\n{text}" if text else f"{header}\n").encode()
+
+        if not overwrite and self.exists():
+            raise FileExistsError(
+                f"create_notebook: destination {self.full_path()!r} "
+                f"already exists. Pass overwrite=True to replace it."
+            )
+
+        self.parent.mkdir(parents=True, exist_ok=True)
+        fmt = _import_format_source()
+        api_path = self.api_path
+        self._call_ensuring_parents(
+            lambda: self.client.workspace_client().workspace.upload(
+                path=api_path,
+                content=body,
+                format=fmt,
+                language=lang,
+                overwrite=overwrite,
+            )
+        )
+        self._persist_stat_cache(
+            IOStats(size=len(body), kind=IOKind.FILE, mtime=time.time())
+        )
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "Created %s notebook %r (%s)",
+                str(getattr(lang, "value", lang)).upper(),
+                self,
+                format_bytes(len(body)),
+            )
+        return self
+
+    # ==================================================================
+    # Notebook execution — submit a one-time job run
+    # ==================================================================
+
+    def run_notebook(
+        self,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        cluster: "Cluster | str | None" = None,
+        environment: Any | str | None = None,
+        run_name: str | None = None,
+        timeout_seconds: int | None = None,
+        wait: WaitingConfigArg = True,
+        raise_error: bool = True,
+        **submit_kwargs: Any,
+    ) -> "JobRun":
+        """Submit this notebook as a one-time job run.
+
+        Wraps the notebook in a single ``SubmitTask`` / ``NotebookTask``
+        and fires it through :meth:`Jobs.submit` — a one-shot run that has
+        a ``run_id`` but no persisted ``job_id``. *parameters* are passed
+        as the notebook task's ``base_parameters``, so inside the run they
+        land on the notebook's **widget bindings**: catchable by
+        :class:`yggdrasil.environ.SystemParameters` (which reads the union
+        of widgets + ``{{job.parameters.*}}`` via
+        ``dbutils.notebook.entry_point.getCurrentBindings()``) or directly
+        with ``dbutils.widgets.get("<name>")``. Values are stringified —
+        the Databricks parameter channel is string-typed, and
+        :class:`SystemParameters` casts them back to the declared field
+        types on the way out.
+
+        Compute is defaulted for you:
+
+        - pass a *cluster* (:class:`Cluster` or cluster-id string) to pin
+          existing compute;
+        - otherwise the run goes **serverless**, and the *environment* is
+          resolved automatically — an explicit :class:`JobEnvironment` or a
+          seeded base-environment name / ``.yml`` path is used as given,
+          while the default (``None``) picks up the seeded **ygg base
+          environment present in the shared workspace path**
+          (``/Workspace/Shared/environments/ygg-<version>-py3XX``), falling
+          back to the workspace's default serverless compute when none is
+          seeded.
+
+        This collapses the verbose ``dbc.jobs.submit(tasks=[SubmitTask(
+        environment_key=…, notebook_task=NotebookTask(…))],
+        environments=[…])`` boilerplate into one call.
+
+        ``wait`` defaults to ``True`` (block until terminal) — a notebook
+        run is usually awaited for its ``dbutils.notebook.exit`` result;
+        pass ``wait=False`` to fire-and-forget, or a number for a timeout
+        in seconds. ``raise_error`` raises on terminal failure when
+        waiting. Returns the :class:`JobRun`.
+
+        Example::
+
+            nb = WorkspacePath("/Workspace/Shared/etl")
+            run = nb.run_notebook({"date": "2024-01-01"})
+            out = run.task_output("etl").notebook_output.result
+
+            # pin a named, seeded serverless environment
+            nb.run_notebook({"category": "wind"}, environment="meteologica")
+        """
+        from databricks.sdk.service.jobs import NotebookTask, SubmitTask
+
+        from ..job.service import Jobs, _resolve_submit_environment
+
+        base_parameters = (
+            {str(k): str(v) for k, v in parameters.items()} if parameters else None
+        )
+        task = SubmitTask(
+            task_key=_notebook_task_key(self.name),
+            notebook_task=NotebookTask(
+                notebook_path=self.api_path,
+                base_parameters=base_parameters,
+            ),
+        )
+        # Serverless (no cluster): resolve the environment now — ``None`` here
+        # means "auto-default to the seeded ygg base env present in the shared
+        # workspace path". With a cluster, leave the environment unset.
+        resolved_environment = (
+            None if cluster is not None
+            else _resolve_submit_environment(self.client, environment)
+        )
+        logger.info(
+            "Submitting notebook run for %r (%d parameter(s))",
+            self,
+            len(base_parameters) if base_parameters else 0,
+        )
+        return Jobs(client=self.client).submit(
+            run_name=run_name or f"run-notebook:{self.name}",
+            tasks=[task],
+            cluster=cluster,
+            environment=resolved_environment,
+            timeout_seconds=timeout_seconds,
+            wait=wait,
+            raise_error=raise_error,
+            **submit_kwargs,
+        )
+
+    # ==================================================================
     # Module upload — stream directly through ``workspace.upload``
     # ==================================================================
 
@@ -824,6 +1001,63 @@ def _looks_like_protected_parent(exc: BaseException) -> bool:
     leaf the caller actually wants is independent of the protected
     ancestor — treat as non-fatal."""
     return "is protected" in str(exc).lower()
+
+
+#: Language → the ``… Databricks notebook source`` magic header
+#: Databricks stamps on the first line of an exported notebook. The
+#: comment prefix is language-specific (``#`` for Python/R, ``--`` for
+#: SQL, ``//`` for Scala); :meth:`WorkspacePath.create_notebook`
+#: prepends it so an imported body lands as a real notebook.
+_NOTEBOOK_HEADERS: dict[str, str] = {
+    "PYTHON": "# Databricks notebook source",
+    "R": "# Databricks notebook source",
+    "SQL": "-- Databricks notebook source",
+    "SCALA": "// Databricks notebook source",
+}
+
+
+def _notebook_task_key(name: str) -> str:
+    """Sanitize a notebook name into a valid Databricks task key.
+
+    Task keys allow alphanumerics, ``_`` and ``-`` only; every other
+    character (dots, spaces, …) collapses to ``_``. Falls back to
+    ``notebook`` when the result is empty.
+    """
+    key = "".join(c if (c.isalnum() or c in "_-") else "_" for c in name).strip("_")
+    return key or "notebook"
+
+
+def _notebook_language(language: Any) -> Any:
+    """Resolve the SDK's ``Language`` enum, falling back to a string.
+
+    Accepts an already-resolved :class:`Language`, or a name like
+    ``"python"`` / ``"SQL"`` (case-insensitive). The literal-string
+    fallback keeps the helper usable in mocked test environments where
+    the SDK isn't installed.
+    """
+    try:
+        from databricks.sdk.service.workspace import Language
+
+        if isinstance(language, Language):
+            return language
+        return Language(str(language).upper())
+    except Exception:
+        return str(language).upper()
+
+
+def _import_format_source() -> Any:
+    """Resolve the SDK's ``ImportFormat.SOURCE`` enum, falling back to a string.
+
+    ``SOURCE`` (paired with an explicit ``language``) is the import
+    format that stores the object as a notebook — distinct from the
+    ``AUTO`` sniff used for arbitrary workspace files.
+    """
+    try:
+        from databricks.sdk.service.workspace import ImportFormat
+
+        return ImportFormat.SOURCE
+    except Exception:
+        return "SOURCE"
 
 
 def _import_format_auto() -> Any:

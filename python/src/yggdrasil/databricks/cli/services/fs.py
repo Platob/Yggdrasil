@@ -64,6 +64,52 @@ class FSCommand:
         mkdir.add_argument("uri")
         mkdir.set_defaults(handler=cls._mkdir)
 
+        mknb = sub.add_parser(
+            "create-notebook",
+            help="Create a notebook at a /Workspace path.",
+        )
+        mknb.add_argument("uri")
+        mknb.add_argument(
+            "--language", default="PYTHON",
+            help="Notebook language: PYTHON | SQL | SCALA | R (default PYTHON).",
+        )
+        mknb.add_argument("--data", default=None, help="Literal notebook source.")
+        mknb.add_argument("--file", default=None, help="Local source file to import.")
+        mknb.add_argument(
+            "--overwrite", action="store_true",
+            help="Replace an existing notebook.",
+        )
+        mknb.set_defaults(handler=cls._create_notebook)
+
+        runnb = sub.add_parser(
+            "run-notebook",
+            help="Submit a /Workspace notebook as a one-time job run.",
+        )
+        runnb.add_argument("uri")
+        runnb.add_argument(
+            "--param", action="append", default=None,
+            help="Notebook parameter k=v (repeatable); read via dbutils.widgets "
+                 "/ SystemParameters.",
+        )
+        runnb.add_argument(
+            "--cluster", default=None,
+            help="Existing cluster id to run on (default: serverless).",
+        )
+        runnb.add_argument(
+            "--environment", default=None,
+            help="Seeded serverless base-environment name (or .yml path) to run "
+                 "on; default auto-picks the seeded ygg environment.",
+        )
+        runnb.add_argument(
+            "--no-wait", dest="no_wait", action="store_true",
+            help="Fire-and-forget instead of blocking until the run finishes.",
+        )
+        runnb.add_argument(
+            "--timeout", type=float, default=1800.0,
+            help="Seconds to wait when blocking (default 1800).",
+        )
+        runnb.set_defaults(handler=cls._run_notebook)
+
         rm = sub.add_parser("rm", help="Remove a file or directory.")
         rm.add_argument("uri")
         rm.add_argument("-r", "--recursive", action="store_true")
@@ -154,6 +200,66 @@ class FSCommand:
         path.mkdir(parents=True, exist_ok=True)
         style.ok(f"created {path.full_path()}")
         return 0
+
+    @classmethod
+    def _create_notebook(cls, args: Any, build_client: Any) -> int:
+        from yggdrasil.cli import style
+        from pathlib import Path
+        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
+
+        path = _path(args, build_client, args.uri)
+        if not isinstance(path, WorkspacePath):
+            sys.stderr.write(
+                f"create-notebook requires a /Workspace path, "
+                f"got {path.full_path()}\n"
+            )
+            return 1
+        if args.data is not None:
+            content = args.data
+        elif args.file is not None:
+            content = Path(args.file).read_text()
+        else:
+            content = None
+        path.create_notebook(
+            args.language, content=content, overwrite=args.overwrite,
+        )
+        style.ok(f"created {args.language.upper()} notebook → {path.full_path()}")
+        return 0
+
+    @classmethod
+    def _run_notebook(cls, args: Any, build_client: Any) -> int:
+        from yggdrasil.cli import style
+        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
+
+        path = _path(args, build_client, args.uri)
+        if not isinstance(path, WorkspacePath):
+            sys.stderr.write(
+                f"run-notebook requires a /Workspace path, "
+                f"got {path.full_path()}\n"
+            )
+            return 1
+        params: dict[str, str] = {}
+        for item in args.param or []:
+            key, _, val = item.partition("=")
+            params[key.strip()] = val
+        run = path.run_notebook(
+            params or None,
+            cluster=args.cluster,
+            environment=args.environment,
+            wait=(args.timeout if not args.no_wait else False),
+            raise_error=False,
+        )
+        style.ok(f"run {run.run_id} submitted → {path.full_path()}")
+        url = getattr(run, "explore_url", None)
+        if url:
+            sys.stdout.write(f"  url: {url}\n")
+        if args.no_wait:
+            return 0
+        if run.is_succeeded:
+            style.ok(f"run {run.run_id} succeeded")
+            return 0
+        style.fail(f"run {run.run_id} ended: {run.result_state}")
+        return 1
 
     @classmethod
     def _rm(cls, args: Any, build_client: Any) -> int:
