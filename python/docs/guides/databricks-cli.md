@@ -533,6 +533,28 @@ Create a directory (parents allowed).
 ygg databricks fs mkdir /Volumes/main/default/staging
 ```
 
+### `fs create-notebook`
+
+Create a notebook at a **`/Workspace`** path (imports via the Workspace
+`SOURCE` format so the object lands as a real notebook, not a plain file).
+`--language` picks `PYTHON` (default), `SQL`, `SCALA`, or `R`; source comes
+from `--data` (literal) or `--file` (local file), or is empty when neither
+is given. Parents are created automatically; `--overwrite` replaces an
+existing notebook.
+
+```bash
+# empty Python notebook
+ygg databricks fs create-notebook /Workspace/Users/me@co.com/scratch
+
+# SQL notebook from a literal body
+ygg databricks fs create-notebook /Workspace/Shared/report \
+  --language SQL --data "SELECT 1"
+
+# import a local source file, replacing any existing notebook
+ygg databricks fs create-notebook /Workspace/Shared/etl \
+  --file ./etl.py --overwrite
+```
+
 ### `fs rm`
 
 Remove a file, or a directory with `-r`.

@@ -121,6 +121,51 @@ class TestRead:
             p.read_bytes()
 
 
+class TestCreateNotebook:
+
+    def test_creates_empty_python_notebook(self, workspace, client, service) -> None:
+        workspace.workspace.get_status.side_effect = NotFound()  # doesn't exist
+        p = WorkspacePath("/Workspace/Users/me/nb", service=service)
+        out = p.create_notebook()
+        assert out is p
+        kwargs = workspace.workspace.upload.call_args.kwargs
+        assert kwargs["path"] == "/Workspace/Users/me/nb"
+        # SOURCE format + explicit language → real notebook (not a file).
+        assert getattr(kwargs["format"], "name", str(kwargs["format"])).upper() == "SOURCE"
+        assert getattr(kwargs["language"], "name", str(kwargs["language"])).upper() == "PYTHON"
+        # Empty body still carries the Databricks magic header.
+        assert kwargs["content"] == b"# Databricks notebook source\n"
+
+    def test_sql_header_and_body(self, workspace, client, service) -> None:
+        workspace.workspace.get_status.side_effect = NotFound()
+        p = WorkspacePath("/Workspace/Shared/report", service=service)
+        p.create_notebook("sql", content="SELECT 1")
+        kwargs = workspace.workspace.upload.call_args.kwargs
+        assert getattr(kwargs["language"], "name", str(kwargs["language"])).upper() == "SQL"
+        assert kwargs["content"] == b"-- Databricks notebook source\nSELECT 1"
+
+    def test_existing_header_not_duplicated(self, workspace, client, service) -> None:
+        workspace.workspace.get_status.side_effect = NotFound()
+        p = WorkspacePath("/Workspace/Shared/etl", service=service)
+        p.create_notebook(content="# Databricks notebook source\nprint(1)")
+        kwargs = workspace.workspace.upload.call_args.kwargs
+        assert kwargs["content"] == b"# Databricks notebook source\nprint(1)"
+
+    def test_no_overwrite_raises_when_exists(self, workspace, client, service) -> None:
+        workspace.workspace.get_status.return_value = _file_status(10)  # exists
+        p = WorkspacePath("/Workspace/Shared/nb", service=service)
+        with pytest.raises(FileExistsError):
+            p.create_notebook()
+        workspace.workspace.upload.assert_not_called()
+
+    def test_overwrite_passes_through(self, workspace, client, service) -> None:
+        workspace.workspace.get_status.return_value = _file_status(10)  # exists
+        p = WorkspacePath("/Workspace/Shared/nb", service=service)
+        p.create_notebook("python", content="print(1)", overwrite=True)
+        kwargs = workspace.workspace.upload.call_args.kwargs
+        assert kwargs["overwrite"] is True
+
+
 class TestWrite:
 
     def test_overwrite(self, workspace, client, service) -> None:

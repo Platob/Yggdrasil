@@ -64,6 +64,23 @@ class FSCommand:
         mkdir.add_argument("uri")
         mkdir.set_defaults(handler=cls._mkdir)
 
+        mknb = sub.add_parser(
+            "create-notebook",
+            help="Create a notebook at a /Workspace path.",
+        )
+        mknb.add_argument("uri")
+        mknb.add_argument(
+            "--language", default="PYTHON",
+            help="Notebook language: PYTHON | SQL | SCALA | R (default PYTHON).",
+        )
+        mknb.add_argument("--data", default=None, help="Literal notebook source.")
+        mknb.add_argument("--file", default=None, help="Local source file to import.")
+        mknb.add_argument(
+            "--overwrite", action="store_true",
+            help="Replace an existing notebook.",
+        )
+        mknb.set_defaults(handler=cls._create_notebook)
+
         rm = sub.add_parser("rm", help="Remove a file or directory.")
         rm.add_argument("uri")
         rm.add_argument("-r", "--recursive", action="store_true")
@@ -153,6 +170,31 @@ class FSCommand:
         path = _path(args, build_client, args.uri)
         path.mkdir(parents=True, exist_ok=True)
         style.ok(f"created {path.full_path()}")
+        return 0
+
+    @classmethod
+    def _create_notebook(cls, args: Any, build_client: Any) -> int:
+        from yggdrasil.cli import style
+        from pathlib import Path
+        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
+
+        path = _path(args, build_client, args.uri)
+        if not isinstance(path, WorkspacePath):
+            sys.stderr.write(
+                f"create-notebook requires a /Workspace path, "
+                f"got {path.full_path()}\n"
+            )
+            return 1
+        if args.data is not None:
+            content = args.data
+        elif args.file is not None:
+            content = Path(args.file).read_text()
+        else:
+            content = None
+        path.create_notebook(
+            args.language, content=content, overwrite=args.overwrite,
+        )
+        style.ok(f"created {args.language.upper()} notebook → {path.full_path()}")
         return 0
 
     @classmethod

@@ -699,6 +699,78 @@ class WorkspacePath(DatabricksPath):
         return size
 
     # ==================================================================
+    # Notebook creation — import a SOURCE-format notebook
+    # ==================================================================
+
+    def create_notebook(
+        self,
+        language: str = "PYTHON",
+        *,
+        content: str | bytes | None = None,
+        overwrite: bool = False,
+    ) -> "WorkspacePath":
+        """Create a notebook at this Workspace path via the import API.
+
+        Imports *content* (or an empty body) as a notebook in
+        *language* (``PYTHON`` / ``SQL`` / ``SCALA`` / ``R``) through
+        ``workspace.upload(format=SOURCE, language=…)`` — the import
+        endpoint that stores the object as a real notebook rather than a
+        plain workspace file. The language-specific
+        ``… Databricks notebook source`` magic header that Databricks
+        stamps on exported notebooks is prepended when the body doesn't
+        already carry it, so a hand-written ``.py`` / ``.sql`` body
+        round-trips as a clean notebook. Parent directories are created
+        as needed; ``overwrite`` replaces an existing object (otherwise a
+        pre-existing path raises :class:`FileExistsError`).
+        """
+        lang = _notebook_language(language)
+        text = (
+            ""
+            if content is None
+            else content.decode()
+            if isinstance(content, (bytes, bytearray))
+            else str(content)
+        )
+        header = _NOTEBOOK_HEADERS.get(
+            str(getattr(lang, "value", lang)).upper(),
+            "# Databricks notebook source",
+        )
+        if text.lstrip().startswith(header):
+            body = text.encode()
+        else:
+            body = (f"{header}\n{text}" if text else f"{header}\n").encode()
+
+        if not overwrite and self.exists():
+            raise FileExistsError(
+                f"create_notebook: destination {self.full_path()!r} "
+                f"already exists. Pass overwrite=True to replace it."
+            )
+
+        self.parent.mkdir(parents=True, exist_ok=True)
+        fmt = _import_format_source()
+        api_path = self.api_path
+        self._call_ensuring_parents(
+            lambda: self.client.workspace_client().workspace.upload(
+                path=api_path,
+                content=body,
+                format=fmt,
+                language=lang,
+                overwrite=overwrite,
+            )
+        )
+        self._persist_stat_cache(
+            IOStats(size=len(body), kind=IOKind.FILE, mtime=time.time())
+        )
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "Created %s notebook %r (%s)",
+                str(getattr(lang, "value", lang)).upper(),
+                self,
+                format_bytes(len(body)),
+            )
+        return self
+
+    # ==================================================================
     # Module upload — stream directly through ``workspace.upload``
     # ==================================================================
 
@@ -824,6 +896,52 @@ def _looks_like_protected_parent(exc: BaseException) -> bool:
     leaf the caller actually wants is independent of the protected
     ancestor — treat as non-fatal."""
     return "is protected" in str(exc).lower()
+
+
+#: Language → the ``… Databricks notebook source`` magic header
+#: Databricks stamps on the first line of an exported notebook. The
+#: comment prefix is language-specific (``#`` for Python/R, ``--`` for
+#: SQL, ``//`` for Scala); :meth:`WorkspacePath.create_notebook`
+#: prepends it so an imported body lands as a real notebook.
+_NOTEBOOK_HEADERS: dict[str, str] = {
+    "PYTHON": "# Databricks notebook source",
+    "R": "# Databricks notebook source",
+    "SQL": "-- Databricks notebook source",
+    "SCALA": "// Databricks notebook source",
+}
+
+
+def _notebook_language(language: Any) -> Any:
+    """Resolve the SDK's ``Language`` enum, falling back to a string.
+
+    Accepts an already-resolved :class:`Language`, or a name like
+    ``"python"`` / ``"SQL"`` (case-insensitive). The literal-string
+    fallback keeps the helper usable in mocked test environments where
+    the SDK isn't installed.
+    """
+    try:
+        from databricks.sdk.service.workspace import Language
+
+        if isinstance(language, Language):
+            return language
+        return Language(str(language).upper())
+    except Exception:
+        return str(language).upper()
+
+
+def _import_format_source() -> Any:
+    """Resolve the SDK's ``ImportFormat.SOURCE`` enum, falling back to a string.
+
+    ``SOURCE`` (paired with an explicit ``language``) is the import
+    format that stores the object as a notebook — distinct from the
+    ``AUTO`` sniff used for arbitrary workspace files.
+    """
+    try:
+        from databricks.sdk.service.workspace import ImportFormat
+
+        return ImportFormat.SOURCE
+    except Exception:
+        return "SOURCE"
 
 
 def _import_format_auto() -> Any:

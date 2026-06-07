@@ -76,6 +76,33 @@ class TestFSDispatch(unittest.TestCase):
         dst.write_bytes.assert_called_once_with(b"DATA", overwrite=True)
         src.unlink.assert_called_once()
 
+    def test_create_notebook_imports_source(self):
+        from yggdrasil.databricks.fs.workspace_path import WorkspacePath
+
+        path = MagicMock(spec=WorkspacePath)
+        path.full_path.return_value = "/Workspace/Users/me/nb"
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.client.DatabricksClient"):
+            DP.from_.return_value = path
+            rc = main([
+                "fs", "create-notebook", "/Workspace/Users/me/nb",
+                "--language", "sql", "--data", "SELECT 1",
+            ])
+        self.assertEqual(rc, 0)
+        path.create_notebook.assert_called_once_with(
+            "sql", content="SELECT 1", overwrite=False,
+        )
+
+    def test_create_notebook_rejects_non_workspace(self):
+        path = MagicMock()  # not a WorkspacePath
+        path.full_path.return_value = "/Volumes/cat/sch/vol/nb"
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.client.DatabricksClient"):
+            DP.from_.return_value = path
+            rc = main(["fs", "create-notebook", "/Volumes/cat/sch/vol/nb"])
+        self.assertEqual(rc, 1)
+        path.create_notebook.assert_not_called()
+
     def test_rm_recursive(self):
         path = MagicMock()
         with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
