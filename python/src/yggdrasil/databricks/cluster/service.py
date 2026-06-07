@@ -104,22 +104,50 @@ class Clusters(DatabricksService):
     # ------------------------------------------------------------------ #
     # Singletons
     # ------------------------------------------------------------------ #
-    def _default_ygg_layer(self) -> str:
+    def _default_ygg_layer(self, python: str | None = None) -> str:
         """The default ygg library for a cluster: the seeded **generic
-        environment** requirements file (zero-PyPI) for the running ygg image —
-        ``<env>/<env>.requirements.txt`` — installed via
-        ``Library(requirements=…)``. It lists the existing workspace wheels, so a
-        cluster installs from those rather than ``pip install``-ing ygg from PyPI.
-        Provisioned by ``ygg databricks seed``; an explicit ``environment`` /
-        ``libraries`` argument overrides it (and may be a PyPI spec to opt back
-        into a pip resolve)."""
+        environment** requirements file (zero-PyPI) for the ygg image matching
+        the cluster's **Python** —
+        ``environment/ygg/ygg-<version>-py3XX.requirements.txt`` — installed via
+        ``Library(requirements=…)``. It lists wheels in the shared pypi registry,
+        so a cluster installs from those rather than ``pip install``-ing ygg from
+        PyPI.
+
+        *python* is the cluster's ``"3.X"`` runtime Python (derived from its DBR
+        in :meth:`all_purpose_cluster`); ``None`` falls back to the local
+        interpreter. Provisioned by ``ygg databricks seed``; an explicit
+        ``environment`` / ``libraries`` argument overrides it (and may be a PyPI
+        spec to opt back into a pip resolve)."""
         from yggdrasil.databricks.job.wheel import (
             WORKSPACE_ENV_DIR,
-            ygg_base_environment_name,
+            environment_folder,
+            environment_stem,
         )
 
-        name = ygg_base_environment_name()
-        return f"{WORKSPACE_ENV_DIR}/{name}/{name}.requirements.txt"
+        stem = environment_stem("ygg", python=python)
+        return f"{WORKSPACE_ENV_DIR}/{environment_folder('ygg')}/{stem}.requirements.txt"
+
+    def _cluster_python(self, cluster_spec: MutableMapping[str, Any]) -> str | None:
+        """The ``"3.X"`` Python the cluster-to-be will run, so its ygg layer can
+        pick the matching ``requirements.txt``.
+
+        Resolved from an explicit ``python_version``, else the cluster's
+        ``spark_version`` (DBR → Python via :data:`PYTHON_BY_DBR`), else the
+        latest runtime that :meth:`create` would default to. Best-effort —
+        returns ``None`` (the caller falls back to the local interpreter) when
+        the runtime list can't be reached or the DBR is unmapped."""
+        py = cluster_spec.get("python_version")
+        if py is not None:
+            t = _py_filter_tuple(py)
+            return f"{t[0]}.{t[1]}"
+        spark_version = cluster_spec.get("spark_version")
+        if spark_version is None:
+            try:
+                spark_version = self.latest_spark_version(allow_ml=False).key
+            except Exception:  # noqa: BLE001 — no runtime list → fall back to local
+                return None
+        t = _py_tuple_for_key(spark_version)
+        return f"{t[0]}.{t[1]}" if t else None
 
     def all_purpose_cluster(
         self,
@@ -165,7 +193,10 @@ class Clusters(DatabricksService):
         # it — a ``…requirements.txt`` / ``…whl`` path, or a PyPI spec to opt back
         # into a pip resolve. ``uv`` / ``dill`` (small public runtime helpers the
         # env doesn't bundle) ride along either way.
-        ygg_layer = environment if environment else self._default_ygg_layer()
+        ygg_layer = (
+            environment if environment
+            else self._default_ygg_layer(python=self._cluster_python(cluster_spec))
+        )
         libraries = (libraries or []) + [ygg_layer, "uv", "dill"]
 
         if existing is None:
@@ -377,8 +408,8 @@ class Clusters(DatabricksService):
             return found
 
         # Default to the seeded generic environment (zero-PyPI workspace wheels)
-        # instead of ``pip install``-ing ygg from PyPI.
-        ygg_layer = self._default_ygg_layer()
+        # for the cluster's Python instead of ``pip install``-ing ygg from PyPI.
+        ygg_layer = self._default_ygg_layer(python=self._cluster_python(cluster_spec))
         libraries = (list(libraries) if libraries else []) + [ygg_layer]
 
         return self.create(
@@ -435,8 +466,8 @@ class Clusters(DatabricksService):
             )
 
         # Default to the seeded generic environment (zero-PyPI workspace wheels)
-        # instead of ``pip install``-ing ygg from PyPI.
-        ygg_layer = self._default_ygg_layer()
+        # for the cluster's Python instead of ``pip install``-ing ygg from PyPI.
+        ygg_layer = self._default_ygg_layer(python=self._cluster_python(cluster_spec))
         libraries = (list(libraries) if libraries else []) + [ygg_layer]
 
         return self.create(

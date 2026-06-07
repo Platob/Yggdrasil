@@ -117,7 +117,6 @@ WORKSPACE_WHL_DIR = WORKSPACE_PYPI_DIR
 #:     /Workspace/Shared/environment/<proj>/
 #:         <proj>-<version>-py3XX.yml             serverless base_environment
 #:         <proj>-<version>-py3XX.requirements.txt   classic-cluster requirements
-#:         binaries/<dist>/<wheel>                the zero-PyPI wheel closure
 #:
 #: e.g. ``environment/ygg/ygg-0.8.57-py311.yml``. Every version / python lands in
 #: the **same** ``<proj>/`` folder (the filenames carry the version + ``py3XX``
@@ -126,9 +125,9 @@ WORKSPACE_WHL_DIR = WORKSPACE_PYPI_DIR
 #:
 #: A job references the ``.yml`` by file path via ``Environment.base_environment``
 #: instead of inlining the whole dependency list (see
-#: :func:`ensure_named_environment`); its dependencies are the **wheels under the
-#: project's own ``binaries/`` folder** (:func:`ensure_environment`), so the env
-#: is self-describing and the runtime installs with zero PyPI access.
+#: :func:`ensure_named_environment`); its dependencies are **wheels in the shared
+#: pypi registry** (:data:`WORKSPACE_PYPI_DIR`, built by :func:`ensure_environment`),
+#: so the env is self-describing and the runtime installs with zero PyPI access.
 WORKSPACE_ENV_DIR = "/Workspace/Shared/environment"
 
 #: Latest serverless environment version — the fallback when the local Python
@@ -1037,18 +1036,19 @@ def ensure_environment(
 
     Lays the environment out under the **project folder** (``ygg``), mirroring
     the wheel registry — every version / python coexists in the one folder, the
-    filenames carry the ``<version>-py3XX`` tag::
+    filenames carry the ``<version>-py3XX`` tag, and the env holds **only its
+    spec files** (no per-env binaries)::
 
         <workspace_dir>/ygg/
             ygg-<version>-py3XX.yml             serverless base_environment
             ygg-<version>-py3XX.requirements.txt   classic-cluster requirements
-            binaries/<dist>/<wheel>             the zero-PyPI wheel closure
 
-    The wheel closure is built (:func:`build_bundle`) and uploaded **under the
-    project's ``binaries/`` folder** (:func:`ensure_bundle` with that folder as
-    its root), so the env carries its binaries rather than pointing into the
-    shared pypi registry. The serverless ``.yml`` and cluster ``requirements.txt``
-    then list those wheel paths, so the runtime installs with zero PyPI access.
+    The wheel closure is built (:func:`build_bundle`) and uploaded into the
+    **shared pypi registry** (:data:`WORKSPACE_PYPI_DIR` — ``pypi/<dist>/<wheel>``),
+    so dependency wheels are shared across images/versions instead of being
+    duplicated per environment. The serverless ``.yml`` and cluster
+    ``requirements.txt`` list those pypi wheel paths, so the runtime installs
+    with zero PyPI access.
 
     *mode* sets the env-config-file policy (the wheel closure is **get-or-create**
     unless *rebuild*): :data:`Mode.APPEND` writes the ``.yml`` / ``.requirements.txt``
@@ -1068,9 +1068,10 @@ def ensure_environment(
     env_name = f"{folder}-{version}-{key}"                 # versioned file stem
     env_dir = f"{workspace_dir.rstrip('/')}/{folder}"
 
-    bundle = ensure_bundle(
-        client, "ygg", python=python, workspace_dir=f"{env_dir}/binaries", rebuild=rebuild,
-    )
+    # Wheels go to the shared pypi registry (not a per-env ``binaries/``), so the
+    # dependency closure is reused across images/versions; the env files just
+    # reference those pypi paths.
+    bundle = ensure_bundle(client, "ygg", python=python, rebuild=rebuild)
     serverless_dest = f"{env_dir}/{env_name}.yml"
     cluster_dest = f"{env_dir}/{env_name}.requirements.txt"
     if overwrite_env or not DatabricksPath.from_(serverless_dest, client=client).exists():
@@ -1280,9 +1281,9 @@ def ensure_project_environment(
     The environment's dependency list is the **project wheel** plus the
     project's own ``[project].dependencies`` (and any requested *extras*' deps).
     With ``bundle=True`` those dependencies are downloaded as Linux-x86_64 wheels
-    into the env's ``binaries/`` folder and listed by workspace path, so the
-    runtime installs with zero PyPI access; otherwise they're listed as index
-    requirements resolved at install time.
+    into the **shared pypi registry** (``pypi/<dist>/<wheel>``) and listed by
+    workspace path, so the runtime installs with zero PyPI access; otherwise
+    they're listed as index requirements resolved at install time.
 
     *mode* (a :class:`~yggdrasil.enums.Mode`) sets the idempotency policy:
 
@@ -1318,12 +1319,14 @@ def ensure_project_environment(
         deps += meta["optional_dependencies"].get(extra, [])
 
     if bundle:
-        # Zero-PyPI: project wheel + dependency closure, all under the env's own
-        # ``binaries/`` folder and listed by workspace path. A ``.manifest``
-        # beside the project wheel records the full path set so a get-or-create
-        # (non-OVERWRITE) deploy can reuse the closure without rebuilding.
-        binaries = f"{env_dir}/binaries"
-        manifest = DatabricksPath.from_(f"{binaries}/{proj}/{env_name}.manifest", client=client)
+        # Zero-PyPI: project wheel + dependency closure, all uploaded to the
+        # shared pypi registry and listed by workspace path. A ``.manifest`` under
+        # the project's registry folder records the full path set so a
+        # get-or-create (non-OVERWRITE) deploy can reuse the closure without
+        # rebuilding.
+        manifest = DatabricksPath.from_(
+            f"{pypi_dir.rstrip('/')}/{proj}/{env_name}.manifest", client=client,
+        )
         reused = (
             [ln.strip() for ln in manifest.read_text().splitlines() if ln.strip()]
             if (not rebuild and manifest.exists()) else []
@@ -1333,11 +1336,11 @@ def ensure_project_environment(
             dependencies = reused
         else:
             dependencies = [
-                registry_upload(client, w, workspace_dir=binaries, overwrite=True)
+                registry_upload(client, w, workspace_dir=pypi_dir, overwrite=True)
                 for w in build_project_wheel(meta["dir"], python=python)
             ]
             dependencies += [
-                registry_upload(client, w, workspace_dir=binaries)
+                registry_upload(client, w, workspace_dir=pypi_dir)
                 for w in download_dependency_wheels(deps, python=python)
             ]
             manifest.parent.mkdir(parents=True, exist_ok=True)

@@ -3,13 +3,13 @@ environment(s) from wheels in the workspace.
 
 The environment machinery in :mod:`yggdrasil.databricks.job.wheel` builds ygg's
 whole transitive dependency closure as wheels and persists, **per Python**, a
-self-contained base environment under ``/Workspace/Shared/environment``::
+base environment under ``/Workspace/Shared/environment``::
 
     <proj>/<proj>-<version>-py3XX.yml               serverless base_environment
     <proj>/<proj>-<version>-py3XX.requirements.txt   classic-cluster requirements
-    <proj>/binaries/…                              the zero-PyPI wheel closure
 
-so ygg jobs and clusters install with zero PyPI access. This command surfaces
+listing wheels from the shared pypi registry (``/Workspace/Shared/pypi``), so
+ygg jobs and clusters install with zero PyPI access. This command surfaces
 that on its own — the same step ``ygg databricks seed`` runs::
 
     ygg databricks environment                 # get-or-install for the local Python

@@ -114,8 +114,8 @@ def test_bundle_downloads_and_lists_wheels(tmp_path):
     )
     client = MagicMock()
     uploads = iter([
-        "/env/demo-0-1-0/binaries/demo/demo-0.1.0-py3-none-any.whl",
-        "/env/demo-0-1-0/binaries/polars/polars-1.0-cp312.whl",
+        "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl",
+        "/Workspace/Shared/pypi/polars/polars-1.0-cp312.whl",
     ])
     with patch("yggdrasil.databricks.path.DatabricksPath", _fake_dbpath(exists=False)), \
          patch.object(W, "build_project_wheel",
@@ -129,8 +129,8 @@ def test_bundle_downloads_and_lists_wheels(tmp_path):
 
     dl.assert_called_once()
     assert info["dependencies"] == [
-        "/env/demo-0-1-0/binaries/demo/demo-0.1.0-py3-none-any.whl",
-        "/env/demo-0-1-0/binaries/polars/polars-1.0-cp312.whl",
+        "/Workspace/Shared/pypi/demo/demo-0.1.0-py3-none-any.whl",
+        "/Workspace/Shared/pypi/polars/polars-1.0-cp312.whl",
     ]
 
 

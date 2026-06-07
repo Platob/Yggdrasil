@@ -340,26 +340,26 @@ class TestWheel:
         ]
 
     def test_ensure_environment_lays_out_self_contained_folder(self):
-        # Binaries land under the env's own ``binaries/`` folder; the spec files
-        # reference that closure and sit beside it.
+        # Wheels land in the shared pypi registry; the env folder holds only the
+        # version-tagged spec files, which reference those pypi paths.
         client = MagicMock()
         bundle = [
-            "/ws/env/ygg-9.9-py312/binaries/ygg/ygg-9.9-py3-none-any.whl",
-            "/ws/env/ygg-9.9-py312/binaries/pyarrow/pyarrow-1-cp312.whl",
+            "/Workspace/Shared/pypi/ygg/ygg-9.9-py3-none-any.whl",
+            "/Workspace/Shared/pypi/pyarrow/pyarrow-1-cp312.whl",
         ]
         with patch("yggdrasil.databricks.job.wheel.ilmd.version", return_value="9.9"), \
              patch("yggdrasil.databricks.job.wheel.ensure_bundle", return_value=bundle) as eb, \
              patch("yggdrasil.databricks.job.wheel.ensure_named_environment",
-                   return_value="/ws/env/ygg-9.9-py312/ygg-9.9-py312.yml") as ene, \
+                   return_value="/ws/env/ygg/ygg-9.9-py312.yml") as ene, \
              patch("yggdrasil.databricks.job.wheel.ensure_cluster_requirements",
-                   return_value="/ws/env/ygg-9.9-py312/ygg-9.9-py312.requirements.txt") as ecr:
+                   return_value="/ws/env/ygg/ygg-9.9-py312.requirements.txt") as ecr:
             out = wheel.ensure_environment(client, python="3.12")
 
-        # Bundle uploaded under the project folder's binaries/ closure.
-        assert eb.call_args.kwargs["workspace_dir"] == "/Workspace/Shared/environment/ygg/binaries"
+        # Bundle uploaded to the shared pypi registry (no per-env binaries dir).
+        assert "workspace_dir" not in eb.call_args.kwargs
         assert eb.call_args.kwargs["python"] == "3.12"
         # Spec files written into the project folder, version-tagged, referencing
-        # the closure.
+        # the pypi closure.
         assert ene.call_args.kwargs["dependencies"] == bundle
         assert ene.call_args.kwargs["filename"] == "ygg-9.9-py312.yml"
         assert ecr.call_args.kwargs["dependencies"] == bundle
@@ -368,8 +368,8 @@ class TestWheel:
             "python": "3.12", "key": "py312", "env_name": "ygg-9.9-py312",
             "env_dir": "/Workspace/Shared/environment/ygg",
             "n_wheels": 2,
-            "serverless": "/ws/env/ygg-9.9-py312/ygg-9.9-py312.yml",
-            "cluster": "/ws/env/ygg-9.9-py312/ygg-9.9-py312.requirements.txt",
+            "serverless": "/ws/env/ygg/ygg-9.9-py312.yml",
+            "cluster": "/ws/env/ygg/ygg-9.9-py312.requirements.txt",
         }
 
     def test_ensure_environment_append_skips_existing_spec_files(self):

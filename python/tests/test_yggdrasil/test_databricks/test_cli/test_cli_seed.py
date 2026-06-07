@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -192,6 +193,7 @@ class TestSeedProvision(unittest.TestCase):
         client.compute.instance_pools.find.assert_any_call(name="Yggdrasil Light")
         client.compute.clusters.all_purpose_cluster.assert_called_once_with(
             single_user_name="alice@co.com", instance_pool_id="pool-light",
+            python_version=f"3.{sys.version_info.minor}",
             environment=_env_requirements(), wait=False,
         )
 
@@ -212,6 +214,7 @@ class TestSeedProvision(unittest.TestCase):
         # still running the seeded generic environment.
         client.compute.clusters.all_purpose_cluster.assert_called_once_with(
             single_user_name="bob@co.com", instance_pool_id=None,
+            python_version=f"3.{sys.version_info.minor}",
             environment=_env_requirements(), wait=False,
         )
 
