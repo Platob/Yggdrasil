@@ -47,6 +47,7 @@ __all__ = [
     "SERVERLESS_ENVIRONMENT_VERSIONS",
     "SERVERLESS_WHEEL_PLATFORMS",
     "BUNDLE_EXCLUDE",
+    "PROJECT_ALIASES",
     "parse_version",
     "wheel_parts",
     "serverless_environment_version",
@@ -85,6 +86,14 @@ SERVERLESS_WHEEL_PLATFORMS: "tuple[str, ...]" = (
 #: Runtime-provided distributions never shipped in the closure (a second copy
 #: conflicts with the serverless image's own).
 BUNDLE_EXCLUDE: "frozenset[str]" = frozenset({"certifi"})
+
+#: Project-name aliases applied before the metadata lookup in
+#: :func:`distribution_for` — the import name a project is known by mapped to the
+#: distribution (pip) name its wheels actually ship under. ``yggdrasil`` is the
+#: import package; ``ygg`` is the distribution, so a deploy named for either lands
+#: in the same registry folder / environment. Keys are normalized on lookup.
+#: Override / extend via ``YGG_DATABRICKS_PROJECT_ALIASES`` (``import=dist,…``).
+PROJECT_ALIASES: "dict[str, str]" = {"yggdrasil": "ygg"}
 
 
 # --------------------------------------------------------------------------- #
@@ -167,8 +176,24 @@ def wheel_for_python(wheels: "list", python: "str | None" = None) -> str:
 
 def distribution_for(package: str) -> str:
     """The distribution (pip) name providing import *package* (``yggdrasil`` →
-    ``ygg``); falls back to *package*."""
+    ``ygg``); falls back to *package*.
+
+    An explicit :data:`PROJECT_ALIASES` entry (extendable via
+    ``YGG_DATABRICKS_PROJECT_ALIASES``) wins first, so a project deploys under one
+    canonical distribution regardless of whether its metadata is installed locally;
+    otherwise the import → distribution mapping is read from installed metadata."""
     import importlib.metadata as ilmd
+
+    aliases = dict(PROJECT_ALIASES)
+    raw = os.environ.get("YGG_DATABRICKS_PROJECT_ALIASES")
+    if raw:
+        for pair in raw.split(","):
+            src, _, dst = pair.partition("=")
+            if src.strip() and dst.strip():
+                aliases[_norm(src.strip())] = dst.strip()
+    alias = aliases.get(_norm(package))
+    if alias:
+        return alias
 
     dists = ilmd.packages_distributions().get(package)
     return dists[0] if dists else package
