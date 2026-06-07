@@ -3232,15 +3232,24 @@ class Table(DatabricksPath):
             )
 
         job_name = name or f"[YGG][AUTOLOADER] {self.full_name()}"
-        flow = Flow(
-            auto_load,
-            name=job_name,
-            trigger=trigger,
-            parameters=[
-                self.full_name(), str(source), file_format,
-                checkpoint or "", available_now, clean_source, clean_source_retention,
-            ],
-        )
+        # The deployed serverless wheel-task runs ``ygg databricks table
+        # autoload`` on the cluster — a dedicated CLI subcommand that coerces
+        # these args and calls :func:`auto_load`. The command is shipped
+        # **verbatim** as the python-wheel task parameters (no ``run`` prefix,
+        # no module:qualname target ref).
+        command = [
+            "databricks", "table", "autoload",
+            "--table", self.full_name(),
+            "--source", str(source),
+            "--format", file_format,
+        ]
+        if checkpoint:
+            command += ["--checkpoint", checkpoint]
+        command.append("--available-now" if available_now else "--no-available-now")
+        if clean_source:
+            command.append("--clean-source")
+        command += ["--clean-source-retention", clean_source_retention]
+        flow = Flow(auto_load, name=job_name, trigger=trigger, command=command)
         # Tag the job so Auto Loader ingestion jobs are filterable in the
         # workspace + cost reports by table, source, format, and trigger shape.
         # Merged on top of the client's owner/product defaults at create time.

@@ -1,49 +1,37 @@
-"""Prefect-style tasks & flows that run **transparently** on Databricks.
+"""Prefect-style tasks & flows that deploy as Databricks **serverless** jobs.
 
 The :func:`task` / :func:`flow` decorators wrap a function into a **callable**
-:class:`Task` / :class:`Flow` — like Prefect, but location-transparent:
+:class:`Task` / :class:`Flow`:
 
-- **call it** (``my_flow(x)`` / ``my_task(x)``) and it runs *where it should*:
-  from your laptop it deploys + runs as a Databricks **serverless** job and
-  returns the real result; already **inside** Databricks (the wheel task on the
-  cluster) it runs **in-process** — so a flow body's ``fetch.map(urls)`` fans
-  tasks out locally on the cluster. One call site, right place, no recursion;
-- ``.local(x)`` forces in-process execution (tests, debugging);
+- ``.local(x)`` runs the body **in-process** (tests, debugging, the on-cluster
+  body of a deployed job);
 - ``.submit(...)`` runs in the background and returns a :class:`Future`
   (``.result()`` blocks) — a flow fans tasks out with ``.submit`` / ``.map``;
-- ``.deploy(client)`` registers it as a Databricks job *without* running it (for
-  schedules / file-arrival triggers).
+- ``.deploy(client)`` registers it as a Databricks **serverless** job for a
+  schedule / file-arrival trigger, shipping the **live** code as a wheel.
 
-    @task(retries=2)
-    def fetch(url: str) -> bytes: ...
+    @flow(name="autoload", command=["databricks", "table", "autoload",
+                                    "--table", "c.s.t", "--source", "s3://…"])
+    def autoloader(): ...
 
-    @flow(name="etl")
-    def etl(day: date, n: int):
-        return [f.result() for f in fetch.map(urls_for(day))]
-
-    etl(date.today(), 7)   # from a laptop → runs on Databricks, returns result
-    etl.local(date.today(), 7)   # force in-process
-    etl.deploy(client)     # register as a job (don't run)
+    autoloader.deploy(client)    # register as a serverless job
 
 The deploy ships the **live** code as a wheel (built from the package on disk —
 dev checkout or installed), placed in the shared workspace pypi registry, or in
-a per-user folder + rebuilt when the package is an editable install. The cluster
-task runs ``ygg run`` (the ``ygg`` entry point's ``run`` subcommand —
-:mod:`yggdrasil.databricks.job.runner`), which imports the target, coerces
-parameters to the function signature via the cast registry, runs the body, and
-round-trips the result.
+a per-user folder + rebuilt when the package is an editable install. The single
+serverless python-wheel task invokes the ``ygg`` entry point with an explicit
+:attr:`~Flow.command` — the CLI subcommand the deployed job runs on the cluster,
+shipped **verbatim** as the wheel-task parameters (e.g. ``databricks table
+autoload --table … --source …`` for an Auto Loader job).
 
 Class-based flows subclass :class:`Flow` and override :meth:`~Flow.run` (the
-body), :attr:`~_Runnable.name`, :meth:`~Flow.parameters`, :meth:`~Flow.trigger`.
+body), :attr:`~_Runnable.name`, :meth:`~_Runnable.command`, :meth:`~Flow.trigger`.
 """
 from __future__ import annotations
 
 import contextvars
 import functools
 import logging
-import pickle
-import re
-import secrets
 import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar
@@ -54,10 +42,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
-#: Active while a body runs **in-process** (``.local`` / ``.submit`` / the
-#: on-cluster ``ygg run`` runner). Nested task/flow calls consult it so they run
-#: locally too instead of each dispatching its own Databricks job — the flow,
-#: not every task, is the unit that ships to the cluster.
+#: Active while a body runs **in-process** (``.local`` / ``.submit``). Nested
+#: task/flow calls consult it so they run locally too instead of each
+#: dispatching its own background run — the flow, not every task, is the unit.
 _LOCAL_MODE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "ygg_local_mode", default=False
 )
@@ -97,10 +84,6 @@ def _render(value: Any) -> str:
     return value if isinstance(value, str) else str(value)
 
 
-def _slug(name: str) -> str:
-    return re.sub(r"[^0-9A-Za-z._-]+", "_", name).strip("_") or "flow"
-
-
 class Future(Generic[T]):
     """Handle to a :meth:`Task.submit` / :meth:`Flow.submit` background run."""
 
@@ -121,11 +104,12 @@ class Future(Generic[T]):
 
 
 class _Runnable:
-    """Shared run + retry + transparent-dispatch + deploy surface for tasks/flows.
+    """Shared run + retry + deploy surface for tasks/flows.
 
-    A call routes by **location**: inside Databricks it runs in-process
-    (:meth:`local`); from anywhere else it deploys + runs itself as a serverless
-    job and returns the real result (:meth:`_dispatch_remote`)."""
+    A call runs **in-process** (:meth:`local` / :meth:`_call`, honouring
+    :attr:`retries`). Deploying registers it as a serverless job whose single
+    python-wheel task invokes the ``ygg`` entry point with an explicit
+    :meth:`command` shipped verbatim as the task parameters."""
 
     fn: Optional[Callable]
     name: str
@@ -134,8 +118,14 @@ class _Runnable:
 
     # -- serverless / wheel defaults (shared by Task and Flow) -----------
     package_name: str = "ygg"          # wheel that ships the single ``ygg`` entry point
-    entry_point: str = "ygg"           # the only console script; ``run`` subcommand → runner.py
-    task_key: str = "run"
+    entry_point: str = "ygg"           # the only console script (e.g. ``ygg databricks …``)
+    task_key: str = "ygg"
+    #: The ``ygg`` CLI subcommand the deployed wheel-task runs on the cluster,
+    #: shipped **verbatim** as the python-wheel task ``parameters`` (no prefix,
+    #: no target ref). e.g. ``["databricks", "table", "autoload", "--table",
+    #: "c.s.t", "--source", "s3://…"]``. Required to deploy — set it on the
+    #: instance (function flows take ``command=`` / override :meth:`command`).
+    _command: "list[str] | None" = None
     #: Job-level tags (key → value) carried onto :meth:`Jobs.create_or_update`,
     #: merged on top of the client's owner/product defaults. ``None`` adds none.
     job_tags: dict[str, str] | None = None
@@ -154,8 +144,6 @@ class _Runnable:
     dependencies: "tuple[str, ...]" = ("ygg[databricks]",)
     #: Always-installed extras on top of the wheel / :attr:`dependencies`.
     extra_dependencies: "tuple[str, ...]" = ("databricks-sdk",)
-    #: Seconds to wait for a remote-dispatched run before giving up.
-    remote_timeout: float = 3600.0
     #: Attach a serverless environment for **every** supported Python (keyed
     #: ``py3XX``) on deploy, not just the local-matched ``default``. The build
     #: already produces a wheel per Python; this exposes them as job environments.
@@ -182,7 +170,6 @@ class _Runnable:
     #: per-Python matrix when :attr:`all_environments`), referenced by path.
     _environment: "Any" = None
     _environment_matrix: "dict[str, Any] | None" = None
-    _runner_params: "list[str] | None" = None
     _client: Any = None
 
     # -- execution -------------------------------------------------------
@@ -216,14 +203,11 @@ class _Runnable:
         return self._call(*args, **kwargs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Run where it belongs: in-process when **inside** Databricks (or under
-        a :meth:`local` / :meth:`submit` body), else deploy + run on Databricks
-        and return the real result."""
-        from yggdrasil.databricks.client import DatabricksClient
-
-        if _LOCAL_MODE.get() or DatabricksClient.is_in_databricks_environment():
-            return self._call(*args, **kwargs)
-        return self._dispatch_remote(args, kwargs)
+        """Run the body **in-process** (honouring :attr:`retries`). A flow's
+        nested task calls run here too. To run on Databricks, :meth:`deploy` it
+        as a serverless job and trigger a run (the wheel-task invokes the
+        ``ygg`` :meth:`command` on the cluster)."""
+        return self._call(*args, **kwargs)
 
     def submit(self, *args: Any, **kwargs: Any) -> "Future":
         """Run in the background; return a :class:`Future`."""
@@ -242,38 +226,13 @@ class _Runnable:
         clone.__dict__.update(overrides)
         return clone
 
-    # -- transparent remote dispatch ------------------------------------
-    def _dispatch_remote(self, args: tuple, kwargs: dict) -> Any:
-        """Deploy this task/flow, run it once on Databricks with *args*/*kwargs*
-        marshalled through a workspace payload, block, and return the real
-        result. The cluster runs ``ygg run`` against :meth:`_target_ref`."""
-        from yggdrasil.databricks.client import DatabricksClient
-        from yggdrasil.databricks.path import DatabricksPath
-
-        client = self._client or DatabricksClient()
-        user = client.workspace_client().current_user.me().user_name
-        base = f"/Workspace/Users/{user}/.ygg/runs/{_slug(self.name)}/{secrets.token_hex(6)}"
-        payload_path, result_path = f"{base}/payload.pkl", f"{base}/result.pkl"
-
-        payload = DatabricksPath.from_(payload_path, client=client)
-        payload.parent.mkdir(parents=True, exist_ok=True)
-        payload.write_bytes(pickle.dumps((tuple(args), dict(kwargs))))
-
-        self._runner_params = [
-            self._target_ref(), "--payload", payload_path, "--result", result_path,
-        ]
-        try:
-            job = self.deploy(client)
-            job.run(wait=self.remote_timeout, raise_error=True)
-        finally:
-            self._runner_params = None
-        return pickle.loads(DatabricksPath.from_(result_path, client=client).read_bytes())
-
-    def _target_ref(self) -> str:
-        """``module.path:qualname`` the on-cluster runner imports to get back
-        this object — the wrapped function, or the class for a class-based flow."""
-        target = self.fn if self.fn is not None else type(self)
-        return f"{target.__module__}:{target.__qualname__}"
+    def command(self) -> "list[str] | None":
+        """The ``ygg`` CLI subcommand the deployed wheel-task runs on the cluster
+        (e.g. ``["databricks", "table", "autoload", "--table", …]``), shipped
+        verbatim as the python-wheel task ``parameters``. ``None`` (the default)
+        means no on-cluster command was configured — set ``command=`` on the
+        flow / override this in a class-based flow."""
+        return self._command
 
     # -- wheel / environment --------------------------------------------
     def wheel_package(self) -> str:
@@ -283,20 +242,19 @@ class _Runnable:
         target = self.fn if self.fn is not None else type(self)
         return target.__module__.split(".")[0]
 
-    def _scheduled_params(self) -> list[str]:
-        """Positional string params a scheduled/triggered run passes (the runner
-        coerces them to the signature). Flows carry ``@flow(parameters=...)``."""
-        return []
-
-    def _runner_parameters(self) -> list[str]:
-        """The wheel-task parameters passed to the ``ygg`` entry point: a leading
-        ``run`` subcommand, then the per-call payload form when dispatching, else
-        ``[target, *scheduled-params]`` for a deploy."""
-        if self._runner_params is not None:
-            base = list(self._runner_params)
-        else:
-            base = [self._target_ref(), *self._scheduled_params()]
-        return ["run", *base]
+    def _wheel_parameters(self) -> list[str]:
+        """The wheel-task parameters passed to the ``ygg`` entry point — the
+        configured :meth:`command` shipped verbatim. Raises if none was set
+        (nothing to run on the cluster)."""
+        cmd = self.command()
+        if not cmd:
+            raise ValueError(
+                f"{type(self).__name__} {self.name!r} has no command() to deploy — "
+                f"set `command=[...]` (the `ygg` CLI subcommand the wheel-task "
+                f"runs, e.g. ['databricks', 'table', 'autoload', '--table', …]) "
+                f"or override command() in a class-based flow."
+            )
+        return [_render(p) for p in cmd]
 
     def _project_spec(self) -> str:
         """The deploy target for this task's package: its on-disk project dir when
@@ -387,7 +345,8 @@ class _Runnable:
         )]
 
     def tasks(self) -> list:
-        """The single serverless python-wheel task that runs ``ygg run``."""
+        """The single serverless python-wheel task that runs the ``ygg``
+        :meth:`command` on the cluster (shipped verbatim as parameters)."""
         from databricks.sdk.service.jobs import PythonWheelTask, Task as DBTask
 
         return [
@@ -397,7 +356,7 @@ class _Runnable:
                 python_wheel_task=PythonWheelTask(
                     package_name=self.package_name,
                     entry_point=self.entry_point,
-                    parameters=self._runner_parameters(),
+                    parameters=self._wheel_parameters(),
                 ),
             )
         ]
@@ -442,6 +401,7 @@ class Task(_Runnable, Generic[T]):
         depends_on: "tuple[str, ...] | list[str]" = (),
         entry_point: Optional[str] = None,
         package_name: Optional[str] = None,
+        command: "list[str] | tuple[str, ...] | None" = None,
         **task_options: Any,
     ) -> None:
         self.fn = fn
@@ -456,14 +416,16 @@ class Task(_Runnable, Generic[T]):
             self.entry_point = entry_point
         if package_name is not None:
             self.package_name = package_name
+        if command is not None:
+            self._command = list(command)
         functools.update_wrapper(self, fn)
 
     def to_task(self, parameters: list[str] | None = None) -> Any:
         """Render a databricks ``Task`` (python-wheel) with explicit *parameters*
-        and dependency edges — for hand-built multi-task job DAGs (the transparent
-        single-task dispatch uses :meth:`tasks`). *parameters* are the arguments
-        the runner receives; the ``run`` subcommand the ``ygg`` entry point needs
-        is prepended automatically."""
+        and dependency edges — for hand-built multi-task job DAGs (the single-task
+        deploy uses :meth:`tasks`). *parameters* are the ``ygg`` CLI subcommand
+        the wheel-task runs on the cluster, shipped verbatim (e.g. ``["databricks",
+        "table", "autoload", …]``)."""
         from databricks.sdk.service.jobs import (
             PythonWheelTask,
             Task as DBTask,
@@ -477,7 +439,7 @@ class Task(_Runnable, Generic[T]):
             python_wheel_task=PythonWheelTask(
                 package_name=self.package_name,
                 entry_point=self.entry_point,
-                parameters=["run", *(parameters or [])],
+                parameters=list(parameters or self.command() or []),
             ),
             **self.task_options,
         )
@@ -494,7 +456,7 @@ class Flow(_Runnable):
         trigger: Any = None,
         retries: int = 0,
         retry_delay_seconds: float = 0.0,
-        parameters: "tuple[str, ...] | list[str]" = (),
+        command: "tuple[str, ...] | list[str] | None" = None,
         entry_point: Optional[str] = None,
         package_name: Optional[str] = None,
     ) -> None:
@@ -503,7 +465,7 @@ class Flow(_Runnable):
         self._trigger = trigger
         self.retries = retries
         self.retry_delay_seconds = retry_delay_seconds
-        self._parameters = tuple(parameters)
+        self._command = list(command) if command is not None else None
         self._wheel_paths = ()
         if entry_point is not None:
             self.entry_point = entry_point
@@ -513,12 +475,6 @@ class Flow(_Runnable):
             functools.update_wrapper(self, fn)
 
     # -- deploy surface (override in class-based flows) -----------------
-    def parameters(self) -> list[str]:
-        """Positional string parameters a scheduled/triggered run passes."""
-        return [_render(p) for p in self._parameters]
-
-    _scheduled_params = parameters
-
     def trigger(self) -> Any:
         """The databricks ``TriggerSettings`` (file-arrival / schedule), or
         ``None``. Function-built flows carry the ``@flow(trigger=...)`` value."""
@@ -575,7 +531,7 @@ def flow(
     trigger: Any = None,
     retries: int = 0,
     retry_delay_seconds: float = 0.0,
-    parameters: "tuple[str, ...] | list[str]" = (),
+    command: "tuple[str, ...] | list[str] | None" = None,
     entry_point: Optional[str] = None,
     package_name: Optional[str] = None,
 ) -> Any:
@@ -588,7 +544,7 @@ def flow(
             trigger=trigger,
             retries=retries,
             retry_delay_seconds=retry_delay_seconds,
-            parameters=parameters,
+            command=command,
             entry_point=entry_point,
             package_name=package_name,
         )

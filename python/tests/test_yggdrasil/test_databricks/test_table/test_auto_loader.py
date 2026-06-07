@@ -24,21 +24,29 @@ def _table(catalog_name="cat", schema_name="sch", table_name="tbl") -> Table:
 
 
 class TestTableAutoLoader:
-    def test_deploys_get_or_create_job_with_ygg_entry_and_params(self):
+    def test_deploys_get_or_create_job_with_ygg_entry_and_command(self):
         tbl = _table()
         with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
             job = tbl.auto_loader("s3://bkt/landing", file_format="json")
 
         Flow.assert_called_once()
         args, kwargs = Flow.call_args
-        # The on-cluster cloudFiles entry point is the job's target.
+        # The on-cluster cloudFiles entry point is the job's target (so the
+        # built wheel is the package that defines it).
         assert args[0] is auto_load
         assert kwargs["name"] == "[YGG][AUTOLOADER] cat.sch.tbl"
         # File-arrival is the default trigger — the job fires when files land.
         assert kwargs["trigger"].file_arrival.url == "s3://bkt/landing/"
-        # Positional job parameters: target table, source, format, checkpoint, mode.
-        assert kwargs["parameters"] == [
-            "cat.sch.tbl", "s3://bkt/landing", "json", "", True, False, "8 days",
+        # The wheel-task command: ``ygg databricks table autoload`` with the
+        # configurable --table / --source and the ingestion options. No
+        # checkpoint flag here (none given → on-cluster derives it).
+        assert kwargs["command"] == [
+            "databricks", "table", "autoload",
+            "--table", "cat.sch.tbl",
+            "--source", "s3://bkt/landing",
+            "--format", "json",
+            "--available-now",
+            "--clean-source-retention", "8 days",
         ]
         # Get-or-create happens through Flow.deploy(client) → create_or_update.
         Flow.return_value.deploy.assert_called_once_with(tbl.client)
@@ -53,9 +61,25 @@ class TestTableAutoLoader:
             )
         kwargs = Flow.call_args.kwargs
         assert kwargs["name"] == "my_loader"
-        assert kwargs["parameters"] == [
-            "cat.sch.tbl", "s3://bkt/landing", "parquet", "s3://bkt/ckpt", False, False, "8 days",
+        # Explicit checkpoint adds --checkpoint; available_now=False → --no-available-now.
+        assert kwargs["command"] == [
+            "databricks", "table", "autoload",
+            "--table", "cat.sch.tbl",
+            "--source", "s3://bkt/landing",
+            "--format", "parquet",
+            "--checkpoint", "s3://bkt/ckpt",
+            "--no-available-now",
+            "--clean-source-retention", "8 days",
         ]
+
+    def test_clean_source_flag_in_command(self):
+        tbl = _table()
+        with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+            tbl.auto_loader("s3://bkt/landing", clean_source=True,
+                            clean_source_retention="30 days")
+        cmd = Flow.call_args.kwargs["command"]
+        assert "--clean-source" in cmd
+        assert cmd[-2:] == ["--clean-source-retention", "30 days"]
 
     def test_file_arrival_builds_trigger_on_source(self):
         tbl = _table()
@@ -279,20 +303,21 @@ class TestStageStorageAndDefaultSource:
         vol.get_or_create.assert_called_once()
         vol.__truediv__.assert_any_call(Table.STAGE_SUBPATH)
         vol.__truediv__.assert_any_call(Table.CHECKPOINT_SUBPATH)
-        params = Flow.call_args.kwargs["parameters"]
-        assert params[1] == "s3://bkt/vol/.staging/data"           # source = staging volume path
-        assert params[3] == "s3://bkt/vol/.staging/_autoloader"    # checkpoint = sibling on it
+        cmd = Flow.call_args.kwargs["command"]
+        # source = staging volume path; checkpoint = the sibling on it.
+        assert cmd[cmd.index("--source") + 1] == "s3://bkt/vol/.staging/data"
+        assert cmd[cmd.index("--checkpoint") + 1] == "s3://bkt/vol/.staging/_autoloader"
         trig = Flow.call_args.kwargs["trigger"]
         assert trig.file_arrival.url == "s3://bkt/vol/.staging/data/"  # file trigger on it
 
     def test_explicit_source_leaves_checkpoint_to_on_cluster_default(self):
         # With an explicit source and no checkpoint, the staging volume is not
-        # touched and the checkpoint param stays empty so the on-cluster step
-        # derives <table-location>/_ygg_autoloader (unchanged behavior).
+        # touched and the command carries no --checkpoint flag so the on-cluster
+        # step derives <table-location>/_ygg_autoloader (unchanged behavior).
         tbl = _table()
         staging = PropertyMock()
         with patch.object(Table, "staging_volume", new=staging), \
                 patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
             tbl.auto_loader("s3://bkt/landing", file_arrival=False)
         staging.assert_not_called()
-        assert Flow.call_args.kwargs["parameters"][3] == ""
+        assert "--checkpoint" not in Flow.call_args.kwargs["command"]

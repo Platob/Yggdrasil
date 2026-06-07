@@ -723,6 +723,54 @@ matching environment per job at runtime).
 
 ---
 
+## Auto Loader (`tables` / `table`)
+
+Two distinct surfaces drive Databricks Auto Loader (`cloudFiles`) ingestion into
+a Unity Catalog table — a **control plane** that deploys the job, and the
+**data plane** the deployed job runs on the cluster:
+
+### `tables autoload` — deploy the ingestion job (control plane)
+
+```bash
+# Get-or-create a serverless cloudFiles ingestion job for a table, watching its
+# default staging area, with the file-arrival trigger on by default.
+ygg databricks tables autoload catalog.schema.events
+
+# Watch an explicit drop path, JSON, and trigger one run after deploying.
+ygg databricks tables autoload c.s.t --source s3://bucket/drop/ --format json --run --wait 900
+```
+
+It builds the serverless job (ygg wheel + zero-pip base environment, file-arrival
+trigger, job tags), named `[YGG][AUTOLOADER] <table>`, and upserts it by name.
+The single python-wheel task it deploys invokes the data-plane command below.
+
+### `table autoload` — run an ingestion sweep (data plane, on-cluster)
+
+This is the dedicated subcommand the deployed wheel-task runs *as* on the
+cluster — it coerces its flags and calls the `auto_load` cloudFiles body. The
+input path is configurable via `--source`:
+
+```bash
+ygg databricks table autoload --table c.s.t --source s3://bucket/drop/ \
+    --format parquet --available-now --clean-source-retention "8 days"
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--table` / `-t` | — (required) | Target table, `catalog.schema.table`. |
+| `--source` / `-s` | — (required) | Cloud/volume input path Auto Loader watches (`s3://…` / `/Volumes/…`). |
+| `--format` | `parquet` | `cloudFiles.format` (parquet/json/csv/avro/…). |
+| `--checkpoint` | derived | Checkpoint + schema location (default: next to the table). |
+| `--available-now` / `--no-available-now` | `--available-now` | One-shot `Trigger.AvailableNow` sweep vs. continuous 1-minute micro-batch. |
+| `--clean-source` | off | Delete each staged file once ingested + past retention. |
+| `--clean-source-retention` | `8 days` | Retention window for `--clean-source` (> 7 days). |
+
+You rarely run this by hand — `tables autoload` deploys a job that runs it for
+you — but it is a clean, inspectable entry point you can also invoke locally on
+a cluster against any table + source.
+
+---
+
 ## Extending the CLI
 
 There are two surfaces in the tree:

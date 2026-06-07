@@ -7,7 +7,8 @@ Subcommands::
     ygg databricks warehouses list/get/create/delete
     ygg databricks sql query/export   (run SQL; export --statement-id/--query → --target)
     ygg databricks job list/get/run/runs/logs/cancel/repair/delete
-    ygg databricks tables autoload <catalog.schema.table>  (cloudFiles ingestion job)
+    ygg databricks tables autoload <catalog.schema.table>  (deploy a cloudFiles ingestion job)
+    ygg databricks table autoload --table <c.s.t> --source <path>  (on-cluster ingestion run)
     ygg databricks fs ls/cat/write/put/get/mkdir/rm/stat/cp/mv  (Workspace/Volumes/DBFS)
     ygg databricks wheel [build/upload/deploy/list]  (build+upload ygg wheel; workspace PyPI-like registry)
     ygg databricks environment [list]  (build / get-or-install the base environment(s) from wheels)
@@ -28,6 +29,7 @@ from .services import (
     FSCommand,
     JobsCommand,
     SQLCommand,
+    TableCommand,
     TablesCommand,
     WarehousesCommand,
     WheelCommand,
@@ -74,6 +76,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     FSCommand.register(subparsers)
     JobsCommand.register(subparsers)
     SQLCommand.register(subparsers)
+    TableCommand.register(subparsers)
     TablesCommand.register(subparsers)
     WarehousesCommand.register(subparsers)
     WheelCommand.register(subparsers)
