@@ -47,6 +47,13 @@ class TestClientProjectAliasesProduct(unittest.TestCase):
         self.assertIsNone(self._client(None).product_name)
         self.assertIsNone(self._client(None).project_name)
 
+    def test_product_name_canonicalizes_through_pypi_alias(self):
+        # The display name a project's default warehouse / cluster are named for
+        # is canonical: ``yggdrasil`` (the name) and ``ygg`` (its PyPI alias) both
+        # render ``Ygg``, so a deploy and a later default() resolve one resource.
+        self.assertEqual(self._client("yggdrasil").product_name, "Ygg")
+        self.assertEqual(self._client("ygg").product_name, "Ygg")
+
     def test_display_name_helper(self):
         self.assertEqual(project_display_name("my-app"), "My App")
         self.assertEqual(project_display_name("my_cool_project"), "My Cool Project")

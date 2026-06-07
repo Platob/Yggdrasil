@@ -22,6 +22,9 @@ class TestDeployProject(unittest.TestCase):
 
     def _client(self):
         client = MagicMock()
+        # The deploy names the default warehouse/cluster from the canonical
+        # ``product_name`` (``compute.clusters.default()`` resolves the same).
+        client.product_name = "Myproj"
         client.workspace_client.return_value.current_user.me.return_value.user_name = "me@co.com"
         env = types.SimpleNamespace(
             project="myproj", version="0.1.0", name="myproj-0.1.0-py311",
