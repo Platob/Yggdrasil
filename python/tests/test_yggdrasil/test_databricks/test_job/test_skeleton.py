@@ -282,7 +282,8 @@ def test_all_environments_attaches_one_env_per_python():
         f._serverless_dependencies(client)
         envs = f.environments()
     keys = [e.environment_key for e in envs]
-    assert keys == ["default", "py310", "py311", "py312", "py313"]
+    # Capped at MAX_PYTHON (3.12) — no py313 (Databricks doesn't run 3.13+ yet).
+    assert keys == ["default", "py310", "py311", "py312"]
     by = {e.environment_key: e for e in envs}
     assert by["py311"].spec.base_environment == "/ws/env/ygg-3.11.yml"
 

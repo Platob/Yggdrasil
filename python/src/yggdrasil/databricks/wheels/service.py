@@ -70,8 +70,14 @@ WORKSPACE_PYPI_DIR = "/Workspace/Shared/pypi"
 WORKSPACE_ENV_DIR = "/Workspace/Shared/environment"
 
 #: Python minors we build/download wheels for. Pure-python projects collapse to a
-#: single ``py3-none-any`` wheel reused across all of them.
-SUPPORTED_PYTHONS: "tuple[str, ...]" = ("3.10", "3.11", "3.12", "3.13")
+#: single ``py3-none-any`` wheel reused across all of them. Capped at
+#: :data:`MAX_PYTHON` — Databricks (serverless + DBR) doesn't run 3.13+ yet.
+SUPPORTED_PYTHONS: "tuple[str, ...]" = ("3.10", "3.11", "3.12")
+
+#: Highest Python minor Databricks can run today. Wheel/env targets are clamped
+#: to it (see :func:`_py_minor`) so a build on a newer local interpreter (3.13+)
+#: still produces an artifact the cluster can actually install.
+MAX_PYTHON: str = "3.12"
 
 #: Latest serverless environment version; per-Python overrides below.
 SERVERLESS_ENVIRONMENT_VERSION = "5"
@@ -115,16 +121,35 @@ def _bundle_exclude() -> "set[str]":
 
 def _py_minor(python: "str | None" = None) -> str:
     """``"3.X"`` for *python* (default: the local interpreter; accepts ``3.11`` /
-    ``311`` / ``py311`` / ``3.11.7``)."""
+    ``311`` / ``py311`` / ``3.11.7``), **clamped to** :data:`MAX_PYTHON` so a
+    build on a newer interpreter (3.13+) still targets a Python Databricks runs."""
     if python is None:
-        return f"3.{sys.version_info[1]}"
-    digits = re.sub(r"[^0-9.]", "", python)
-    parts = digits.split(".")
-    if len(parts) >= 2:
-        return f"{parts[0]}.{parts[1]}"
-    if digits.startswith("3") and len(digits) >= 3:
-        return f"3.{digits[1:]}"
-    return digits or f"3.{sys.version_info[1]}"
+        minor = f"3.{sys.version_info[1]}"
+    else:
+        digits = re.sub(r"[^0-9.]", "", python)
+        parts = digits.split(".")
+        if len(parts) >= 2:
+            minor = f"{parts[0]}.{parts[1]}"
+        elif digits.startswith("3") and len(digits) >= 3:
+            minor = f"3.{digits[1:]}"
+        else:
+            minor = digits or f"3.{sys.version_info[1]}"
+    return _clamp_python(minor)
+
+
+def _clamp_python(minor: str) -> str:
+    """Cap *minor* (``"3.X"``) at :data:`MAX_PYTHON` — Databricks can't run 3.13+
+    yet, so a newer target would build an unusable wheel / environment."""
+    try:
+        if tuple(map(int, minor.split("."))) > tuple(map(int, MAX_PYTHON.split("."))):
+            logger.debug(
+                "Python %s exceeds the Databricks max (%s); building for %s.",
+                minor, MAX_PYTHON, MAX_PYTHON,
+            )
+            return MAX_PYTHON
+    except ValueError:
+        pass
+    return minor
 
 
 def serverless_environment_version(python: "str | None" = None) -> str:

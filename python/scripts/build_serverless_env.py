@@ -3,7 +3,7 @@
 built wheel with the matching Databricks runtime.
 
 Run right after ``uv build`` (see ``.github/workflows/publish.yml``). For each
-``--python`` (repeatable; default 3.12, ``--all-versions`` covers 3.10–3.13) it
+``--python`` (repeatable; default 3.12, ``--all-versions`` covers 3.10–3.12) it
 writes, under ``environments/ygg/``:
 
 * ``ygg-<version>-py<py>-serverless.yml`` — a Databricks serverless
@@ -24,7 +24,7 @@ needs the client and server to share a minor Python).
 
 Stdlib only — no install of ygg (or its heavy deps) is needed in CI. The
 ``python → serverless environment version`` mapping mirrors
-:func:`yggdrasil.databricks.job.wheel.serverless_environment_version`; a test
+:func:`yggdrasil.databricks.wheels.service.serverless_environment_version`; a test
 (``tests/test_yggdrasil/test_databricks/test_serverless_env.py``) asserts the
 two agree so they can't drift.
 """
@@ -37,13 +37,14 @@ from pathlib import Path
 # Databricks serverless environment versions, keyed by the runtime's Python
 # minor; anything newer maps to the latest. KEEP IN SYNC with
 # ``serverless_environment_version`` in
-# ``python/src/yggdrasil/databricks/job/wheel.py`` (a test enforces it).
+# ``python/src/yggdrasil/databricks/wheels/service.py`` (a test enforces it).
 SERVERLESS_ENVIRONMENT_VERSION = "5"
 _PY_MINOR_TO_ENV_VERSION = {10: "1", 11: "2"}
 
 # Python minors we build wheels / environments for. KEEP IN SYNC with
-# ``SUPPORTED_PYTHONS`` in ``yggdrasil.databricks.job.wheel``.
-SUPPORTED_PYTHONS = ("3.10", "3.11", "3.12", "3.13")
+# ``SUPPORTED_PYTHONS`` in ``yggdrasil.databricks.wheels.service`` — capped at
+# 3.12 because Databricks (serverless + DBR) doesn't run 3.13+ yet.
+SUPPORTED_PYTHONS = ("3.10", "3.11", "3.12")
 
 
 def serverless_environment_version(python_minor: int) -> str:
@@ -129,7 +130,7 @@ def main(argv: "list[str] | None" = None) -> int:
     )
     parser.add_argument(
         "--all-versions", dest="all_versions", action="store_true",
-        help="emit specs for every supported Python (3.10–3.13).",
+        help="emit specs for every supported Python (3.10–3.12).",
     )
     parser.add_argument(
         "--version", default=None,
