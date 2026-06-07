@@ -21,8 +21,14 @@ from typing import Any, Optional
 
 __all__ = [
     "snapshot", "size_tier", "can_run_local",
-    "accelerator", "intel_gpu_present", "has_npu",
+    "accelerator", "intel_gpu_present", "has_npu", "XPU_TORCH_INDEX",
 ]
+
+#: The dedicated PyTorch wheel index that ships **Intel GPU (XPU)** support —
+#: ``pip install --index-url <this> torch`` turns a *detected* Intel GPU into a
+#: *torch-usable* one (``ygg loki setup`` offers this). The stock PyPI wheel is
+#: CPU/CUDA-only, so a fresh box never drives the Intel GPU without it.
+XPU_TORCH_INDEX = "https://download.pytorch.org/whl/xpu"
 
 #: RAM (GB) thresholds for the CPU size tiers; a CUDA GPU jumps to ``xlarge``.
 _RAM_LARGE = 32.0

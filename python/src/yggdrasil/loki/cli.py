@@ -249,7 +249,51 @@ def _setup(loki: Any, style: Any, arg: str) -> int:
         style.warn("no local engine yet — install one of:")
         for hint in res.get("install", []):
             style.out(f"    {style.brand('›')} {style.dim(hint)}\n")
+    _enable_intel_gpu(style)
     return 0
+
+
+def _enable_intel_gpu(style: Any) -> None:
+    """Turn a *detected* Intel GPU into a *usable* one.
+
+    The Intel GPU shows in ``status`` as soon as the OS sees it, but a local
+    model only runs on it once torch can target the XPU backend — which the
+    stock CPU/CUDA wheel can't. When the GPU is present but not yet usable, offer
+    to install the GPU (XPU) torch build from the dedicated PyTorch index. The
+    Intel NPU is reported too, but the HF pipeline can't target it (that path is
+    OpenVINO / optimum-intel), so it's informational only.
+    """
+    import subprocess
+    import sys
+
+    from yggdrasil.loki import resources
+
+    if resources.has_npu():
+        style.out(f"  {style.brand('▸ Intel NPU')} {style.dim('detected — offload via optimum-intel + openvino (the HF pipeline runs on GPU/CPU)')}\n")
+    if not resources.intel_gpu_present() or resources.accelerator() == "xpu":
+        return                                   # no Intel GPU, or it's already usable
+    cmd = [sys.executable, "-m", "pip", "install", "--index-url",
+           resources.XPU_TORCH_INDEX, "torch"]
+    style.out(f"  {style.brand('▸ Intel GPU')} {style.dim('detected but not yet usable by torch (CPU build)')}\n")
+    style.out(f"  {style.dim('enable it with:')}\n    {style.brand(' '.join(cmd))}\n")
+    try:
+        ans = input(f"  install the GPU torch build now? {style.dim('(~1 GB download)')} [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if ans not in ("y", "yes"):
+        return
+    with style.Spinner("installing GPU torch (xpu) — this downloads ~1 GB…"):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "see pip output"
+        style.fail(f"GPU torch install failed — {_short(tail)}")
+        return
+    # torch may already be imported (CPU) in this process — a reinstall can't
+    # swap the live module, so a fresh `ygg loki` is what actually picks it up.
+    if "torch" not in sys.modules and resources.accelerator() == "xpu":
+        style.ok("Intel GPU enabled — local models now run on the GPU (xpu)")
+    else:
+        style.ok("GPU torch installed — restart `ygg loki` to run local models on the Intel GPU")
 
 
 # -- interactive session ---------------------------------------------------

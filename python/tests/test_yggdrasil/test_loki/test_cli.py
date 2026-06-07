@@ -111,6 +111,68 @@ class TestHardwareLine(unittest.TestCase):
         self.assertIn("Intel NPU", line)
 
 
+class TestIntelGpuEnable(unittest.TestCase):
+    """``ygg loki setup`` turns a detected Intel GPU into a usable one."""
+
+    def _run(self, *, gpu=False, accel=None, npu=False, answer="n", rc=0):
+        import io
+        import subprocess
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        from yggdrasil.cli import style
+        from yggdrasil.loki import resources
+
+        style.force_color(False)
+        buf = io.StringIO()
+        proc = subprocess.CompletedProcess([], rc, stdout="", stderr="boom\nthe real error")
+        with patch.object(resources, "intel_gpu_present", return_value=gpu), \
+                patch.object(resources, "accelerator", return_value=accel), \
+                patch.object(resources, "has_npu", return_value=npu), \
+                patch("builtins.input", return_value=answer) as inp, \
+                patch("subprocess.run", return_value=proc) as run, \
+                redirect_stdout(buf):
+            cli._enable_intel_gpu(style)
+        return style.strip(buf.getvalue()), inp, run
+
+    def test_silent_without_intel_hardware(self):
+        out, inp, run = self._run(gpu=False, npu=False)
+        self.assertEqual(out, "")
+        inp.assert_not_called()
+        run.assert_not_called()
+
+    def test_reports_npu_without_offering_gpu_install(self):
+        out, inp, run = self._run(gpu=False, npu=True)
+        self.assertIn("Intel NPU", out)
+        inp.assert_not_called()                 # NPU is informational, no install
+        run.assert_not_called()
+
+    def test_offers_install_when_gpu_present_but_unusable(self):
+        out, inp, run = self._run(gpu=True, accel=None, answer="n")
+        self.assertIn("Intel GPU", out)
+        self.assertIn("download.pytorch.org/whl/xpu", out)   # the exact command shown
+        inp.assert_called_once()                # prompted…
+        run.assert_not_called()                 # …but declined → no install
+
+    def test_runs_xpu_install_on_yes(self):
+        out, inp, run = self._run(gpu=True, accel=None, answer="y", rc=0)
+        run.assert_called_once()
+        argv = run.call_args.args[0]
+        self.assertIn("--index-url", argv)
+        self.assertIn("https://download.pytorch.org/whl/xpu", argv)
+        self.assertIn("torch", argv)
+
+    def test_install_failure_surfaces_error_tail(self):
+        out, inp, run = self._run(gpu=True, accel=None, answer="y", rc=1)
+        self.assertIn("failed", out)
+        self.assertIn("the real error", out)    # last stderr line, not the whole dump
+
+    def test_skips_when_gpu_already_usable(self):
+        out, inp, run = self._run(gpu=True, accel="xpu")
+        self.assertEqual(out, "")               # already xpu → nothing to do
+        inp.assert_not_called()
+
+
 class TestActMonitor(unittest.TestCase):
     """The live cumulative step view for the autonomous ``act`` loop."""
 

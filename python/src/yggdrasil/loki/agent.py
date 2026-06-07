@@ -451,12 +451,20 @@ class Loki:
             return {"engine": "transformers", "ready": True,
                     "model": model or tf.bootstrap_model, "was_present": False,
                     "status": "ready (weights lazy-download on first use)"}
+        # A box with an Intel GPU should install the GPU (XPU) torch build, not
+        # the stock CPU wheel — so the local model runs on the GPU from the start.
+        from .resources import XPU_TORCH_INDEX, intel_gpu_present
+
+        torch_hint = (f"pip install transformers && pip install --index-url {XPU_TORCH_INDEX} torch"
+                      "  (HF local engine, on the Intel GPU)"
+                      if intel_gpu_present() else
+                      "or: pip install transformers torch  (HF local engine)")
         return {
             "engine": None, "ready": False,
             "install": [
                 "install Ollama (https://ollama.com), then it auto-pulls "
                 f"{OllamaEngine().bootstrap_model!r} (sized to this box)",
-                "or: pip install transformers torch  (HF local engine)",
+                torch_hint,
             ],
         }
 
