@@ -42,6 +42,12 @@ class TransformersEngine(LocalEngine):
     }
     #: One pipeline per model, shared across instances (weights load once).
     _PIPES: ClassVar[dict[str, Any]] = {}
+    #: Models whose build already failed this process → the surfaced cause.
+    #: A local load is slow (download weights → build the pipeline) and can
+    #: fail late (corrupt cache, torch mismatch); without this the doomed load
+    #: re-runs on *every* turn — the "it reloads every chat, it's too slow"
+    #: pain. Remembering the failure makes the retry fail fast instead.
+    _FAILED: ClassVar[dict[str, Exception]] = {}
 
     def __init__(self, *, model: Optional[str] = None, tier: Optional[str] = None,
                  device: Optional[str] = None) -> None:
@@ -61,24 +67,60 @@ class TransformersEngine(LocalEngine):
         """
         return (model or self.resolve_model()) in self._PIPES
 
+    def warm(self, model: Optional[str] = None) -> None:
+        """Build the model's pipeline ahead of the first turn — best-effort.
+
+        Loading a local model is slow and silent (download weights → build the
+        pipeline); the ``ygg loki`` REPL calls this on a background thread so
+        the wait overlaps the user picking a session and typing, instead of
+        stalling the first submit. Swallows failures — they're cached in
+        :attr:`_FAILED` and surfaced on the first real turn.
+        """
+        try:
+            self._pipeline(model or self.resolve_model())
+        except Exception:
+            pass
+
     def _pipeline(self, model: str) -> Any:
         """The cached text-generation pipeline for *model*, built on first use.
 
         The build is the slow, silent part on a fresh box — weights download
         then load — so it's bracketed with progress logs (see :data:`_log`).
+        A build that already failed this process is **not retried**: it raises
+        the remembered cause straight away, so a doomed load doesn't re-run its
+        slow download on every turn.
         """
         pipe = self._PIPES.get(model)
         if pipe is not None:
             return pipe
+        failed = self._FAILED.get(model)
+        if failed is not None:
+            raise failed
         from ..runtime import load
 
         _log.info("loading local model %s on %s — first run downloads weights, "
                   "this can take a while…", model, self.device or "cpu")
         load("torch")  # the pipeline backend — auto-installed if missing
-        pipe = self._PIPES[model] = load("transformers").pipeline(
-            "text-generation", model=model,
-            device=self.device, trust_remote_code=False,
-        )
+        try:
+            pipe = self._PIPES[model] = load("transformers").pipeline(
+                "text-generation", model=model,
+                device=self.device, trust_remote_code=False,
+            )
+        except Exception as exc:
+            # transformers masks the real reason behind a generic "Could not
+            # load model … with any of the following classes" — unwrap the
+            # underlying cause so the log says *why* (corrupt download, torch
+            # mismatch, OOM), and remember the failure so the slow, doomed load
+            # isn't re-attempted on every chat turn.
+            cause = exc.__cause__ or exc.__context__ or exc
+            err = RuntimeError(
+                f"could not load local model {model!r}: "
+                f"{type(cause).__name__}: {cause}. Pin a smaller model with "
+                f"YGG_LOKI_HF_MODEL, or clear the HuggingFace cache and retry."
+            )
+            self._FAILED[model] = err
+            _log.warning("local model %s failed to load — %s", model, err)
+            raise err from exc
         _log.info("local model %s ready", model)
         return pipe
 

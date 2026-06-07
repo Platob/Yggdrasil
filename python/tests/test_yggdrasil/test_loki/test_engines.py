@@ -295,7 +295,8 @@ class TestTransformersEngine(unittest.TestCase):
     """The local HuggingFace engine — open models on this workstation, free."""
 
     def setUp(self):
-        TransformersEngine._PIPES.clear()  # don't leak a pipeline across tests
+        TransformersEngine._PIPES.clear()   # don't leak a pipeline across tests
+        TransformersEngine._FAILED.clear()  # nor a remembered load failure
 
     def test_is_local_and_free(self):
         self.assertTrue(TransformersEngine.local)
@@ -349,6 +350,45 @@ class TestTransformersEngine(unittest.TestCase):
         self.assertEqual(calls["kw"]["max_new_tokens"], 512)
         self.assertEqual(METER.rows_for("transformers")[0].calls, 1)
         self.assertEqual(METER.total_cost, 0.0)  # local is free
+
+    def test_failed_load_is_cached_not_retried_and_surfaces_cause(self):
+        # A local load is slow and can fail late (corrupt download, torch
+        # mismatch). The build must run once: a remembered failure fast-fails
+        # the next turn instead of re-downloading weights every chat.
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(side_effect=ValueError("Could not load model X"))
+        fake_torch = types.ModuleType("torch")
+        eng = TransformersEngine(model="m")
+        with patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch}):
+            with self.assertRaises(RuntimeError) as first:
+                eng.generate("hi")
+            with self.assertRaises(RuntimeError) as second:
+                eng.generate("hi again")
+        # The pipeline build ran exactly once — the second turn reused the cache.
+        fake.pipeline.assert_called_once()
+        # The surfaced error names the model and the underlying cause.
+        self.assertIn("m", str(first.exception))
+        self.assertIn("Could not load model X", str(first.exception))
+        self.assertIs(first.exception, second.exception)
+
+    def test_warm_preloads_pipeline_and_swallows_failure(self):
+        pipe = MagicMock()
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(return_value=pipe)
+        fake_torch = types.ModuleType("torch")
+        eng = TransformersEngine(model="m")
+        with patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch}):
+            eng.warm()
+            self.assertTrue(eng.ready("m"))   # built ahead of any turn
+
+        # A failing warm is best-effort — it must not raise (the first real
+        # turn surfaces the remembered failure instead).
+        TransformersEngine._PIPES.clear()
+        TransformersEngine._FAILED.clear()
+        fake.pipeline = MagicMock(side_effect=RuntimeError("boom"))
+        with patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch}):
+            eng.warm()                        # does not raise
+        self.assertIn("m", TransformersEngine._FAILED)
 
     def test_ready_tracks_loaded_pipeline(self):
         eng = TransformersEngine(model="m")

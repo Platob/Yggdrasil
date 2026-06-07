@@ -268,6 +268,20 @@ def _repl(loki: Any, style: Any) -> int:
               f"{style.dim('· ' + session.user)}\n")
     style.out(f"  {style.dim('workspace ' + str(session.workspace))}\n")
     _select_engine(loki, style, state)
+    # Pre-load the *chosen* engine in the background (the startup _warm thread
+    # only warms the best-by-preference one). For a local transformers model
+    # this overlaps the slow weights download with the capability probe and the
+    # user's first keystrokes, so the first turn isn't a multi-minute black box.
+    if state.get("engine"):
+        def _warm_chosen(name: str = state["engine"]) -> None:
+            try:
+                warm = getattr(loki.engine(name), "warm", None)
+                if callable(warm):
+                    warm()
+            except Exception:
+                pass
+
+        threading.Thread(target=_warm_chosen, daemon=True).start()
     # Warm the local-capability probe now (it imports torch the first time —
     # slow on a box that has it) so the first turn's engine selection doesn't
     # stall silently. Only matters when a local engine is actually reachable.
