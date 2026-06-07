@@ -218,6 +218,19 @@ class TestTableAccessPrecheck:
             tbl.external_location()
         assert tbl.service.client.external_locations.find_url.call_count == 2
 
+    def test_invalidate_clears_external_location_and_staging_memo(self) -> None:
+        from yggdrasil.databricks.table.table import _UNRESOLVED
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            tbl.external_location()
+        tbl._staging_volume = MagicMock()
+        # Invalidation (what delete runs) drops the storage-derived caches.
+        tbl.invalidate_singleton()
+        assert tbl._external_location is _UNRESOLVED
+        assert tbl._staging_volume is None
+        assert tbl._infos is None
+
 
 # ---------------------------------------------------------------------------
 # Mocking — arrow_insert routes through insert_volume_path

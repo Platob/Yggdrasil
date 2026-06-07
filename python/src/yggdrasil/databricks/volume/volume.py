@@ -86,7 +86,7 @@ class Volume(DatabricksPath):
     use.
     """
 
-    DEFAULT_INFO_TTL: ClassVar[float] = 1800.0  # 30 minutes
+    DEFAULT_INFO_TTL: ClassVar[float] = 900.0  # 15 minutes
     NAMESPACE_PREFIX: ClassVar[str] = "/Volumes/"
     _INSTANCES: ClassVar = Singleton._INSTANCES.__class__(default_ttl=None)
     _SINGLETON_TTL: ClassVar[Any] = 300.0
@@ -559,6 +559,11 @@ class Volume(DatabricksPath):
         self._catalog = None
         self._schema = None
         self._external_location = _UNRESOLVED
+        # Drop the per-mode direct-storage verdicts too: a delete / rebind can
+        # flip a volume between EXTERNAL and MANAGED, so a stale "usable" /
+        # "denied" flag would mis-route the next read or write.
+        self._external_readable = None
+        self._external_writable = None
         # The info and the stat snapshot describe the same object — drop
         # them together so a re-probe after a delete / rebind is honest.
         self._stat_cached = None
@@ -578,14 +583,14 @@ class Volume(DatabricksPath):
 
     @property
     def info(self) -> VolumeInfo:
-        """Cached :class:`VolumeInfo` (5-minute TTL by default)."""
+        """Cached :class:`VolumeInfo` (15-minute TTL by default)."""
         return self.read_info()
 
     def read_info(self, *, refresh: bool = False, default: Any = ...) -> VolumeInfo:
         """Return the SDK's :class:`VolumeInfo` for this volume.
 
         Refreshes whenever the cached entry is past
-        :attr:`DEFAULT_INFO_TTL` (5 minutes by default), or when
+        :attr:`DEFAULT_INFO_TTL` (15 minutes by default), or when
         ``refresh=True`` forces it. If the underlying ``volumes.read``
         raises :class:`NotFound`, auto-creates the volume (and any
         missing catalog / schema parents) and retries the read once.

@@ -1468,6 +1468,11 @@ class Table(DatabricksPath):
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
+        # Storage-derived caches go stale on a delete / rebind: drop the
+        # memoised external location and the per-table staging-volume handle so
+        # the next access re-derives against fresh info.
+        object.__setattr__(self, "_external_location", _UNRESOLVED)
+        object.__setattr__(self, "_staging_volume", None)
         self._invalidate_entity_tag_cache()
         super().invalidate_singleton(remove_global=remove_global)
 
