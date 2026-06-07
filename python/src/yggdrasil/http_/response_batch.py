@@ -18,7 +18,7 @@ from yggdrasil.environ import PyEnv
 from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.response import HTTPResponse
 from yggdrasil.http_.schemas import REQUEST_SCHEMA, RESPONSE_SCHEMA
-from yggdrasil.http_.cache_config import CacheConfig, MATCH_KEY
+from yggdrasil.http_.cache_config import CacheConfig, MATCH_COLUMN, MATCH_KEY
 from yggdrasil.http_.send_config import SendConfig
 from yggdrasil.io.tabular import ArrowTabular
 from yggdrasil.arrow.tabular import ArrowTabular
@@ -139,7 +139,11 @@ class HTTPResponseBatch(Tabular):
     def _read_cache_hits(
         self, cache: "CacheConfig | None", hashes: set[int],
     ) -> "Tabular | None":
-        """Read full responses for hit hashes from a cache, filtering stale."""
+        """Rebuild responses for hit hashes from a cache, filtering stale.
+
+        The read is projected to just the response payload + the request join key
+        (:meth:`SendConfig.read_hits`); the full live request is reattached from
+        memory, so the heavy request_* columns never come back over the wire."""
         if not hashes or cache is None:
             return None
         hit_reqs = [r for r in self._requests if r.match_value(MATCH_KEY) in hashes]
@@ -150,12 +154,25 @@ class HTTPResponseBatch(Tabular):
             return None
         request_map = {r.match_value(MATCH_KEY): r for r in hit_reqs}
         kept: list[HTTPResponse] = []
-        for resp in HTTPResponse.from_arrow_tabular(tab.read_arrow_batches()):
-            req = request_map.get(
-                resp.match_value(MATCH_KEY) if hasattr(resp, "match_value") else None
-            )
-            if req is not None and cache.filter_response(resp, request=req):
-                kept.append(resp)
+        # The read is projected to the response payload + the request join key
+        # (``read_hits``) — not the full request — so a response's ``public_hash``
+        # can't be recomputed from the row. Match each row on the cached
+        # ``request_public_hash`` (MATCH_COLUMN) column directly and reattach the
+        # full live request we already hold; the heavy request_* columns never
+        # come back over the wire.
+        for batch in tab.read_arrow_batches():
+            keys = (batch.column(MATCH_COLUMN).to_pylist()
+                    if MATCH_COLUMN in batch.schema.names
+                    else [None] * batch.num_rows)
+            for key, resp in zip(keys, HTTPResponse.from_arrow_tabular(batch)):
+                req = request_map.get(key)
+                if req is None and hasattr(resp, "match_value"):
+                    req = request_map.get(resp.match_value(MATCH_KEY))
+                if req is None:
+                    continue
+                resp.request = req
+                if cache.filter_response(resp, request=req):
+                    kept.append(resp)
         return responses_to_tabular(kept) if kept else None
 
     def _fetch(

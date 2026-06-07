@@ -69,7 +69,6 @@ class DeployCommand:
 
         from yggdrasil.databricks.wheels.service import (
             find_pyproject,
-            project_display_name,
             read_pyproject,
         )
 
@@ -114,13 +113,15 @@ class DeployCommand:
         project = primary.project
         # Reconcile the client with the authoritative project + version from the
         # built environment (covers the PyPI-name path with no local pyproject).
-        # The default warehouse + cluster are named for the project's capitalized
-        # display name — what `find_default` / `default_names()` resolve to once
-        # the client carries the project.
         client.project = project
         if primary.version is not None:
             client.product_version = str(primary.version)
-        name = project_display_name(project)
+        # The default warehouse + cluster are named for the project's canonical
+        # display name (:attr:`DatabricksClient.product_name`) — the exact name
+        # `warehouses.default()` / `compute.clusters.default()` resolve to, so a
+        # later default lookup finds what this deploy provisions regardless of
+        # whether the project was named by its name or its PyPI alias.
+        name = client.product_name
         style.ok(f"deployed project {style.brand(project)} {primary.version} "
                  f"· {len(envs)} environment(s)")
 

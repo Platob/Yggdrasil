@@ -147,12 +147,15 @@ def _resolve_submit_environment(client: DatabricksClient, environment: Any) -> A
     ``JobEnvironment``. Accepts:
 
     - a :class:`JobEnvironment` — returned as-is;
-    - a ``str`` — a seeded serverless **base-environment** stem name (or a direct
-      workspace path to its ``.yml`` spec), reused via ``Environment.base_environment``
-      so the run shares the cached image;
-    - ``None`` — **auto**: the running client project's deployed environment, else
-      the seeded **ygg** base environment for the current Python, else ``None``
-      (the run falls back to the workspace's default serverless compute).
+    - a ``str`` — a seeded serverless **base-environment**: a version-tagged stem
+      name (``ygg-0.8.58-py311``), a **project name** (``ygg`` / ``yggdrasil`` /
+      ``meteologica`` → that project's deployed env for the current Python), or a
+      direct workspace path to its ``.yml`` spec; reused via
+      ``Environment.base_environment`` so the run shares the cached image;
+    - ``None`` — **auto**: the project :meth:`~yggdrasil.databricks.environments.service.Environments.default`
+      (local pyproject / client project, else the seeded **ygg** base environment
+      for the current Python), else ``None`` (the run falls back to the
+      workspace's default serverless compute).
 
     A named environment that can't be found raises :class:`FileNotFoundError`
     — the miss is loud because the caller asked for a specific image.

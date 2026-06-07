@@ -1097,10 +1097,15 @@ class DatabricksClient(Singleton, URLBased):
     @property
     def project(self) -> Optional[str]:
         """The client **project** — an alias of :attr:`product`, **always
-        lowercased** (the canonical identifier). Defaults to ``"yggdrasil"``; set
-        it (or ``product``) to name a project and it persists with the client
-        (it is one of :data:`_INIT_NAMES`, so it rides through config, session
-        snapshots, and clones)."""
+        lowercased** (the canonical project identifier). ``yggdrasil`` and ``ygg``
+        are the same project: ``yggdrasil`` is the name (and the import package),
+        ``ygg`` is only its **PyPI distribution alias**. That distribution mapping
+        lives in the wheel / environment layer (:func:`~yggdrasil.databricks.wheels.service.distribution_for`),
+        not here — so ``client.project`` stays the human project name while the
+        deployed wheels / base environment land under the ``ygg`` distribution
+        folder. Defaults to ``"yggdrasil"``; set it (or ``product``) to name a
+        project and it persists with the client (``product`` is one of
+        :data:`_INIT_NAMES`, so it rides config, session snapshots, and clones)."""
         return self.product.strip().lower() if self.product else None
 
     @project.setter
@@ -1108,13 +1113,20 @@ class DatabricksClient(Singleton, URLBased):
         self.product = str(value).strip().lower() if value else None
 
     @property
-    def project_name(self) -> Optional[str]:
-        """A nice, capitalized display name for the client :attr:`project`
-        (``my-app`` → ``My App``), or ``None`` when unset."""
+    def product_name(self) -> Optional[str]:
+        """A nice, capitalized display name for the client :attr:`project` — the
+        **real project name** (``yggdrasil`` → ``Yggdrasil``, ``my-app`` → ``My
+        App``), or ``None`` when unset. The project's default warehouse and cluster
+        are named for this. The ``ygg`` PyPI alias is not applied here — it belongs
+        to the wheel / distribution layer, not the project's identity."""
         from yggdrasil.databricks.wheels.service import project_display_name
 
         project = self.project
         return project_display_name(project) if project else None
+
+    #: ``project_name`` is the same display name under the project vocabulary —
+    #: :attr:`product` and :attr:`project` name one thing, so do their displays.
+    project_name = product_name
 
     @property
     def connected(self) -> bool:

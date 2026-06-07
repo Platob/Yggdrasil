@@ -176,15 +176,22 @@ class Warehouses(DatabricksService):
 
         Based on the client **project** (:attr:`DatabricksClient.project` — an
         alias of ``product``, always lowercased): its nice display name
-        (:attr:`~DatabricksClient.project_name`) with a serverless sibling —
+        (:attr:`~DatabricksClient.product_name`) with a serverless sibling —
         ``("My App", "My App Serverless")`` — so each project gets its own default
-        warehouse pair. The default ``ygg`` product (``ygg`` / ``yggdrasil``) and
-        "no project" both fall back to the workspace-wide ygg defaults
+        warehouse pair. The default ``yggdrasil`` product (``ygg`` / ``yggdrasil``)
+        and "no project" both fall back to the workspace-wide ygg defaults
         (:data:`DEFAULT_ALL_PURPOSE_CLASSIC_NAME` / ``…_SERVERLESS_NAME``)."""
         if self.client.project and self.client.project not in ("ygg", "yggdrasil"):
-            classic = self.client.project_name
+            classic = self.client.product_name
             return classic, f"{classic} Serverless"
         return DEFAULT_ALL_PURPOSE_CLASSIC_NAME, DEFAULT_ALL_PURPOSE_SERVERLESS_NAME
+
+    def default(self, raise_error: bool = True) -> Optional["SQLWarehouse"]:
+        """The project's **default SQL warehouse** — named for the running client
+        project (see :meth:`default_names`), resolving or creating it via
+        :meth:`find_default`. The warehouse sibling of
+        ``dbc.environments.default()`` / ``compute.clusters.default()``."""
+        return self.find_default(raise_error=raise_error)
 
     def find_default(self, raise_error: bool = True) -> Optional["SQLWarehouse"]:
         """

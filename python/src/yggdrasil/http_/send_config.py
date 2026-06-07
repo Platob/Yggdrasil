@@ -31,6 +31,21 @@ from yggdrasil.http_.cache_config import (
 
 DEFAULT_MAX_BATCH_TTL: float = 300.0
 
+#: The only columns a cache read needs to rebuild a response — the response
+#: payload plus the request join key (``request_public_hash``) and ``request_url``
+#: (so the row's throwaway request still deserializes; the *real* request is
+#: reattached from memory in ``HTTPResponseBatch._read_cache_hits``). The heavy
+#: ``request_headers`` / ``request_body`` / ``request_params`` / ``receiver`` /
+#: ``*_hash`` / ``_pkl`` columns are never pulled back over the wire — a remote
+#: (Databricks/Delta) hit read scans far fewer bytes. Mirrors the local
+#: content-addressed cache's stored set
+#: (:func:`~yggdrasil.http_.response_cache._encode`), which likewise keeps only
+#: the response payload and rebuilds against the caller's request.
+RESPONSE_REBUILD_COLUMNS: "tuple[str, ...]" = (
+    MATCH_COLUMN, "request_url", "status_code", "headers", "tags", "body", "received_at",
+)
+
+
 
 class SendConfig:
 
@@ -201,7 +216,12 @@ class SendConfig:
             hits, _misses = holder.read_responses(requests, config=cache)
             return responses_to_tabular(hits) if hits else None
         batch_predicate = cache.make_batch_lookup_predicate(requests)
-        opts = CastOptions(predicate=batch_predicate, target=RESPONSE_SCHEMA)
+        # Project to just the rebuild columns: the response payload + the request
+        # join key. The full request is reattached from memory in
+        # ``HTTPResponseBatch._read_cache_hits``, so a remote read never pulls the
+        # heavy request_* / receiver / *_hash / _pkl columns it would discard.
+        light = RESPONSE_SCHEMA.select(RESPONSE_REBUILD_COLUMNS)
+        opts = CastOptions(predicate=batch_predicate, target=light)
         return holder.read_table(options=opts)
 
     def write_responses(
