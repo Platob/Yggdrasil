@@ -61,7 +61,7 @@ class EnvironmentCommand:
         pythons = list(whl.SUPPORTED_PYTHONS) if args.all_versions else [None]
         plural = "s" if len(pythons) > 1 else ""
         with style.Spinner(
-            f"building {len(pythons)} base environment{plural} (wheel closure + binaries)…"
+            f"building {len(pythons)} base environment{plural} (wheel closure into shared pypi)…"
         ):
             envs = whl.ensure_environments(
                 client, versions=pythons, workspace_dir=workspace_dir, rebuild=args.rebuild,
