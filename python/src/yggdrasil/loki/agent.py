@@ -636,8 +636,14 @@ class Loki:
             '  to use a tool:  {"thought": "...", "tool": "<name>", "args": {...}}\n'
             '  when finished:  {"thought": "...", "done": true, "answer": "<summary>"}\n\n'
             "Rules: take the smallest useful step; read a file before editing "
-            "it; `edit_file` needs `old` to be unique, else write the whole "
-            "file; stop as soon as the goal is met and summarize what changed."
+            "it; `edit_file` needs `old` to be unique, else write the whole file.\n"
+            "Validation discipline (checkpoints): after each meaningful change, run a "
+            "quick `smoke` test to confirm it still works before moving on — never "
+            "stack unverified changes. At a bigger milestone (a feature done, a module "
+            "reshaped) run `bench` to validate performance, not just correctness. Do "
+            "NOT declare done until a `smoke` test passes; in your final answer say "
+            "what you validated. Stop as soon as the goal is met and verified, and "
+            "summarize what changed and what you ran."
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": f"GOAL: {task}"}]
         steps: list[dict[str, Any]] = []

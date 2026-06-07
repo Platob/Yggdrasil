@@ -271,10 +271,13 @@ def filesystem_toolbox(
                 box.changed.append(r)
             return f"edited {r} (1 replacement)"
 
-        def _run(argv, *, timeout, shell):
+        def _run(argv, *, timeout, shell, env=None):
+            import os as _os
+
             proc = subprocess.run(
                 argv, shell=shell, cwd=str(base),
                 capture_output=True, text=True, timeout=timeout,
+                env={**_os.environ, **env} if env else None,
             )
             parts = [f"exit={proc.returncode}"]
             if proc.stdout:
@@ -289,6 +292,49 @@ def filesystem_toolbox(
         def run_cmd(command: str, timeout: float = 60.0) -> str:
             return _run(command, timeout=timeout, shell=True)
 
+        def _src_env() -> dict:
+            """Make a ``src/`` layout importable for the run (PYTHONPATH)."""
+            import os as _os
+
+            paths = [str(base)]
+            if (base / "src").is_dir():
+                paths.insert(0, str(base / "src"))
+            existing = _os.environ.get("PYTHONPATH")
+            return {"PYTHONPATH": _os.pathsep.join(paths + ([existing] if existing else []))}
+
+        def smoke(path: str = "", code: str = "", timeout: float = 180.0) -> str:
+            """A fast **checkpoint** validation — run after each change.
+
+            ``code`` runs a quick assertion snippet; ``path`` runs that test
+            file/dir under pytest; with neither it auto-discovers — pytest when
+            the tree has tests, else a byte-compile of every ``.py`` (catches
+            syntax/import breakage). The agent root's ``src/`` is importable.
+            """
+            if code:
+                return _run([sys.executable, "-c", code], timeout=timeout, shell=False,
+                            env=_src_env())
+            if path:
+                return _run([sys.executable, "-m", "pytest", "-q", path],
+                            timeout=timeout, shell=False, env=_src_env())
+            has_tests = (base / "tests").is_dir() or next(base.rglob("test_*.py"), None) is not None
+            if has_tests:
+                return _run([sys.executable, "-m", "pytest", "-q"],
+                            timeout=timeout, shell=False, env=_src_env())
+            pys = [str(p) for p in base.rglob("*.py") if ".git/" not in rel(p)][:100]
+            if not pys:
+                return "(nothing to smoke-test: no tests and no .py files)"
+            return _run([sys.executable, "-c",
+                         "import py_compile,sys\n"
+                         "for f in sys.argv[1:]:\n    py_compile.compile(f, doraise=True)\n"
+                         "print('compiled OK:', len(sys.argv)-1, 'files')",
+                         *pys], timeout=timeout, shell=False, env=_src_env())
+
+        def bench(path: str, repeat: int = 5, timeout: float = 600.0) -> str:
+            """Run a benchmark script (``python <path> --repeat N``) at a bigger
+            **checkpoint** to validate performance, not just correctness."""
+            return _run([sys.executable, path, "--repeat", str(repeat)],
+                        timeout=timeout, shell=False, env=_src_env())
+
         box.add(Tool("write_file", "Create or overwrite a file with content.",
                      {"path": "file path", "content": "full file content"},
                      write_file, mutates=True))
@@ -302,6 +348,15 @@ def filesystem_toolbox(
         box.add(Tool("run", "Run a shell command in the agent root and capture output.",
                      {"command": "shell command", "timeout": "seconds, default 60"},
                      run_cmd, mutates=True))
+        box.add(Tool("smoke", "Checkpoint validation: run a quick assertion (`code`), a "
+                     "test (`path`), or auto-discover tests / byte-compile. Run after "
+                     "each change.",
+                     {"path": "test file/dir (optional)", "code": "assertion snippet (optional)",
+                      "timeout": "seconds, default 180"}, smoke))
+        box.add(Tool("bench", "Run a benchmark script (python <path> --repeat N) to validate "
+                     "performance at a bigger checkpoint.",
+                     {"path": "benchmark script path", "repeat": "iterations, default 5",
+                      "timeout": "seconds, default 600"}, bench))
 
     if allow_web:
         def web_fetch(url: str) -> str:

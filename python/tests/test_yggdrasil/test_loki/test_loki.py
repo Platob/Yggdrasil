@@ -212,6 +212,25 @@ class TestAgentAct(unittest.TestCase):
         self.assertEqual(len(result["steps"]), 1)
         self.assertEqual((pathlib.Path(self.dir) / "hi.txt").read_text(), "hello loki")
 
+    def test_act_can_smoke_test_a_change_as_a_checkpoint(self):
+        import json
+        import pathlib
+
+        loki, _ = self._loki([
+            json.dumps({"thought": "write it", "tool": "write_file",
+                        "args": {"path": "calc.py", "content": "def add(a, b):\n    return a + b\n"}}),
+            json.dumps({"thought": "checkpoint", "tool": "smoke",
+                        "args": {"code": "from calc import add; assert add(2, 3) == 5; print('ok')"}}),
+            json.dumps({"thought": "verified", "done": True, "answer": "added add(); smoke passed"}),
+        ])
+        result = loki.act("add add() and validate it", root=self.dir, max_steps=6)
+        self.assertTrue(result["completed"])
+        # The smoke checkpoint actually ran the assertion against the new file.
+        smoke_step = next(s for s in result["steps"] if s["tool"] == "smoke")
+        self.assertIn("exit=0", smoke_step["observation"])
+        self.assertIn("ok", smoke_step["observation"])
+        self.assertEqual((pathlib.Path(self.dir) / "calc.py").exists(), True)
+
     def test_act_stops_when_over_budget(self):
         import json
         from unittest.mock import patch
