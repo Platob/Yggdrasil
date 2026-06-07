@@ -1346,13 +1346,14 @@ def _volume_info(
     name: str = "vol",
     volume_id: str = "volume-uuid-0001",
     storage_location: str = "s3://my-bucket/__unitystorage/cat/sch/vol",
+    volume_type: str = "MANAGED",
 ):
     return SimpleNamespace(
         catalog_name=catalog,
         schema_name=schema,
         name=name,
         volume_id=volume_id,
-        volume_type="MANAGED",
+        volume_type=volume_type,
         storage_location=storage_location,
         full_name=f"{catalog}.{schema}.{name}",
         access_point=None,
@@ -2207,110 +2208,112 @@ class TestUploadVolumeRecovery:
 
 
 class TestExternalStorageGating:
-    """``_external_storage_file`` resolves the direct cloud-storage Path only
-    for an EXTERNAL volume whose schema grants the current user
-    ``EXTERNAL USE SCHEMA`` — otherwise ``None`` (the caller uses the Files
-    API)."""
-
-    def _vp(self):
-        return VolumePath(
-            "/Volumes/cat/sch/vol/sub/file.bin", service=MagicMock(spec=Volumes),
-        )
+    """``Volume.external_storage_root`` resolves the direct cloud-storage root
+    only for an EXTERNAL volume whose schema grants the current user
+    ``EXTERNAL USE SCHEMA`` — otherwise ``None`` (callers use the Files API).
+    ``VolumePath._external_storage_file`` is a thin per-file join on top."""
 
     def _volume(self, *, external=True, can_use=True, access=None,
                 location="s3://bkt/root"):
-        vol = MagicMock()
-        vol.volume_type = "EXTERNAL" if external else "MANAGED"
-        vol.schema.can_use_external.return_value = can_use
-        vol.external_access.return_value = access   # None=undetermined by default
-        vol.storage_location.return_value = location
-        sentinel = object()
+        from yggdrasil.databricks.volume.volume import Volume
+
+        vol = Volume(
+            service=MagicMock(spec=Volumes),
+            catalog_name="cat", schema_name="sch", volume_name="vol",
+        )
+        # Seed a fresh ``VolumeInfo`` so the (property) ``storage_location`` /
+        # ``volume_type`` reads resolve without a network round trip.
+        vol._infos = _volume_info(
+            storage_location=location,
+            volume_type="EXTERNAL" if external else "MANAGED",
+        )
+        vol._infos_fetched_at = time.time()
+        # Pre-seed the per-mode access cache (``None`` = undetermined).
+        vol._external_writable = access
+        vol._external_readable = access
+        schema = MagicMock()
+        schema.can_use_external.return_value = can_use
+        vol._schema = schema
         root = MagicMock()
-        root.__truediv__.return_value = sentinel
+        vol.aws = MagicMock()
         vol.aws.return_value.s3.path.return_value = root
-        return vol, root, sentinel
+        return vol, root
 
     def test_none_when_volume_access_previously_denied(self) -> None:
         # A cached False (managed / no grant / prior 403) → fast path off
         # without re-running the eligibility check.
-        p = self._vp()
-        vol, *_ = self._volume(access=False)
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            assert p._external_storage_file(write=True) is None
-        vol.external_access.assert_called_once_with(write=True)
+        vol, _root = self._volume(access=False)
+        assert vol.external_storage_root(write=True) is None
         vol.schema.can_use_external.assert_not_called()  # skipped — cached
         vol.aws.assert_not_called()
 
     def test_eligibility_check_runs_once_then_cached(self) -> None:
         # First call determines + caches (mark_external_ok); the second sees
         # the cached True and skips the grant check.
-        p = self._vp()
-        vol, _root, sentinel = self._volume()
-        vol.external_access.side_effect = [None, True]   # undetermined, then cached
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            assert p._external_storage_file(write=False) is sentinel
-            assert p._external_storage_file(write=False) is sentinel
-        vol.mark_external_ok.assert_called_once_with(write=False)
+        vol, root = self._volume()
+        assert vol.external_storage_root(write=False) is root
+        assert vol.external_storage_root(write=False) is root
+        assert vol.external_access(write=False) is True
         vol.schema.can_use_external.assert_called_once()  # only the first time
 
     def test_ineligible_is_cached_denied(self) -> None:
         # A managed volume records the negative so it isn't re-evaluated.
-        p = self._vp()
-        vol, *_ = self._volume(external=False)
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            assert p._external_storage_file(write=True) is None
-        vol.mark_external_denied.assert_called_once_with(write=True)
+        vol, _root = self._volume(external=False)
+        assert vol.external_storage_root(write=True) is None
+        assert vol.external_access(write=True) is False
 
     def test_resolves_when_external_and_permitted(self) -> None:
-        p = self._vp()
-        vol, root, sentinel = self._volume()
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            out = p._external_storage_file(write=True)
-        assert out is sentinel
-        # Joined under the volume root by the entry's relative path.
-        root.__truediv__.assert_called_once_with("sub/file.bin")
+        vol, root = self._volume(location="s3://bkt/root")
+        assert vol.external_storage_root(write=True) is root
+        vol.aws.return_value.s3.path.assert_called_once_with("s3://bkt/root")
 
     def test_none_when_permission_absent(self) -> None:
-        p = self._vp()
-        vol, *_ = self._volume(can_use=False)
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            assert p._external_storage_file(write=False) is None
+        vol, _root = self._volume(can_use=False)
+        assert vol.external_storage_root(write=False) is None
         vol.schema.can_use_external.assert_called_once()
         vol.aws.assert_not_called()
 
-    def test_none_when_managed_short_circuits_before_permission(self) -> None:
-        p = self._vp()
-        vol, *_ = self._volume(external=False)
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            assert p._external_storage_file(write=True) is None
-        vol.schema.can_use_external.assert_not_called()
-
     def test_none_for_non_s3_location(self) -> None:
-        p = self._vp()
-        vol, *_ = self._volume(location="abfss://c@acct.dfs.core.windows.net/root")
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            assert p._external_storage_file(write=True) is None
+        vol, _root = self._volume(location="abfss://c@acct.dfs.core.windows.net/root")
+        assert vol.external_storage_root(write=True) is None
 
     def test_write_disabled_on_uc_managed_storage_layout(self) -> None:
         # A ``__unitystorage`` / ``__unitycatalog`` path is UC-managed storage —
         # direct PUTs are denied, so writes route through the Files API while
         # reads can still go direct.
         for marker in ("__unitystorage", "__unitycatalog"):
-            p = self._vp()
-            vol, _root, sentinel = self._volume(
+            vol, root = self._volume(
                 location=f"s3://bkt/metastore/{marker}/catalogs/x/vol",
             )
-            with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-                assert p._external_storage_file(write=True) is None
-                assert p._external_storage_file(write=False) is sentinel
+            assert vol.external_storage_root(write=True) is None
+            assert vol.external_storage_root(write=False) is root
 
     def test_read_scope_uses_read_only_credentials(self) -> None:
         from yggdrasil.enums import Mode
-        p = self._vp()
-        vol, *_ = self._volume()
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            p._external_storage_file(write=False)
+        vol, _root = self._volume()
+        vol.external_storage_root(write=False)
         assert vol.aws.call_args.kwargs["mode"] == Mode.READ_ONLY
+
+    def test_external_storage_file_joins_rel_under_root(self) -> None:
+        # The VolumePath helper delegates eligibility to the Volume and only
+        # joins this entry's path *under* the resolved root.
+        p = VolumePath("/Volumes/cat/sch/vol/sub/file.bin", service=MagicMock(spec=Volumes))
+        vol = MagicMock()
+        joined = object()
+        root = MagicMock()
+        root.__truediv__.return_value = joined
+        vol.external_storage_root.return_value = root
+        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
+            assert p._external_storage_file(write=True) is joined
+        vol.external_storage_root.assert_called_once_with(write=True)
+        root.__truediv__.assert_called_once_with("sub/file.bin")
+
+    def test_external_storage_file_none_when_root_unavailable(self) -> None:
+        p = VolumePath("/Volumes/cat/sch/vol/sub/file.bin", service=MagicMock(spec=Volumes))
+        vol = MagicMock()
+        vol.external_storage_root.return_value = None
+        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
+            assert p._external_storage_file(write=False) is None
 
 
 class TestVolumeExternalAccessFlags:

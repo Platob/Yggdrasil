@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import types
 from contextlib import ExitStack
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 from yggdrasil.databricks.table.table import Table
 from yggdrasil.databricks.table.auto_loader import auto_load
@@ -236,46 +236,47 @@ class TestAutoLoadEntryPoint:
 
 
 class TestStageStorageAndDefaultSource:
-    def test_auto_loader_defaults_source_to_staging_volume_storage(self):
-        # The default source is the staging volume's cloud storage path joined
-        # with STAGE_SUBPATH, and (on this same zero-config path) the checkpoint
-        # defaults to its CHECKPOINT_SUBPATH sibling — both resolved straight off
-        # the staging volume's (writable, external) storage, never the MANAGED
-        # table's governed location.
-        from yggdrasil.enums import Mode
+    def test_auto_loader_defaults_source_to_staging_volume_path(self):
+        # The default source is ``staging_volume / STAGE_SUBPATH`` and (on this
+        # same zero-config path) the checkpoint defaults to its
+        # CHECKPOINT_SUBPATH sibling. ``staging_volume / SUBPATH`` resolves to
+        # the volume's direct cloud-storage path (``s3://…``) when external +
+        # reachable, else the governed ``/Volumes/…`` path — both off the
+        # dedicated staging volume, never the MANAGED table's own location.
         tbl = _table()
         vol = MagicMock()
-        storage_root = MagicMock()
         leaves = {
-            Table.STAGE_SUBPATH: "s3://bkt/3mv/.ygg/stage",
-            Table.CHECKPOINT_SUBPATH: "s3://bkt/3mv/.ygg/_autoloader",
+            Table.STAGE_SUBPATH: "s3://bkt/vol/.staging/data",
+            Table.CHECKPOINT_SUBPATH: "s3://bkt/vol/.staging/_autoloader",
         }
         def _join(sub):
             m = MagicMock()
             m.full_path.return_value = leaves[sub]
             return m
-        storage_root.__truediv__.side_effect = _join
-        vol.storage_path.return_value = storage_root
-        with patch.object(Table, "ensure_staging_volume", return_value=vol), \
-                patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
+        vol.__truediv__.side_effect = _join
+        with patch.object(
+            Table, "staging_volume", new_callable=PropertyMock, return_value=vol,
+        ), patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
             tbl.auto_loader(file_arrival=True)  # no source, no checkpoint
 
-        assert vol.storage_path.call_args.kwargs["mode"] is Mode.AUTO
-        storage_root.__truediv__.assert_any_call(Table.STAGE_SUBPATH)
-        storage_root.__truediv__.assert_any_call(Table.CHECKPOINT_SUBPATH)
+        # The staging volume is ensured present before its paths are taken.
+        vol.get_or_create.assert_called_once()
+        vol.__truediv__.assert_any_call(Table.STAGE_SUBPATH)
+        vol.__truediv__.assert_any_call(Table.CHECKPOINT_SUBPATH)
         params = Flow.call_args.kwargs["parameters"]
-        assert params[1] == "s3://bkt/3mv/.ygg/stage"             # source = staging storage path
-        assert params[3] == "s3://bkt/3mv/.ygg/_autoloader"       # checkpoint = sibling, writable
+        assert params[1] == "s3://bkt/vol/.staging/data"           # source = staging volume path
+        assert params[3] == "s3://bkt/vol/.staging/_autoloader"    # checkpoint = sibling on it
         trig = Flow.call_args.kwargs["trigger"]
-        assert trig.file_arrival.url == "s3://bkt/3mv/.ygg/stage/"  # file trigger on it
+        assert trig.file_arrival.url == "s3://bkt/vol/.staging/data/"  # file trigger on it
 
     def test_explicit_source_leaves_checkpoint_to_on_cluster_default(self):
         # With an explicit source and no checkpoint, the staging volume is not
         # touched and the checkpoint param stays empty so the on-cluster step
         # derives <table-location>/_ygg_autoloader (unchanged behavior).
         tbl = _table()
-        with patch.object(Table, "ensure_staging_volume") as ensure, \
+        staging = PropertyMock()
+        with patch.object(Table, "staging_volume", new=staging), \
                 patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:
             tbl.auto_loader("s3://bkt/landing", file_arrival=False)
-        ensure.assert_not_called()
+        staging.assert_not_called()
         assert Flow.call_args.kwargs["parameters"][3] == ""

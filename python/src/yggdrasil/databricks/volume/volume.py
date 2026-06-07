@@ -238,6 +238,46 @@ class Volume(DatabricksPath):
         else:
             self._external_readable = False
 
+    def external_storage_root(self, *, write: bool) -> Path | None:
+        """The volume's backing cloud-storage root :class:`Path` (an
+        :class:`S3Path` today) when this volume is **directly reachable** for
+        *write* / read — else ``None`` (the caller stays on the Files-API
+        :class:`VolumePath`).
+
+        Eligibility — volume is ``EXTERNAL``, the current identity holds
+        ``EXTERNAL USE SCHEMA`` on its schema, the location is ``s3://``, and —
+        for a write — it isn't a UC-managed ``__unitystorage`` /
+        ``__unitycatalog`` layout (where direct ``PutObject`` is denied) — is
+        decided **once per mode** and cached on this singleton via
+        :meth:`external_access`, so the check doesn't re-run on every path
+        build / I/O. When eligible the backing object store is reachable
+        directly, skipping the Files-API hop and the UC quota burn. Never
+        raises into the caller — any metadata / vend / credential failure
+        resolves to ``None`` and the Files-API path takes over.
+        """
+        try:
+            cached = self.external_access(write=write)
+            if cached is False:
+                return None
+            raw = self.storage_location
+            if cached is None:
+                # First time for this mode — run the eligibility check + cache
+                # the verdict so later path builds / ops skip straight to the
+                # root resolution below.
+                eligible = (
+                    (self.volume_type or "").upper() == "EXTERNAL"
+                    and self.schema.can_use_external()
+                    and (URL.from_str(raw).scheme or "").startswith("s3")
+                    and not (write and ("__unitystorage" in raw or "__unitycatalog" in raw))
+                )
+                self.mark_external_ok(write=write) if eligible else self.mark_external_denied(write=write)
+                if not eligible:
+                    return None
+            return self.aws(mode=Mode.AUTO if write else Mode.READ_ONLY).s3.path(raw)
+        except Exception as exc:  # type / location / credential resolution
+            logger.debug("external storage root unavailable for %r: %s", self, exc)
+            return None
+
     # ── identity ──────────────────────────────────────────────────────────────
 
     def full_name(self, safe: str | bool | None = None) -> str:
@@ -276,8 +316,17 @@ class Volume(DatabricksPath):
         if n == 3:
             # ``/<catalog>/<schema>/<volume>`` — this volume itself.
             return self
-        # Depth ≥ 4 — a file or directory under this volume.
-        return self.path("/".join(parts[3:]))
+        # Depth ≥ 4 — a file or directory under this volume. Prefer the
+        # volume's **direct cloud-storage Path** (S3) when it's EXTERNAL and
+        # reachable, so navigation / reads / writes / Auto Loader bypass the
+        # Files-API hop and the UC quota burn; fall back to the Files-API
+        # ``/Volumes/...`` :class:`VolumePath` for managed volumes, a missing
+        # ``EXTERNAL USE SCHEMA`` grant, or a non-s3 backend (where the object
+        # store isn't reachable directly). The eligibility verdict is cached on
+        # the singleton, so this costs one resolution per volume, not per join.
+        rel = "/".join(parts[3:])
+        root = self.external_storage_root(write=True)
+        return (root / rel) if root is not None else self.path(rel)
 
     def __str__(self) -> str:
         return self.full_name()

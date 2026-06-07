@@ -3102,19 +3102,22 @@ class Table(DatabricksPath):
 
         Args:
             source: Cloud path Auto Loader watches (``s3://…`` / ``/Volumes/…``).
-                ``None`` (default) uses the staging volume's cloud storage path
-                (``ensure_staging_volume().storage_path() / STAGE_SUBPATH``), so
-                files staged there are ingested with no explicit wiring.
+                ``None`` (default) uses this table's dedicated staging volume
+                (:attr:`staging_volume` ``/ STAGE_SUBPATH``), which resolves to
+                the volume's direct cloud-storage path (``s3://…``) when the
+                volume is EXTERNAL and reachable, else the governed Files-API
+                ``/Volumes/…`` path — so files staged there are ingested with no
+                explicit wiring.
             name: Job name override (default ``[YGG][AUTOLOADER] <full_name>``).
             file_format: ``cloudFiles.format`` (parquet / json / csv / avro / …).
             checkpoint: Streaming checkpoint + schema location. ``None`` (default)
                 on the zero-config path (when *source* also defaults) co-locates
-                it with the staging area on the volume's writable external storage
-                (``<staging-storage>/<CHECKPOINT_SUBPATH>``) — a MANAGED table's own
-                storage is governed ``__unitystorage`` that Unity Catalog forbids
-                Auto Loader from writing into. With an explicit *source*, ``None``
-                instead lets the on-cluster step derive
-                ``<table-location>/_ygg_autoloader``.
+                it with the staging area on the same staging volume
+                (:attr:`staging_volume` ``/ CHECKPOINT_SUBPATH``) — kept off a
+                MANAGED *table*'s own governed ``__unitystorage`` storage, which
+                Unity Catalog forbids Auto Loader from writing into. With an
+                explicit *source*, ``None`` instead lets the on-cluster step
+                derive ``<table-location>/_ygg_autoloader``.
             available_now: ``True`` → a one-shot ``Trigger.AvailableNow`` sweep
                 (the shape a scheduled / file-arrival run wants); ``False`` →
                 continuous micro-batch.
@@ -3168,19 +3171,23 @@ class Table(DatabricksPath):
             environment = environment_stem("ygg")
 
         if source is None:
-            # Zero-config path: both source and checkpoint live on the staging
-            # volume's own (writable, external) cloud storage. The files staged
-            # there are ingested with no explicit wiring, and the streaming
-            # checkpoint + schema sit beside them as a sibling of
-            # ``STAGE_SUBPATH`` (outside the watched ``stage/`` dir so it isn't
-            # re-ingested). This deliberately avoids the on-cluster default of
-            # ``<table-location>/_ygg_autoloader``: a MANAGED table's storage is
-            # governed ``__unitystorage`` that Unity Catalog forbids Auto Loader
-            # from writing into (``LOCATION_OVERLAP`` on ``CheckPathAccess``).
-            staging_storage = self.staging_volume.get_or_create().storage_path(mode=Mode.AUTO)
-            source = (staging_storage / self.STAGE_SUBPATH).full_path()
+            # Zero-config path: both the watched source and the streaming
+            # checkpoint live on this table's dedicated **staging volume**.
+            # ``staging_volume / SUBPATH`` resolves to the volume's direct
+            # cloud-storage path (``s3://…``) when the volume is EXTERNAL and
+            # reachable — optimal for ``cloudFiles`` + the file-arrival trigger
+            # — and to the governed Files-API ``/Volumes/…`` path otherwise (a
+            # managed staging volume, still watchable + writable from the
+            # cluster). The checkpoint sits beside the staged data under
+            # ``.staging/`` (a sibling of the watched ``data/`` dir so it's
+            # never re-ingested). Either way this stays on the staging volume,
+            # so a MANAGED *table*'s own governed ``__unitystorage`` location
+            # — which Unity Catalog forbids Auto Loader from writing into
+            # (``LOCATION_OVERLAP`` on ``CheckPathAccess``) — is never touched.
+            self.staging_volume.get_or_create()
+            source = (self.staging_volume / self.STAGE_SUBPATH).full_path()
             if checkpoint is None:
-                checkpoint = (staging_storage / self.CHECKPOINT_SUBPATH).full_path()
+                checkpoint = (self.staging_volume / self.CHECKPOINT_SUBPATH).full_path()
 
         if file_arrival and trigger is None:
             from databricks.sdk.service.jobs import (
@@ -3242,13 +3249,14 @@ class Table(DatabricksPath):
         """Stage *data* as Parquet under this table's **Auto Loader staging
         area** and return the path it landed at — no warehouse statement runs.
 
-        Writes a fresh, uniquely-named Parquet file directly under the staging
-        volume's cloud storage path (``STAGE_SUBPATH`` prefix) — the same path a
-        deployed :meth:`auto_loader` job watches — so staged rows are ingested
-        with no extra wiring: ``stage_insert`` → Auto Loader → table. Falls back
-        to the Files-API volume staging (:meth:`staging_folder`) when a direct
-        cloud path isn't available (e.g. a managed staging volume), preserving a
-        stage-for-later-load there.
+        Writes a fresh, uniquely-named Parquet file under the staging volume's
+        ``STAGE_SUBPATH`` prefix — the same path a deployed :meth:`auto_loader`
+        job watches — so staged rows are ingested with no extra wiring:
+        ``stage_insert`` → Auto Loader → table. ``staging_volume / STAGE_SUBPATH``
+        resolves to the volume's direct cloud storage (``s3://…``, no Files-API
+        hop) when the volume is EXTERNAL and reachable, and to the governed
+        Files-API ``/Volumes/…`` path otherwise (e.g. a managed staging volume)
+        — both land the file where the watcher expects it.
         """
         leaf = f"insert-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.parquet"
         root = self.staging_volume / self.STAGE_SUBPATH
