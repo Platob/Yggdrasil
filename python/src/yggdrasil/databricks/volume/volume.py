@@ -212,7 +212,8 @@ class Volume(DatabricksPath):
         # ``None`` = not yet determined, ``True`` = usable, ``False`` = not
         # usable (managed / no grant / non-s3, or a permission error proved the
         # vended creds can't actually read/write the storage). Process-wide via
-        # the singleton. See :meth:`VolumePath._external_storage_file`.
+        # the singleton. See :meth:`external_storage_root` /
+        # :meth:`VolumePath.storage_path`.
         self._external_readable: Optional[bool] = None
         self._external_writable: Optional[bool] = None
         self._initialized = True
