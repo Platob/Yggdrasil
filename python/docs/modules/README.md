@@ -13,6 +13,7 @@ Hand-written, copy-paste-friendly pages for the most-used surfaces. The auto-gen
 
 - [io](io/README.md) — `URL`, Tabular IO holders, codecs.
 - [http_](http_/README.md) — `HTTPSession`, prepared requests, batch dispatch.
+- [loki](loki/README.md) — `Loki`, the global agent (skills, engines, tools).
 
 ## Databricks
 
