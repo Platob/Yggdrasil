@@ -72,55 +72,84 @@ class TestTask:
         assert g.retries == 5 and g.name == "renamed"
         assert f.retries == 0 and f.name == "f"   # original untouched
 
-    def test_to_task_renders_serverless_wheel(self):
+    def test_to_task_ships_command_verbatim(self):
         @task(key="ld")
         def load():
             ...
 
-        t = load.to_task(["c.s.t"])
+        t = load.to_task(["databricks", "table", "autoload", "--table", "c.s.t"])
         assert t.task_key == "ld"
         assert t.environment_key == "default"      # serverless
         assert t.python_wheel_task.entry_point == "ygg"
-        # the single ``ygg`` entry point gets a leading ``run`` subcommand
-        assert t.python_wheel_task.parameters == ["run", "c.s.t"]
+        # the explicit command is the wheel-task parameters verbatim (no prefix)
+        assert t.python_wheel_task.parameters == [
+            "databricks", "table", "autoload", "--table", "c.s.t",
+        ]
+
+    def test_to_task_falls_back_to_configured_command(self):
+        @task(key="ld", command=["databricks", "table", "autoload", "-t", "c.s.t"])
+        def load():
+            ...
+
+        t = load.to_task()
+        assert t.python_wheel_task.parameters == [
+            "databricks", "table", "autoload", "-t", "c.s.t",
+        ]
 
 
 # --------------------------------------------------------------------------- #
-# transparent dispatch — in-Databricks runs local, elsewhere routes remote
+# call — runs the body in-process (honouring retries); deploy runs on the cluster
 # --------------------------------------------------------------------------- #
-class TestTransparentDispatch:
-    def test_call_inside_databricks_runs_in_process(self):
+class TestCallRunsInProcess:
+    def test_call_runs_in_process(self):
         @task
         def add(a, b):
             return a + b
 
-        with patch(
-            "yggdrasil.databricks.client.DatabricksClient.is_in_databricks_environment",
-            return_value=True,
-        ):
-            assert add(2, 3) == 5                   # ran locally, no deploy
+        assert add(2, 3) == 5                       # ran locally, no deploy
 
-    def test_call_outside_databricks_dispatches_remote(self):
-        @flow
-        def etl(x):
-            return x
+    def test_command_ships_verbatim_as_wheel_parameters(self):
+        @flow(name="autoload",
+              command=["databricks", "table", "autoload", "--table", "c.s.t",
+                       "--source", "s3://x"])
+        def etl():
+            ...
 
-        with patch(
-            "yggdrasil.databricks.client.DatabricksClient.is_in_databricks_environment",
-            return_value=False,
-        ), patch.object(Flow, "_dispatch_remote", return_value="REMOTE") as disp:
-            assert etl(7, k=1) == "REMOTE"
-        disp.assert_called_once_with((7,), {"k": 1})
-
-    def test_target_ref_points_at_the_decorated_object(self):
-        # A module-level flow has an importable target the runner can resolve.
-        ref = module_level_flow._target_ref()
-        assert ref == f"{__name__}:module_level_flow"
+        assert etl.command() == [
+            "databricks", "table", "autoload", "--table", "c.s.t", "--source", "s3://x",
+        ]
 
 
 # --------------------------------------------------------------------------- #
 # @flow — local orchestration + serverless rendering
 # --------------------------------------------------------------------------- #
+class TestProjectSpec:
+    def test_resolves_the_local_checkout_for_an_editable_package(self):
+        # A flow whose function lives in the editable yggdrasil checkout must
+        # deploy from *source* (its project dir), not the published PyPI name —
+        # otherwise the cluster runs stale published code. (Regression: a missing
+        # ``Path`` import made ``_project_spec`` silently fall back to PyPI.)
+        from pathlib import Path
+
+        from yggdrasil.databricks.table.auto_loader import auto_load
+
+        f = Flow(auto_load, name="x", command=["databricks", "table", "autoload"])
+        assert f.wheel_package() == "yggdrasil"
+        spec = Path(f._project_spec())
+        assert (spec / "pyproject.toml").is_file()           # a real local project dir
+        assert spec.name == "python" and spec.parent.name == "Yggdrasil"
+
+    def test_falls_back_to_distribution_name_when_not_importable(self):
+        from unittest.mock import patch
+
+        @flow(name="ghost")
+        def ghost(): ...
+
+        with patch.object(type(ghost), "wheel_package", return_value="no_such_pkg_xyz"):
+            # Not importable → PyPI distribution name, no exception leaks.
+            assert ghost._project_spec() == "no_such_pkg_xyz"
+
+
 class TestFlow:
     def test_flow_runs_tasks_locally(self):
         @task
@@ -146,30 +175,41 @@ class TestFlow:
 
         assert gather.local([3, 1, 2]) == [1, 2, 3]
 
-    def test_definition_runs_target_via_ygg_run(self):
+    def test_definition_ships_command_verbatim(self):
         from yggdrasil.databricks.wheels.service import serverless_environment_version
 
-        @flow(parameters=["a", "b"])
-        def etl(x, y):
+        @flow(command=["databricks", "table", "autoload", "--table", "c.s.t",
+                       "--source", "s3://x"])
+        def etl():
             ...
 
         spec = etl.definition()
         assert spec["name"] == "etl"
         assert "trigger" not in spec
         task_obj = spec["tasks"][0]
-        # the cluster runs the single ``ygg`` entry point's ``run`` subcommand
-        # against the target + scheduled params
+        # the cluster runs the single ``ygg`` entry point with the explicit
+        # command shipped verbatim as the wheel-task parameters (no ``run`` prefix)
         assert task_obj.python_wheel_task.package_name == "ygg"
         assert task_obj.python_wheel_task.entry_point == "ygg"
-        assert task_obj.python_wheel_task.parameters == ["run", etl._target_ref(), "a", "b"]
+        assert task_obj.python_wheel_task.parameters == [
+            "databricks", "table", "autoload", "--table", "c.s.t", "--source", "s3://x",
+        ]
         assert task_obj.environment_key == "default"
         env = spec["environments"][0]
         assert env.spec.environment_version == serverless_environment_version()
         # no wheels shipped yet (definition without deploy) → published fallback
         assert env.spec.dependencies == [f"ygg[databricks]=={__version__}", "databricks-sdk"]
 
+    def test_definition_without_command_raises(self):
+        @flow(name="no-cmd")
+        def etl():
+            ...
+
+        with pytest.raises(ValueError, match="no command"):
+            etl.definition()
+
     def test_serverless_false_drops_environment(self):
-        @flow
+        @flow(command=["databricks", "table", "autoload", "-t", "c.s.t"])
         def etl():
             ...
 
@@ -179,14 +219,15 @@ class TestFlow:
         assert spec["tasks"][0].environment_key is None
 
     def test_trigger_included_when_set(self):
-        @flow(trigger={"file_arrival": {"url": "/Volumes/x"}})
+        @flow(trigger={"file_arrival": {"url": "/Volumes/x"}},
+              command=["databricks", "table", "autoload", "-t", "c.s.t"])
         def etl():
             ...
 
         assert etl.definition()["trigger"] == {"file_arrival": {"url": "/Volumes/x"}}
 
     def test_job_tags_flow_into_definition(self):
-        @flow
+        @flow(command=["databricks", "table", "autoload", "-t", "c.s.t"])
         def etl():
             ...
 
@@ -195,8 +236,8 @@ class TestFlow:
         assert etl.definition()["tags"] == {"ygg": "demo", "team": "data"}
 
     def test_deploy_ships_composed_wheels_by_default(self):
-        @flow(name="ygg-demo", parameters=["a"])
-        def demo(x):
+        @flow(name="ygg-demo", command=["databricks", "table", "autoload", "-t", "c.s.t"])
+        def demo():
             ...
 
         client = MagicMock()
@@ -210,13 +251,15 @@ class TestFlow:
         sd.assert_called_once_with(client)
         kwargs = client.jobs.create_or_update.call_args.kwargs
         assert kwargs["name"] == "ygg-demo"
-        assert kwargs["tasks"][0].python_wheel_task.parameters == ["run", demo._target_ref(), "a"]
+        assert kwargs["tasks"][0].python_wheel_task.parameters == [
+            "databricks", "table", "autoload", "-t", "c.s.t",
+        ]
         assert kwargs["environments"][0].spec.dependencies == wheels  # shipped by path
         assert deployed is client.jobs.create_or_update.return_value
 
     def test_deploy_can_use_published_ygg(self):
-        @flow(name="ygg-demo", parameters=["a"])
-        def demo(x):
+        @flow(name="ygg-demo", command=["databricks", "table", "autoload", "-t", "c.s.t"])
+        def demo():
             ...
 
         demo.build_wheel = False                      # opt out → pip-install from index
@@ -230,7 +273,7 @@ class TestFlow:
         assert deployed is client.jobs.create_or_update.return_value
 
 
-def test_class_based_flow_overrides_run():
+def test_class_based_flow_overrides_run_and_command():
     class MyFlow(Flow):
         def __init__(self):
             super().__init__(name="mine")
@@ -238,16 +281,16 @@ def test_class_based_flow_overrides_run():
         def run(self, x):
             return x + 100
 
+        def command(self):
+            return ["databricks", "table", "autoload", "-t", "c.s.t"]
+
     f = MyFlow()
     assert f.local(5) == 105                          # in-process
     assert f.name == "mine"
-    assert "MyFlow" in f._target_ref()                # class-based target
-
-
-# A module-level flow target (importable ``module:qualname`` for the runner).
-@flow(name="module-level")
-def module_level_flow(x):
-    return x
+    # a class-based flow ships its overridden command() verbatim
+    assert f.definition()["tasks"][0].python_wheel_task.parameters == [
+        "databricks", "table", "autoload", "-t", "c.s.t",
+    ]
 
 
 def test_all_environments_attaches_one_env_per_python():
@@ -266,7 +309,8 @@ def test_all_environments_attaches_one_env_per_python():
         f._serverless_dependencies(client)
         envs = f.environments()
     keys = [e.environment_key for e in envs]
-    assert keys == ["default", "py310", "py311", "py312", "py313"]
+    # Capped at MAX_PYTHON (3.12) — no py313 (Databricks doesn't run 3.13+ yet).
+    assert keys == ["default", "py310", "py311", "py312"]
     by = {e.environment_key: e for e in envs}
     assert by["py311"].spec.base_environment == "/ws/env/ygg-3.11.yml"
 

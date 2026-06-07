@@ -92,6 +92,68 @@ def test_delete(service, store):
     assert "raw_zone" not in store
 
 
+# --- find_url + list caching ----------------------------------------------
+def test_find_url_longest_prefix_match(service):
+    el = service.find_url("s3://my-bucket/raw/sub/f.parquet")
+    assert el is not None and el.name == "raw_zone"   # covered by raw_zone's root
+    assert service.find_url("s3://my-bucket/raw") is not None      # the root itself
+    assert service.find_url("s3://nowhere/x") is None             # uncovered
+
+
+def test_list_is_cached_within_ttl(service):
+    api = service.client.workspace_client.return_value.external_locations
+    service.find_url("s3://my-bucket/raw/x")
+    service.find_url("s3://other/ro/y")
+    list(service.list())
+    # All served from one underlying list() — external locations are near-static.
+    assert api.list.call_count == 1
+
+
+def test_refresh_forces_a_relist(service):
+    api = service.client.workspace_client.return_value.external_locations
+    service.find_url("s3://my-bucket/raw/x")
+    service.find_url("s3://my-bucket/raw/x", refresh=True)
+    assert api.list.call_count == 2
+
+
+def test_writes_bust_the_cache(service):
+    api = service.client.workspace_client.return_value.external_locations
+    service.find_url("s3://my-bucket/raw/x")          # list #1, populates cache
+    service.create("new_zone", "s3://b/new/", "c")    # write → invalidate
+    found = service.find_url("s3://b/new/sub/f")       # list #2, sees the new one
+    assert found is not None and found.name == "new_zone"
+    assert api.list.call_count == 2
+
+
+def test_permission_error_listing_is_skipped_not_raised(service):
+    from databricks.sdk.errors import PermissionDenied
+
+    api = service.client.workspace_client.return_value.external_locations
+    api.list.side_effect = PermissionDenied("does not have permission to list")
+    # find_url / list degrade to "nothing" rather than raising.
+    assert service.find_url("s3://my-bucket/raw/x") is None
+    assert list(service.list()) == []
+
+
+def test_permission_skip_is_cached_no_relisting(service):
+    from databricks.sdk.errors import PermissionDenied
+
+    api = service.client.workspace_client.return_value.external_locations
+    api.list.side_effect = PermissionDenied("forbidden")
+    service.find_url("s3://b/x")
+    service.find_url("s3://b/y")
+    # The empty result is cached for the TTL — no repeated denied calls.
+    assert api.list.call_count == 1
+
+
+def test_non_permission_list_error_still_raises(service):
+    api = service.client.workspace_client.return_value.external_locations
+    api.list.side_effect = RuntimeError("transient network blip")
+    # Not a rights problem — surface it rather than silently hiding a bug.
+    with pytest.raises(RuntimeError):
+        service.find_url("s3://b/x")
+
+
 def test_client_external_locations_property_is_cached():
     # ``client.external_locations`` is a flat alias onto the
     # ``client.external`` umbrella (centralized external-data services).

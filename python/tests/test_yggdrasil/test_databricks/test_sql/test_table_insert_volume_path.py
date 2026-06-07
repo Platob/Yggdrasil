@@ -67,8 +67,8 @@ class TestInsertVolumePath:
         assert isinstance(path, VolumePath)
         full = path.full_path()
         # ``staging_volume`` is ``<table>`` under the table's
-        # catalog / schema; staging files land in ``.sql/tmp/``.
-        assert full.startswith("/Volumes/cat/sch/tbl/.sql/tmp/")
+        # catalog / schema; staging files land in ``tmp/``.
+        assert full.startswith("/Volumes/cat/sch/tbl/tmp/")
         assert full.endswith(".parquet")
         # Default keeps the staged Parquet temporary so the holder
         # cleans up after itself.
@@ -86,7 +86,7 @@ class TestInsertVolumePath:
         other = _table("cat2", "sch2", "extra")
         path = tbl.insert_volume_path(other)
         full = path.full_path()
-        assert "/Volumes/cat2/sch2/extra/.sql/tmp/" in full
+        assert "/Volumes/cat2/sch2/extra/tmp/" in full
 
     def test_unique_per_call(self) -> None:
         tbl = _table()
@@ -106,31 +106,130 @@ class TestInsertVolumePath:
 
 
 # ---------------------------------------------------------------------------
-# staging_volume — the cheap, lazily-created staging handle
+# staging_volume — the per-table staging volume, derived + get-or-created
 # ---------------------------------------------------------------------------
 
 
 class TestStagingVolume:
 
-    def test_property_is_a_cheap_handle(self) -> None:
-        """Reading ``staging_volume`` never resolves infos or creates a
-        volume — it just mints the handle (creation is deferred to
-        :meth:`Table.ensure_staging_volume`)."""
+    def test_none_when_table_has_no_infos(self) -> None:
+        """The staging volume is isolated *under the table's own identity* — with
+        no table info to derive it from, the property is ``None``."""
         tbl = _table("cat", "sch", "tbl")
-        with patch.object(Volume, "get_or_create") as goc:
-            vol = tbl.staging_volume
-            assert tbl.staging_volume is vol  # singleton
-        assert isinstance(vol, Volume)
-        goc.assert_not_called()
+        with patch.object(Table, "read_infos", return_value=None):
+            assert tbl.staging_volume is None
 
-    def test_ensure_get_or_creates_the_staging_volume(self) -> None:
-        """``ensure_staging_volume`` is a plain idempotent get-or-create on the
-        staging volume (managed by default) and returns the volume handle."""
+    def test_builds_fast_external_candidate_sibling_of_table_data(self) -> None:
+        """``staging_volume`` builds a fast ``_ygg_staging`` candidate location —
+        a sibling of the table's own data (parent dir + table id) — and hands it
+        to ``Volume.create`` (which owns the external-location validation), then
+        caches the handle. No external-location lookup happens on the table."""
+        from types import SimpleNamespace
+
         tbl = _table("cat", "sch", "tbl")
-        sentinel = object()
-        with patch.object(Volume, "get_or_create", return_value=sentinel) as goc:
-            assert tbl.staging_volume.get_or_create() is sentinel
-        goc.assert_called_once_with()
+        infos = SimpleNamespace(
+            storage_location="s3://bkt/apps/team/tbl", table_id="tid-1",
+        )
+        with patch.object(Table, "read_infos", return_value=infos), \
+                patch.object(Volume, "get_or_create", return_value=None) as goc:
+            vol = tbl.staging_volume
+            again = tbl.staging_volume
+
+        assert isinstance(vol, Volume)
+        assert vol.volume_name == "tbl"           # named after the table
+        assert again is vol                        # cached on the instance
+        # The table does not consult external locations — that's Volume.create.
+        tbl.service.client.external_locations.find_url.assert_not_called()
+        loc = goc.call_args.kwargs["storage_location"]
+        assert loc == "s3://bkt/apps/team/_ygg_staging/volumes/tid-1"
+
+
+class TestTableAccessPrecheck:
+    """``Table.external_location`` / ``can_read`` / ``can_write`` — the cheap,
+    cached, external-location-governed read/write precheck (direct cloud
+    access, bypassing the warehouse)."""
+
+    def _infos(self, loc="s3://bkt/apps/team/tbl"):
+        from types import SimpleNamespace
+        return SimpleNamespace(storage_location=loc, table_id="tid-1")
+
+    def test_read_and_write_when_a_writable_location_covers(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        el = MagicMock(read_only=False)
+        tbl.service.client.external_locations.find_url.return_value = el
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            assert tbl.external_location() is el
+            assert tbl.can_read() is True
+            assert tbl.can_write() is True
+        tbl.service.client.external_locations.find_url.assert_called_with(
+            "s3://bkt/apps/team/tbl", refresh=False)
+
+    def test_read_only_location_blocks_write(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=True)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            assert tbl.can_read() is True
+            assert tbl.can_write() is False
+
+    def test_no_covering_location_means_no_direct_access(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = None
+        with patch.object(Table, "read_infos", return_value=self._infos("s3://bkt/__unitystorage/x")):
+            assert tbl.external_location() is None
+            assert tbl.can_read() is False
+            assert tbl.can_write() is False
+
+    def test_no_storage_location_is_safe_and_skips_lookup(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        with patch.object(Table, "read_infos", return_value=None):
+            assert tbl.external_location() is None
+            assert tbl.can_read() is False
+        tbl.service.client.external_locations.find_url.assert_not_called()
+
+    def test_external_location_is_memoised(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            tbl.external_location()
+            tbl.external_location()
+            tbl.can_read()
+            tbl.can_write()
+        tbl.service.client.external_locations.find_url.assert_called_once()
+
+    def test_refresh_re_resolves(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            tbl.external_location()
+            tbl.external_location(refresh=True)
+        assert tbl.service.client.external_locations.find_url.call_count == 2
+
+    def test_info_refresh_drops_the_memo(self) -> None:
+        from types import SimpleNamespace
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            tbl.external_location()
+        # A fresh info store drops the memo → next lookup re-resolves.
+        tbl._store_infos(SimpleNamespace(
+            storage_location="s3://bkt/x", table_id="tid-1", columns=[],
+        ))
+        with patch.object(Table, "read_infos", return_value=self._infos("s3://bkt/x")):
+            tbl.external_location()
+        assert tbl.service.client.external_locations.find_url.call_count == 2
+
+    def test_invalidate_clears_external_location_and_staging_memo(self) -> None:
+        from yggdrasil.databricks.table.table import _UNRESOLVED
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            tbl.external_location()
+        tbl._staging_volume = MagicMock()
+        # Invalidation (what delete runs) drops the storage-derived caches.
+        tbl.invalidate_singleton()
+        assert tbl._external_location is _UNRESOLVED
+        assert tbl._staging_volume is None
+        assert tbl._infos is None
 
 
 # ---------------------------------------------------------------------------

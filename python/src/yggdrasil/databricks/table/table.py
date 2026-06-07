@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
+    from yggdrasil.databricks.external.location.resource import ExternalLocation
     from yggdrasil.data.statement import StatementBatch
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
@@ -150,6 +151,10 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+#: Sentinel for "external location not yet resolved" — distinct from a resolved
+#: ``None`` (no accessible location covers this table).
+_UNRESOLVED: Any = object()
 
 _INVALID_COL_CHARS = set(" ,;{}()\n\t=")
 
@@ -800,6 +805,9 @@ class Table(DatabricksPath):
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
         self._staging_volume: Volume | None = None
+        # Memoised covering external location (reused by ``external_location`` /
+        # ``can_read`` / ``can_write``); ``_UNRESOLVED`` until first looked up.
+        self._external_location: Any = _UNRESOLVED
         self._initialized = True
 
     # ------------------------------------
@@ -1460,6 +1468,11 @@ class Table(DatabricksPath):
         object.__setattr__(self, "_infos", None)
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
+        # Storage-derived caches go stale on a delete / rebind: drop the
+        # memoised external location and the per-table staging-volume handle so
+        # the next access re-derives against fresh info.
+        object.__setattr__(self, "_external_location", _UNRESOLVED)
+        object.__setattr__(self, "_staging_volume", None)
         self._invalidate_entity_tag_cache()
         super().invalidate_singleton(remove_global=remove_global)
 
@@ -1501,6 +1514,9 @@ class Table(DatabricksPath):
         """Populate the ``infos`` + ``columns`` caches."""
         self._infos_fetched_at = time.time()
         self._infos = infos
+        # Storage location may have shifted — drop the memoised external
+        # location so the next precheck resolves against the fresh URL.
+        self._external_location = _UNRESOLVED
         self._columns = [
             Column.from_api(table=self, infos=col_info)
             for col_info in (infos.columns or [])
@@ -3082,6 +3098,7 @@ class Table(DatabricksPath):
         checkpoint: "str | None" = None,
         available_now: bool = True,
         file_arrival: bool = True,
+        file_arrival_min_seconds: int = 60,
         trigger: "Any" = None,
         clean_source: bool = False,
         clean_source_retention: str = "8 days",
@@ -3102,28 +3119,39 @@ class Table(DatabricksPath):
 
         Args:
             source: Cloud path Auto Loader watches (``s3://…`` / ``/Volumes/…``).
-                ``None`` (default) uses the staging volume's cloud storage path
-                (``ensure_staging_volume().storage_path() / STAGE_SUBPATH``), so
-                files staged there are ingested with no explicit wiring.
+                ``None`` (default) uses this table's dedicated staging volume as
+                the governed ``/Volumes/<cat>/<sch>/<vol>/STAGE_SUBPATH`` path —
+                on-cluster ``cloudFiles`` reads it through Unity Catalog's own
+                optimized access, so it works for managed *and* external staging
+                volumes. (Uploads via :meth:`stage_insert` still take the direct
+                cloud-storage fast path when the volume is external.) Files staged
+                there are ingested with no explicit wiring.
             name: Job name override (default ``[YGG][AUTOLOADER] <full_name>``).
             file_format: ``cloudFiles.format`` (parquet / json / csv / avro / …).
             checkpoint: Streaming checkpoint + schema location. ``None`` (default)
                 on the zero-config path (when *source* also defaults) co-locates
-                it with the staging area on the volume's writable external storage
-                (``<staging-storage>/<CHECKPOINT_SUBPATH>``) — a MANAGED table's own
-                storage is governed ``__unitystorage`` that Unity Catalog forbids
-                Auto Loader from writing into. With an explicit *source*, ``None``
-                instead lets the on-cluster step derive
-                ``<table-location>/_ygg_autoloader``.
+                it with the staging area on the same staging volume — the
+                governed ``/Volumes/…/CHECKPOINT_SUBPATH`` path — kept off a
+                MANAGED *table*'s own governed ``__unitystorage`` storage, which
+                Unity Catalog forbids Auto Loader from writing into. With an
+                explicit *source*, ``None`` instead lets the on-cluster step
+                derive ``<table-location>/_ygg_autoloader``.
             available_now: ``True`` → a one-shot ``Trigger.AvailableNow`` sweep
                 (the shape a scheduled / file-arrival run wants); ``False`` →
                 continuous micro-batch.
             file_arrival: ``True`` (default) → attach a file-arrival trigger on
                 *source* so the job fires automatically when new files land —
-                the natural shape for an ingestion job watching a drop path.
+                the natural shape for an ingestion job watching a drop path. The
+                trigger establishes a **baseline when it's created** and only
+                fires for files arriving *after* that, so stage rows *after*
+                deploying (a file already present at creation won't trigger it).
                 ``False`` deploys the job with no trigger (run it on a schedule,
                 manually, or via ``.run()``). Ignored when an explicit *trigger*
                 is given.
+            file_arrival_min_seconds: Databricks polling floor for the
+                file-arrival trigger (``min_time_between_triggers_seconds``) — it
+                won't evaluate *source* more often than this. Databricks' minimum
+                is **60s**; smaller values are clamped up to it. Default ``60``.
             trigger: An explicit Databricks ``TriggerSettings`` (schedule /
                 file-arrival), passed through as-is. Takes precedence over
                 *file_arrival*.
@@ -3168,42 +3196,62 @@ class Table(DatabricksPath):
             environment = environment_stem("ygg")
 
         if source is None:
-            # Zero-config path: both source and checkpoint live on the staging
-            # volume's own (writable, external) cloud storage. The files staged
-            # there are ingested with no explicit wiring, and the streaming
-            # checkpoint + schema sit beside them as a sibling of
-            # ``STAGE_SUBPATH`` (outside the watched ``stage/`` dir so it isn't
-            # re-ingested). This deliberately avoids the on-cluster default of
-            # ``<table-location>/_ygg_autoloader``: a MANAGED table's storage is
-            # governed ``__unitystorage`` that Unity Catalog forbids Auto Loader
-            # from writing into (``LOCATION_OVERLAP`` on ``CheckPathAccess``).
-            staging_storage = self.staging_volume.get_or_create().storage_path(mode=Mode.AUTO)
-            source = (staging_storage / self.STAGE_SUBPATH).full_path()
+            # Zero-config path: both the watched source and the streaming
+            # checkpoint live on this table's dedicated **staging volume**, as
+            # the governed ``/Volumes/<cat>/<sch>/<vol>/…`` path
+            # (:meth:`Volume.path`, NOT the ``/`` operator — which would resolve
+            # to a raw ``s3://`` URL for an external volume). On-cluster
+            # ``cloudFiles`` + the file-arrival trigger read the volume path
+            # through Unity Catalog's own optimized access, so it works for both
+            # managed and external staging volumes; the upload side
+            # (:meth:`stage_insert`) still takes the direct-S3 fast path when the
+            # volume is external. The checkpoint sits beside the staged data
+            # under ``.staging/`` (a sibling of the watched ``data/`` dir so it's
+            # never re-ingested), keeping a MANAGED *table*'s governed
+            # ``__unitystorage`` location (which UC forbids Auto Loader from
+            # writing into) untouched.
+            self.staging_volume.get_or_create()
+            source = self.staging_volume.path(self.STAGE_SUBPATH).full_path()
             if checkpoint is None:
-                checkpoint = (staging_storage / self.CHECKPOINT_SUBPATH).full_path()
+                checkpoint = self.staging_volume.path(self.CHECKPOINT_SUBPATH).full_path()
 
         if file_arrival and trigger is None:
             from databricks.sdk.service.jobs import (
                 FileArrivalTriggerConfiguration, TriggerSettings,
             )
             # The file-arrival trigger URL must be a directory — Databricks
-            # rejects it unless it ends with '/'.
+            # rejects it unless it ends with '/'. ``min_time_between_triggers``
+            # is Databricks' polling floor (it won't evaluate the path more
+            # often than this); 60s is the minimum it accepts. Note the trigger
+            # establishes a **baseline at creation** and only fires for files
+            # that land *after* it's active — files already present (or staged
+            # before deploy) won't fire it, so stage after :meth:`auto_loader`.
             trigger = TriggerSettings(
                 file_arrival=FileArrivalTriggerConfiguration(
                     url=str(source).rstrip("/") + "/",
+                    min_time_between_triggers_seconds=max(60, int(file_arrival_min_seconds)),
                 ),
             )
 
         job_name = name or f"[YGG][AUTOLOADER] {self.full_name()}"
-        flow = Flow(
-            auto_load,
-            name=job_name,
-            trigger=trigger,
-            parameters=[
-                self.full_name(), str(source), file_format,
-                checkpoint or "", available_now, clean_source, clean_source_retention,
-            ],
-        )
+        # The deployed serverless wheel-task runs ``ygg databricks table
+        # autoload`` on the cluster — a dedicated CLI subcommand that coerces
+        # these args and calls :func:`auto_load`. The command is shipped
+        # **verbatim** as the python-wheel task parameters (no ``run`` prefix,
+        # no module:qualname target ref).
+        command = [
+            "databricks", "table", "autoload",
+            "--table", self.full_name(),
+            "--source", str(source),
+            "--format", file_format,
+        ]
+        if checkpoint:
+            command += ["--checkpoint", checkpoint]
+        command.append("--available-now" if available_now else "--no-available-now")
+        if clean_source:
+            command.append("--clean-source")
+        command += ["--clean-source-retention", clean_source_retention]
+        flow = Flow(auto_load, name=job_name, trigger=trigger, command=command)
         # Tag the job so Auto Loader ingestion jobs are filterable in the
         # workspace + cost reports by table, source, format, and trigger shape.
         # Merged on top of the client's owner/product defaults at create time.
@@ -3242,13 +3290,14 @@ class Table(DatabricksPath):
         """Stage *data* as Parquet under this table's **Auto Loader staging
         area** and return the path it landed at — no warehouse statement runs.
 
-        Writes a fresh, uniquely-named Parquet file directly under the staging
-        volume's cloud storage path (``STAGE_SUBPATH`` prefix) — the same path a
-        deployed :meth:`auto_loader` job watches — so staged rows are ingested
-        with no extra wiring: ``stage_insert`` → Auto Loader → table. Falls back
-        to the Files-API volume staging (:meth:`staging_folder`) when a direct
-        cloud path isn't available (e.g. a managed staging volume), preserving a
-        stage-for-later-load there.
+        Writes a fresh, uniquely-named Parquet file under the staging volume's
+        ``STAGE_SUBPATH`` prefix — the same path a deployed :meth:`auto_loader`
+        job watches — so staged rows are ingested with no extra wiring:
+        ``stage_insert`` → Auto Loader → table. ``staging_volume / STAGE_SUBPATH``
+        resolves to the volume's direct cloud storage (``s3://…``, no Files-API
+        hop) when the volume is EXTERNAL and reachable, and to the governed
+        Files-API ``/Volumes/…`` path otherwise (e.g. a managed staging volume)
+        — both land the file where the watcher expects it.
         """
         leaf = f"insert-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.parquet"
         root = self.staging_volume / self.STAGE_SUBPATH
@@ -3359,13 +3408,6 @@ class Table(DatabricksPath):
             if not self.catalog_name or not self.schema_name or not self.table_name:
                 raise ValueError(f"Table {self} is missing required catalog, schema, or table name")
 
-            loc = infos.storage_location
-            storage_location = (
-                f"{loc.partition('/unity_catalog')[0]}/external_unity_catalog/volumes/{infos.table_id or uuid.uuid4()}"
-                if loc and "/unity_catalog" in loc
-                else None
-            )
-
             self._staging_volume = Volume(
                 service=self.service.volumes,
                 catalog_name=self.catalog_name,
@@ -3373,11 +3415,20 @@ class Table(DatabricksPath):
                 volume_name=self.client.safe_tag_value(self.table_name, repl="_").lower()
             )
 
-            # First try to create as external for best performances
-            try:
-                self._staging_volume.get_or_create(storage_location=storage_location)
-            except Exception:
-                self._staging_volume.get_or_create()
+            # Fast, local candidate location for an EXTERNAL staging volume: a
+            # ``_ygg_staging`` sibling of the table's own data (its parent dir +
+            # table-id), so it never overlaps the table securable. No network /
+            # external-location lookup here — :meth:`Volume.create` validates the
+            # candidate against the (cached) Unity Catalog external locations and
+            # falls back to a MANAGED volume (with a warning) when nothing
+            # accessible covers it. So an external table gets direct-S3 staging
+            # and a managed table transparently gets Files-API staging.
+            loc = infos.storage_location
+            storage_location = (
+                f"{loc.rstrip('/').rsplit('/', 1)[0]}/_ygg_staging/volumes/{infos.table_id or uuid.uuid4()}"
+                if loc else None
+            )
+            self._staging_volume.get_or_create(storage_location=storage_location)
 
         return self._staging_volume
 
@@ -3740,6 +3791,46 @@ class Table(DatabricksPath):
             return None
 
         return infos.storage_location
+
+    def external_location(self, *, refresh: bool = False) -> ExternalLocation | None:
+        """The Unity Catalog **external location** governing this table's
+        backing storage — the most specific one whose URL the table's
+        ``storage_location`` sits under (longest-prefix match over the cached
+        external-location list, :meth:`ExternalLocations.find_url`) — or
+        ``None`` when the table has no resolvable storage or no accessible
+        location covers it (e.g. a MANAGED table on governed
+        ``__unitystorage``). Never raises.
+
+        **Memoised on the table**: resolved once and reused (a resolved ``None``
+        is cached too) so repeated precheck calls don't re-walk the location
+        list. ``refresh=True`` re-resolves; the memo is dropped on any info
+        refresh (:meth:`_store_infos`)."""
+        if not refresh and self._external_location is not _UNRESOLVED:
+            return self._external_location
+        loc = self.storage_location
+        result: ExternalLocation | None = None
+        if loc:
+            try:
+                result = self.client.external_locations.find_url(loc, refresh=refresh)
+            except Exception as exc:  # noqa: BLE001 — listing is best-effort
+                logger.debug("external-location lookup failed for %r: %s", self, exc)
+                result = None
+        self._external_location = result
+        return result
+
+    def can_read(self, *, refresh: bool = False) -> bool:
+        """Global precheck — can this table's storage be **read** directly at
+        the cloud layer (bypassing the warehouse)? ``True`` when an accessible
+        external location covers it. Cheap and cached (no per-object probe) —
+        gate :meth:`delta` / :meth:`storage_path` bulk work on it."""
+        return self.external_location(refresh=refresh) is not None
+
+    def can_write(self, *, refresh: bool = False) -> bool:
+        """Global precheck — can this table's storage be **written** directly at
+        the cloud layer? ``True`` when a covering external location exists and
+        is not read-only."""
+        el = self.external_location(refresh=refresh)
+        return el is not None and not el.read_only
 
     def storage_path(self, *, write: "bool | None" = None) -> "Path | None":
         """Return the table's backing storage as an addressable :class:`Path`.

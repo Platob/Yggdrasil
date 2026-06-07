@@ -231,3 +231,6 @@ __marimo__/
 node_modules/
 .claude/worktrees/
 tsconfig.tsbuildinfo
+
+# Throwaway local live-smoke scripts (never committed).
+smoke_*.py

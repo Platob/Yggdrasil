@@ -10,6 +10,7 @@ from .environment import EnvironmentCommand
 from .fs import FSCommand
 from .jobs import JobsCommand
 from .sql import SQLCommand
+from .table import TableCommand
 from .tables import TablesCommand
 from .warehouses import WarehousesCommand
 from .wheel import WheelCommand
@@ -22,6 +23,7 @@ __all__ = [
     "FSCommand",
     "JobsCommand",
     "SQLCommand",
+    "TableCommand",
     "TablesCommand",
     "WarehousesCommand",
     "WheelCommand",

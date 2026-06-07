@@ -698,6 +698,19 @@ class TestSecretsBackedPersistence:
         # from the memo, so it adds no extra read.
         client.secrets.secret.assert_called_once()
 
+    def test_default_path_memoises_without_secret_cache(self) -> None:
+        # The common path (no secret_cache) still memoises the vended credential
+        # in-process, so repeated resolutions within validity vend from Unity
+        # Catalog exactly once and never touch the Secrets API.
+        client, gen = _volume_client()
+        p = AWSDatabricksVolumeCredentials("vid-memo-default", client=client)
+        p.get_credentials(mode="read")
+        p.get_credentials(mode="read")
+        p.get_credentials(mode="read")
+        gen.assert_called_once()
+        client.secrets.secret.assert_not_called()
+        client.secrets.create_secret.assert_not_called()
+
     def test_disabled_when_prefix_empty(self, monkeypatch) -> None:
         monkeypatch.setenv("YGG_DATABRICKS_CREDS_SECRET_PREFIX", "")
         client, gen = _volume_client()

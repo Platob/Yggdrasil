@@ -2,15 +2,15 @@
 
 :func:`auto_load` is what the Databricks job built by
 :meth:`yggdrasil.databricks.table.table.Table.auto_loader` actually runs on
-the cluster (imported by ``ygg run`` from the shipped ygg wheel). It streams
-files from a source path into a Unity Catalog table via Spark Structured
-Streaming + Databricks Auto Loader — incremental, exactly-once, schema-evolving
-— so a table keeps absorbing new files dropped at *source* without a bespoke
-pipeline.
+the cluster, invoked by the ``ygg databricks table autoload`` CLI subcommand
+(from the shipped ygg wheel). It streams files from a source path into a Unity
+Catalog table via Spark Structured Streaming + Databricks Auto Loader —
+incremental, exactly-once, schema-evolving — so a table keeps absorbing new
+files dropped at *source* without a bespoke pipeline.
 
-Kept as a plain module-level function (typed params) so the runner can both
-import it (``module:qualname``) and coerce the positional string job parameters
-to the signature.
+Kept as a plain module-level function (typed params) so the ``ygg databricks
+table autoload`` handler stays thin: it just coerces its CLI args and calls in
+here.
 """
 from __future__ import annotations
 

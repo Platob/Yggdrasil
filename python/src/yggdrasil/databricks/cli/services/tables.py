@@ -23,8 +23,8 @@ class TablesCommand:
 
     @classmethod
     def register(cls, subparsers: Any) -> None:
-        parser = subparsers.add_parser("tables", aliases=["table"],
-                                       help="Table operations (Auto Loader ingestion).")
+        parser = subparsers.add_parser("tables",
+                                       help="Table operations: deploy an Auto Loader ingestion job.")
         sub = parser.add_subparsers(dest="tables_action")
 
         al = sub.add_parser("autoload", aliases=["auto-load", "auto_loader"],

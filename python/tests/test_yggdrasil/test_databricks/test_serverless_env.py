@@ -162,13 +162,27 @@ class TestMain:
             ["--version", "9.9.9", "--all-versions", "--out-dir", str(tmp_path)]
         )
         assert rc == 0
-        for py in ("3.10", "3.11", "3.12", "3.13"):
+        # Capped at MAX_PYTHON (3.12) — Databricks doesn't run 3.13+ yet.
+        for py in ("3.10", "3.11", "3.12"):
             assert (tmp_path / f"ygg-9.9.9-py{py}-serverless.yml").exists()
             assert (tmp_path / f"ygg-9.9.9-py{py}-cluster.requirements.txt").exists()
+        assert not (tmp_path / "ygg-9.9.9-py3.13-serverless.yml").exists()
         # py3.10 → environment_version "1"; py3.12 → latest "5".
         assert yaml.safe_load(
             (tmp_path / "ygg-9.9.9-py3.10-serverless.yml").read_text()
         )["environment_version"] == "1"
+
+    def test_python_target_is_capped_at_max(self) -> None:
+        # Databricks doesn't run 3.13+ yet — every build target clamps to 3.12.
+        from yggdrasil.databricks.wheels.service import (
+            MAX_PYTHON, SUPPORTED_PYTHONS, _py_minor, environment_key_for,
+        )
+        assert MAX_PYTHON == "3.12"
+        assert "3.13" not in SUPPORTED_PYTHONS and SUPPORTED_PYTHONS[-1] == "3.12"
+        assert _py_minor("3.13") == "3.12"        # clamped
+        assert _py_minor("py314") == "3.12"       # clamped
+        assert _py_minor("3.11") == "3.11"        # under the cap, untouched
+        assert environment_key_for("3.13") == "py312"   # env key follows the clamp
 
     def test_main_writes_versioned_spec(self, tmp_path) -> None:
         wheel_dir = tmp_path / "wheels"

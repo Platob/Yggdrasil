@@ -12,7 +12,7 @@ degrades to the warehouse.
 from __future__ import annotations
 
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -209,22 +209,33 @@ class TestCredentialFallback:
 
 class TestStoragePathCredentialScope:
     def _t(self):
+        # ``storage_location`` is a read-only property (resolved off
+        # ``VolumeInfo``); pin it for the test and capture ``aws`` to assert the
+        # credential scope ``storage_path`` requests.
         t = _table(TableType.EXTERNAL, DataSourceFormat.DELTA)
-        t.storage_location = MagicMock(return_value="s3://b/x")
         t.aws = MagicMock()
         return t
 
+    def _pin_location(self):
+        return patch.object(
+            Table, "storage_location", new_callable=PropertyMock,
+            return_value="s3://b/x",
+        )
+
     def test_write_false_requests_read(self):
         t = self._t()
-        t.storage_path(write=False)
+        with self._pin_location():
+            t.storage_path(write=False)
         t.aws.assert_called_once_with(TableOperation.READ)
 
     def test_write_true_requests_read_write(self):
         t = self._t()
-        t.storage_path(write=True)
+        with self._pin_location():
+            t.storage_path(write=True)
         t.aws.assert_called_once_with(TableOperation.READ_WRITE)
 
     def test_write_none_uses_default(self):
         t = self._t()
-        t.storage_path(write=None)
+        with self._pin_location():
+            t.storage_path(write=None)
         t.aws.assert_called_once_with()
