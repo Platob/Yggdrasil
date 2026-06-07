@@ -155,11 +155,14 @@ class HTTPResponseBatch(Tabular):
         request_map = {r.match_value(MATCH_KEY): r for r in hit_reqs}
         kept: list[HTTPResponse] = []
         # The read is projected to the response payload + the request join key
-        # (``read_hits``) — not the full request — so a response's ``public_hash``
-        # can't be recomputed from the row. Match each row on the cached
-        # ``request_public_hash`` (MATCH_COLUMN) column directly and reattach the
-        # full live request we already hold; the heavy request_* columns never
-        # come back over the wire.
+        # (``read_hits``) — not the full request, and not ``received_at``. Match
+        # each row on the cached ``request_public_hash`` (MATCH_COLUMN) column
+        # directly, reattach the full live request we already hold, and stamp the
+        # retrieval time as ``received_at`` (it isn't fetched). The received-window
+        # is already enforced upstream — the remote probe is window-aware and the
+        # local cache filters on its own stored value — so no per-row re-check is
+        # needed here.
+        now = dt.datetime.now(dt.timezone.utc)
         for batch in tab.read_arrow_batches():
             keys = (batch.column(MATCH_COLUMN).to_pylist()
                     if MATCH_COLUMN in batch.schema.names
@@ -171,8 +174,8 @@ class HTTPResponseBatch(Tabular):
                 if req is None:
                     continue
                 resp.request = req
-                if cache.filter_response(resp, request=req):
-                    kept.append(resp)
+                resp.received_at = now
+                kept.append(resp)
         return responses_to_tabular(kept) if kept else None
 
     def _fetch(

@@ -34,15 +34,15 @@ DEFAULT_MAX_BATCH_TTL: float = 300.0
 #: The only columns a cache read needs to rebuild a response — the response
 #: payload plus the request join key (``request_public_hash``) and ``request_url``
 #: (so the row's throwaway request still deserializes; the *real* request is
-#: reattached from memory in ``HTTPResponseBatch._read_cache_hits``). The heavy
-#: ``request_headers`` / ``request_body`` / ``request_params`` / ``receiver`` /
-#: ``*_hash`` / ``_pkl`` columns are never pulled back over the wire — a remote
-#: (Databricks/Delta) hit read scans far fewer bytes. Mirrors the local
-#: content-addressed cache's stored set
-#: (:func:`~yggdrasil.http_.response_cache._encode`), which likewise keeps only
-#: the response payload and rebuilds against the caller's request.
+#: reattached from memory in ``HTTPResponseBatch._read_cache_hits``). ``received_at``
+#: is deliberately *not* read — the received-window is already enforced upstream
+#: (the remote probe is window-aware; the local cache filters on its own stored
+#: value), so the retrieved response is stamped with the current UTC time instead.
+#: The heavy ``request_headers`` / ``request_body`` / ``request_params`` /
+#: ``receiver`` / ``*_hash`` / ``_pkl`` columns are never pulled back over the
+#: wire — a remote (Databricks/Delta) hit read scans far fewer bytes.
 RESPONSE_REBUILD_COLUMNS: "tuple[str, ...]" = (
-    MATCH_COLUMN, "request_url", "status_code", "headers", "tags", "body", "received_at",
+    MATCH_COLUMN, "request_url", "status_code", "headers", "tags", "body",
 )
 
 
