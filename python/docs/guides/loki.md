@@ -224,7 +224,17 @@ muscle, the larger the default. It climbs a ladder of Qwen2.5 instruct models:
 
 (`ygg loki engines` shows the pick, e.g. `qwen2.5:7b (resources: medium)`.) An
 explicit pin (`OllamaEngine(model=…)`, `YGG_LOKI_OLLAMA_MODEL`/`YGG_LOKI_HF_MODEL`)
-always wins. `Loki.bootstrap_local()` readies the sized model **lazily** — it
+always wins.
+
+**Accelerator auto-detection.** When `YGG_LOKI_HF_DEVICE` is unset the
+`transformers` engine loads onto the best device it can find — NVIDIA `cuda`,
+**Intel GPU** `xpu` (Arc / integrated Xe), or Apple `mps` — instead of crawling
+on the CPU (`yggdrasil.loki.resources.accelerator()`). An **Intel NPU** (AI
+Boost) is detected too (`resources.has_npu()`, via OpenVINO) and surfaced in
+`ygg loki status` under `compute`, but the HF pipeline can't target it directly
+— offload it with `optimum-intel` + `openvino`. The download forces the classic
+LFS transfer (`HF_HUB_DISABLE_XET=1`) so a blocked xet CAS endpoint behind a
+corporate proxy doesn't abort the weights fetch. `Loki.bootstrap_local()` readies the sized model **lazily** — it
 pulls it only when missing (Ollama `POST /api/pull`), notes that HF weights
 download on first use, or tells you what to install:
 
@@ -285,8 +295,8 @@ resources**:
 - *Complexity* comes from an explicit `tier` (`deep` → complex) or, failing
   that, the prompt itself — long or reasoning-heavy text (the same signals
   that drive adaptive tiers) counts as complex.
-- *Resources* are probed inline: a CUDA GPU (`torch.cuda.is_available()`), or
-  enough CPU + RAM (≥ 4 cores and ≥ 8 GB).
+- *Resources* are probed inline: any GPU accelerator (NVIDIA `cuda`, Intel
+  `xpu`, or Apple `mps`), or enough CPU + RAM (≥ 4 cores and ≥ 8 GB).
 
 Simple work on a capable box stays **local** (free, private); complex work,
 or a thin machine, goes to the best available **remote** API. Either way it

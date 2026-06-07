@@ -8,6 +8,7 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -111,12 +112,35 @@ yellow = amber                   # caution
 cyan = magenta = brand           # decorative accents → brand coral
 blue = muted                     # paths / secondary → muted grey
 
+#: Matches SGR / CSI escape sequences so a colored string can be rendered plain
+#: (e.g. into a terminal title, which doesn't interpret color codes).
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def strip(text: str) -> str:
+    """*text* with ANSI color escapes removed."""
+    return _ANSI_RE.sub("", text)
+
 def clear_line() -> None:
     sys.stdout.write(f"{_CSI}2K\r")
     sys.stdout.flush()
 
 def out(text: str) -> None:
     sys.stdout.write(text)
+    sys.stdout.flush()
+
+def set_title(text: str) -> None:
+    """Set the terminal title bar (OSC 2) — a *static* status line that updates
+    in place instead of scrolling the transcript.
+
+    Used by the Loki REPL to keep live token/cost KPIs pinned in the terminal
+    "head" rather than reprinting a usage line after every turn. TTY-only (the
+    escape is meaningless and would be junk in a redirected log); the title is
+    stripped of any ANSI so it shows clean in the window/tab chrome."""
+    if not _IS_TTY:
+        return
+    plain = strip(text).replace("\a", " ").replace("\n", " ")
+    sys.stdout.write(f"\033]2;{plain}\a")
     sys.stdout.flush()
 
 # -- username color --------------------------------------------------------

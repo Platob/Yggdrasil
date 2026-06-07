@@ -96,7 +96,10 @@ class DatabricksLoki(Loki):
 
     # -- Databricks-first engine wiring ------------------------------------
 
-    def _engine_instances(self) -> "dict[str, TokenEngine]":
+    def _engine_instances(self, *, refresh: bool = False) -> "dict[str, TokenEngine]":
+        # Built fresh each call (no cache to invalidate), so ``refresh`` is a
+        # no-op here — but the signature must mirror the base so the shared
+        # ``available_engines(refresh=…)`` call works on a DatabricksLoki too.
         from yggdrasil.loki.engines import (
             ClaudeEngine,
             DatabricksServingEngine,

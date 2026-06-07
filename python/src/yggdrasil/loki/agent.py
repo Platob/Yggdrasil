@@ -117,6 +117,11 @@ class Loki:
         self._capable: "Optional[bool]" = None
         self._agent_id: "Optional[int]" = None
         self._specialists: "dict[str, Optional[Loki]]" = {}
+        #: ``(engine, brief-error)`` pairs already logged at WARNING this session
+        #: — a wedged engine (e.g. a model that can't download) fails on *every*
+        #: turn, so we warn once and stay quiet after, instead of re-dumping the
+        #: same failure each time it's skipped in the fallback chain.
+        self._warned_failures: "set[tuple[str, str]]" = set()
 
     # -- singleton ---------------------------------------------------------
 
@@ -481,8 +486,7 @@ class Loki:
                 return eng.generate(prompt, system=system, tier=tier, **options)
             except Exception as exc:
                 last = exc
-                _log.warning("engine '%s' failed: %s — skipping to next",
-                             eng.name, _short_err(exc))
+                self._warn_engine_failure(eng, exc)
         raise last if last is not None else RuntimeError(_NO_ENGINE)
 
     def reason_stream(
@@ -514,9 +518,20 @@ class Loki:
                 if started:
                     raise            # already emitted output — can't silently switch
                 last = exc
-                _log.warning("engine '%s' failed: %s — skipping to next",
-                             eng.name, _short_err(exc))
+                self._warn_engine_failure(eng, exc)
         raise last if last is not None else RuntimeError(_NO_ENGINE)
+
+    def _warn_engine_failure(self, eng: "TokenEngine", exc: Exception) -> None:
+        """Warn that *eng* was skipped — but only the **first** time this exact
+        failure is seen. A wedged engine fails identically every turn; logging it
+        once keeps the session readable instead of re-dumping the same error."""
+        key = (eng.name, _short_err(exc))
+        if key in self._warned_failures:
+            _log.debug("engine '%s' failed again (suppressed): %s", *key)
+            return
+        self._warned_failures.add(key)
+        _log.warning("engine '%s' failed: %s — skipping to next (further repeats "
+                     "of this error are suppressed)", *key)
 
     # -- autonomous action loop -------------------------------------------
 

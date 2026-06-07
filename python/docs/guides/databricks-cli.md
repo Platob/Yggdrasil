@@ -684,8 +684,12 @@ Take **your own project** to Databricks in one command. `ygg databricks deploy
 [path]` builds the project's base environment (via
 [`environment create`](#environments-environment) — wheel closure, zero-PyPI),
 then provisions its **default serverless SQL warehouse** and **default
-single-user cluster** wired to that env config. The project is discovered from
-`path` (a dir or `pyproject.toml`) or the cwd.
+single-user cluster** — both named for the project's capitalized display name —
+wired to that env config. The project is discovered from `path` (a dir or
+`pyproject.toml`) or the cwd. The client is bound to the deployed project +
+version first (so the warehouse/cluster resolve to *this* project), and the
+warehouse + cluster are created **fire-and-forget** — the command doesn't block
+on them reaching a running state.
 
 ```bash
 ygg databricks deploy [path] [flags]
@@ -694,6 +698,7 @@ ygg databricks deploy [path] [flags]
 | Flag | Purpose |
 |---|---|
 | `--extra` | optional-dependency extra to fold into the environment (repeatable) |
+| `--python` | Python version to build the environment for, e.g. `3.11` (repeatable; default: the interpreter running the CLI) |
 | `--rebuild` | Force a fresh build of the wheel closure + env config |
 | `--no-cluster` | Don't provision the default single-user cluster |
 | `--no-warehouse` | Don't provision the default serverless SQL warehouse |
@@ -703,9 +708,14 @@ ygg databricks deploy [path] [flags]
 ```bash
 ygg databricks deploy                          # discover from the cwd
 ygg databricks deploy ./my-app --extra databricks
+ygg databricks deploy --python 3.11 --python 3.12   # one environment per Python
 ygg databricks deploy --rebuild                # force a fresh build of everything
 ygg databricks deploy --no-cluster             # env + warehouse only
 ```
+
+With several `--python` flags, one environment is built per version (the
+cluster, which runs a single Python, installs the first; serverless picks the
+matching environment per job at runtime).
 
 > The lower-level wheel/environment CRUD lives under the dedicated
 > [`ygg databricks wheel`](#wheels-wheel) and
