@@ -116,7 +116,7 @@ class DatabricksService(ABC):
     def is_in_databricks_environment(self):
         return self.client.is_in_databricks_environment()
 
-    def default_tags(self, update: bool = True):
+    def default_tags(self, update: bool = True) -> dict[str, str]:
         """Return default resource tags for Databricks assets.
 
         Returns:

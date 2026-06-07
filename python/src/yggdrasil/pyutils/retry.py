@@ -340,7 +340,7 @@ if __name__ == "__main__":
 
     print("Result:", flaky_function())
 
-    async def main():
+    async def main() -> None:
         """Run an async retry demonstration.
 
         Returns:

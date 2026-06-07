@@ -33,7 +33,10 @@ def encode_metadata(metadata: Mapping[bytes, bytes] | None) -> bytes:
     """Encode metadata as length-prefixed key/value pairs.
 
     Format:
-        [k_len:u32][key][v_len:u32][value]...
+
+    ```text
+    [k_len:u32][key][v_len:u32][value]...
+    ```
     """
     if not metadata:
         return b""

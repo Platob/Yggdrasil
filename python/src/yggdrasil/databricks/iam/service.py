@@ -367,7 +367,7 @@ class IAMUsers(IAM):
         files = sorted(p for p in oauth_dir.iterdir() if p.is_file())
         return str(files[0]) if files else None
 
-    def reset_local_cache(self):
+    def reset_local_cache(self) -> None:
         """Remove cached browser OAuth tokens.
 
         Returns:

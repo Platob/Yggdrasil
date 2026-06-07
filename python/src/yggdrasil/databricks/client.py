@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 import re
@@ -1290,7 +1292,7 @@ class DatabricksClient(Singleton, URLBased):
     def is_in_databricks_environment() -> bool:
         return getenv("DATABRICKS_RUNTIME_VERSION") is not None
 
-    def default_tags(self, update: bool = True):
+    def default_tags(self, update: bool = True) -> dict[str, str]:
         """Return default resource tags for Databricks assets.
 
         On create (``update=False``) the tag set is enriched with
@@ -1415,7 +1417,7 @@ class DatabricksClient(Singleton, URLBased):
         self,
         parts: Union[list[str], str],
         temporary: bool = False,
-    ):
+    ) -> DatabricksPath:
         """Create a DatabricksPath in this workspace.
 
         .. deprecated:: 0.8.31

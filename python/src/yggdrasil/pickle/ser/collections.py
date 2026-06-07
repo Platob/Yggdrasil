@@ -183,13 +183,17 @@ class CollectionSerialized(Serialized[T], Generic[T]):
     """
     Base class for count-prefixed collection payloads.
 
-    Standard wire format
-    --------------------
-    Ordered collections:
-        [count:u32][item_0][item_1]...[item_n]
+    Standard wire format — ordered collections:
+
+    ```text
+    [count:u32][item_0][item_1]...[item_n]
+    ```
 
     Mapping collections:
-        [count:u32][key_0][value_0]...[key_n][value_n]
+
+    ```text
+    [count:u32][key_0][value_0]...[key_n][value_n]
+    ```
     """
 
     TAG: ClassVar[int]
