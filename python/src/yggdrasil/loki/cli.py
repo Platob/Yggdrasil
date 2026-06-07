@@ -167,7 +167,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _status(loki: Any, style: Any) -> int:
     style.out(f"  {style.cyan('agent')}   {style.bold(loki.name)}  {style.dim('#' + str(loki.agent_id))}\n")
-    style.out(f"  {style.cyan('user')}    {loki.user}@{loki.host}\n\n")
+    style.out(f"  {style.cyan('user')}    {loki.user}@{loki.host}\n")
+    _print_hardware(style)
+    style.out("\n")
     style.out(f"  {style.bold('backends')}\n")
     for b in loki.backends():
         glyph = style.green("●") if b.available else style.dim("○")
@@ -188,6 +190,21 @@ def _status(loki: Any, style: Any) -> int:
     if not loki.skills():
         style.out(f"    {style.dim('(none registered)')}\n")
     return 0
+
+
+def _print_hardware(style: Any) -> None:
+    """One line of the box's compute: cores, RAM, and the detected accelerator —
+    NVIDIA cuda / **Intel GPU** xpu / Apple mps, plus an Intel NPU flag — so the
+    user can see what a local model will run on."""
+    from yggdrasil.loki import resources
+
+    snap = resources.snapshot()
+    accel = {"cuda": "NVIDIA GPU (cuda)", "xpu": "Intel GPU (xpu)",
+             "mps": "Apple GPU (mps)"}.get(snap.get("accelerator") or "", "CPU only")
+    bits = [f"{snap['cpu']} cores", f"{snap['ram_gb']:g} GB", accel]
+    if snap.get("npu"):
+        bits.append(style.brand("Intel NPU"))
+    style.out(f"  {style.cyan('compute')} {style.dim(' · '.join(str(b) for b in bits))}\n")
 
 
 def _engines(loki: Any, style: Any) -> int:
@@ -289,7 +306,8 @@ def _repl(loki: Any, style: Any) -> int:
         with style.Spinner("checking local model capacity…"):
             loki.can_run_local()
     style.out(f"  {style.dim('cost budget')} {style.brand(f'${METER.cost_limit:.2f}')} "
-              f"{style.dim('· raised in $1 steps when reached')}\n\n")
+              f"{style.dim('· raised in $1 steps when reached · live KPIs in the title bar')}\n\n")
+    style.set_title(_usage_title())   # pin the KPIs in the terminal head
 
     while True:
         try:
@@ -419,8 +437,17 @@ def _local_load_notice(agent: Any, style: Any, engine: "str | None") -> None:
     eng = agent.engine("transformers")
     model = eng.resolve_model()
     if not eng.ready(model):
+        # Name the device it'll actually load on (auto-detected Intel GPU / cuda
+        # / mps, else CPU) so the user sees the accelerator is in play.
+        device = None
+        try:
+            device = eng.resolve_device()
+        except Exception:
+            pass
+        where = {"cuda": "the NVIDIA GPU", "xpu": "the Intel GPU",
+                 "mps": "the Apple GPU"}.get(device or "", "CPU")
         style.out(f"  {style.dim('▹ loading local model')} {style.brand(model)} "
-                  f"{style.dim('· first run downloads weights, then runs on CPU — this can take a while')}\n")
+                  f"{style.dim(f'· first run downloads weights, then runs on {where} — this can take a while')}\n")
 
 
 def _stream_reply(agent: Any, style: Any, line: str, state: dict,
@@ -512,9 +539,6 @@ def _short_text(s: str, n: int) -> str:
 
 
 def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
-    from yggdrasil.loki.usage import METER
-
-    before = METER.total_tokens
     plan = loki.plan(line)
 
     agent, tail = loki, ""
@@ -595,7 +619,9 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             if compressed:
                 note = f"· memory compressed → {memory.chars()} chars"
                 style.out(f"  {style.dim(note)}\n")
-    _usage_line(style, delta=METER.total_tokens - before)
+    # Token/cost KPIs ride the terminal title bar (a static "head"), not a fresh
+    # line each turn — local turns are free, so the spend only moves on a remote.
+    style.set_title(_usage_title())
 
 
 def _act_step(style: Any, rec: dict) -> None:
@@ -827,6 +853,22 @@ def _usd(s: str) -> "float | None":
         return float(s.strip().lstrip("$"))
     except (ValueError, AttributeError):
         return None
+
+
+def _usage_title() -> str:
+    """A compact one-line KPI string for the terminal title bar (no color).
+
+    Shows global tokens, USD spent, and budget left — the same numbers as the
+    per-turn ``usage`` line, but pinned statically in the terminal head so the
+    transcript isn't padded with a usage line after every (often free) turn."""
+    from yggdrasil.loki.usage import METER
+
+    t = METER.total()
+    bits = ["ygg loki", f"↑{t.input_tokens:,} ↓{t.output_tokens:,}",
+            f"{t.total_tokens:,} tok", f"${METER.total_cost:.4f}"]
+    if METER.cost_limit is not None:
+        bits.append(f"${(METER.remaining() or 0.0):.2f} left")
+    return "  ·  ".join(bits)
 
 
 def _usage_line(style: Any, *, delta: int | None = None, prefix: str = "usage") -> None:

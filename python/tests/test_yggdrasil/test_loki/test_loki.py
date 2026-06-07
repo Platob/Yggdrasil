@@ -485,6 +485,23 @@ class TestEngineFallback(unittest.TestCase):
              self.assertLogs("yggdrasil.loki.agent", level="WARNING"):
             loki.reason("hi")
 
+    def test_repeated_identical_failure_is_logged_once(self):
+        # A wedged engine fails the same way every turn (e.g. a model that can't
+        # download). The first skip warns; later turns must NOT re-dump it.
+        loki = self._loki({"claude": _BoomEngine(), "openai": _OkEngine()})
+        with self.assertLogs("yggdrasil.loki.agent", level="WARNING") as first:
+            loki.reason("turn one")
+        self.assertTrue(any("claude" in m and "skipping" in m for m in first.output))
+        # Subsequent identical failures are suppressed at WARNING (demoted to
+        # DEBUG), so the same error doesn't spam the session log.
+        with self.assertLogs("yggdrasil.loki.agent", level="DEBUG") as again:
+            loki.reason("turn two")
+            loki.reason("turn three")
+        warnings = [m for m in again.output if m.startswith("WARNING")]
+        suppressed = [m for m in again.output if "suppressed" in m and m.startswith("DEBUG")]
+        self.assertEqual(warnings, [])
+        self.assertTrue(suppressed)
+
 
 if __name__ == "__main__":
     unittest.main()

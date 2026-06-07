@@ -49,6 +49,19 @@ class TestEngines(unittest.TestCase):
             # No configure session → no databricks engine bound (no env fallback).
             self.assertNotIn("databricks", loki._engine_instances())
 
+    def test_engine_instances_accepts_refresh_kwarg(self):
+        # The base ``available_engines(refresh=…)`` forwards refresh into
+        # ``_engine_instances`` — the DatabricksLoki override must accept it
+        # (regression: it used to raise "unexpected keyword argument 'refresh'").
+        with patch("yggdrasil.databricks.loki.agent.read_session", return_value=None):
+            loki = DatabricksLoki()
+            self.assertEqual(
+                set(loki._engine_instances(refresh=True)),
+                set(loki._engine_instances()),
+            )
+            # The path that actually triggered the bug in a live session.
+            self.assertIsInstance(loki.available_engines(refresh=True), dict)
+
 
 class TestDeploy(unittest.TestCase):
     def test_deploy_requires_session(self):

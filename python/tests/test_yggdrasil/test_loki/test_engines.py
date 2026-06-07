@@ -311,6 +311,22 @@ class TestTransformersEngine(unittest.TestCase):
         with patch("importlib.util.find_spec", return_value=None):
             self.assertFalse(TransformersEngine().available())
 
+    def test_resolve_device_pin_wins_over_autodetect(self):
+        # An explicit ctor pin or YGG_LOKI_HF_DEVICE short-circuits detection.
+        self.assertEqual(TransformersEngine(device="cuda:1").resolve_device(), "cuda:1")
+        with patch.dict(os.environ, {"YGG_LOKI_HF_DEVICE": "xpu"}):
+            self.assertEqual(TransformersEngine().resolve_device(), "xpu")
+
+    def test_resolve_device_auto_detects_intel_gpu(self):
+        from yggdrasil.loki import resources
+
+        # No pin → the engine lands the model on the detected accelerator
+        # (Intel GPU here), or CPU (None) when there's none.
+        with patch.object(resources, "accelerator", return_value="xpu"):
+            self.assertEqual(TransformersEngine().resolve_device(), "xpu")
+        with patch.object(resources, "accelerator", return_value=None):
+            self.assertIsNone(TransformersEngine().resolve_device())
+
     def test_model_sizes_to_resources_not_prompt_tier(self):
         from yggdrasil.loki import resources
 
@@ -327,6 +343,69 @@ class TestTransformersEngine(unittest.TestCase):
     def test_explicit_model_pin_overrides_resource_sizing(self):
         eng = TransformersEngine(model="some/custom-model")
         self.assertEqual(eng.resolve_model(), "some/custom-model")
+
+    def test_pipeline_loads_on_detected_intel_gpu(self):
+        # No device pin → the build targets the auto-detected Intel GPU.
+        from yggdrasil.loki import resources
+
+        pipe = MagicMock(return_value=[{"generated_text": [
+            {"role": "assistant", "content": "ok"}]}])
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(return_value=pipe)
+        fake_torch = types.ModuleType("torch")
+        TransformersEngine._PIPES.clear()
+        TransformersEngine._FAILED.clear()
+        eng = TransformersEngine(model="m")
+        with patch.object(resources, "accelerator", return_value="xpu"), \
+                patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch}):
+            eng.generate("hi")
+        self.assertEqual(fake.pipeline.call_args.kwargs["device"], "xpu")
+
+    def test_pipeline_disables_xet_and_quiets_transformers(self):
+        # The corporate-proxy 403 came from HuggingFace's xet transfer; the build
+        # forces the classic LFS download and pins transformers to errors so a
+        # failure is one line, not nested framework tracebacks.
+        pipe = MagicMock(return_value=[{"generated_text": [
+            {"role": "assistant", "content": "ok"}]}])
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(return_value=pipe)
+        fake.logging = types.SimpleNamespace(set_verbosity_error=MagicMock())
+        fake_torch = types.ModuleType("torch")
+        TransformersEngine._PIPES.clear()
+        TransformersEngine._FAILED.clear()
+        with patch.dict(os.environ, {}, clear=False), \
+                patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch}):
+            os.environ.pop("HF_HUB_DISABLE_XET", None)
+            TransformersEngine(model="m").generate("hi")
+            self.assertEqual(os.environ.get("HF_HUB_DISABLE_XET"), "1")
+        fake.logging.set_verbosity_error.assert_called_once()
+
+    def test_local_engine_never_charges_cost(self):
+        # Local models run on this box → free. The meter records tokens but the
+        # USD cost (and budget) must not move.
+        from yggdrasil.loki.usage import METER
+
+        pipe = MagicMock(return_value=[{"generated_text": [
+            {"role": "assistant", "content": "a local reply"}]}])
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(return_value=pipe)
+        fake_torch = types.ModuleType("torch")
+        TransformersEngine._PIPES.clear()
+        TransformersEngine._FAILED.clear()
+        METER.reset()
+        with patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch}):
+            TransformersEngine(model="m").generate("hi there")
+        self.assertGreater(METER.total_tokens, 0)   # tokens are still counted
+        self.assertEqual(METER.total_cost, 0.0)      # but cost stays zero
+
+    def test_brief_collapses_nested_traceback(self):
+        from yggdrasil.loki.engines.transformers_engine import _brief
+
+        huge = "Could not load model X\n" + ("Traceback line\n" * 500)
+        out = _brief(huge)
+        self.assertLessEqual(len(out), 200)
+        self.assertNotIn("\n", out)
+        self.assertTrue(out.startswith("Could not load model X"))
 
     def test_complete_runs_pipeline_and_records_usage(self):
         from yggdrasil.loki.usage import METER
@@ -794,6 +873,82 @@ class TestEngineSelection(unittest.TestCase):
         with patch.object(Loki, "_engine_instances",
                           return_value={"boom": boom, "good": good}):
             self.assertEqual(set(loki.available_engines()), {"good"})
+
+
+class TestResourceAccelerator(unittest.TestCase):
+    """The accelerator probe spans CUDA, Intel GPU (xpu), and Apple mps; the
+    Intel NPU is detected and reported separately."""
+
+    @staticmethod
+    def _torch(*, cuda=False, xpu=False, mps=False):
+        t = types.ModuleType("torch")
+        t.cuda = types.SimpleNamespace(is_available=lambda: cuda)
+        if xpu:
+            t.xpu = types.SimpleNamespace(is_available=lambda: True)
+        t.backends = types.SimpleNamespace(
+            mps=types.SimpleNamespace(is_available=lambda: mps))
+        return t
+
+    def test_detects_cuda_first(self):
+        from yggdrasil.loki import resources
+
+        with patch.dict(sys.modules, {"torch": self._torch(cuda=True, xpu=True)}):
+            self.assertEqual(resources.accelerator(), "cuda")
+
+    def test_detects_intel_gpu_xpu(self):
+        from yggdrasil.loki import resources
+
+        with patch.dict(sys.modules, {"torch": self._torch(xpu=True)}):
+            self.assertEqual(resources.accelerator(), "xpu")
+
+    def test_detects_apple_mps(self):
+        from yggdrasil.loki import resources
+
+        with patch.dict(sys.modules, {"torch": self._torch(mps=True)}):
+            self.assertEqual(resources.accelerator(), "mps")
+
+    def test_cpu_only_has_no_accelerator(self):
+        from yggdrasil.loki import resources
+
+        with patch.dict(sys.modules, {"torch": self._torch()}):
+            self.assertIsNone(resources.accelerator())
+
+    def test_snapshot_reports_accelerator_and_npu(self):
+        from yggdrasil.loki import resources
+
+        with patch.object(resources, "accelerator", return_value="xpu"), \
+                patch.object(resources, "has_npu", return_value=True):
+            snap = resources.snapshot()
+        self.assertEqual(snap["accelerator"], "xpu")
+        self.assertTrue(snap["npu"])
+        self.assertFalse(snap["gpu"])  # gpu stays the CUDA-only xlarge driver
+
+    def test_intel_gpu_enables_local_without_big_ram(self):
+        from yggdrasil.loki import resources
+
+        # An Intel GPU box can host a local model even on modest CPU/RAM.
+        snap = {"cpu": 2, "ram_gb": 4, "gpu": False,
+                "accelerator": "xpu", "npu": False}
+        self.assertTrue(resources.can_run_local(snap))
+
+    def test_has_npu_detects_intel_npu_via_openvino(self):
+        from yggdrasil.loki import resources
+
+        ov = types.ModuleType("openvino")
+        ov.Core = lambda: types.SimpleNamespace(available_devices=["CPU", "GPU", "NPU"])
+        with patch.dict(sys.modules, {"openvino": ov}):
+            self.assertTrue(resources.has_npu())
+        # No NPU listed → False.
+        ov.Core = lambda: types.SimpleNamespace(available_devices=["CPU", "GPU"])
+        with patch.dict(sys.modules, {"openvino": ov}):
+            self.assertFalse(resources.has_npu())
+
+    def test_has_npu_false_when_openvino_missing(self):
+        from yggdrasil.loki import resources
+
+        # Importing a guaranteed-absent module name fails → best-effort False.
+        with patch.dict(sys.modules, {"openvino": None}):
+            self.assertFalse(resources.has_npu())
 
 
 if __name__ == "__main__":

@@ -5,8 +5,13 @@ text-generation pipeline — free, private, offline. The default model is **size
 to the machine** (:class:`LocalEngine` + :mod:`yggdrasil.loki.resources`): a
 small Qwen instruct model on a modest CPU box, a larger one as RAM/GPU allow.
 Override with ``YGG_LOKI_HF_MODEL`` (any chat/instruct id) and
-``YGG_LOKI_HF_DEVICE`` (e.g. ``"cuda"``). Available only when ``transformers``
-+ ``torch`` are installed.
+``YGG_LOKI_HF_DEVICE`` (e.g. ``"cuda"``). When the device is left unset the
+engine **auto-detects an accelerator** (:func:`yggdrasil.loki.resources.accelerator`)
+— NVIDIA ``cuda``, **Intel GPU** ``xpu``, or Apple ``mps`` — so a local model
+lands on the GPU instead of the CPU. An **Intel NPU** (AI Boost) is detected and
+flagged, but the HF pipeline can't target it directly (use OpenVINO /
+``optimum-intel`` for that). Available only when ``transformers`` + ``torch``
+are installed.
 """
 from __future__ import annotations
 
@@ -16,6 +21,7 @@ import os
 import threading
 from typing import Any, ClassVar, Iterator, Optional
 
+from .. import resources
 from ..engine import DEFAULT_MAX_TOKENS, Completion
 from .local import LocalEngine
 
@@ -25,6 +31,17 @@ __all__ = ["TransformersEngine"]
 #: terminal (``style.install_logging``) so a long, otherwise-silent first load
 #: on a CPU box (download weights → load → generate) reports what it's doing.
 _log = logging.getLogger(__name__)
+
+
+def _brief(exc: object, limit: int = 200) -> str:
+    """One-line, length-capped rendering of an exception (or its message).
+
+    transformers reports a failed load by stuffing several nested tracebacks
+    into a single error *string*; logged verbatim that's hundreds of lines per
+    turn. Collapse the whitespace and cap it so the log stays one readable line.
+    """
+    msg = " ".join(str(exc).split())
+    return msg if len(msg) <= limit else msg[: limit - 1] + "…"
 
 
 class TransformersEngine(LocalEngine):
@@ -57,6 +74,16 @@ class TransformersEngine(LocalEngine):
     def available(self) -> bool:
         return (importlib.util.find_spec("transformers") is not None
                 and importlib.util.find_spec("torch") is not None)
+
+    def resolve_device(self) -> Optional[str]:
+        """The device to load the pipeline on: an explicit pin (ctor arg /
+        ``YGG_LOKI_HF_DEVICE``) wins; otherwise the best auto-detected
+        accelerator — NVIDIA ``cuda``, **Intel GPU** ``xpu``, Apple ``mps`` —
+        or ``None`` (CPU). Lets a local model use the GPU without configuration.
+        """
+        if self.device:
+            return self.device
+        return resources.accelerator()
 
     def ready(self, model: Optional[str] = None) -> bool:
         """True when the pipeline for *model* (resolved if omitted) is loaded.
@@ -104,14 +131,34 @@ class TransformersEngine(LocalEngine):
         # any of the following classes". Quiet the symlink warning here; on a
         # load failure below we re-fetch the repo once to repair exactly that.
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-        _log.info("loading local model %s on %s — first run downloads weights, "
-                  "this can take a while…", model, self.device or "cpu")
+        # Xet is HuggingFace's newer CAS transfer; behind a corporate proxy its
+        # endpoint (cas-server.xethub.hf.co) is often blocked — a 403 there
+        # aborts the weights fetch with a giant nested traceback. Fall back to
+        # the classic LFS-over-HTTPS download, which rides the normal hub host.
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
         load("torch")  # the pipeline backend — auto-installed if missing
         transformers = load("transformers")
+        # transformers is loud — a failed load dumps several nested tracebacks
+        # through its own logger. Pin it to errors so our one concise line is the
+        # signal, not buried under framework noise.
+        try:
+            transformers.logging.set_verbosity_error()
+        except Exception:
+            pass
+        # Auto-detect the accelerator (cuda / Intel xpu / mps) unless pinned, so
+        # the model uses the GPU instead of the CPU. torch must be importable
+        # first, hence after load("torch").
+        device = self.resolve_device()
+        _log.info("loading local model %s on %s — first run downloads weights, "
+                  "this can take a while…", model, device or "cpu")
+        if device is None and resources.has_npu():
+            _log.info("an Intel NPU (AI Boost) was detected but the HF pipeline "
+                      "runs on CPU — install optimum-intel + openvino to offload "
+                      "the model onto the NPU.")
         try:
             pipe = transformers.pipeline(
                 "text-generation", model=model,
-                device=self.device, trust_remote_code=False,
+                device=device, trust_remote_code=False,
             )
         except Exception as first:
             # The common failure — chiefly on Windows — is a half-downloaded /
@@ -119,23 +166,24 @@ class TransformersEngine(LocalEngine):
             # weights) once with force_download to repair it, then rebuild.
             _log.warning("local model %s failed to load (%s: %s) — re-fetching "
                          "the weights to repair a partial download, retrying "
-                         "once…", model, type(first).__name__, first)
+                         "once…", model, type(first).__name__, _brief(first))
             try:
                 load("huggingface_hub").snapshot_download(model, force_download=True)
                 pipe = transformers.pipeline(
                     "text-generation", model=model,
-                    device=self.device, trust_remote_code=False,
+                    device=device, trust_remote_code=False,
                 )
             except Exception as exc:
                 # transformers masks the real reason behind a generic "Could not
                 # load model …" — unwrap the underlying cause so the log says
                 # *why* (corrupt download, torch mismatch, OOM), and remember the
                 # failure so the slow, doomed load isn't re-attempted every turn.
+                # The cause string can itself embed nested tracebacks — brief it.
                 cause = exc.__cause__ or exc.__context__ or exc
                 err = RuntimeError(
                     f"could not load local model {model!r}: "
-                    f"{type(cause).__name__}: {cause}. Pin a smaller model with "
-                    f"YGG_LOKI_HF_MODEL, or clear the HuggingFace cache and retry."
+                    f"{type(cause).__name__}: {_brief(cause)}. Pin a smaller model "
+                    f"with YGG_LOKI_HF_MODEL, or clear the HuggingFace cache and retry."
                 )
                 self._FAILED[model] = err
                 _log.warning("local model %s failed to load — %s", model, err)

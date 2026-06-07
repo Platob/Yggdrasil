@@ -34,6 +34,29 @@ class TestLogo:
         assert art == style.logo("YGG")      # plain mark, no "YGGNOPE" subtitle
 
 
+class TestStripAndTitle:
+    def test_strip_removes_ansi_color(self):
+        assert style.strip(style.red("hi") + " " + style.dim("there")) == "hi there"
+        assert style.strip("\033[1;36mbold cyan\033[0m") == "bold cyan"
+        assert style.strip("plain") == "plain"
+
+    def test_set_title_emits_osc_on_tty(self, monkeypatch, capsys):
+        # OSC 2 sets the terminal title; only meaningful on a TTY.
+        monkeypatch.setattr(style, "_IS_TTY", True)
+        style.set_title(style.green("10 tok") + "\n$0.00")
+        out = capsys.readouterr().out
+        assert out.startswith("\033]2;")
+        assert out.endswith("\a")
+        # ANSI stripped and newlines flattened so the title chrome stays clean.
+        assert "\033[" not in out[2:]
+        assert "\n" not in out
+
+    def test_set_title_noop_off_tty(self, monkeypatch, capsys):
+        monkeypatch.setattr(style, "_IS_TTY", False)
+        style.set_title("anything")
+        assert capsys.readouterr().out == ""
+
+
 class TestLogFormatter:
     def test_renders_clock_glyph_name_message(self):
         fmt = _plain_formatter()
