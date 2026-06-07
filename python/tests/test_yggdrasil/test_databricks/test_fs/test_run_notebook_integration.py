@@ -116,6 +116,48 @@ class TestRunNotebookIntegration(DatabricksIntegrationCase):
             self.skipTest(f"run_notebook needs job/serverless access: {exc}")
         self.assertTrue(run.is_succeeded, f"run failed:\n{run.debug()}")
 
+    def test_run_notebook_default_env_uses_seeded_ygg(self) -> None:
+        # The default (environment=None) serverless path auto-resolves to the
+        # seeded ygg base environment under WORKSPACE_ENV_DIR. Skip when it
+        # isn't deployed (seeding builds a wheel closure — too heavy for a
+        # test); otherwise prove it's genuinely the active image by importing
+        # yggdrasil *inside* the run, which only succeeds against the seeded
+        # zero-PyPI ygg environment.
+        from yggdrasil.databricks.job import wheel as W
+        from yggdrasil.databricks.job.service import (
+            _environment_spec_path,
+            _resolve_submit_environment,
+        )
+
+        name = W.ygg_base_environment_name()
+        spec_path = _environment_spec_path(self.client, name)
+        if spec_path is None:
+            self.skipTest(
+                f"ygg base environment {name!r} not seeded under "
+                f"{W.WORKSPACE_ENV_DIR} (run `ygg databricks environment`)."
+            )
+        # Auto-resolution points the run at the seeded .yml.
+        resolved = _resolve_submit_environment(self.client, None)
+        self.assertEqual(resolved.spec.base_environment, spec_path)
+
+        nb = self._notebook(
+            "import yggdrasil\n"
+            'dbutils.notebook.exit("ygg=" + yggdrasil.__version__)\n'
+        )
+        try:
+            run = nb.run_notebook(wait=_WAIT_SECONDS)
+        except (DatabricksError, PermissionDenied) as exc:
+            self.skipTest(f"run_notebook needs job/serverless access: {exc}")
+
+        self.assertTrue(run.is_succeeded, f"run failed:\n{run.debug()}")
+        out = run.task_output(nb.name)
+        self.assertIsNotNone(out)
+        # yggdrasil imported from the seeded env and reported its version.
+        self.assertTrue(
+            out.notebook_output.result.startswith("ygg="),
+            f"unexpected notebook output: {out.notebook_output.result!r}",
+        )
+
     def test_run_notebook_failure_surfaces_error(self) -> None:
         nb = self._notebook('raise Exception("boom-ygg")\n')
         try:
