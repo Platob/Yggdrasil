@@ -19,6 +19,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
+from yggdrasil.dataclasses.expiring import ExpiringDict
 from yggdrasil.version import VersionInfo
 
 from ..service import DatabricksService
@@ -54,6 +55,25 @@ __all__ = [
     "deployed_environments",
     "Environments",
 ]
+
+#: TTL (seconds) for the in-process deployed-environment listing cache. Walking
+#: the workspace tree is a remote round-trip per folder; ``get`` / ``find`` /
+#: ``resolve`` all funnel through :meth:`Environments.list`, so a short-lived
+#: snapshot turns repeated lookups into a dict hit. In-process mutations
+#: (``create`` / ``update`` / ``delete``) invalidate eagerly; the TTL only
+#: bounds staleness from *other* processes deploying environments.
+ENVIRONMENT_LIST_TTL = 300.0
+
+# host -> ExpiringDict(workspace_root -> list[Environment])
+_LIST_CACHE: "dict[str, ExpiringDict[str, list[Environment]]]" = {}
+
+
+def _list_bucket(client: Any) -> "ExpiringDict[str, list[Environment]]":
+    host = client.base_url.to_string() if getattr(client, "base_url", None) else "default"
+    bucket = _LIST_CACHE.get(host)
+    if bucket is None:
+        bucket = _LIST_CACHE[host] = ExpiringDict(default_ttl=ENVIRONMENT_LIST_TTL)
+    return bucket
 
 
 def environment_folder(project: str = "ygg") -> str:
@@ -207,6 +227,7 @@ class Environments(DatabricksService):
             self.client, subdir, dependencies=dependencies,
             workspace_dir=root, filename=f"{stem}.requirements.txt",
         )
+        self.invalidate_cache()                        # newly-written env supersedes any cached listing
         return Environment(self, name=stem, project=name, version=ver, python=python,
                           env_dir=serverless.rsplit("/", 1)[0],
                           serverless=serverless, cluster=cluster, dependencies=dependencies)
@@ -218,9 +239,19 @@ class Environments(DatabricksService):
         return self.create(project, version, **kwargs)
 
     # -- read --------------------------------------------------------------
-    def list(self, *, workspace_dir: "str | None" = None) -> "list[Environment]":
-        """The deployed base environments, one :class:`Environment` per stem."""
+    def list(self, *, workspace_dir: "str | None" = None,
+             refresh: bool = False) -> "list[Environment]":
+        """The deployed base environments, one :class:`Environment` per stem.
+
+        Cached per ``(host, workspace_dir)`` for :data:`ENVIRONMENT_LIST_TTL`
+        seconds so the ``get`` / ``find`` / ``resolve`` hot path skips the
+        workspace walk; pass ``refresh=True`` to force a fresh read."""
         root = workspace_dir or self.default_dir
+        bucket = _list_bucket(self.client)
+        if not refresh:
+            cached = bucket.get(root)
+            if cached is not None:
+                return cached
         by_stem: "dict[str, dict[str, Any]]" = {}
         for path in deployed_environments(self.client, workspace_dir=root):
             folder, fname = path.rsplit("/", 1)
@@ -239,13 +270,15 @@ class Environments(DatabricksService):
             out.append(Environment(self, name=stem, project=project, version=version,
                                   env_dir=info["folder"], serverless=info.get("serverless"),
                                   cluster=info.get("cluster")))
+        bucket[root] = out
         return out
 
     def get(self, project: "str | Path" = "ygg", version=None, *, python=None,
-            workspace_dir: "str | None" = None) -> "Optional[Environment]":
+            workspace_dir: "str | None" = None, refresh: bool = False) -> "Optional[Environment]":
         """The deployed environment for *project* (matching *version* / *python*),
         or ``None`` — never builds."""
-        return self.find(project, version, install=False, python=python, workspace_dir=workspace_dir)
+        return self.find(project, version, install=False, python=python,
+                         workspace_dir=workspace_dir, refresh=refresh)
 
     def find(
         self,
@@ -256,6 +289,7 @@ class Environments(DatabricksService):
         python: "str | None" = None,
         extras: "tuple[str, ...] | list[str]" = (),
         workspace_dir: "str | None" = None,
+        refresh: bool = False,
     ) -> "Optional[Environment]":
         """Find *project*'s base environment **for a Python** (its ``py3XX`` tag,
         defaulting to the local interpreter); build + write it (from a local
@@ -263,7 +297,7 @@ class Environments(DatabricksService):
         name = _project_name(project)
         ver = parse_version(version)
         key = environment_key_for(python)              # py3XX — the env's Python tag
-        envs = [e for e in self.list(workspace_dir=workspace_dir)
+        envs = [e for e in self.list(workspace_dir=workspace_dir, refresh=refresh)
                 if environment_folder_of(e.name) == environment_folder(name)
                 and e.name.endswith(f"-{key}")
                 and (ver is None or e.version == ver)]
@@ -274,7 +308,18 @@ class Environments(DatabricksService):
         return self.create(project, ver, python=python, extras=extras,
                           workspace_dir=workspace_dir, overwrite=False)
 
-    def client_project(self, *, workspace_dir: "str | None" = None) -> "Optional[Environment]":
+    def invalidate_cache(self) -> None:
+        """Drop this client's cached :meth:`list` snapshots — call after the
+        workspace's environments change out-of-band (the in-process ``create`` /
+        ``update`` / ``delete`` paths do this for you)."""
+        host = (self.client.base_url.to_string()
+                if getattr(self.client, "base_url", None) else "default")
+        bucket = _LIST_CACHE.get(host)
+        if bucket is not None:
+            bucket.clear()
+
+    def client_project(self, *, workspace_dir: "str | None" = None,
+                       refresh: bool = False) -> "Optional[Environment]":
         """The **running client project's** deployed environment — discovered
         from the nearest ``pyproject.toml`` (walking up from the cwd), matched by
         its ``[project].name`` / ``version`` for the local Python. ``None`` when
@@ -283,10 +328,11 @@ class Environments(DatabricksService):
             meta = read_pyproject(find_pyproject())
         except Exception:  # noqa: BLE001 — no/unreadable pyproject → no project default
             return None
-        return self.get(meta["name"], meta["version"], workspace_dir=workspace_dir)
+        return self.get(meta["name"], meta["version"], workspace_dir=workspace_dir, refresh=refresh)
 
     def resolve(self, ref: "str | None" = None, *,
-                workspace_dir: "str | None" = None) -> "Optional[Environment]":
+                workspace_dir: "str | None" = None,
+                refresh: bool = False) -> "Optional[Environment]":
         """Resolve a base-environment *reference* to a deployed :class:`Environment`.
 
         - a ``str`` carrying a ``/`` or a ``.yml`` / ``.yaml`` suffix — a **direct
@@ -295,6 +341,9 @@ class Environments(DatabricksService):
           looked up among :meth:`list`;
         - ``None`` — **auto**: the running :meth:`client_project`, else the ``ygg``
           base environment for the current Python, else ``None``.
+
+        Discovery rides the cached :meth:`list` snapshot; pass ``refresh=True`` to
+        bypass it.
         """
         from ..path import DatabricksPath
 
@@ -306,12 +355,12 @@ class Environments(DatabricksService):
             name = full.rsplit("/", 1)[-1].removesuffix(".yaml").removesuffix(".yml").removesuffix(".env")
             return Environment(self, name=name, env_dir=full.rsplit("/", 1)[0], serverless=full)
         if isinstance(ref, str):
-            for env in self.list(workspace_dir=workspace_dir):
+            for env in self.list(workspace_dir=workspace_dir, refresh=refresh):
                 if env.name == ref:
                     return env
             return None
-        return (self.client_project(workspace_dir=workspace_dir)
-                or self.get("ygg", workspace_dir=workspace_dir))
+        return (self.client_project(workspace_dir=workspace_dir, refresh=refresh)
+                or self.get("ygg", workspace_dir=workspace_dir, refresh=refresh))
 
     # -- delete ------------------------------------------------------------
     def delete(self, project: "str | Path" = "ygg", version=None, *,
@@ -324,6 +373,8 @@ class Environments(DatabricksService):
                 and (ver is None or e.version == ver)]
         for e in envs:
             e.delete()
+        if envs:
+            self.invalidate_cache()
         return envs
 
 

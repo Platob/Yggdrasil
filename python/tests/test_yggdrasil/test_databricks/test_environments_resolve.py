@@ -72,13 +72,64 @@ class TestResolveAuto:
         with patch.object(svc, "client_project", return_value=None), \
                 patch.object(svc, "get", return_value=ygg) as get:
             assert svc.resolve() is ygg
-            get.assert_called_once_with("ygg", workspace_dir=None)
+            get.assert_called_once_with("ygg", workspace_dir=None, refresh=False)
 
     def test_returns_none_when_nothing_deployed(self) -> None:
         svc = _service()
         with patch.object(svc, "client_project", return_value=None), \
                 patch.object(svc, "get", return_value=None):
             assert svc.resolve() is None
+
+
+class TestListCache:
+    _WALK = [
+        "/ws/env/ygg/0.8.58/ygg-0.8.58-py311.yml",
+        "/ws/env/ygg/0.8.58/ygg-0.8.58-py311.requirements.txt",
+    ]
+
+    def test_list_served_from_cache_within_ttl(self) -> None:
+        svc = _service()
+        with patch("yggdrasil.databricks.environments.service.deployed_environments",
+                   return_value=self._WALK) as walk:
+            first = svc.list()
+            second = svc.list()
+        assert walk.call_count == 1            # second call hit the cache
+        assert second is first                 # same cached snapshot object
+        assert [e.name for e in first] == ["ygg-0.8.58-py311"]
+
+    def test_refresh_bypasses_cache(self) -> None:
+        svc = _service()
+        with patch("yggdrasil.databricks.environments.service.deployed_environments",
+                   return_value=self._WALK) as walk:
+            svc.list()
+            svc.list(refresh=True)
+        assert walk.call_count == 2
+
+    def test_invalidate_cache_forces_rewalk(self) -> None:
+        svc = _service()
+        with patch("yggdrasil.databricks.environments.service.deployed_environments",
+                   return_value=self._WALK) as walk:
+            svc.list()
+            svc.invalidate_cache()      # e.g. after an out-of-band deploy
+            svc.list()
+        assert walk.call_count == 2
+
+    def test_get_and_resolve_share_one_walk(self) -> None:
+        # get → find → list, and resolve(stem) → list: both ride one cached walk.
+        # Build the stem for the live interpreter so find()'s py3XX filter matches.
+        from yggdrasil.databricks.wheels.service import environment_key_for
+
+        stem = f"ygg-0.8.58-{environment_key_for()}"
+        walk_paths = [f"/ws/env/ygg/0.8.58/{stem}.yml",
+                      f"/ws/env/ygg/0.8.58/{stem}.requirements.txt"]
+        svc = _service()
+        with patch("yggdrasil.databricks.environments.service.deployed_environments",
+                   return_value=walk_paths) as walk:
+            got = svc.get("ygg")
+            resolved = svc.resolve(stem)
+        assert walk.call_count == 1
+        assert got is not None and got.name == stem
+        assert resolved is not None and resolved.name == stem
 
 
 class TestClientProject:
@@ -91,7 +142,7 @@ class TestClientProject:
                       return_value={"name": "ygg", "version": "0.8.58"}), \
                 patch.object(svc, "get", return_value=proj) as get:
             assert svc.client_project() is proj
-            get.assert_called_once_with("ygg", "0.8.58", workspace_dir=None)
+            get.assert_called_once_with("ygg", "0.8.58", workspace_dir=None, refresh=False)
 
     def test_no_pyproject_returns_none(self) -> None:
         svc = _service()
