@@ -362,7 +362,7 @@ class WorkspacePyPIRegistry:
     local_cache: _LocalPath = field(default=None)  # type: ignore[assignment]
 
     #: Shared workspace registry root — the same PyPI-like index the ygg image
-    #: deploys to (``yggdrasil.databricks.job.wheel.WORKSPACE_PYPI_DIR``), so the
+    #: deploys to (``yggdrasil.databricks.wheels.service.WORKSPACE_PYPI_DIR``), so the
     #: Spark Connect path and the serverless job image share one workspace-wide
     #: index. Pass an explicit ``base_path`` for a private / per-user root.
     DEFAULT_BASE: ClassVar[str] = "/Workspace/Shared/pypi"

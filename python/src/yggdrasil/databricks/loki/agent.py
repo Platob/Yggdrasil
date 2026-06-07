@@ -152,8 +152,6 @@ class DatabricksLoki(Loki):
 
         from databricks.sdk.service.jobs import PythonWheelTask, Task
 
-        from yggdrasil.databricks.job import wheel as whl
-
         # The single ``ygg`` entry point with a ``loki`` subcommand. ``reason``
         # takes the prompt positionally; every other behavior goes through
         # ``run`` with JSON-encoded ``--kwarg`` pairs (the CLI JSON-decodes each).
@@ -169,7 +167,7 @@ class DatabricksLoki(Loki):
                 parameters += ["--kwarg", f"{key}={json.dumps(value)}"]
 
         # Serverless environment carrying the pre-built ygg wheel image.
-        environment = whl.ygg_environment(client, environment_key="default")
+        environment = client.environments.job_environment(environment_key="default")
         task = Task(
             task_key="loki",
             environment_key="default",

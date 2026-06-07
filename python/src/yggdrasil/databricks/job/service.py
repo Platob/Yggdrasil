@@ -145,14 +145,14 @@ def _environment_spec_path(client: DatabricksClient, name: str) -> str | None:
     A value carrying a ``/`` or a ``.yml`` / ``.yaml`` suffix is taken as a
     direct workspace path to the serverless base-environment spec. A bare
     name is looked up under the shared environment root
-    (:data:`~yggdrasil.databricks.job.wheel.WORKSPACE_ENV_DIR`) in the
+    (:data:`~yggdrasil.databricks.environments.service.WORKSPACE_ENV_DIR`) in the
     project-folder layout the seed writes — ``<proj>/<proj>-<version>-py3XX.yml``
     for a version-tagged stem (the folder derived via
-    :func:`~yggdrasil.databricks.job.wheel.environment_folder_of`), with the
+    :func:`~yggdrasil.databricks.environments.service.environment_folder_of`), with the
     legacy ``<name>/<name>.yml`` / flat / ``.env.yaml`` spellings as fallbacks.
     Returns the first existing path, or ``None`` when nothing matches.
     """
-    from yggdrasil.databricks.job import wheel as W
+    from yggdrasil.databricks.environments import service as W
     from yggdrasil.databricks.path import DatabricksPath
 
     if "/" in name or name.endswith((".yml", ".yaml")):
@@ -200,7 +200,7 @@ def _resolve_submit_environment(client: DatabricksClient, environment: Any) -> A
     if isinstance(environment, JobEnvironment):
         return environment
 
-    from yggdrasil.databricks.job import wheel as W
+    from yggdrasil.databricks.environments import service as W
 
     if isinstance(environment, str):
         spec_path = _environment_spec_path(client, environment)
@@ -246,13 +246,13 @@ def _client_project_spec_path(client: DatabricksClient) -> str | None:
     Discovers the caller's ``pyproject.toml`` (walking up from the cwd) and, from
     its ``[project].name`` / ``version``, builds the version-tagged environment
     stem for the local Python and looks it up under
-    :data:`~yggdrasil.databricks.job.wheel.WORKSPACE_ENV_DIR`. Returns the spec
+    :data:`~yggdrasil.databricks.environments.service.WORKSPACE_ENV_DIR`. Returns the spec
     path when that project environment is deployed, else ``None`` — so a job run
     from inside a project tree defaults to *that* project's image. Best-effort:
     any failure (no pyproject, unreadable metadata) yields ``None`` and the
     caller falls back to the ygg base environment.
     """
-    from yggdrasil.databricks.job import wheel as W
+    from yggdrasil.databricks.environments import service as W
 
     try:
         meta = W.read_pyproject(W.find_pyproject())

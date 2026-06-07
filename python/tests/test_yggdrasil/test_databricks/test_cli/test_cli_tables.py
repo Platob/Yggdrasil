@@ -37,7 +37,7 @@ class TestAutoloadDispatch(unittest.TestCase):
             rc = main(["tables", "autoload", "cat.sch.events"])
         self.assertEqual(rc, 0)
         client.tables.table.assert_called_once_with("cat.sch.events")
-        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+        from yggdrasil.databricks.environments.service import ygg_base_environment_name
         kwargs = table.auto_loader.call_args.kwargs
         self.assertIs(kwargs["file_arrival"], True)            # default file-arrival trigger
         self.assertEqual(kwargs["available_now"], True)        # default sweep

@@ -1,7 +1,7 @@
 """``ygg databricks environment`` — build / get-or-install the reusable ygg base
 environment(s) from wheels in the workspace.
 
-The environment machinery in :mod:`yggdrasil.databricks.job.wheel` builds ygg's
+The environment machinery in :mod:`yggdrasil.databricks.environments.service` builds ygg's
 whole transitive dependency closure as wheels and persists, **per Python**, a
 base environment under ``/Workspace/Shared/environment``::
 
@@ -54,25 +54,24 @@ class EnvironmentCommand:
         """Bare ``environment`` — get-or-install the base environment(s) from
         wheels (build the closure once, reuse it next time; ``--rebuild`` forces)."""
         from yggdrasil.cli import style
-        from yggdrasil.databricks.job import wheel as whl
+        from yggdrasil.databricks.wheels.service import SUPPORTED_PYTHONS
 
         client = build_client(args)
-        workspace_dir = args.workspace_dir or whl.WORKSPACE_ENV_DIR
-        pythons = [None] if args.current else list(whl.SUPPORTED_PYTHONS)
+        pythons = [None] if args.current else list(SUPPORTED_PYTHONS)
         plural = "s" if len(pythons) > 1 else ""
         with style.Spinner(
             f"building {len(pythons)} base environment{plural} (wheel closure into shared pypi)…"
         ):
-            envs = whl.ensure_environments(
-                client, versions=pythons, workspace_dir=workspace_dir, rebuild=args.rebuild,
+            envs = client.environments.deploy_ygg(
+                versions=pythons, workspace_dir=args.workspace_dir, rebuild=args.rebuild,
             )
         for env in envs:
             style.out(
-                f"    {style.dim(env['env_name'])}  {env['n_wheels']} wheels  "
-                f"{style.dim('dir')} {env['env_dir']}\n"
+                f"    {style.dim(env.name)}  {len(env.dependencies)} wheels  "
+                f"{style.dim('dir')} {env.env_dir}\n"
             )
-            style.out(f"          {style.dim('serverless')} {env['serverless']}\n")
-            style.out(f"          {style.dim('cluster')}    {env['cluster']}\n")
+            style.out(f"          {style.dim('serverless')} {env.serverless}\n")
+            style.out(f"          {style.dim('cluster')}    {env.cluster}\n")
         style.ok(
             f"{len(envs)} base environment(s) ready (serverless + cluster, zero-PyPI)"
         )
@@ -81,15 +80,16 @@ class EnvironmentCommand:
     @classmethod
     def _list(cls, args: Any, build_client: Any) -> int:
         from yggdrasil.cli import style
-        from yggdrasil.databricks.job import wheel as whl
 
         client = build_client(args)
-        workspace_dir = args.workspace_dir or whl.WORKSPACE_ENV_DIR
-        paths = whl.deployed_environments(client, workspace_dir=workspace_dir)
-        if not paths:
+        workspace_dir = args.workspace_dir or client.environments.default_dir
+        envs = client.environments.list(workspace_dir=workspace_dir)
+        if not envs:
             style.warn(f"no base environment files under {workspace_dir}")
             return 1
-        for path in paths:
-            style.out(f"    {path}\n")
-        style.ok(f"{len(paths)} environment file(s)")
+        for env in envs:
+            for path in (env.serverless, env.cluster):
+                if path:
+                    style.out(f"    {path}\n")
+        style.ok(f"{len(envs)} environment(s)")
         return 0

@@ -36,7 +36,7 @@ def _client_with(*, user="me@co.com", warehouses=None, default_wh=...):
 
 def _env_requirements():
     """The seeded generic-environment requirements path for the local Python."""
-    from yggdrasil.databricks.job.wheel import (
+    from yggdrasil.databricks.environments.service import (
         WORKSPACE_ENV_DIR,
         environment_folder,
         ygg_base_environment_name,
@@ -72,9 +72,9 @@ class TestSeedCheck(unittest.TestCase):
         client = _client_with(warehouses=[wh])
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels",
+             patch("yggdrasil.databricks.wheels.service.deployed_wheels",
                    return_value=["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.deployed_environments",
+             patch("yggdrasil.databricks.environments.service.deployed_environments",
                    return_value=["/Workspace/Shared/environments/yellow.env.yaml",
                                  "/Workspace/Shared/environments/yellow.requirements.txt"]), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -87,9 +87,9 @@ class TestSeedCheck(unittest.TestCase):
         client = _client_with(warehouses=[wh])
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels",
+             patch("yggdrasil.databricks.wheels.service.deployed_wheels",
                    return_value=["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.deployed_environments", return_value=[]), \
+             patch("yggdrasil.databricks.environments.service.deployed_environments", return_value=[]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--check"])
         self.assertEqual(rc, 1)
@@ -98,8 +98,8 @@ class TestSeedCheck(unittest.TestCase):
         client = _client_with(warehouses=[])   # no warehouses
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=[]), \
-             patch("yggdrasil.databricks.job.wheel.deployed_environments", return_value=[]), \
+             patch("yggdrasil.databricks.wheels.service.deployed_wheels", return_value=[]), \
+             patch("yggdrasil.databricks.environments.service.deployed_environments", return_value=[]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--check"])
         self.assertEqual(rc, 1)
@@ -111,9 +111,9 @@ class TestSeedCheck(unittest.TestCase):
         client.compute.clusters.find_cluster.return_value = None   # no default cluster
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels",
+             patch("yggdrasil.databricks.wheels.service.deployed_wheels",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.deployed_environments",
+             patch("yggdrasil.databricks.environments.service.deployed_environments",
                    return_value=["/w/env/yellow.yml", "/w/env/yellow.requirements.txt"]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--check"])
@@ -127,9 +127,9 @@ class TestSeedCheck(unittest.TestCase):
         client.compute.instance_pools.find.return_value = None   # no pools
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels",
+             patch("yggdrasil.databricks.wheels.service.deployed_wheels",
                    return_value=["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.deployed_environments",
+             patch("yggdrasil.databricks.environments.service.deployed_environments",
                    return_value=["/Workspace/Shared/environments/ygg-1.0.yml",
                                  "/Workspace/Shared/environments/ygg-1.0.requirements.txt"]), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -140,10 +140,10 @@ class TestSeedCheck(unittest.TestCase):
         client = _client_with(warehouses=[])
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels", return_value=[]), \
-             patch("yggdrasil.databricks.job.wheel.deployed_environments", return_value=[]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure, \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments") as envs, \
+             patch("yggdrasil.databricks.wheels.service.deployed_wheels", return_value=[]), \
+             patch("yggdrasil.databricks.environments.service.deployed_environments", return_value=[]), \
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel") as ensure, \
+             patch("yggdrasil.databricks.environments.service.ensure_environments") as envs, \
              contextlib.redirect_stdout(io.StringIO()):
             main(["seed", "--check"])
         ensure.assert_not_called()
@@ -159,9 +159,9 @@ class TestSeedProvision(unittest.TestCase):
         client = _client_with(default_wh=wh)
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel",
                    return_value=["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]) as ensure, \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(None)]) as envs, \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed"])
@@ -180,9 +180,9 @@ class TestSeedProvision(unittest.TestCase):
         client = _client_with(user="alice@co.com", default_wh=wh)
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(None)]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed"])
@@ -203,9 +203,9 @@ class TestSeedProvision(unittest.TestCase):
         client.compute.instance_pools.find.return_value = None   # Light pool absent
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(None)]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed"])
@@ -223,9 +223,9 @@ class TestSeedProvision(unittest.TestCase):
         client = _client_with(default_wh=wh)
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(None)]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--no-cluster"])
@@ -233,13 +233,13 @@ class TestSeedProvision(unittest.TestCase):
         client.compute.clusters.all_purpose_cluster.assert_not_called()
 
     def test_seed_overwrite_skips_cluster_step(self):
-        from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
+        from yggdrasil.databricks.wheels.service import SUPPORTED_PYTHONS
         client = _client_with(default_wh=MagicMock())
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheels",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(v) for v in SUPPORTED_PYTHONS]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--mode", "overwrite"])
@@ -252,9 +252,9 @@ class TestSeedProvision(unittest.TestCase):
         client = _client_with(default_wh=wh)
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(None)]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--no-pools"])
@@ -262,13 +262,13 @@ class TestSeedProvision(unittest.TestCase):
         client.compute.instance_pools.seed_default_pools.assert_not_called()
 
     def test_seed_overwrite_skips_pool_step(self):
-        from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
+        from yggdrasil.databricks.wheels.service import SUPPORTED_PYTHONS
         client = _client_with(default_wh=MagicMock())
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheels",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(v) for v in SUPPORTED_PYTHONS]), \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--mode", "overwrite"])
@@ -277,14 +277,14 @@ class TestSeedProvision(unittest.TestCase):
         client.compute.instance_pools.seed_default_pools.assert_not_called()
 
     def test_seed_all_versions_builds_every_python_environment(self):
-        from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
+        from yggdrasil.databricks.wheels.service import SUPPORTED_PYTHONS
         wh = MagicMock(); wh.warehouse_name = "wh"; wh.warehouse_id = "id"; wh.state = "RUNNING"
         client = _client_with(default_wh=wh)
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheels",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]) as ensure, \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(v) for v in SUPPORTED_PYTHONS]) as envs, \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--all-versions"])
@@ -297,14 +297,14 @@ class TestSeedProvision(unittest.TestCase):
     def test_seed_overwrite_rebuilds_all_wheels_and_ends(self):
         """overwrite mode forces a from-scratch rebuild (all Pythons + envs),
         rewrites the envs, and ends before the warehouse step."""
-        from yggdrasil.databricks.job.wheel import SUPPORTED_PYTHONS
+        from yggdrasil.databricks.wheels.service import SUPPORTED_PYTHONS
         client = _client_with(default_wh=MagicMock())
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheels",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheels",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]) as ensure_all, \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure_one, \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel") as ensure_one, \
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(v) for v in SUPPORTED_PYTHONS]) as envs, \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed", "--mode", "overwrite"])
@@ -330,9 +330,9 @@ class TestSeedProvision(unittest.TestCase):
         }
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(None)]), \
              patch("yggdrasil.databricks.assistant.deploy", return_value=deployed) as dep, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -349,9 +349,9 @@ class TestSeedProvision(unittest.TestCase):
         deployed = {"uploaded": [], "missing": [], "skipped": [], "api": None}
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]) as one, \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(None)]) as envs, \
              patch("yggdrasil.databricks.assistant.deploy", return_value=deployed) as dep, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -371,9 +371,9 @@ class TestSeedProvision(unittest.TestCase):
         deployed = {"uploaded": [], "missing": [], "skipped": [], "api": None}
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]) as one, \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(None)]) as envs, \
              patch("yggdrasil.databricks.assistant.deploy", return_value=deployed) as dep, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -392,9 +392,9 @@ class TestSeedProvision(unittest.TestCase):
         client = _client_with(default_wh=wh)
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel",
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel",
                    return_value=["/w/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.ensure_environments",
+             patch("yggdrasil.databricks.environments.service.ensure_environments",
                    return_value=[_env(None)]), \
              patch("yggdrasil.databricks.assistant.deploy") as dep, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -413,9 +413,9 @@ class TestSeedProvision(unittest.TestCase):
         }
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.deployed_wheels",
+             patch("yggdrasil.databricks.wheels.service.deployed_wheels",
                    return_value=["/Workspace/Shared/pypi/ygg/ygg-1.0-py3-none-any.whl"]), \
-             patch("yggdrasil.databricks.job.wheel.deployed_environments",
+             patch("yggdrasil.databricks.environments.service.deployed_environments",
                    return_value=["/w/env/yellow.yml", "/w/env/yellow.requirements.txt"]), \
              patch("yggdrasil.databricks.assistant.deploy", return_value=missing) as dep, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -428,7 +428,7 @@ class TestSeedProvision(unittest.TestCase):
         client.workspace_client.return_value.current_user.me.side_effect = RuntimeError("401")
         with patch("yggdrasil.databricks.client.DatabricksClient", return_value=client), \
              patch("yggdrasil.cli.style.print_logo"), \
-             patch("yggdrasil.databricks.job.wheel.ensure_ygg_wheel") as ensure, \
+             patch("yggdrasil.databricks.wheels.service.ensure_ygg_wheel") as ensure, \
              contextlib.redirect_stdout(io.StringIO()):
             rc = main(["seed"])
         self.assertEqual(rc, 1)

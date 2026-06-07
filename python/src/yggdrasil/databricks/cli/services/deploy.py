@@ -60,33 +60,32 @@ class DeployCommand:
         environment, and provision the project's default warehouse and cluster
         wired to that env config."""
         from yggdrasil.cli import style
-        from yggdrasil.databricks.job import wheel as whl
         from yggdrasil.enums.mode import Mode
 
         client = build_client(args)
-        pypi_dir = args.workspace_dir or whl.WORKSPACE_PYPI_DIR
         extras = tuple(args.extra or ())
         mode = Mode.from_(args.mode)
 
         with style.Spinner("building project wheel + environment…"):
-            info = whl.ensure_project_environment(
-                client, args.path, extras=extras, bundle=args.bundle,
-                mode=mode, pypi_dir=pypi_dir,
+            env = client.environments.deploy_project(
+                args.path, extras=extras, bundle=args.bundle,
+                mode=mode, pypi_dir=args.workspace_dir or client.wheels.default_dir,
             )
-        style.ok(f"deployed project {style.brand(info['name'])} {info['version']}")
+        project = env.project
+        style.ok(f"deployed project {style.brand(project)} {env.version}")
         style.out(f"    {style.dim('mode')}        {mode.name.lower()}\n")
-        style.out(f"    {style.dim('env')}         {info['env_name']}\n")
-        style.out(f"    {style.dim('serverless')}  {info['serverless']}\n")
-        style.out(f"    {style.dim('cluster cfg')} {info['cluster']}\n")
-        style.out(f"    {style.dim('deps')}        {info['n_wheels']} entr(y/ies)\n")
+        style.out(f"    {style.dim('env')}         {env.name}\n")
+        style.out(f"    {style.dim('serverless')}  {env.serverless}\n")
+        style.out(f"    {style.dim('cluster cfg')} {env.cluster}\n")
+        style.out(f"    {style.dim('deps')}        {len(env.dependencies)} entr(y/ies)\n")
 
         if not args.no_warehouse:
             # A default serverless SQL warehouse named for the project — its
             # entry point for SQL/Genie work. (Warehouses run SQL, not wheels;
             # the env config wheels go on the cluster below.)
-            with style.Spinner(f"provisioning default warehouse {info['name']!r}…"):
+            with style.Spinner(f"provisioning default warehouse {project!r}…"):
                 wh = client.warehouses.create_or_update(
-                    name=info["name"], enable_serverless_compute=True,
+                    name=project, enable_serverless_compute=True,
                 )
             style.ok(f"default warehouse {wh.warehouse_name!r} ready (serverless)")
 
@@ -99,10 +98,10 @@ class DeployCommand:
             user = client.workspace_client().current_user.me().user_name
             single_user = args.single_user_name or user
             clusters = client.compute.clusters
-            libraries = [info["cluster"], "uv", "dill"]
-            with style.Spinner(f"provisioning default cluster {info['name']!r}…"):
+            libraries = [env.cluster, "uv", "dill"]
+            with style.Spinner(f"provisioning default cluster {project!r}…"):
                 existing = (
-                    clusters.find_cluster(cluster_name=info["name"], raise_error=False)
+                    clusters.find_cluster(cluster_name=project, raise_error=False)
                     if mode is Mode.OVERWRITE else None
                 )
                 if existing is not None:
@@ -111,8 +110,8 @@ class DeployCommand:
                     )
                 else:
                     cluster = clusters.all_purpose_cluster(
-                        name=info["name"], single_user_name=single_user,
-                        environment=info["cluster"], wait=False,
+                        name=project, single_user_name=single_user,
+                        environment=env.cluster, wait=False,
                     )
             style.ok(
                 f"default cluster {cluster.cluster_name!r} ready "

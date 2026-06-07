@@ -231,7 +231,7 @@ class TestWorkspacePyPIRegistry:
     def test_default_base_is_shared_registry(self, serverless_client, monkeypatch):
         # No base_path → the shared workspace registry (same root the job image
         # uses), so Spark Connect and the job image share one index.
-        from yggdrasil.databricks.job.wheel import WORKSPACE_PYPI_DIR
+        from yggdrasil.databricks.wheels.service import WORKSPACE_PYPI_DIR
         monkeypatch.setattr(
             type(serverless_client), "workspaces",
             property(lambda self: MagicMock(name="Workspaces")),
@@ -399,7 +399,7 @@ class TestServerlessBranch:
         self, serverless_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
-        from yggdrasil.databricks.job.wheel import ygg_runtime_dependencies
+        from yggdrasil.databricks.environments.service import ygg_runtime_dependencies
 
         builder, session, _env_cls, env_instances = mocked_builder
         result = serverless_client.spark()
@@ -420,7 +420,7 @@ class TestServerlessBranch:
         self, serverless_client, mocked_builder, stubbed_workspace_config,
         fake_registry,
     ) -> None:
-        from yggdrasil.databricks.job.wheel import ygg_runtime_dependencies
+        from yggdrasil.databricks.environments.service import ygg_runtime_dependencies
 
         _builder, _session, _env_cls, env_instances = mocked_builder
         serverless_client.spark("numpy==1.0")

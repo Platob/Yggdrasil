@@ -147,7 +147,7 @@ class TestFlow:
         assert gather.local([3, 1, 2]) == [1, 2, 3]
 
     def test_definition_runs_target_via_ygg_run(self):
-        from yggdrasil.databricks.job.wheel import serverless_environment_version
+        from yggdrasil.databricks.wheels.service import serverless_environment_version
 
         @flow(parameters=["a", "b"])
         def etl(x, y):
@@ -251,7 +251,7 @@ def module_level_flow(x):
 
 
 def test_all_environments_attaches_one_env_per_python():
-    from yggdrasil.databricks.job import wheel as W
+    from yggdrasil.databricks.environments import service as W
 
     @flow(name="multi")
     def f(x):
@@ -314,7 +314,8 @@ def test_named_base_environment_empty_layer_is_none():
 
 
 def test_serverless_dependencies_writes_base_env_and_splits_layer():
-    from yggdrasil.databricks.job import wheel as W
+    from yggdrasil.databricks.wheels import service as W
+    from yggdrasil.databricks.environments import service as E
 
     @flow(name="splitjob")
     def f(x):
@@ -327,8 +328,8 @@ def test_serverless_dependencies_writes_base_env_and_splits_layer():
          patch.object(W, "_norm", side_effect=lambda s: s), \
          patch.object(W, "ensure_ygg_wheels", return_value=["/ws/ygg-1.0-py3-none-any.whl"]), \
          patch.object(W, "wheel_for_python", side_effect=lambda wheels, *a: wheels[0]), \
-         patch.object(W, "ygg_runtime_dependencies", return_value=["pyarrow>=20"]), \
-         patch.object(W, "ensure_named_environment", return_value="/ws/env/yellow.env.yaml") as ene:
+         patch.object(E, "ygg_runtime_dependencies", return_value=["pyarrow>=20"]), \
+         patch.object(E, "ensure_named_environment", return_value="/ws/env/yellow.env.yaml") as ene:
         flat = f._serverless_dependencies(client)
 
     # The shared ygg image (wheel + runtime) was written to the named env...

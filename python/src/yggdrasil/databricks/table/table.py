@@ -3146,7 +3146,7 @@ class Table(DatabricksPath):
             environment: Name of a reusable serverless **base environment** to
                 create-or-update and reference. Default (unset) resolves to the
                 canonical, version-pinned ygg image
-                (:func:`~yggdrasil.databricks.job.wheel.ygg_base_environment_name`,
+                (:func:`~yggdrasil.databricks.environments.service.ygg_base_environment_name`,
                 ``ygg-<version>-py3XX``) — the same ``<name>.yml`` file
                 ``ygg databricks seed`` writes under ``/Workspace/Shared/
                 environments``, so the job reuses the seeded wheel-built image
@@ -3166,7 +3166,7 @@ class Table(DatabricksPath):
         if environment is ...:
             # Default to the canonical, version-pinned ygg base environment —
             # the wheel-built image the seed writes — rather than a static name.
-            from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+            from yggdrasil.databricks.environments.service import ygg_base_environment_name
             environment = ygg_base_environment_name()
 
         if source is None:

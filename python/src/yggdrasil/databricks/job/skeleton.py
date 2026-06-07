@@ -315,7 +315,8 @@ class _Runnable:
         **user-package layer** so :attr:`base_environment_name`, when set, can
         write the (stable) image into a reusable named env and layer the user
         package on top. Returns the flat union (the inline fallback)."""
-        from yggdrasil.databricks.job import wheel as W
+        from yggdrasil.databricks.wheels import service as W
+        from yggdrasil.databricks.environments import service as E
 
         editable_ygg = W.is_editable_install("ygg")
         pkg = self.wheel_package()
@@ -343,7 +344,7 @@ class _Runnable:
             )
             # The shared image is the local-matched ygg wheel + its runtime
             # (index) deps; the user package (if any) is the layer on top.
-            ygg_base = [W.wheel_for_python(ygg_wheels)] + W.ygg_runtime_dependencies()
+            ygg_base = [W.wheel_for_python(ygg_wheels)] + E.ygg_runtime_dependencies()
             user_wheels: list[str] = []
             user_deps: list[str] = []
             if user_pkg:
@@ -360,8 +361,8 @@ class _Runnable:
         self._base_environment_path, self._user_layer = None, None
         if self.base_environment_name and not self.all_environments:
             try:
-                self._base_environment_path = W.ensure_named_environment(
-                    client, W.environment_folder_of(self.base_environment_name),
+                self._base_environment_path = E.ensure_named_environment(
+                    client, E.environment_folder_of(self.base_environment_name),
                     dependencies=ygg_base,
                     environment_version=self.environment_version,
                     # Match the seed's project-folder layout: a job whose
@@ -385,9 +386,10 @@ class _Runnable:
     def _python_dependencies(self, python: str) -> list[str]:
         """The dependency list for a specific *python* — the wheels matching it
         (by path) + runtime/user index deps (composed from the stashed matrix)."""
-        from yggdrasil.databricks.job import wheel as W
+        from yggdrasil.databricks.wheels import service as W
+        from yggdrasil.databricks.environments import service as E
 
-        deps = [W.wheel_for_python(self._ygg_wheels, python)] + W.ygg_runtime_dependencies()
+        deps = [W.wheel_for_python(self._ygg_wheels, python)] + E.ygg_runtime_dependencies()
         if self._user_wheels:
             deps += [W.wheel_for_python(self._user_wheels, python)] + list(self._user_deps)
         seen: set[str] = set()
@@ -417,7 +419,7 @@ class _Runnable:
         Always carries a ``"default"`` env (the local-matched runtime +
         :meth:`effective_dependencies`). When :attr:`all_environments` is set and
         the per-Python wheels have been built (post-:meth:`deploy`), also appends
-        one env per :data:`~yggdrasil.databricks.job.wheel.SUPPORTED_PYTHONS`
+        one env per :data:`~yggdrasil.databricks.wheels.service.SUPPORTED_PYTHONS`
         (keyed ``py3XX``) so a task can run under any Python by environment key.
 
         When :meth:`_serverless_dependencies` wrote a reusable named base
@@ -428,7 +430,7 @@ class _Runnable:
             return None
         from databricks.sdk.service.compute import Environment
         from databricks.sdk.service.jobs import JobEnvironment
-        from yggdrasil.databricks.job import wheel as W
+        from yggdrasil.databricks.wheels import service as W
 
         def env(key: str, deps: list, python: "str | None") -> Any:
             return JobEnvironment(

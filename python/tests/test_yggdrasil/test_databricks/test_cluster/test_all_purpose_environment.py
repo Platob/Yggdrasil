@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from yggdrasil.databricks.job.wheel import (
+from yggdrasil.databricks.environments.service import (
     WORKSPACE_ENV_DIR,
     environment_folder,
     ygg_base_environment_name,

@@ -118,7 +118,7 @@ class Clusters(DatabricksService):
         interpreter. Provisioned by ``ygg databricks seed``; an explicit
         ``environment`` / ``libraries`` argument overrides it (and may be a PyPI
         spec to opt back into a pip resolve)."""
-        from yggdrasil.databricks.job.wheel import (
+        from yggdrasil.databricks.environments.service import (
             WORKSPACE_ENV_DIR,
             environment_folder,
             environment_stem,

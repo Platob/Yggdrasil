@@ -239,7 +239,7 @@ class TestRunNotebook:
         assert task.environment_key == env.environment_key
 
     def test_auto_environment_uses_seeded_ygg_env(self, workspace, client, service) -> None:
-        from yggdrasil.databricks.job.wheel import (
+        from yggdrasil.databricks.environments.service import (
             WORKSPACE_ENV_DIR,
             environment_folder,
             ygg_base_environment_name,

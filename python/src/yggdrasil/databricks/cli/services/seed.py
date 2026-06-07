@@ -136,7 +136,8 @@ class SeedCommand:
             style.fail(f"cannot reach workspace: {exc}")
             return 1
 
-        from yggdrasil.databricks.job import wheel as whl
+        from yggdrasil.databricks.wheels import service as whl
+        from yggdrasil.databricks.environments import service as E
         workspace_dir = (args.workspace_dir or whl.WORKSPACE_PYPI_DIR).rstrip("/")
         import importlib.metadata as ilmd
         version = ilmd.version("ygg")
@@ -174,13 +175,13 @@ class SeedCommand:
         try:
             if check:
                 # Read-only: verify the reusable environment files were written.
-                persisted = whl.deployed_environments(client)
+                persisted = E.deployed_environments(client)
                 if persisted:
                     for path in persisted[:6]:
                         style.out(f"    {style.dim('found')}  {path}\n")
                     style.ok("base environment files present (serverless + cluster)")
                 else:
-                    style.warn(f"no base environment files under {whl.WORKSPACE_ENV_DIR}")
+                    style.warn(f"no base environment files under {E.WORKSPACE_ENV_DIR}")
                     ok = False
             else:
                 # Persist the version-pinned base environments under the project
@@ -203,9 +204,9 @@ class SeedCommand:
                     f"building {len(pythons)} base environment{plural} "
                     f"(parallel, wheel bundle into shared pypi)…"
                 ):
-                    envs = whl.ensure_environments(
+                    envs = E.ensure_environments(
                         client, versions=pythons,
-                        workspace_dir=whl.WORKSPACE_ENV_DIR, rebuild=rebuild,
+                        workspace_dir=E.WORKSPACE_ENV_DIR, rebuild=rebuild,
                         mode=deploy_mode,
                     )
                 for env in envs:
@@ -349,9 +350,9 @@ class SeedCommand:
                     # seeded), so its requirements file — selected by Python version —
                     # matches the runtime it lands on.
                     local_python = f"3.{sys.version_info.minor}"
-                    env_name = whl.ygg_base_environment_name()
+                    env_name = E.ygg_base_environment_name()
                     env_requirements = (
-                        f"{whl.WORKSPACE_ENV_DIR}/{whl.environment_folder('ygg')}/"
+                        f"{E.WORKSPACE_ENV_DIR}/{E.environment_folder('ygg')}/"
                         f"{env_name}.requirements.txt"
                     )
                     with style.Spinner("provisioning default single-user cluster…"):

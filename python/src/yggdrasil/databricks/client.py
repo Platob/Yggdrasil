@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     from .schema.schemas import Schemas
     from .volume.volumes import Volumes
     from .warehouse.service import Warehouses
+    from .wheels.service import Wheels
+    from .environments.service import Environments
     from .compute.service import Compute
     from .cluster import Cluster
     from .secrets.service import Secrets
@@ -364,6 +366,8 @@ class DatabricksClient(Singleton, URLBased):
             "_sql",
             "_entity_tags",
             "_warehouses",
+            "_wheels",
+            "_environments",
             "_compute",
             "_secrets",
             "_iam",
@@ -1184,13 +1188,10 @@ class DatabricksClient(Singleton, URLBased):
         :meth:`ygg_environment`), so they land as platform-correct builds rather
         than wheels bundled from this host.
         """
-        from yggdrasil.databricks.job.wheel import ensure_ygg_wheel, WORKSPACE_PYPI_DIR
-
-        return ensure_ygg_wheel(
-            self,
-            workspace_dir=workspace_dir or WORKSPACE_PYPI_DIR,
-            rebuild=rebuild,
+        wheels = self.wheels.deploy_ygg(
+            all_versions=False, rebuild=rebuild, workspace_dir=workspace_dir,
         )
+        return [w.path for w in wheels]
 
     def ygg_environment(
         self,
@@ -1202,22 +1203,16 @@ class DatabricksClient(Singleton, URLBased):
         """The serverless ``JobEnvironment`` for the versioned ygg image.
 
         Pairs the serverless runtime — defaulting to
-        :func:`~yggdrasil.databricks.job.wheel.serverless_environment_version`
+        :func:`~yggdrasil.databricks.wheels.service.serverless_environment_version`
         so the cluster Python matches the local interpreter — with the
         get-or-created :meth:`ensure_ygg_wheel` bundle.
         Drop it straight into a serverless job's ``environments=[...]`` so its
         python-wheel tasks run the ``ygg`` CLI against a pinned, pre-installed
         image.
         """
-        from yggdrasil.databricks.job.wheel import (
-            ygg_environment,
-            serverless_environment_version,
-        )
-
-        return ygg_environment(
-            self,
+        return self.environments.job_environment(
             environment_key=environment_key,
-            environment_version=environment_version or serverless_environment_version(),
+            environment_version=environment_version,
             rebuild=rebuild,
         )
 
@@ -1766,6 +1761,30 @@ class DatabricksClient(Singleton, URLBased):
         return cached
 
     @property
+    def wheels(self) -> "Wheels":
+        """Wheel registry service — build/upload/deploy/browse wheels."""
+        cached = self.__dict__.get("_wheels")
+        if cached is not None:
+            return cached
+        from yggdrasil.databricks.wheels.service import Wheels
+
+        cached = Wheels(client=self)
+        self.__dict__["_wheels"] = cached
+        return cached
+
+    @property
+    def environments(self) -> "Environments":
+        """Base-environment service — assemble/deploy serverless + cluster images, deploy projects."""
+        cached = self.__dict__.get("_environments")
+        if cached is not None:
+            return cached
+        from yggdrasil.databricks.environments.service import Environments
+
+        cached = Environments(client=self)
+        self.__dict__["_environments"] = cached
+        return cached
+
+    @property
     def compute(self) -> "Compute":
         """Default cluster helper for this client."""
         cached = self.__dict__.get("_compute")
@@ -2128,7 +2147,7 @@ class DatabricksClient(Singleton, URLBased):
             # cluster without a public index (the same reason the loader job's
             # image uses a wheel). Its runtime dependencies ride along as index
             # requirement names so the cluster resolves platform-correct builds.
-            from yggdrasil.databricks.job.wheel import ygg_runtime_dependencies
+            from yggdrasil.databricks.environments.service import ygg_runtime_dependencies
 
             deps = ["ygg", *ygg_runtime_dependencies(), *deps]
 

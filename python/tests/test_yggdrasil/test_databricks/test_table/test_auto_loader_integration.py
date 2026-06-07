@@ -154,7 +154,7 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         # environment (written to /Workspace/Shared/environments as
         # ``ygg-<version>-py3XX.yml`` — the same file the seed writes) rather
         # than inlining the dependency list.
-        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+        from yggdrasil.databricks.environments.service import ygg_base_environment_name
         env = settings.environments[0]
         assert env.spec.base_environment is not None
         assert env.spec.base_environment.endswith(f"{ygg_base_environment_name()}.yml")
@@ -172,7 +172,7 @@ class TestAutoLoaderIngestion(DatabricksIntegrationCase):
         through it lands on the backing S3, and the deployed job targets the
         volume source with the version-pinned ygg base environment. The actual
         serverless run is gated behind ``YGG_TEST_AUTOLOADER_RUN=1`` (minutes)."""
-        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+        from yggdrasil.databricks.environments.service import ygg_base_environment_name
 
         # Volume-addressed staging: /Volumes/<cat>/<sch>/<vol>/.sql/tmp, backed by
         # the table's EXTERNAL S3 location (created in setUpClass).

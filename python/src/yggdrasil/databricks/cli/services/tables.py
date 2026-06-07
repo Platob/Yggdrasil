@@ -76,7 +76,7 @@ class TablesCommand:
         elif args.environment is not None:
             environment = args.environment           # explicit shared env name
         else:
-            from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+            from yggdrasil.databricks.environments.service import ygg_base_environment_name
             environment = ygg_base_environment_name()  # canonical version-pinned ygg image
         deploy = not args.no_deploy
 

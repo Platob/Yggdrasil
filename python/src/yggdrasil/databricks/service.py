@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from .table.tables import Tables
     from .volume.volumes import Volumes
     from .warehouse.service import Warehouses
+    from .wheels.service import Wheels
+    from .environments.service import Environments
 
 __all__ = ["DatabricksService"]
 
@@ -134,6 +136,16 @@ class DatabricksService(ABC):
     @property
     def warehouses(self) -> "Warehouses":
         return self.client.warehouses
+
+    @property
+    def wheels(self) -> "Wheels":
+        """Wheel registry service (shorthand for ``client.wheels``)."""
+        return self.client.wheels
+
+    @property
+    def environments(self) -> "Environments":
+        """Base-environment service (shorthand for ``client.environments``)."""
+        return self.client.environments
 
     @property
     def compute(self) -> "Compute":

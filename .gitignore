@@ -22,6 +22,8 @@ parts/
 sdist/
 var/
 wheels/
+# …but the Databricks wheel-registry service package is real source, not build output.
+!python/src/yggdrasil/databricks/wheels/
 # CI-only scratch for the serverless env bundle (publish.yml): the fetched
 # databricks-sdk wheel + the staged release bundle. The env spec itself
 # (environments/ygg/*.yml) IS committed.

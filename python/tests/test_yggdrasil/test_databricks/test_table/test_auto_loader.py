@@ -94,7 +94,7 @@ class TestTableAutoLoader:
         assert Flow.call_args.kwargs["name"] == "[YGG][AUTOLOADER] cat.sch.tbl"
 
     def test_defaults_bundle_and_canonical_ygg_environment(self):
-        from yggdrasil.databricks.job.wheel import ygg_base_environment_name
+        from yggdrasil.databricks.environments.service import ygg_base_environment_name
 
         tbl = _table()
         with patch("yggdrasil.databricks.job.skeleton.Flow") as Flow:

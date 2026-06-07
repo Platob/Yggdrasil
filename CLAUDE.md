@@ -61,7 +61,8 @@ Treat a cross-language divergence as a bug.
 
 `yggdrasil.databricks` wraps the Databricks SDK behind `DatabricksClient` and
 its `dbc.<service>` accessors (`sql`, `tables`, `volumes`, `warehouses`,
-`compute`, `jobs`, `job_runs`, `secrets`, `iam`, `ai`, `genie`, …). Tabular
+`compute`, `jobs`, `job_runs`, `wheels`, `environments`, `secrets`, `iam`,
+`ai`, `genie`, …). Tabular
 data moves as Arrow; `Table` is itself a `Tabular`. See `docs/guides/databricks.md`
 and `docs/guides/databricks-cli.md`. Primary compute rules: prefer
 **serverless** for inner Databricks I/O, a **single-user cluster** for
@@ -91,6 +92,8 @@ python/src/yggdrasil/
   databricks/           Databricks SDK integrations
     client.py           DatabricksClient + dbc.<service> accessors
     sql/ table/ volume/ warehouse/ compute/ cluster/ job/ secrets/ iam/ ai/
+    wheels/             dbc.wheels — build/upload/deploy/browse the wheel registry
+    environments/       dbc.environments — assemble base envs + deploy projects
     genie/              dbc.genie — AI/BI Genie spaces
     cli/                ygg databricks ... (configure/seed/deploy/sql/jobs/fs/…)
     assistant/          Databricks Assistant skills + guidance (deployed by seed)

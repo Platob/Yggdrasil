@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from yggdrasil.databricks.job import wheel as W
+from yggdrasil.databricks.environments import service as W
 from yggdrasil.enums.mode import Mode
 
 

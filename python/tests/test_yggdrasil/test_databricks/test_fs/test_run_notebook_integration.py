@@ -123,7 +123,7 @@ class TestRunNotebookIntegration(DatabricksIntegrationCase):
         # test); otherwise prove it's genuinely the active image by importing
         # yggdrasil *inside* the run, which only succeeds against the seeded
         # zero-PyPI ygg environment.
-        from yggdrasil.databricks.job import wheel as W
+        from yggdrasil.databricks.environments import service as W
         from yggdrasil.databricks.job.service import (
             _environment_spec_path,
             _resolve_submit_environment,
