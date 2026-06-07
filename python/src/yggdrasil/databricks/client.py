@@ -1096,25 +1096,38 @@ class DatabricksClient(Singleton, URLBased):
 
     @property
     def project(self) -> Optional[str]:
-        """The client **project** — an alias of :attr:`product`, **always
-        lowercased** (the canonical identifier). Defaults to ``"yggdrasil"``; set
+        """The client **project** — the canonical *distribution* identifier for
+        :attr:`product`, resolved through the deploy alias map (``yggdrasil`` →
+        ``ygg``) and **always lowercased**. This is the name the deployed base
+        environment, the wheel registry, and the project's default resources are
+        all keyed by, so ``client.project`` lines up with what
+        ``ygg databricks deploy`` writes — ``dbc.environments.default()`` /
+        ``warehouses.default()`` / ``compute.clusters.default()`` resolve against
+        it. Defaults to ``"ygg"`` (the ``yggdrasil`` product's distribution); set
         it (or ``product``) to name a project and it persists with the client
-        (it is one of :data:`_INIT_NAMES`, so it rides through config, session
-        snapshots, and clones)."""
-        return self.product.strip().lower() if self.product else None
+        (``product`` is one of :data:`_INIT_NAMES`, so it rides through config,
+        session snapshots, and clones)."""
+        from yggdrasil.databricks.wheels.service import _norm, distribution_for
+
+        return _norm(distribution_for(self.product)) if self.product else None
 
     @project.setter
     def project(self, value: Optional[str]) -> None:
         self.product = str(value).strip().lower() if value else None
 
     @property
-    def project_name(self) -> Optional[str]:
+    def product_name(self) -> Optional[str]:
         """A nice, capitalized display name for the client :attr:`project`
-        (``my-app`` → ``My App``), or ``None`` when unset."""
+        (``my-app`` → ``My App``), or ``None`` when unset. The project's default
+        warehouse and cluster are named for this."""
         from yggdrasil.databricks.wheels.service import project_display_name
 
         project = self.project
         return project_display_name(project) if project else None
+
+    #: ``project_name`` is the same display name under the project vocabulary —
+    #: :attr:`product` and :attr:`project` name one thing, so do their displays.
+    project_name = product_name
 
     @property
     def connected(self) -> bool:

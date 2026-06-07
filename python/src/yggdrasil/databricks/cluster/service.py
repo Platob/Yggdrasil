@@ -518,6 +518,16 @@ class Clusters(DatabricksService):
 
         return instance
 
+    def default(self, *, raise_error: bool = False) -> Optional["Cluster"]:
+        """The project's **default all-purpose cluster** — the single-user cluster
+        named for the running client project (its capitalized display name,
+        :attr:`DatabricksClient.product_name`), as provisioned by
+        ``ygg databricks deploy``. Resolves the existing cluster (no creation);
+        ``None`` when it isn't deployed unless *raise_error*. The cluster sibling
+        of ``dbc.environments.default()`` / ``warehouses.default()``."""
+        name = self.client.product_name or "Ygg"
+        return self.find_cluster(cluster_name=name, raise_error=raise_error)
+
     def find_cluster(
         self,
         obj: Any = None,

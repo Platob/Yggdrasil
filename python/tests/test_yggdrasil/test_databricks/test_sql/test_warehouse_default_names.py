@@ -1,7 +1,9 @@
-"""``DatabricksClient.project`` is an alias of ``product`` (always lowercased)
-and persists with the client; ``project_name`` is its nice display. The default
-SQL warehouse is named for it, falling back to the workspace ygg defaults for
-the default ``ygg`` / ``yggdrasil`` product (or no project)."""
+"""``DatabricksClient.project`` is the canonical *distribution* name for
+``product`` — resolved through the deploy alias map (``yggdrasil`` → ``ygg``) and
+always lowercased — and persists with the client; ``product_name`` /
+``project_name`` are its nice display. The default SQL warehouse is named for it,
+falling back to the workspace ygg defaults for the default ``ygg`` / ``yggdrasil``
+product (or no project)."""
 from __future__ import annotations
 
 import unittest
@@ -25,9 +27,11 @@ class TestClientProjectAliasesProduct(unittest.TestCase):
         client.product = product
         return client
 
-    def test_project_is_lowercased_product(self):
+    def test_project_is_canonical_distribution(self):
         self.assertEqual(self._client("My-App").project, "my-app")
-        self.assertEqual(self._client("yggdrasil").project, "yggdrasil")
+        # The ``yggdrasil`` product resolves to its distribution ``ygg``.
+        self.assertEqual(self._client("yggdrasil").project, "ygg")
+        self.assertEqual(self._client("ygg").project, "ygg")
         self.assertIsNone(self._client(None).project)
 
     def test_setting_project_writes_product(self):
@@ -36,8 +40,10 @@ class TestClientProjectAliasesProduct(unittest.TestCase):
         self.assertEqual(client.product, "my-app")       # persisted on product
         self.assertEqual(client.project, "my-app")
 
-    def test_project_name_is_nice(self):
+    def test_product_name_and_project_name_are_nice_and_identical(self):
+        self.assertEqual(self._client("my-app").product_name, "My App")
         self.assertEqual(self._client("my-app").project_name, "My App")
+        self.assertIsNone(self._client(None).product_name)
         self.assertIsNone(self._client(None).project_name)
 
     def test_display_name_helper(self):
@@ -49,7 +55,7 @@ class TestDefaultNames(unittest.TestCase):
     def _names(self, project):
         client = MagicMock()
         client.project = project
-        client.project_name = project_display_name(project) if project else None
+        client.product_name = project_display_name(project) if project else None
         return Warehouses(client=client).default_names()
 
     def test_project_nice_name_with_serverless_sibling(self):

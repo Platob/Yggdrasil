@@ -330,6 +330,27 @@ class Environments(DatabricksService):
             return None
         return self.get(meta["name"], meta["version"], workspace_dir=workspace_dir, refresh=refresh)
 
+    def default(self, version: "VersionInfo | str | None" = None, *,
+                python: "str | None" = None, workspace_dir: "str | None" = None,
+                refresh: bool = False) -> "Optional[Environment]":
+        """The running **client project's** default base environment — the
+        deployed image keyed by :attr:`DatabricksClient.project` (its canonical
+        distribution name) for *python* (the local interpreter by default).
+
+        Prefers a local ``pyproject`` match (:meth:`client_project`), then the
+        client project's deployed env, then the seeded ``ygg`` base environment;
+        ``None`` when nothing is deployed (never builds). This is the environment
+        ``dbc.environments`` auto-submits a serverless run on, the sibling of
+        ``warehouses.default()`` / ``compute.clusters.default()``."""
+        project = self.client.project or "ygg"
+        env = (self.client_project(workspace_dir=workspace_dir, refresh=refresh)
+               or self.get(project, version, python=python,
+                           workspace_dir=workspace_dir, refresh=refresh))
+        if env is None and project != "ygg":
+            env = self.get("ygg", version, python=python,
+                           workspace_dir=workspace_dir, refresh=refresh)
+        return env
+
     def resolve(self, ref: "str | None" = None, *,
                 workspace_dir: "str | None" = None,
                 refresh: bool = False) -> "Optional[Environment]":
@@ -337,10 +358,13 @@ class Environments(DatabricksService):
 
         - a ``str`` carrying a ``/`` or a ``.yml`` / ``.yaml`` suffix — a **direct
           workspace path** to a serverless spec (``None`` when it's absent);
-        - any other ``str`` — a deployed **stem name** (``ygg-<version>-py3XX``),
-          looked up among :meth:`list`;
-        - ``None`` — **auto**: the running :meth:`client_project`, else the ``ygg``
-          base environment for the current Python, else ``None``.
+        - a ``str`` matching a deployed **stem name** (``ygg-<version>-py3XX``) —
+          that exact environment;
+        - any other ``str`` — a **project name** (``ygg`` / ``yggdrasil`` /
+          ``My App``); resolved through :meth:`get` to that project's deployed env
+          for the current Python (so callers can pass the project, not just the
+          version-tagged stem);
+        - ``None`` — **auto**: the project :meth:`default`.
 
         Discovery rides the cached :meth:`list` snapshot; pass ``refresh=True`` to
         bypass it.
@@ -358,9 +382,10 @@ class Environments(DatabricksService):
             for env in self.list(workspace_dir=workspace_dir, refresh=refresh):
                 if env.name == ref:
                     return env
-            return None
-        return (self.client_project(workspace_dir=workspace_dir, refresh=refresh)
-                or self.get("ygg", workspace_dir=workspace_dir, refresh=refresh))
+            # Not a version-tagged stem — treat it as a project name and resolve
+            # its deployed env (by env-folder) for the local Python.
+            return self.get(ref, workspace_dir=workspace_dir, refresh=refresh)
+        return self.default(workspace_dir=workspace_dir, refresh=refresh)
 
     # -- delete ------------------------------------------------------------
     def delete(self, project: "str | Path" = "ygg", version=None, *,

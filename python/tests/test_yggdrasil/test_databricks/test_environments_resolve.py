@@ -59,6 +59,7 @@ class TestResolveNamedStem:
 class TestResolveAuto:
     def test_prefers_client_project(self) -> None:
         svc = _service()
+        svc.client.project = "ygg"
         proj = Environment(name="myproj-2.0.0-py311", serverless="/ws/myproj.yml")
         with patch.object(svc, "client_project", return_value=proj) as cp, \
                 patch.object(svc, "get") as get:
@@ -66,16 +67,19 @@ class TestResolveAuto:
             cp.assert_called_once()
             get.assert_not_called()
 
-    def test_falls_back_to_ygg(self) -> None:
+    def test_falls_back_to_client_project_env(self) -> None:
         svc = _service()
+        svc.client.project = "ygg"
         ygg = Environment(name="ygg-0.8.58-py311", serverless="/ws/ygg.yml")
         with patch.object(svc, "client_project", return_value=None), \
                 patch.object(svc, "get", return_value=ygg) as get:
             assert svc.resolve() is ygg
-            get.assert_called_once_with("ygg", workspace_dir=None, refresh=False)
+            get.assert_called_once_with("ygg", None, python=None,
+                                        workspace_dir=None, refresh=False)
 
     def test_returns_none_when_nothing_deployed(self) -> None:
         svc = _service()
+        svc.client.project = "ygg"
         with patch.object(svc, "client_project", return_value=None), \
                 patch.object(svc, "get", return_value=None):
             assert svc.resolve() is None
