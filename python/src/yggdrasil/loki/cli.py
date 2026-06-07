@@ -821,9 +821,15 @@ def _fleet_lines(style: Any, agents: list, frame: str) -> list[str]:
             tail = style.dim(_short_text(a.stderr_tail, 40))
         else:
             tail = ""
+        # Validation badge — did this agent self-check with a passing smoke test?
+        if not a.running:
+            badge = ({True: style.good("✓test"), False: style.bad("✗test")}
+                     .get(a.validated, style.amber("untested")))
+        else:
+            badge = ""
         lines.append(
-            f"  {glyph} {style.dim('#' + str(a.id))} {_short_text(a.task, 44).ljust(45)} "
-            f"{st.ljust(8)} {style.dim(f'{a.elapsed:4.1f}s')}  {tail}"
+            f"  {glyph} {style.dim('#' + str(a.id))} {_short_text(a.task, 40).ljust(41)} "
+            f"{st.ljust(8)} {badge.ljust(8)} {style.dim(f'{a.elapsed:4.1f}s')}  {tail}"
         )
     return lines
 
@@ -838,6 +844,8 @@ def _fleet_kpi_line(style: Any, fleet: Any) -> str:
         bits.append(style.brand(f"{k['running']} running"))
     if k["queued"]:
         bits.append(style.dim(f"{k['queued']} queued"))
+    if k.get("validated"):
+        bits.append(style.good(f"{k['validated']} tested"))
     cost = f"${k['cost']:.4f}" + (f"/${fleet.cost_cap:.2f}" if fleet.cost_cap else "")
     tail = f"{k['steps']} steps · {k['tokens']:,} tok · {cost} · {k['elapsed']:.1f}s"
     return f"  {style.dim('agents')} {'  '.join(bits)}  {style.dim('· ' + tail)}"

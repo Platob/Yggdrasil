@@ -17,6 +17,17 @@ def _ok_cmd(answer: str = "did it", files=("a.py",), tokens=1000, cost=0.01) -> 
     return [sys.executable, "-c", f"print({payload!r})"]
 
 
+def _smoke_cmd(passed: bool = True) -> list[str]:
+    """A stand-in agent whose transcript includes a smoke checkpoint step."""
+    import json
+    obs = "exit=0\nstdout:\n1 passed" if passed else "exit=1\nstdout:\n1 failed"
+    payload = json.dumps({"completed": True, "answer": "done", "files_changed": ["m.py"],
+                          "steps": [{"tool": "write_file", "observation": "created m.py"},
+                                    {"tool": "smoke", "observation": obs}],
+                          "usage": {"total_tokens": 100, "cost_usd": 0.0}})
+    return [sys.executable, "-c", f"print({payload!r})"]
+
+
 def _fail_cmd() -> list[str]:
     return [sys.executable, "-c", "import sys; sys.stderr.write('boom: nope\\n'); sys.exit(1)"]
 
@@ -143,6 +154,18 @@ class TestFleet(unittest.TestCase):
         fleet.monitor(interval=0.02, on_cap=lambda k: None)   # decline to go further
         self.assertEqual(fleet.queued(), 0)               # queue dropped
         self.assertEqual(len(fleet.agents), 1)            # only the first ever launched
+
+    def test_validated_reflects_smoke_checkpoint(self):
+        fleet = Fleet()
+        fleet.spawn("passed", cmd=_smoke_cmd(passed=True))
+        fleet.spawn("failed", cmd=_smoke_cmd(passed=False))
+        fleet.spawn("untested", cmd=_ok_cmd())          # steps are placeholders, no smoke
+        fleet.monitor(interval=0.02)
+        passed, failed, untested = fleet.agents
+        self.assertIs(passed.validated, True)
+        self.assertIs(failed.validated, False)
+        self.assertIsNone(untested.validated)
+        self.assertEqual(fleet.kpis()["validated"], 1)   # only the green smoke counts
 
     def test_mesh_json_written_to_shared_dir(self):
         import json as _json

@@ -76,6 +76,17 @@ class AgentHandle:
         return len((self.result or {}).get("steps", []))
 
     @property
+    def validated(self) -> "Optional[bool]":
+        """Whether the agent ran a passing ``smoke`` checkpoint — ``True`` (all
+        smokes green), ``False`` (one failed), or ``None`` (no smoke run). Lets
+        the dashboard show which delegated work was actually self-validated."""
+        steps = (self.result or {}).get("steps", [])
+        smokes = [s for s in steps if isinstance(s, dict) and s.get("tool") == "smoke"]
+        if not smokes:
+            return None
+        return all("exit=0" in str(s.get("observation", "")) for s in smokes)
+
+    @property
     def tokens(self) -> int:
         return int((self.result or {}).get("usage", {}).get("total_tokens", 0)) if self.result else 0
 
@@ -321,6 +332,7 @@ class Fleet:
             "done": done,
             "failed": failed,
             "queued": self.queued(),
+            "validated": sum(1 for h in self.agents if h.validated is True),
             "steps": sum(h.steps for h in self.agents),
             "tokens": sum(h.tokens for h in self.agents),
             "cost": round(sum(h.cost for h in self.agents), 6),

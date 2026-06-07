@@ -77,6 +77,9 @@ SCAFFOLD_SIGNALS: tuple[str, ...] = (
     "bootstrap a project", "from scratch", "starter project", "boilerplate",
     "project template", "set up a repo", "set up a project", "ready to push",
     "new app", "spin up a project",
+    # full-app phrasings (pair with the scaffold presets)
+    "full-stack", "fullstack", "full stack", "web app", "webapp",
+    "realtime app", "real-time app", "streaming app", "dashboard app",
 )
 
 #: "Run these in parallel" phrasing → the ``delegate`` action (a monitored fleet
@@ -801,8 +804,8 @@ class Loki:
         # Scaffold: an explicit signal, or a "<create-verb> … <project-noun>" phrase
         # (so "create a new python project" routes even with words in between).
         if any(s in low for s in SCAFFOLD_SIGNALS) or (
-            re.search(r"\b(new|create|start|bootstrap|scaffold|generate|spin up|set up)\b", low)
-            and re.search(r"\b(project|repo|repository|app|package|library|service|cli|tool)\b", low)
+            re.search(r"\b(new|create|start|bootstrap|scaffold|generate|spin up|set up|build|make)\b", low)
+            and re.search(r"\b(project|repo|repository|app|package|library|service|microservice|cli|tool)\b", low)
         ):
             return made("files", "scaffold",
                         why="scaffold a ready-to-push project from scratch")
@@ -834,6 +837,22 @@ class Loki:
                 skill, kw = hit
                 p = made("databricks", "skill", specialist="databricks",
                          why=f"databricks request → {skill}")
+                p.skill = skill
+                p.skill_kwargs = {k: v for k, v in kw.items() if v is not None}
+                return p
+
+        # Same for AWS: a precise NL read request ("list my s3 buckets", "show
+        # ec2 instances", "who am i on aws") dispatches the right aws-* skill.
+        if self.has("aws") and not re.search(r"https?://", text):
+            try:
+                from yggdrasil.aws.loki.router import route as _aws_route
+
+                hit = _aws_route(text)
+            except Exception:
+                hit = None
+            if hit is not None:
+                skill, kw = hit
+                p = made("aws", "skill", why=f"aws request → {skill}")
                 p.skill = skill
                 p.skill_kwargs = {k: v for k, v in kw.items() if v is not None}
                 return p

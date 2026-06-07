@@ -116,6 +116,15 @@ class TestPresets(unittest.TestCase):
         self.assertEqual(args["preset"], "fullstack-realtime")
         self.assertEqual(args["cloud"], ["aws", "databricks"])
 
+    def test_build_make_phrasings_route_to_scaffold(self):
+        from yggdrasil.loki import Loki
+
+        loki = Loki()
+        self.assertEqual(loki.plan("build a realtime full-stack app called pulse").action, "scaffold")
+        self.assertEqual(loki.plan("make a python microservice").action, "scaffold")
+        # "build" without a project noun stays a normal task, not a scaffold.
+        self.assertNotEqual(loki.plan("build an ETL pipeline into delta").action, "scaffold")
+
     def test_repl_scaffold_args_name_from_called(self):
         from yggdrasil.loki import cli
 
