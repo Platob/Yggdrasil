@@ -46,17 +46,24 @@ class TestDeployProject(unittest.TestCase):
         create.assert_called_once()
         self.assertEqual(create.call_args.args[0], "/tmp/myproj")
         self.assertEqual(create.call_args.kwargs["extras"], ("databricks",))
-        # default serverless warehouse named for the project
+        # No --python → build for the current interpreter (python=None).
+        self.assertIsNone(create.call_args.kwargs["python"])
+        # The client is bound to the deployed project + version.
+        self.assertEqual(client.project, "myproj")
+        self.assertEqual(client.product_version, "0.1.0")
+        # default serverless warehouse named for the project — fire-and-forget.
         wh = client.warehouses.create_or_update
         wh.assert_called_once()
         self.assertEqual(wh.call_args.kwargs["name"], "Myproj")  # capitalized project
         self.assertTrue(wh.call_args.kwargs["enable_serverless_compute"])
-        # default cluster, named for the project, installing its env config
+        self.assertIs(wh.call_args.kwargs["wait"], False)
+        # default cluster, named for the project (display name), installing its env config
         cl = client.compute.clusters.all_purpose_cluster
         cl.assert_called_once()
-        self.assertEqual(cl.call_args.kwargs["name"], "myproj")
+        self.assertEqual(cl.call_args.kwargs["name"], "Myproj")
         self.assertEqual(cl.call_args.kwargs["single_user_name"], "me@co.com")
         self.assertEqual(cl.call_args.kwargs["environment"], self.CLUSTER_CFG)
+        self.assertIs(cl.call_args.kwargs["wait"], False)
 
     def test_cwd_default(self):
         client = self._client()
@@ -77,6 +84,33 @@ class TestDeployProject(unittest.TestCase):
         self.assertEqual(rc, 0)
         client.warehouses.create_or_update.assert_not_called()
         client.compute.clusters.all_purpose_cluster.assert_called_once()
+
+    def test_python_versions_build_one_env_each(self):
+        client = self._client()
+        built = []
+
+        def _make(path, *, python=None, **kw):
+            e = types.SimpleNamespace(
+                project="myproj", version="0.1.0",
+                name=f"myproj-0.1.0-py{(python or '3.11').replace('.', '')}",
+                serverless=f"/ws/env/myproj/{python}.yml",
+                cluster=f"/ws/env/myproj/{python}.requirements.txt",
+                dependencies=["x"])
+            built.append(e)
+            return e
+
+        client.environments.create.side_effect = _make
+        rc = self._run(["deploy", "--python", "3.11", "--python", "3.12"], client)
+        self.assertEqual(rc, 0)
+        # One environment built per requested Python.
+        pys = [c.kwargs["python"] for c in client.environments.create.call_args_list]
+        self.assertEqual(pys, ["3.11", "3.12"])
+        # Warehouse + cluster provisioned once; the cluster installs the FIRST
+        # env's requirements (a cluster runs a single Python).
+        client.warehouses.create_or_update.assert_called_once()
+        cl = client.compute.clusters.all_purpose_cluster
+        cl.assert_called_once()
+        self.assertEqual(cl.call_args.kwargs["environment"], built[0].cluster)
 
     def test_rebuild_updates_existing_cluster(self):
         client = self._client()
