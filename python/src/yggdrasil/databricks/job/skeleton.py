@@ -125,7 +125,7 @@ class _Runnable:
     #: no target ref). e.g. ``["databricks", "table", "autoload", "--table",
     #: "c.s.t", "--source", "s3://…"]``. Required to deploy — set it on the
     #: instance (function flows take ``command=`` / override :meth:`command`).
-    _command: "list[str] | None" = None
+    _command: list[str] | None = None
     #: Job-level tags (key → value) carried onto :meth:`Jobs.create_or_update`,
     #: merged on top of the client's owner/product defaults. ``None`` adds none.
     job_tags: dict[str, str] | None = None
@@ -226,7 +226,7 @@ class _Runnable:
         clone.__dict__.update(overrides)
         return clone
 
-    def command(self) -> "list[str] | None":
+    def command(self) -> list[str] | None:
         """The ``ygg`` CLI subcommand the deployed wheel-task runs on the cluster
         (e.g. ``["databricks", "table", "autoload", "--table", …]``), shipped
         verbatim as the python-wheel task ``parameters``. ``None`` (the default)
@@ -401,7 +401,7 @@ class Task(_Runnable, Generic[T]):
         depends_on: "tuple[str, ...] | list[str]" = (),
         entry_point: Optional[str] = None,
         package_name: Optional[str] = None,
-        command: "list[str] | tuple[str, ...] | None" = None,
+        command: list[str] | tuple[str, ...] | None = None,
         **task_options: Any,
     ) -> None:
         self.fn = fn
@@ -456,7 +456,7 @@ class Flow(_Runnable):
         trigger: Any = None,
         retries: int = 0,
         retry_delay_seconds: float = 0.0,
-        command: "tuple[str, ...] | list[str] | None" = None,
+        command: tuple[str, ...] | list[str] | None = None,
         entry_point: Optional[str] = None,
         package_name: Optional[str] = None,
     ) -> None:
@@ -531,7 +531,7 @@ def flow(
     trigger: Any = None,
     retries: int = 0,
     retry_delay_seconds: float = 0.0,
-    command: "tuple[str, ...] | list[str] | None" = None,
+    command: tuple[str, ...] | list[str] | None = None,
     entry_point: Optional[str] = None,
     package_name: Optional[str] = None,
 ) -> Any:
