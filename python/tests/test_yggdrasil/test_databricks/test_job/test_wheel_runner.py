@@ -298,6 +298,46 @@ class TestWheel:
         # Flat pip requirements — no environment_version, no list indentation.
         assert body == "/ws/pypi/ygg-1.0-py3-none-any.whl\npyarrow==1\n"
 
+    def test_ensure_named_environment_skips_write_when_unchanged(self):
+        # Upsert: an existing file whose body already matches is left untouched —
+        # no re-stamp, no churn on an unchanged redeploy.
+        client = MagicMock()
+        path = MagicMock()
+        path.exists.return_value = True
+        expected = (
+            "environment_version: '5'\n"
+            "dependencies:\n"
+            "  - /ws/pypi/ygg/ygg-1.0-py3-none-any.whl\n"
+        )
+        path.read_text.return_value = expected
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.job.wheel.serverless_environment_version", return_value="5"):
+            DP.from_.return_value = path
+            dest = wheel.ensure_named_environment(
+                client, "ygg",
+                dependencies=["/ws/pypi/ygg/ygg-1.0-py3-none-any.whl"],
+                filename="ygg-1.0-py311.yml",
+            )
+        assert dest == "/Workspace/Shared/environment/ygg/ygg-1.0-py311.yml"
+        path.write_text.assert_not_called()              # unchanged → no write
+        path.parent.mkdir.assert_not_called()
+
+    def test_ensure_named_environment_overwrites_when_content_differs(self):
+        # A drifted (different) existing file IS overwritten.
+        client = MagicMock()
+        path = MagicMock()
+        path.exists.return_value = True
+        path.read_text.return_value = "environment_version: '5'\ndependencies:\n  - /old.whl\n"
+        with patch("yggdrasil.databricks.path.DatabricksPath") as DP, \
+             patch("yggdrasil.databricks.job.wheel.serverless_environment_version", return_value="5"):
+            DP.from_.return_value = path
+            wheel.ensure_named_environment(
+                client, "ygg",
+                dependencies=["/ws/pypi/ygg/ygg-1.0-py3-none-any.whl"],
+                filename="ygg-1.0-py311.yml",
+            )
+        path.write_text.assert_called_once()             # differs → overwritten
+
     def test_deployed_environments_descends_into_per_env_folders(self):
         # Each env is its own ``<name>/`` folder now; deployed_environments
         # descends one level and still picks up legacy flat files.

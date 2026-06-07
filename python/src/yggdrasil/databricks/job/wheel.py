@@ -313,6 +313,22 @@ def is_editable_install(dist: str) -> bool:
     return False
 
 
+def _workspace_text_unchanged(path: Any, body: str) -> bool:
+    """``True`` when *path* exists and already holds exactly *body*.
+
+    Lets the env-config writers (:func:`ensure_named_environment`,
+    :func:`ensure_cluster_requirements`) be a true upsert — overwrite only when
+    the content **differs** — so re-running a deploy doesn't churn unchanged
+    ``.yml`` / ``.requirements.txt`` files. Any read failure (missing file,
+    transient API error) is treated as "changed" so the write still happens."""
+    try:
+        if not path.exists():
+            return False
+        return path.read_text() == body
+    except Exception:  # noqa: BLE001 — unreadable → fall through and (re)write
+        return False
+
+
 def user_pypi_dir(client: Any) -> str:
     """The current user's private PyPI-like wheel folder
     (``/Workspace/Users/<me>/pypi``) — where **editable / dev** builds land so a
@@ -955,9 +971,10 @@ def ensure_named_environment(
     Here *name* is the **project folder** (e.g. ``ygg``); the file is
     ``<name>.env.yaml`` unless *filename* overrides it — the seed writes a
     version-pinned ``<proj>-<version>-py3XX.yml`` so jobs can point at an exact
-    image and every version coexists in the one project folder. Written
-    (overwritten) on every call — upsert semantics, so redeploying keeps the
-    file pointing at the current image. *dependencies* are wheel workspace paths
+    image and every version coexists in the one project folder. **Upsert that
+    only writes when the content differs**: an existing file whose body already
+    matches is left untouched (no needless re-stamp / churn); a missing or
+    drifted file is (over)written. *dependencies* are wheel workspace paths
     (and/or pip requirement lines, when an index resolve is wanted instead)."""
     from yggdrasil.databricks.path import DatabricksPath
 
@@ -971,6 +988,9 @@ def ensure_named_environment(
     # + ``py3XX`` tag so every build coexists rather than overwriting a flat file.
     dest = f"{workspace_dir.rstrip('/')}/{name}/{filename or f'{name}.env.yaml'}"
     path = DatabricksPath.from_(dest, client=client)
+    if _workspace_text_unchanged(path, body):
+        logger.info("serverless base environment %r unchanged -> %s", name, dest)
+        return dest
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
     logger.info(
@@ -1001,9 +1021,10 @@ def ensure_cluster_requirements(
         /Workspace/Shared/pypi/ygg/ygg-0.8.54-py3-none-any.whl
         pyarrow==...
 
-    Written (overwritten) on every call — upsert semantics, so redeploying keeps
-    *name* pointing at the current image. *dependencies* are wheel workspace
-    paths and/or pip requirement lines (typically the same list fed to
+    **Upsert that only writes when the content differs** — an existing file whose
+    body already matches is left untouched; a missing or drifted file is
+    (over)written. *dependencies* are wheel workspace paths and/or pip
+    requirement lines (typically the same list fed to
     :func:`ensure_named_environment`)."""
     from yggdrasil.databricks.path import DatabricksPath
 
@@ -1013,6 +1034,9 @@ def ensure_cluster_requirements(
     # default flat name so every version coexists in the one project folder.
     dest = f"{workspace_dir.rstrip('/')}/{name}/{filename or f'{name}.requirements.txt'}"
     path = DatabricksPath.from_(dest, client=client)
+    if _workspace_text_unchanged(path, body):
+        logger.info("cluster requirements %r unchanged -> %s", name, dest)
+        return dest
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
     logger.info(
@@ -1052,8 +1076,9 @@ def ensure_environment(
 
     *mode* sets the env-config-file policy (the wheel closure is **get-or-create**
     unless *rebuild*): :data:`Mode.APPEND` writes the ``.yml`` / ``.requirements.txt``
-    only when they don't exist yet; :data:`Mode.AUTO` / :data:`Mode.OVERWRITE`
-    (re)write them so they track the current closure.
+    only when they don't exist yet; :data:`Mode.AUTO` (default) and
+    :data:`Mode.OVERWRITE` upsert them — **overwriting only when the content
+    differs** so an unchanged redeploy leaves the files untouched.
 
     Returns ``{python, key, env_name, env_dir, n_wheels, serverless, cluster}``
     where ``env_name`` is the version-tagged stem and ``env_dir`` the project
@@ -1292,8 +1317,9 @@ def ensure_project_environment(
     - :data:`Mode.APPEND` — **add only what's missing**: reuse an already-deployed
       wheel, and write the env config files only when they don't exist yet.
     - :data:`Mode.AUTO` (default) — **get-or-create** the wheel(s) (reuse when
-      already deployed, build when not) but always **overwrite** the env config
-      files so they track the current dependency set.
+      already deployed, build when not) and **upsert** the env config files,
+      overwriting them only when the content differs so an unchanged redeploy is
+      a no-op.
 
     Returns a descriptor with the project name/version, the env name, the written
     file paths, the dependency list, and the resolved *mode*.
