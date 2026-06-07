@@ -125,6 +125,35 @@ def test_writes_bust_the_cache(service):
     assert api.list.call_count == 2
 
 
+def test_permission_error_listing_is_skipped_not_raised(service):
+    from databricks.sdk.errors import PermissionDenied
+
+    api = service.client.workspace_client.return_value.external_locations
+    api.list.side_effect = PermissionDenied("does not have permission to list")
+    # find_url / list degrade to "nothing" rather than raising.
+    assert service.find_url("s3://my-bucket/raw/x") is None
+    assert list(service.list()) == []
+
+
+def test_permission_skip_is_cached_no_relisting(service):
+    from databricks.sdk.errors import PermissionDenied
+
+    api = service.client.workspace_client.return_value.external_locations
+    api.list.side_effect = PermissionDenied("forbidden")
+    service.find_url("s3://b/x")
+    service.find_url("s3://b/y")
+    # The empty result is cached for the TTL — no repeated denied calls.
+    assert api.list.call_count == 1
+
+
+def test_non_permission_list_error_still_raises(service):
+    api = service.client.workspace_client.return_value.external_locations
+    api.list.side_effect = RuntimeError("transient network blip")
+    # Not a rights problem — surface it rather than silently hiding a bug.
+    with pytest.raises(RuntimeError):
+        service.find_url("s3://b/x")
+
+
 def test_client_external_locations_property_is_cached():
     # ``client.external_locations`` is a flat alias onto the
     # ``client.external`` umbrella (centralized external-data services).

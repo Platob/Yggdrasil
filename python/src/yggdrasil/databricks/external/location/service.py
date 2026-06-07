@@ -19,6 +19,7 @@ import logging
 import time
 from typing import Any, ClassVar, Iterator, Optional
 
+from databricks.sdk.errors import PermissionDenied
 from databricks.sdk.service.catalog import ExternalLocationInfo
 
 from yggdrasil.databricks.external.location.resource import ExternalLocation
@@ -27,6 +28,15 @@ from yggdrasil.databricks.securable import SecurableMapping
 __all__ = ["ExternalLocations"]
 
 logger = logging.getLogger(__name__)
+
+
+def _is_permission_error(exc: BaseException) -> bool:
+    """True when *exc* looks like "not authorized to list external locations" —
+    an SDK :class:`PermissionDenied`, or a message naming a permission gap."""
+    if isinstance(exc, PermissionDenied):
+        return True
+    msg = str(exc).lower()
+    return any(s in msg for s in ("permission", "not authorized", "does not have", "forbidden"))
 
 
 class ExternalLocations(SecurableMapping):
@@ -102,7 +112,25 @@ class ExternalLocations(SecurableMapping):
         cached_at = getattr(self, "_loc_cache_at", 0.0)
         if not refresh and cache is not None and (time.monotonic() - cached_at) < self.LIST_TTL:
             return iter(cache)
-        cache = list(self._api.list())
+        try:
+            cache = list(self._api.list())
+        except Exception as exc:  # noqa: BLE001
+            # A principal without rights to list external locations shouldn't
+            # break callers (``find_url`` gates the direct-storage fast path) —
+            # treat the catalog as empty so lookups resolve to ``None`` and
+            # callers degrade (e.g. MANAGED staging). Cache the empty result so
+            # we don't re-hit / re-warn within the TTL. Non-permission failures
+            # still propagate — those aren't "you can't see them", they're bugs.
+            if not _is_permission_error(exc):
+                raise
+            logger.warning(
+                "Not permitted to list Unity Catalog external locations (%s); "
+                "treating the catalog as empty — external-location lookups will "
+                "resolve to None and direct-storage prechecks report no access. "
+                "Grant the principal access to external locations to enable it.",
+                exc,
+            )
+            cache = []
         self._loc_cache = cache
         self._loc_cache_at = time.monotonic()
         return iter(cache)
