@@ -3,7 +3,7 @@
 Everything runs on polars lazy scans. On a WIDE file an aggregate that touches
 2 of 30 columns should read only those 2 (projection pushdown) and stream the
 group-by — versus eagerly loading the whole table first. Also times the
-adaptive downsample and OHLC resample.
+adaptive downsample and OHLC resample, and the ridge-regression forecaster.
 
 Usage::
 
@@ -12,6 +12,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import math
 import tempfile
 import time
 from pathlib import Path
@@ -21,11 +22,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.node.api.schemas.analysis import (
-    AggMeasure, AggregateRequest, ForecastRequest, OhlcRequest, PivotRequest,
+    AggregateRequest,
+    ForecastRequest,
+    OhlcRequest,
+    PivotRequest,
+    AggMeasure,
     SeriesRequest,
 )
 from yggdrasil.node.api.services.analysis import AnalysisService
-from yggdrasil.node.api.services.fs import FsService
 from yggdrasil.node.config import Settings
 
 
@@ -37,15 +41,14 @@ def main() -> None:
                 "region": [["NA", "EU", "APAC", "LATAM"][i % 4] for i in range(n)],
                 "price": [100.0 + (i % 1000) * 0.1 for i in range(n)]}
         for j in range(ncols - 3):
-            cols[f"pad{j}"] = [float(i % 97) for i in range(n)]   # noise columns
+            cols[f"pad{j}"] = [float(i % 97) for i in range(n)]
         pq.write_table(pa.table(cols), str(home / "wide.parquet"))
         mb = (home / "wide.parquet").stat().st_size // 1024 // 1024
-        settings = Settings(node_id="bench", node_home=home, front_home=home)
-        svc = AnalysisService(settings, fs=FsService(settings))
+        settings = Settings(node_id="bench", node_home=home)
+        svc = AnalysisService(settings)
         print(f"\n  wide.parquet: {n:,} rows x {ncols} cols ({mb} MB), aggregate touches 2 cols\n")
 
-        req = AggregateRequest(path="wide.parquet", group_by=["sector"],
-                               measures=[AggMeasure(column="price", agg="mean")])
+        req = AggregateRequest(path="wide.parquet", column="price", agg="mean", group_by="sector")
         t0 = time.perf_counter()
         for _ in range(5):
             res = asyncio.run(svc.aggregate(req))
@@ -58,7 +61,7 @@ def main() -> None:
             _ = df.group_by("sector").agg(pl.col("price").mean())
         eager_ms = (time.perf_counter() - t0) / 5 * 1000
 
-        print(f"  lazy scan + projection pushdown (2 cols):  {lazy_ms:8.1f} ms   ({res.group_count} groups)")
+        print(f"  lazy scan + projection pushdown (2 cols):  {lazy_ms:8.1f} ms   ({len(res.rows)} groups)")
         print(f"  eager full read (30 cols) + aggregate:     {eager_ms:8.1f} ms")
         print(f"  ==> {eager_ms / lazy_ms:5.1f}x  (pushdown skips 28 unused columns)\n")
 
@@ -72,8 +75,7 @@ def main() -> None:
         print(f"  downsample {n:,} -> {len(s.x)} pts:  {ds_ms:8.1f} ms")
         print(f"  ohlc {n:,} -> {o.bars} bars:      {ohlc_ms:8.1f} ms\n")
 
-        # cross-tab pivot: sector(5) x region(4), sum(price) — pushdown reads
-        # only 3 cols, streams the group-by, shapes the bounded 20-cell grid.
+        # cross-tab pivot: sector(5) x region(4), sum(price) — pushdown reads only 3 cols
         preq = PivotRequest(path="wide.parquet", rows=["sector"], columns=["region"],
                             measures=[AggMeasure(column="price", agg="sum")])
         t0 = time.perf_counter()
@@ -91,8 +93,7 @@ def main() -> None:
         print(f"  eager full read (30) + pivot:   {eager_pivot_ms:8.1f} ms")
         print(f"  ==> {eager_pivot_ms / pivot_ms:5.1f}x\n")
 
-    # -- forecasting (xgboost→gbr→ridge over engineered features) -----------
-    import math
+    # -- forecasting (ridge over engineered features; gbr/xgboost if installed) ----
     with tempfile.TemporaryDirectory() as d:
         home = Path(d)
         m = 50_000
@@ -100,22 +101,22 @@ def main() -> None:
         grp = [["a", "b", "c", "d"][i % 4] for i in range(m)]
         val = [100.0 + 0.01 * i + 12.0 * math.sin(2 * math.pi * i / 24) for i in range(m)]
         pq.write_table(pa.table({"ts": ts, "grp": grp, "value": val}), str(home / "ts.parquet"))
-        settings = Settings(node_id="bench", node_home=home, front_home=home)
-        svc = AnalysisService(settings, fs=FsService(settings))
+        settings2 = Settings(node_id="bench", node_home=home)
+        svc2 = AnalysisService(settings2)
         print(f"  ts.parquet: {m:,} rows, 4 groups — forecast value~ts\n")
         for model in ("ridge", "gbr", "xgboost"):
             t0 = time.perf_counter()
             try:
-                r = asyncio.run(svc.forecast(ForecastRequest(
+                r = asyncio.run(svc2.forecast(ForecastRequest(
                     path="ts.parquet", column="value", x="ts", group="grp",
                     horizon=48, model=model, period=24)))
-            except Exception as exc:                       # backend not installed
+            except Exception as exc:
                 print(f"  forecast {model:8s}: skipped ({type(exc).__name__})")
                 continue
             ms = (time.perf_counter() - t0) * 1000
             rmse = r.series[0].rmse
             print(f"  forecast {model:8s} ({r.model_used:8s}): {ms:8.1f} ms  "
-                  f"{len(r.series)} series x 48h  rmse≈{rmse}")
+                  f"{len(r.series)} series x 48h  rmse≈{rmse:.2f}")
         print()
 
 

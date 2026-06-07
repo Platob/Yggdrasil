@@ -1,4 +1,4 @@
-"""Benchmark the v2 API hot endpoints: /ping, /stats, /backend, /audit.
+"""Benchmark the v2 API hot endpoints of the trading node.
 
 Spins up the in-process FastAPI app (no uvicorn round-trip cost) and
 hits each endpoint N times with httpx.AsyncClient. Reports p50/p99 in
@@ -17,18 +17,17 @@ import time
 
 import httpx
 
-from yggdrasil.node.api.app import create_api
+from yggdrasil.node.app import create_api
 
 
 ENDPOINTS = [
-    ("/api/ping",        "ping       "),
-    ("/api/v2/stats",    "stats      "),
-    ("/api/v2/backend",  "backend    "),
-    ("/api/v2/backend/summary", "back/sum   "),
-    ("/api/v2/health",   "health     "),
-    ("/api/v2/audit?limit=20", "audit      "),
-    ("/api/v2/pyfunc",   "pyfunc/list"),
-    ("/api/v2/pyenv",    "pyenv/list "),
+    ("/api/ping",                              "ping       "),
+    ("/api/v2/health",                         "health     "),
+    ("/api/v2/stats",                          "stats      "),
+    ("/api/v2/market/assets",                  "assets     "),
+    ("/api/v2/market/candles?symbol=BTC/USD&interval=1h&limit=200", "candles    "),
+    ("/api/v2/market/tick?symbol=BTC/USD",     "tick       "),
+    ("/api/v2/market/book?symbol=BTC/USD",     "book       "),
 ]
 
 

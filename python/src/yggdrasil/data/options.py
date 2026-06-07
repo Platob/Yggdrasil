@@ -1128,11 +1128,12 @@ class CastOptions:
         """Filter + cast a :class:`pa.Table`."""
         return self._apply_predicate_and_cast(table)
 
-    def cast_arrow_tabular(self, data: "ArrowTabular") -> "ArrowTabular":
+    def cast_arrow_tabular(self, data: "ArrowTabular | pa.Table") -> "ArrowTabular":
         """Filter + cast an :class:`ArrowTabular` (batch by batch)."""
+        import pyarrow as pa
         from yggdrasil.arrow.tabular import ArrowTabular
-        batches = [self.cast_arrow_batch(b) for b in data.batches]
-        return ArrowTabular(batches)
+        src = data.to_batches() if isinstance(data, pa.Table) else data.batches
+        return ArrowTabular([self.cast_arrow_batch(b) for b in src])
 
     def cast_arrow(self, data: Any) -> Any:
         """Dispatch arrow types to the specific cast method."""

@@ -4,6 +4,7 @@ Subcommands::
 
     ygg databricks      YGGDBKS Databricks management CLI
     ygg loki            Loki — the global yggdrasil agent (status/run/token)
+    ygg node            Trading node server (serve/status)
     ygg run             Run a deployed @task/@flow on the cluster (job runner)
 
 ``ygg`` is the single console-script entry point: deployed Databricks
@@ -35,6 +36,10 @@ def _build_parser() -> argparse.ArgumentParser:
     loki = sub.add_parser("loki", help="Loki — the global yggdrasil agent.", add_help=False)
     loki.set_defaults(handler=_loki)
 
+    # -- node --------------------------------------------------------------
+    node = sub.add_parser("node", help="Trading node server (serve/status).", add_help=False)
+    node.set_defaults(handler=_node)
+
     # -- run ---------------------------------------------------------------
     run = sub.add_parser(
         "run",
@@ -56,6 +61,12 @@ def _loki(args: argparse.Namespace) -> int:
     from yggdrasil.loki.cli import main as loki_main
     remaining = sys.argv[2:] if len(sys.argv) > 2 else []
     return loki_main(remaining)
+
+
+def _node(args: argparse.Namespace) -> int:
+    from yggdrasil.node.cli import main as node_main
+    remaining = sys.argv[2:] if len(sys.argv) > 2 else []
+    return node_main(remaining)
 
 
 def _run(args: argparse.Namespace) -> int:
