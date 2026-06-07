@@ -5,6 +5,8 @@ These run anywhere Loki runs (no cloud session required):
 - :class:`WebSkill` — reach and *drive* the internet (browse, tables, forms).
 - :class:`TabularSkill` / :class:`TransformSkill` — the data path: fetch a
   source into a frame through the io handlers, cache it, reshape it.
+- :class:`EntsoeSkill` — the energy-data path: pull ENTSO-E power-market series
+  (prices / load / generation) for a bidding zone into a cached frame.
 - :class:`PythonProjectSkill` — scaffold a Python project, write code into it
   (provided, or reasoned from a task via the agent's engine), and run it.
 - :class:`SetupSkill` — bootstrap a free local model on demand.
@@ -28,7 +30,7 @@ from .skill import LokiSkill, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentSkill", "PythonProjectSkill", "SetupSkill",
+__all__ = ["AgentSkill", "EntsoeSkill", "PythonProjectSkill", "SetupSkill",
            "WebSkill", "TabularSkill", "TransformSkill"]
 
 
@@ -368,6 +370,91 @@ class TransformSkill(LokiSkill):
             "next_steps": [
                 f"reuse:  loki.run('tabular', cache={str(cached_to)!r})",
                 f"store:  loki.run('tabular', cache={str(cached_to)!r}, store='out.parquet')",
+            ],
+        }
+
+
+@register
+class EntsoeSkill(LokiSkill):
+    """Pull European power-market data (ENTSO-E) into a cached frame.
+
+    The energy-data path: fetch day-ahead **prices**, actual **load**, or
+    **generation** for a bidding zone from the ENTSO-E Transparency Platform,
+    parse the publication XML into a tidy timestamp/value frame
+    (:mod:`yggdrasil.loki.entsoe`), **cache it as Parquet** through the io
+    handlers, and return the preview plus reuse/transform/store next steps —
+    the same data loop as :class:`TabularSkill`, sourced from the power markets.
+
+    Token-gated: set ``ENTSOE_API_TOKEN``. Runs anywhere (no cloud session); with
+    no token it returns an offline-safe hint instead of raising. Defaults to the
+    last 24h of day-ahead prices for ``DE_LU`` when nothing is specified.
+    """
+
+    name = "entsoe"
+    description = "Fetch ENTSO-E power-market data (prices/load/generation) for a zone as a cached frame."
+    preprompt = (
+        "You are a power-market analyst. Reason only from the fetched frame; "
+        "day-ahead prices are EUR/MWh, load/generation are MW, timestamps are "
+        "UTC. Be precise with units, zones, and the time window."
+    )
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        series: str = "day_ahead_prices",
+        zone: str = "DE_LU",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        days: int = 1,
+        store: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        import datetime as dt
+
+        from yggdrasil.io.holder import IO
+
+        from . import entsoe
+
+        if entsoe.token() is None:
+            return {"available": False, "series": series, "zone": zone,
+                    "hint": "set ENTSOE_API_TOKEN (free, from transparency.entsoe.eu) "
+                            "to fetch power-market data."}
+        # Default window: the trailing *days* up to now (UTC), aligned to the day.
+        now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        start_v = start or (now - dt.timedelta(days=days))
+        end_v = end or now
+        df = entsoe.fetch_frame(series, zone, start_v, end_v)
+
+        cdir = pathlib.Path(cache_dir) if cache_dir else (pathlib.Path.home() / ".loki" / "cache")
+        cdir.mkdir(parents=True, exist_ok=True)
+        eic = entsoe.resolve_zone(zone)
+        key = f"entsoe-{series}-{re.sub(r'[^0-9A-Za-z]+', '-', zone).strip('-').lower()}-{eic[-6:]}"
+        cached_to = cdir / f"{key}.parquet"
+        IO.from_(str(cached_to)).write_polars_frame(df)
+
+        stored = None
+        if store:
+            IO.from_(store).write_polars_frame(df)
+            stored = store
+
+        return {
+            "available": True,
+            "series": series,
+            "zone": zone,
+            "eic": eic,
+            "rows": df.height,
+            "columns": list(df.columns),
+            "preview": IO.from_(str(cached_to)).display(),
+            "cached_to": str(cached_to),
+            "stored": stored,
+            "next_steps": [
+                f"reuse:  loki.run('tabular', cache={str(cached_to)!r})",
+                f"resample to daily mean:  loki.run('transform', cache={str(cached_to)!r}) "
+                f"then group by date  (or polars: df.group_by_dynamic('timestamp', every='1d'))",
+                f"store as Parquet/Arrow/CSV/Delta:  loki.run('entsoe', series={series!r}, "
+                f"zone={zone!r}, store='out.parquet')",
             ],
         }
 

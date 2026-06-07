@@ -120,8 +120,11 @@ class OpenVINOEngine(TransformersEngine):
 
     @property
     def model_label(self) -> str:
-        # Append the target device so `ygg loki engines` shows where it runs.
-        return f"{super().model_label} @ {self.resolve_device()}"
+        # Append the target device so `ygg loki engines` shows where it runs —
+        # but only when the engine is actually usable, so an unavailable engine
+        # (no openvino/NPU) shows a plain label instead of a misleading "@ CPU".
+        base = super().model_label
+        return f"{base} @ {self.resolve_device()}" if self.available() else base
 
     def _pipeline(self, model: str) -> Any:
         """The cached OpenVINO text-generation pipeline for *model*.

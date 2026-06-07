@@ -223,6 +223,25 @@ class TestIntelNpuEnable(unittest.TestCase):
         self.assertIn("the real error", out)
 
 
+class TestPrompt(unittest.TestCase):
+    """The REPL prompt tag — engine·tier, plus a pinned model when set."""
+
+    def test_shows_engine_and_tier(self):
+        from yggdrasil.cli import style
+        style.force_color(False)
+        self.assertIn("claude·auto", style.strip(cli._prompt(style, {"engine": "claude", "tier": None})))
+
+    def test_appends_pinned_model_compactly(self):
+        from yggdrasil.cli import style
+        style.force_color(False)
+        out = style.strip(cli._prompt(style, {
+            "engine": "openvino", "tier": "fast",
+            "model": "OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov"}))
+        self.assertIn("openvino·fast·", out)
+        self.assertIn("…", out)                  # long id truncated to a compact tail
+        self.assertNotIn("OpenVINO/", out)       # shown as the last path segment only
+
+
 class TestModelChooser(unittest.TestCase):
     """``/model`` pins the engine's model for the session (interactive picker)."""
 

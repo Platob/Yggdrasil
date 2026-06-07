@@ -487,6 +487,10 @@ def _choose_session(style: Any) -> Any:
 
 def _prompt(style: Any, state: dict) -> str:
     tag = f"{state.get('engine') or 'auto'}·{state['tier'] or 'auto'}"
+    model = state.get("model")           # show a pinned model (from /model) compactly
+    if model:
+        short = model.split("/")[-1]
+        tag += "·" + (short if len(short) <= 18 else short[:17] + "…")
     return f"  {style.brand('⟢')} {style.dim(tag)} {style.bold('›')} "
 
 
