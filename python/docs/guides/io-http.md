@@ -53,14 +53,11 @@ print(resp.status, resp.json()["json"])
 ## Batch / parallel dispatch
 
 ```python
-from yggdrasil.io import SendManyConfig
-
 reqs = [
     http.prepare_request("GET", "https://httpbin.org/get", params={"idx": i})
     for i in range(10)
 ]
-cfg = SendManyConfig(max_workers=5)
-responses = list(http.send_many(reqs, send_config=cfg))
+responses = list(http.send_many(reqs, max_in_flight=5))
 print([r.status for r in responses])
 ```
 
@@ -89,14 +86,13 @@ resp.ok
 
 ```python
 from yggdrasil.http_ import HTTPSession
-from yggdrasil.io import SendManyConfig
 
 http = HTTPSession()
 
 # Stage 1: fetch pages concurrently.
 reqs = [http.prepare_request("GET", "https://httpbin.org/get", params={"page": p})
         for p in range(1, 6)]
-responses = list(http.send_many(reqs, send_config=SendManyConfig(max_workers=3)))
+responses = list(http.send_many(reqs, max_in_flight=3))
 
 # Stage 2: normalize.
 rows = []

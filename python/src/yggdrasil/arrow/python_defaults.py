@@ -200,7 +200,7 @@ def _default_for_dataclass(hint):
 def default_arrow_scalar(
     dtype: Union[pa.DataType, pa.ListType, pa.MapType, pa.StructType, pa.FixedSizeListType],
     nullable: bool
-):
+) -> pa.Scalar:
     """Return a default scalar for a given Arrow type.
 
     Args:
@@ -256,7 +256,7 @@ def default_arrow_scalar(
         raise TypeError(f"Cannot determine default value for Arrow type {dtype!r}")
 
 
-def default_python_scalar(hint: Any):
+def default_python_scalar(hint: Any) -> Any:
     """Return a default Python value for the given type hint.
 
     Args:
@@ -312,7 +312,7 @@ def default_scalar(
         pa.DataType, pa.Field,
     ],
     nullable: bool | None = None
-):
+) -> Any:
     """Return a default scalar value for Python or Arrow type hints.
 
     Args:

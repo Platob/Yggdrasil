@@ -173,6 +173,8 @@ nav:
       - IO & HTTP:
           - io: modules/io/README.md
           - http_: modules/http_/README.md
+      - Agent:
+          - loki: modules/loki/README.md
       - Databricks:
           - Overview: modules/databricks/README.md
           - sql: modules/databricks/sql/README.md

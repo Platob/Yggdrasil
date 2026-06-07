@@ -26,8 +26,9 @@ Engines register their converters **on import** — pull them in once at startup
 
 | Module | Purpose | Page |
 |---|---|---|
-| `yggdrasil.io` | `URL`, `SendConfig`/`SendManyConfig`, codecs, media types | [io](modules/io/README.md) |
+| `yggdrasil.io` | `URL`, codecs, media types | [io](modules/io/README.md) |
 | `yggdrasil.http_` | `HTTPSession` (preferred HTTP client) | [http_](modules/http_/README.md) |
+| `yggdrasil.loki` | `Loki` agent — skills, engines, tools, token provider | [loki](modules/loki/README.md) |
 
 ## Serialization
 

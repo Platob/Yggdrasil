@@ -5,7 +5,7 @@ Yggdrasil IO and transport layer for URLs, request/response models, media detect
 ## What this module gives you
 
 - `URL` for immutable URL parsing and composition
-- `SendConfig` / `SendManyConfig` for request behavior and batching
+- `SendConfig` (in `yggdrasil.http_`) for request behavior; batch via `HTTPSession.send_many`
 - `HTTPSession` (`yggdrasil.http_`) as the preferred HTTP client
 
 ---

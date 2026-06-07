@@ -43,17 +43,16 @@ convert("19,95", Decimal)   # Decimal('19.95')
 
 ## `CastOptions`
 
-Source: [`python/src/yggdrasil/data/cast/options.py`](https://github.com/Platob/Yggdrasil/blob/main/python/src/yggdrasil/data/cast/options.py).
+Source: [`python/src/yggdrasil/data/options.py`](https://github.com/Platob/Yggdrasil/blob/main/python/src/yggdrasil/data/options.py).
 
 `CastOptions` is the **single normalized options carrier**. It threads through every cast helper and holds source hints, target field/schema, safety/memory/nullability behavior, and strictness flags.
 
 ```python
 import pyarrow as pa
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 opts = CastOptions(
-    target_field=pa.schema([pa.field("id", pa.int64(), nullable=False)]),
-    strict_match_names=True,
+    target=pa.schema([pa.field("id", pa.int64(), nullable=False)]),
 )
 ```
 
@@ -61,7 +60,7 @@ In your own helpers, normalize input through `CastOptions.check`:
 
 ```python
 def normalize_options(options=None, *, target_field=None) -> CastOptions:
-    return CastOptions.check(options, target_field=target_field, strict_match_names=True)
+    return CastOptions.check(options, target=target_field)
 ```
 
 Don't invent parallel per-call option objects — extend `CastOptions` or pass it through.

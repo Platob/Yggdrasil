@@ -34,14 +34,14 @@ Cast a Polars DataFrame to a target Arrow schema:
 import pyarrow as pa
 import polars as pl
 from yggdrasil.polars.cast import cast_polars_dataframe
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 df = pl.DataFrame({"id": ["1", "2", "3"], "score": ["9.1", "8.7", "7.4"]})
 target = pa.schema([
     pa.field("id",    pa.int64(),   nullable=False),
     pa.field("score", pa.float64(), nullable=False),
 ])
-out: pl.DataFrame = cast_polars_dataframe(df, CastOptions(target_field=target))
+out: pl.DataFrame = cast_polars_dataframe(df, CastOptions(target=target))
 ```
 
 Cast a LazyFrame (stays lazy until `.collect()`):
@@ -50,7 +50,7 @@ Cast a LazyFrame (stays lazy until `.collect()`):
 from yggdrasil.polars.cast import cast_polars_lazyframe
 
 lf = pl.LazyFrame({"id": ["1", "2"], "value": ["4.2", "5.8"]})
-casted_lf = cast_polars_lazyframe(lf, CastOptions(target_field=target))
+casted_lf = cast_polars_lazyframe(lf, CastOptions(target=target))
 result = casted_lf.collect()
 ```
 
@@ -108,11 +108,11 @@ Cast a pandas Series to a target Arrow type:
 import pandas as pd
 import pyarrow as pa
 from yggdrasil.pandas.cast import cast_pandas_series
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 s = pd.Series(["1.1", "2.2", "3.3"], name="value")
 target = pa.schema([pa.field("value", pa.float64())])
-out = cast_pandas_series(s, CastOptions(target_field=target))
+out = cast_pandas_series(s, CastOptions(target=target))
 ```
 
 Cast a pandas DataFrame:
@@ -122,7 +122,7 @@ from yggdrasil.pandas.cast import cast_pandas_dataframe
 
 df = pd.DataFrame({"id": ["1", "2"], "score": ["9.1", "8.7"]})
 target = pa.schema([pa.field("id", pa.int64()), pa.field("score", pa.float64())])
-out = cast_pandas_dataframe(df, CastOptions(target_field=target))
+out = cast_pandas_dataframe(df, CastOptions(target=target))
 ```
 
 Arrow ↔ pandas:

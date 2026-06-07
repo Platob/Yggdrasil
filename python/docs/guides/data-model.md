@@ -427,7 +427,7 @@ Tips:
 
 ```python
 import pyarrow as pa
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 opts = CastOptions(
     target=pa.schema([
@@ -437,7 +437,6 @@ opts = CastOptions(
     safe=True,
     byte_size=128 * 1024 * 1024,
     row_size=10_000,
-    strict_match_names=True,
 )
 ```
 

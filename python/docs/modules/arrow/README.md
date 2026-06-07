@@ -65,11 +65,11 @@ field = dataclass_to_arrow_field(Order)
 ```python
 import pyarrow as pa
 from yggdrasil.arrow.cast import cast_arrow_array
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 arr    = pa.array(["1", "2", "3"])
 target = pa.field("id", pa.int64(), nullable=False)
-out    = cast_arrow_array(arr, CastOptions(target_field=target))
+out    = cast_arrow_array(arr, CastOptions(target=target))
 # pa.array([1, 2, 3], type=int64)
 ```
 
@@ -78,7 +78,7 @@ out    = cast_arrow_array(arr, CastOptions(target_field=target))
 ```python
 import pyarrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 raw = pa.table({
     "id":    ["1", "2"],
@@ -90,17 +90,17 @@ target = pa.schema([
     pa.field("ts",    pa.timestamp("us", tz="UTC")),
     pa.field("score", pa.float64()),
 ])
-out = cast_arrow_tabular(raw, CastOptions(target_field=target))
+out = cast_arrow_tabular(raw, CastOptions(target=target))
 print(out.schema)
 ```
 
 ## Cast with strict name matching
 
 ```python
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 # Raise if source has extra columns not in target schema
-opts = CastOptions(target_field=target, strict_match_names=True)
+opts = CastOptions(target=target)
 out  = cast_arrow_tabular(raw, opts)
 ```
 
@@ -109,7 +109,7 @@ out  = cast_arrow_tabular(raw, opts)
 ```python
 import pyarrow as pa
 from yggdrasil.arrow.cast import cast_arrow_tabular
-from yggdrasil.data.cast.options import CastOptions
+from yggdrasil.data.options import CastOptions
 
 schema = pa.schema([pa.field("id", pa.int64()), pa.field("v", pa.float64())])
 
@@ -118,7 +118,7 @@ def produce_batches():
         yield pa.record_batch({"id": [i], "v": [float(i)]})
 
 reader = pa.RecordBatchReader.from_batches(schema, produce_batches())
-out    = cast_arrow_tabular(reader, CastOptions(target_field=target))
+out    = cast_arrow_tabular(reader, CastOptions(target=target))
 ```
 
 ## JSON → Arrow (vectorized)

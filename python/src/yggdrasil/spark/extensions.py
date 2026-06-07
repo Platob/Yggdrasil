@@ -149,9 +149,9 @@ def checkJoin(
     df: SparkSQL.DataFrame,
     other: SparkSQL.DataFrame,
     on: Optional[Union[str, List[str], SparkSQL.Column, List[SparkSQL.Column]]] = None,
-    *args,
-    **kwargs,
-):
+    *args: Any,
+    **kwargs: Any,
+) -> SparkSQL.DataFrame:
     """Join two DataFrames with schema-aware column casting.
 
     Args:
@@ -201,9 +201,9 @@ def checkMapInArrow(
     df: SparkSQL.DataFrame,
     func: Callable[[Iterable[pa.RecordBatch]], Iterable[pa.RecordBatch]],
     schema: Union["T.StructType", str],
-    *args,
-    **kwargs,
-):
+    *args: Any,
+    **kwargs: Any,
+) -> SparkSQL.DataFrame:
     """Wrap mapInArrow to enforce output schema conversion.
 
     Args:
@@ -243,9 +243,9 @@ def checkMapInPandas(
     df: SparkSQL.DataFrame,
     func: Callable[[Iterable["pandas.DataFrame"]], Iterable["pandas.DataFrame"]],
     schema: Union["T.StructType", str],
-    *args,
-    **kwargs,
-):
+    *args: Any,
+    **kwargs: Any,
+) -> SparkSQL.DataFrame:
     """Wrap mapInPandas to enforce output schema conversion.
 
     Args:

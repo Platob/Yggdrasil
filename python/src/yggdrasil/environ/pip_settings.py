@@ -49,7 +49,7 @@ class PipIndexSettings:
     sources: Dict[str, Dict[str, Any]] = dc.field(default_factory=dict)  # {"env": {...}, "config": {...}}
 
     @classmethod
-    def current(cls):
+    def current(cls) -> PipIndexSettings:
         """Return the cached default pip index settings.
 
         Returns:
@@ -63,7 +63,7 @@ class PipIndexSettings:
         return DEFAULT_PIP_INDEX_SETTINGS
 
     @property
-    def extra_index_url(self):
+    def extra_index_url(self) -> str | None:
         """Return extra index URLs as a space-separated string.
 
         Returns:
