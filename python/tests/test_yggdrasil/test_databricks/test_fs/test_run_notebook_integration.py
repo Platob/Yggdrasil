@@ -124,21 +124,17 @@ class TestRunNotebookIntegration(DatabricksIntegrationCase):
         # yggdrasil *inside* the run, which only succeeds against the seeded
         # zero-PyPI ygg environment.
         from yggdrasil.databricks.environments import service as W
-        from yggdrasil.databricks.job.service import (
-            _environment_spec_path,
-            _resolve_submit_environment,
-        )
+        from yggdrasil.databricks.job.service import _resolve_submit_environment
 
-        name = W.environment_stem('ygg')
-        spec_path = _environment_spec_path(self.client, name)
-        if spec_path is None:
+        env = self.client.environments.get('ygg')
+        if env is None or not env.serverless:
             self.skipTest(
-                f"ygg base environment {name!r} not seeded under "
+                f"ygg base environment not seeded under "
                 f"{W.WORKSPACE_ENV_DIR} (run `ygg databricks environment`)."
             )
         # Auto-resolution points the run at the seeded .yml.
         resolved = _resolve_submit_environment(self.client, None)
-        self.assertEqual(resolved.spec.base_environment, spec_path)
+        self.assertEqual(resolved.spec.base_environment, env.serverless)
 
         nb = self._notebook(
             "import yggdrasil\n"
