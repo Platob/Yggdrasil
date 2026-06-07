@@ -8,7 +8,7 @@ Unity Catalog Volume resource — singleton-cached per `(catalog, schema, volume
 from yggdrasil.databricks import DatabricksClient
 
 vol = DatabricksClient().volumes["main.raw.landing"]
-print(vol.storage_location())
+print(vol.storage_location)
 ```
 
 ## Find a volume
@@ -41,7 +41,7 @@ print(vol.schema_name)           # "raw"
 print(vol.volume_type)           # "MANAGED" or "EXTERNAL"
 print(vol.owner)
 print(vol.comment)
-print(vol.storage_location())    # s3://bucket/path or abfss://...
+print(vol.storage_location)    # s3://bucket/path or abfss://...
 print(vol.volume_id)
 print(vol.exists())
 print(vol.explore_url)           # Databricks UI link
@@ -148,7 +148,7 @@ for i, batch in enumerate(produce_batches()):
 # 2. COPY INTO from the volume
 client.sql.execute(f"""
 COPY INTO main.raw.events
-FROM '{vol.storage_location()}/events/'
+FROM '{vol.storage_location}/events/'
 FILEFORMAT = PARQUET
 """).wait().raise_for_status()
 ```

@@ -112,16 +112,6 @@ class TestSQLEngineIntegration(SQLIntegrationCase):
         )
         self.assertTrue(again.exists())
 
-        vol = table.staging_volume
-        vp = table.staging_folder(temporary=False)
-        assert vol is table.staging_volume
-        assert vp == table.staging_folder(temporary=False)
-
-        fp = vp / "test.parquet"
-        fp.write_pylist([{"id": 1, "name": "Nika"}])
-
-        assert fp.read_pylist() == [{"id": 1, "name": "Nika"}]
-
     # ------------------------------------------------------------------
     # Table.create / Table.ensure_created
     # ------------------------------------------------------------------

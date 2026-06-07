@@ -122,7 +122,7 @@ class TestExternalVolumeLifecycle(_VolumeLifecycleCase):
         try:
             self.assertEqual((vol.volume_type or "").upper(), "EXTERNAL")
             # The backing object store is real cloud storage (e.g. S3).
-            self.assertTrue(vol.storage_location())
+            self.assertTrue(vol.storage_location)
             path = vol.path(f"scratch/{secrets.token_hex(4)}.bin")
             payload = b"external-" + secrets.token_bytes(16)
             path.write_bytes(payload)

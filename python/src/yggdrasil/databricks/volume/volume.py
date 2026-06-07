@@ -52,7 +52,9 @@ from yggdrasil.dataclasses import Singleton, WaitingConfig
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.enums import Mode, ModeLike, Scheme, IOKind, MediaTypes
 from yggdrasil.io import IOStats
+from yggdrasil.io.io_stats import TimeLike
 from yggdrasil.url import URL
+from yggdrasil.path import Path
 
 if TYPE_CHECKING:
     from databricks.sdk.service.catalog import VolumeType
@@ -520,7 +522,8 @@ class Volume(DatabricksPath):
 
     # ── storage location / temporary credentials ──────────────────────────────
 
-    def storage_location(self, *, refresh: bool = False) -> str:
+    @property
+    def storage_location(self) -> str | None:
         """Volume's backing storage URL string (e.g. ``s3://bucket/...``).
 
         Pure read from :meth:`read_info` — no AWS auth resolution, no
@@ -529,7 +532,11 @@ class Volume(DatabricksPath):
         :meth:`storage_path` when you'll do actual I/O against the
         location.
         """
-        info = self.read_info(refresh=refresh)
+        info = self.read_info(default=None)
+
+        if not info:
+            return None
+
         raw = getattr(info, "storage_location", None)
         if not raw:
             raise ValueError(
@@ -538,13 +545,24 @@ class Volume(DatabricksPath):
             )
         return str(raw)
 
+    @storage_location.setter
+    def storage_location(self, value: str) -> None:
+        info = self.read_info(default=None)
+        value = str(value)
+
+        if info is not None:
+            if value != info.storage_location:
+                self.delete()
+        else:
+            self.create(refresh=True, storage_location=value, volume_type="EXTERNAL")
+
     def storage_path(
         self,
         *,
         mode: ModeLike = Mode.AUTO,
         region: Optional[str] = None,
         refresh: bool = False,
-    ) -> Any:
+    ) -> Path:
         """Return the volume's root storage :class:`Path`.
 
         Dispatches to the right :class:`URLBased` subclass —
@@ -556,9 +574,14 @@ class Volume(DatabricksPath):
         if self._storage_path is not None and not refresh:
             return self._storage_path
 
-        from yggdrasil.path import Path
+        raw = self.storage_location
 
-        raw = self.storage_location(refresh=refresh)
+        if not raw:
+            raise ValueError(
+                f"{self!r}: volume has no storage_location "
+                "create with storage_location"
+            )
+
         scheme = URL.from_str(raw).scheme or ""
         if scheme.startswith("s3"):
             storage_path = self.aws(mode=mode, region=region).s3.path(raw)
@@ -758,6 +781,7 @@ class Volume(DatabricksPath):
             return self
 
         uc = self.client.workspace_client().volumes
+        storage_location = str(storage_location) if storage_location else None
 
         try:
             from databricks.sdk.service.catalog import VolumeType
@@ -830,20 +854,39 @@ class Volume(DatabricksPath):
             missing_ok=True,
         )
 
-    def delete(
+    def _delete(
         self,
         predicate: str = None,
         *,
+        remove_path: bool = False,
+        recursive: bool = True,
+        files_only: bool = False,
+        missing_ok: bool = True,
         wait: WaitingConfigArg = True,
-        raise_error: bool = True,
+        fresher_than: Optional[TimeLike] = None,
+        older_than: Optional[TimeLike] = None,
+        **kwargs: Any,
     ) -> "Volume":
         """Delete this volume from Unity Catalog."""
+        if predicate is not None:
+            return super()._delete(
+                predicate=predicate,
+                remove_path=remove_path,
+                recursive=recursive,
+                files_only=files_only,
+                missing_ok=missing_ok,
+                wait=wait,
+                fresher_than=fresher_than,
+                older_than=older_than,
+                **kwargs,
+            )
+
         uc = self.client.workspace_client().volumes
         if wait:
             try:
                 uc.delete(name=self.full_name())
             except DatabricksError:
-                if raise_error:
+                if not missing_ok:
                     raise
         else:
             Job.make(uc.delete, self.full_name()).fire_and_forget()
@@ -965,11 +1008,20 @@ class Volume(DatabricksPath):
         return None
 
     def _remove_file(self, missing_ok: bool, wait: WaitingConfig) -> None:
-        self.delete(wait=wait)
+        self._remove_dir(recursive=True, wait=wait, missing_ok=missing_ok)
         return None
 
     def _remove_dir(self, recursive: bool, missing_ok: bool, wait: WaitingConfig) -> None:
-        self.delete(wait=wait)
+        uc = self.client.workspace_client().volumes
+        if wait:
+            try:
+                uc.delete(name=self.full_name())
+            except DatabricksError:
+                if not missing_ok:
+                    raise
+        else:
+            Job.make(uc.delete, self.full_name()).fire_and_forget()
+        self._reset_cache()
         return None
 
 # ---------------------------------------------------------------------------

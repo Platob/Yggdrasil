@@ -1411,7 +1411,7 @@ class TestVolumeInfoCaching:
             storage_location="s3://bkt/__unitystorage/c/s/v",
         )
         p = VolumePath("/Volumes/c/s/v/sub/y.parquet", service=service)
-        assert p.storage_location() == "s3://bkt/__unitystorage/c/s/v"
+        assert p.storage_location == "s3://bkt/__unitystorage/c/s/v"
 
     def test_storage_location_caches_independently_of_volume_info(
         self,
@@ -1421,8 +1421,8 @@ class TestVolumeInfoCaching:
     ) -> None:
         workspace.volumes.read.return_value = _volume_info()
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
-        p.storage_location()
-        p.storage_location()
+        p.storage_location
+        p.storage_location
         # One read call drives both — the value is snapshotted onto
         # ``_storage_location`` and the second call returns the cached
         # string without re-touching ``VolumeInfo``.
@@ -1432,7 +1432,7 @@ class TestVolumeInfoCaching:
         workspace.volumes.read.return_value = _volume_info(storage_location=None)
         p = VolumePath("/Volumes/cat/sch/vol/x", service=service)
         with pytest.raises(ValueError, match="storage_location"):
-            p.storage_location()
+            p.storage_location
 
 
 class TestTemporaryCredentials:

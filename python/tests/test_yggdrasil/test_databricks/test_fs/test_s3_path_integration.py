@@ -59,7 +59,7 @@ class TestS3PathViaExternalVolume(DatabricksIntegrationCase):
                 catalog_name=cls.INTEGRATION_CATALOG,
                 schema_name=cls.schema.schema_name,
             ).create(volume_name="ygg_s3_ext", volume_type="EXTERNAL")
-            storage = cls.volume.storage_location().rstrip("/")
+            storage = cls.volume.storage_location.rstrip("/")
         except (DatabricksError, PermissionDenied) as exc:
             cls.safe_drop_schema(cls.schema)
             raise unittest.SkipTest(

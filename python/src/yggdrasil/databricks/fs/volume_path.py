@@ -845,7 +845,7 @@ class VolumePath(DatabricksPath):
             cached = vol.external_access(write=write)
             if cached is False:
                 return None  # known not directly reachable for this mode
-            raw = vol.storage_location()
+            raw = vol.storage_location
             if cached is None:
                 # First time for this mode — run the eligibility check + cache
                 # the verdict so later ops skip straight to path resolution.

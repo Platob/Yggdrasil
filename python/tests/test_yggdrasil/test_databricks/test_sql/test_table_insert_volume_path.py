@@ -129,74 +129,8 @@ class TestStagingVolume:
         tbl = _table("cat", "sch", "tbl")
         sentinel = object()
         with patch.object(Volume, "get_or_create", return_value=sentinel) as goc:
-            assert tbl.ensure_staging_volume() is sentinel
+            assert tbl.staging_volume.get_or_create() is sentinel
         goc.assert_called_once_with()
-
-
-# ---------------------------------------------------------------------------
-# staging_location — the staging volume's external storage location
-# ---------------------------------------------------------------------------
-
-
-class TestStagingLocation:
-
-    def test_getter_reads_volume_storage_location(self) -> None:
-        from types import SimpleNamespace
-
-        tbl = _table("cat", "sch", "tbl")
-        with patch.object(
-            Volume, "read_info",
-            return_value=SimpleNamespace(storage_location="s3://bkt/loc"),
-        ):
-            assert tbl.staging_location == "s3://bkt/loc"
-
-    def test_getter_none_when_volume_absent(self) -> None:
-        # Non-failing read: a missing staging volume reads as ``None``.
-        tbl = _table("cat", "sch", "tbl")
-        with patch.object(Volume, "read_info", return_value=None):
-            assert tbl.staging_location is None
-
-    def test_setter_creates_external_when_absent(self) -> None:
-        tbl = _table("cat", "sch", "tbl")
-        with patch.object(Volume, "read_info", return_value=None), \
-                patch.object(Volume, "create") as create, \
-                patch.object(Volume, "delete") as delete:
-            tbl.staging_location = "s3://bkt/loc"
-        delete.assert_not_called()
-        create.assert_called_once()
-        kw = create.call_args.kwargs
-        assert kw["storage_location"] == "s3://bkt/loc"
-        assert kw["volume_type"] == "EXTERNAL"
-
-    def test_setter_skips_when_unchanged(self) -> None:
-        from types import SimpleNamespace
-
-        tbl = _table("cat", "sch", "tbl")
-        with patch.object(
-            Volume, "read_info",
-            return_value=SimpleNamespace(storage_location="s3://bkt/loc"),
-        ), patch.object(Volume, "create") as create, \
-                patch.object(Volume, "delete") as delete:
-            tbl.staging_location = "s3://bkt/loc"
-        create.assert_not_called()
-        delete.assert_not_called()
-
-    def test_setter_relocates_via_delete_and_recreate(self) -> None:
-        # An external volume's storage_location is immutable → delete + recreate.
-        from types import SimpleNamespace
-
-        tbl = _table("cat", "sch", "tbl")
-        with patch.object(
-            Volume, "read_info",
-            return_value=SimpleNamespace(storage_location="s3://bkt/old"),
-        ), patch.object(Volume, "create") as create, \
-                patch.object(Volume, "delete") as delete:
-            tbl.staging_location = "s3://bkt/new"
-        delete.assert_called_once()
-        create.assert_called_once()
-        kw = create.call_args.kwargs
-        assert kw["storage_location"] == "s3://bkt/new"
-        assert kw["volume_type"] == "EXTERNAL"
 
 
 # ---------------------------------------------------------------------------

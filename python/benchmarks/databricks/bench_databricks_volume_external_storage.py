@@ -89,7 +89,7 @@ def main() -> None:
         f"ygg_bench_{tag}")
     volume.get_or_create(volume_type="EXTERNAL",
                          storage_location=f"{args.base.rstrip('/')}/bench/{tag}")
-    print(f"external volume: {volume.full_name()} -> {volume.storage_location()}")
+    print(f"external volume: {volume.full_name()} -> {volume.storage_location}")
 
     # Confirm the direct path is actually reachable before benchmarking it.
     probe = volume.path("_probe.bin")

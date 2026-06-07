@@ -238,19 +238,19 @@ def _execute_dml(
 
 
 def _coalesce_predicate(
-    cast_options: "CastOptions | None",
+    options: "CastOptions | None",
     predicate: "Predicate | None",
 ) -> "CastOptions":
     """Fold *predicate* into :attr:`CastOptions.predicate`.
 
     Used at insert-method boundaries so callers can pass a top-level
     ``predicate=`` kwarg without juggling :class:`CastOptions`
-    manually. When both the kwarg and ``cast_options.predicate`` carry
+    manually. When both the kwarg and ``options.predicate`` carry
     a value, they're combined with ``&`` (logical AND) so the
     downstream SQL prune and source-row filter both see the merged
     expression.
     """
-    opts = CastOptions.check(options=cast_options)
+    opts = CastOptions.check(options=options)
     if predicate is None:
         return opts
     if opts.predicate is None:
@@ -443,7 +443,12 @@ class TableProperties(MutableMapping):
 
     def _current(self) -> Dict[str, str]:
         """A snapshot copy of the catalog's current properties."""
-        return dict(self._table.infos.properties or {})
+        infos = self._table.read_infos(default=None)
+
+        if not infos:
+            return {}
+
+        return dict(infos.properties)
 
     def _keyword(self) -> str:
         """``VIEW`` for view-shaped securables, else ``TABLE`` — for the DDL."""
@@ -508,6 +513,9 @@ class TableProperties(MutableMapping):
         }
         if changed:
             self._set(changed)
+
+    def get(self, key: str, default: Any = None):
+        return self._current().get(key, default)
 
     def __repr__(self) -> str:
         return f"TableProperties({self._current()!r})"
@@ -1539,17 +1547,7 @@ class Table(DatabricksPath):
 
     @property
     def infos(self) -> TableInfo:
-        """Basic :class:`TableInfo` — TTL-cached."""
-        if self._infos is not None and self._is_fresh(self._infos_fetched_at):
-            return self._infos
-
-        info = self.client.tables.find_table_remote(
-            catalog_name=self.catalog_name,
-            schema_name=self.schema_name,
-            table_name=self.table_name,
-        )
-        self._store_infos(info)
-        return info
+        return self.read_infos()
 
     # =========================================================================
     # View-shaped tables — Unity Catalog stores views in the same ``tables``
@@ -3179,7 +3177,7 @@ class Table(DatabricksPath):
             # ``<table-location>/_ygg_autoloader``: a MANAGED table's storage is
             # governed ``__unitystorage`` that Unity Catalog forbids Auto Loader
             # from writing into (``LOCATION_OVERLAP`` on ``CheckPathAccess``).
-            staging_storage = self.ensure_staging_volume().storage_path(mode=Mode.AUTO)
+            staging_storage = self.staging_volume.get_or_create().storage_path(mode=Mode.AUTO)
             source = (staging_storage / self.STAGE_SUBPATH).full_path()
             if checkpoint is None:
                 checkpoint = (staging_storage / self.CHECKPOINT_SUBPATH).full_path()
@@ -3239,7 +3237,7 @@ class Table(DatabricksPath):
         self,
         data: Any,
         *,
-        cast_options: Optional[CastOptions] = None,
+        options: Optional[CastOptions] = None,
     ) -> "Path":
         """Stage *data* as Parquet under this table's **Auto Loader staging
         area** and return the path it landed at — no warehouse statement runs.
@@ -3253,16 +3251,9 @@ class Table(DatabricksPath):
         stage-for-later-load there.
         """
         leaf = f"insert-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.parquet"
-        try:
-            root = self.ensure_staging_volume().storage_path(mode=Mode.AUTO) / self.STAGE_SUBPATH
-        except Exception:  # noqa: BLE001 — degrade to Files-API volume staging
-            logger.debug(
-                "stage_insert: direct cloud staging unavailable for %s; "
-                "using volume staging", self, exc_info=True,
-            )
-            root = self.staging_folder(temporary=False)
+        root = self.staging_volume / self.STAGE_SUBPATH
         path = root / leaf
-        path.write_table(data, cast_options, mode=Mode.OVERWRITE)
+        path.write_table(data, options, mode=Mode.OVERWRITE)
         return path
 
     # =========================================================================
@@ -3280,7 +3271,7 @@ class Table(DatabricksPath):
         *,
         mode: Mode | str | None = None,
         schema_mode: Mode | str | None = None,
-        cast_options: Optional[CastOptions] = None,
+        options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
         update_column_names: Optional[list[str]] = None,
@@ -3312,9 +3303,10 @@ class Table(DatabricksPath):
         :meth:`arrow_insert`, :class:`Dataset` from :meth:`spark_insert` —
         for downstream chaining without re-querying the target.
         """
-        # Fold the top-level predicate into cast_options so the
+        # Fold the top-level predicate into options so the
         # downstream backends read a single source of truth.
-        cast_options = _coalesce_predicate(cast_options, predicate)
+        options = _coalesce_predicate(options, predicate)
+
         common = dict(
             mode=mode,
             match_by=match_by,
@@ -3337,7 +3329,7 @@ class Table(DatabricksPath):
             return self.spark_insert(
                 data=data,
                 schema_mode=schema_mode,
-                cast_options=cast_options,
+                options=options,
                 overwrite_schema=overwrite_schema,
                 spark_options=spark_options,
                 spark_session=spark_session,
@@ -3347,7 +3339,7 @@ class Table(DatabricksPath):
         return self.arrow_insert(
             data=data,
             schema_mode=schema_mode,
-            cast_options=cast_options,
+            options=options,
             overwrite_schema=overwrite_schema,
             **common,
         )
@@ -3359,8 +3351,20 @@ class Table(DatabricksPath):
     @property
     def staging_volume(self):
         if self._staging_volume is None:
+            infos = self.read_infos(default=None)
+
+            if infos is None:
+                return None
+
             if not self.catalog_name or not self.schema_name or not self.table_name:
                 raise ValueError(f"Table {self} is missing required catalog, schema, or table name")
+
+            loc = infos.storage_location
+            storage_location = (
+                f"{loc.partition('/unity_catalog')[0]}/external_unity_catalog/volumes/{infos.table_id or uuid.uuid4()}"
+                if loc and "/unity_catalog" in loc
+                else None
+            )
 
             self._staging_volume = Volume(
                 service=self.service.volumes,
@@ -3368,6 +3372,13 @@ class Table(DatabricksPath):
                 schema_name=self.schema_name,
                 volume_name=self.client.safe_tag_value(self.table_name, repl="_").lower()
             )
+
+            # First try to create as external for best performances
+            try:
+                self._staging_volume.get_or_create(storage_location=storage_location)
+            except Exception:
+                self._staging_volume.get_or_create()
+
         return self._staging_volume
 
     @staging_volume.setter
@@ -3390,64 +3401,11 @@ class Table(DatabricksPath):
     #: Auto Loader from writing into — ``LOCATION_OVERLAP``).
     CHECKPOINT_SUBPATH: ClassVar[str] = ".staging/_autoloader"
 
-    @property
-    def staging_location(self) -> "str | None":
-        """The staging :class:`Volume`'s backing storage location, or ``None``.
-
-        A pure, non-failing read of the staging volume's :class:`VolumeInfo`
-        (``read_info(default=None)``): yields the backing ``storage_location``
-        URL when the volume exists, ``None`` when it doesn't exist yet.
-        """
-        info = self.staging_volume.read_info(default=None)
-        return getattr(info, "storage_location", None) if info is not None else None
-
-    @staging_location.setter
-    def staging_location(self, value: str) -> None:
-        """Pin the staging volume to *value* as an **external** volume.
-
-        Creates the staging volume external at *value* when it doesn't exist
-        yet; when it already exists, leaves it untouched if the location is
-        unchanged, otherwise drops and recreates it there (an external volume's
-        ``storage_location`` is immutable in Unity Catalog, so a relocation is
-        a delete + create).
-        """
-        volume = self.staging_volume
-        info = volume.read_info(default=None)
-        if info is None:
-            volume.create(storage_location=value, volume_type="EXTERNAL")
-            return
-        if getattr(info, "storage_location", None) == value:
-            return
-        volume.delete()
-        volume.create(storage_location=value, volume_type="EXTERNAL")
-
-    def ensure_staging_volume(self) -> "Volume":
-        """Get-or-create this table's staging :class:`Volume` and return it.
-
-        Managed by default, created (and its parents ensured) lazily on first
-        call — idempotent, so repeated calls collapse to a cached read. To
-        stage on a governed external location instead, set
-        :attr:`staging_location` first; that creates / relocates the volume as
-        external and this call then just confirms it exists.
-        """
-        return self.staging_volume.get_or_create()
-
-    def staging_folder(
-        self,
-        temporary: bool = False,
-    ) -> VolumePath:
-        """Return the staging folder for this table.
-
-        Ensures the staging volume exists first (see
-        :meth:`ensure_staging_volume`).
-        """
-        return self.ensure_staging_volume().path(".sql/tmp", temporary=temporary)
-
     def insert_volume_path(
         self,
         target: "Table | None" = None,
         *,
-        staging_volume: "Volume | None" = None,
+        volume: "Volume | None" = None,
         temporary: bool = True,
     ) -> VolumePath:
         """Mint a fresh Parquet staging path under the target table's
@@ -3464,12 +3422,9 @@ class Table(DatabricksPath):
         target = target if target is not None else self
         seed = uuid.uuid4().hex[:8]
         leaf = f"tmp-{int(time.time() * 1000)}-{seed}.parquet"
-        staging_volume = target.ensure_staging_volume() if staging_volume is None else staging_volume
+        volume = target.staging_volume if volume is None else volume
 
-        return staging_volume.path(
-            f".sql/tmp/{leaf}",
-            temporary=temporary,
-        )
+        return volume.path(f"tmp/{leaf}", temporary=temporary)
 
     def arrow_insert(
         self,
@@ -3478,7 +3433,7 @@ class Table(DatabricksPath):
         engine: Literal["api", "spark"] | None = None,
         mode: Mode | str | None = None,
         schema_mode: Mode | str | None = None,
-        cast_options: Optional[CastOptions] = None,
+        options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
         update_column_names: Optional[list[str]] = None,
@@ -3511,7 +3466,7 @@ class Table(DatabricksPath):
         the staged source rows so callers can chain on the payload
         without re-reading from the target.
         """
-        cast_options = _coalesce_predicate(cast_options, predicate)
+        options = _coalesce_predicate(options, predicate)
 
         mode_enum = Mode.from_(mode, default=Mode.AUTO)
         # Data-level OVERWRITE replaces rows (the write below), not the schema:
@@ -3524,15 +3479,15 @@ class Table(DatabricksPath):
             mode=schema_mode,
         )
         existing_schema = target.collect_schema()
-        cast_options = CastOptions.check(options=cast_options).with_target(existing_schema)
+        options = CastOptions.check(options=options).with_target(existing_schema)
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
 
         wait = WaitingConfig.from_(wait)
-        staging = self.insert_volume_path(target, temporary=bool(wait), staging_volume=staging_volume)
+        staging = self.insert_volume_path(target, temporary=bool(wait), volume=staging_volume)
         output_data: "Tabular | None" = None
-        staging.write_table(data, cast_options, mode=Mode.OVERWRITE)
+        staging.write_table(data, options, mode=Mode.OVERWRITE)
         if return_data:
             output_data = staging.read_arrow_table()
 
@@ -3546,7 +3501,7 @@ class Table(DatabricksPath):
             data=staging,
             client=self.client,
             schema=existing_schema,
-            predicate=cast_options.predicate,
+            predicate=options.predicate,
             match_by=match_by,
             update_column_names=update_column_names,
             zorder_by=zorder_by,
@@ -3568,7 +3523,7 @@ class Table(DatabricksPath):
         *,
         mode: Mode | str | None = None,
         schema_mode: Mode | str | None = None,
-        cast_options: Optional[CastOptions] = None,
+        options: Optional[CastOptions] = None,
         overwrite_schema: bool | None = None,
         match_by: Optional[list[str]] = None,
         update_column_names: Optional[list[str]] = None,
@@ -3598,7 +3553,7 @@ class Table(DatabricksPath):
         the materialised source DataFrame — handy for chaining
         downstream transforms without re-querying the target.
         """
-        cast_options = _coalesce_predicate(cast_options, predicate)
+        options = _coalesce_predicate(options, predicate)
 
         from yggdrasil.spark.cast import any_to_spark_dataframe
         from yggdrasil.spark.statement import SparkPreparedStatement
@@ -3615,18 +3570,18 @@ class Table(DatabricksPath):
         )
         target_location = target.full_name(safe=True)
         existing_schema = target.collect_schema()
-        cast_options = CastOptions.check(options=cast_options).check_target(
+        options = CastOptions.check(options=options).check_target(
             target.collect_data_field(),
         )
 
         sql_engine = self.sql
         session = spark_session or sql_engine.spark.resolve_session(create=True)
-        data_df = any_to_spark_dataframe(data, cast_options)
+        data_df = any_to_spark_dataframe(data, options)
 
         if match_by == "auto":
             match_by = [f.name for f in existing_schema.primary_fields] or None
         prune_predicates = _build_where_predicates(
-            cast_options.predicate, target_alias="T",
+            options.predicate, target_alias="T",
         )
 
         # Spark fast path for keyed APPEND under ``safe_merge=True``
@@ -3768,6 +3723,7 @@ class Table(DatabricksPath):
 
         return infos.storage_location
 
+    @property
     def storage_location(self) -> str | None:
         """Return the raw storage-location URL string for this table, or
         ``None`` when the table has no resolvable metadata.
@@ -3803,7 +3759,7 @@ class Table(DatabricksPath):
         - ``True`` — ``READ_WRITE`` (collapses to ``READ`` for managed, which
           UC never vends write creds for).
         """
-        location = self.storage_location()
+        location = self.storage_location
         if location is None:
             return None
         if write is None:
