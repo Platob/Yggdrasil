@@ -21,6 +21,11 @@ import argparse
 import json
 from typing import Any, Sequence
 
+#: Tool-call budget for an autonomous turn inside the interactive session (the
+#: ``ygg loki do`` CLI takes its own ``--max-steps``). Kept here so the live
+#: step-budget bar and the ``act`` call agree on the denominator.
+_REPL_ACT_STEPS = 12
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ygg loki", description="Loki — the global yggdrasil agent.")
@@ -480,7 +485,7 @@ def _stream_reply(agent: Any, style: Any, line: str, state: dict,
     threading.Thread(target=produce, daemon=True).start()   # submit
 
     parts: list[str] = []
-    spin = style.Spinner("thinking…").start()
+    spin = style.Spinner(f"{engine} · thinking…" if engine else "thinking…").start()
     try:
         while True:
             chunk = q.get()                    # yield as tokens land
@@ -538,6 +543,61 @@ def _short_text(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+class _ActMonitor:
+    """Live view of the autonomous ``act`` loop.
+
+    A spinner + step-budget bar runs through the model's otherwise-silent
+    "thinking" (``on_think``), then each finished turn is *committed* as a clean
+    line to the scrollback (``on_step``). The cursor line always shows what's
+    happening **now**; the transcript above it accumulates the important steps —
+    each with the one-line *thought* that drove it. ``confirm`` pauses the
+    spinner so an approval prompt never fights the animation.
+    """
+
+    def __init__(self, style: Any, max_steps: int, *, verbose: bool = False) -> None:
+        self.style = style
+        self.max = max_steps
+        self.verbose = verbose          # the `do` CLI shows observations; the REPL stays terse
+        self.count = 0                  # tool steps committed (the visible "important steps")
+        self._spin: Any = None
+
+    def think(self, n: int) -> None:
+        """Turn *n* is about to call the model — spin on it, advancing the bar."""
+        label = f"{self.style.dim(f'step {n}/{self.max}')} {self.style.dim('· thinking…')}"
+        if self._spin is None:
+            self._spin = self.style.Spinner(label).start()
+        else:
+            self._spin.update(label)
+        self._spin.set_progress(n - 1, self.max)
+
+    def step(self, rec: dict) -> None:
+        """A turn finished — drop the spinner and commit the step (cumulative)."""
+        self._drop()
+        if rec.get("done"):
+            return                       # the final answer is printed by the caller
+        self.count += 1
+        call = f"{rec['tool']}({', '.join(f'{k}={_short(v)}' for k, v in rec['args'].items())})"
+        self.style.out(f"  {self.style.dim(str(rec['n']).rjust(2))} {self.style.brand(call)}\n")
+        if rec.get("thought"):           # the thinking behind the step — the bit worth seeing
+            self.style.out(f"     {self.style.dim('↳ ' + _short_text(rec['thought'], 110))}\n")
+        if self.verbose and rec.get("observation"):
+            first = rec["observation"].splitlines()[0]
+            self.style.out(f"     {self.style.dim('→ ' + _short(first))}\n")
+
+    def confirm(self, action: str) -> bool:
+        """Approve a destructive op — pausing the spinner so the prompt is clean."""
+        self._drop()
+        return _confirm(self.style, action)
+
+    def close(self) -> None:
+        self._drop()
+
+    def _drop(self) -> None:
+        if self._spin is not None:
+            self._spin.stop()
+            self._spin = None
+
+
 def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
     plan = loki.plan(line)
 
@@ -567,11 +627,16 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             reply = res.get("answer") or style.dim(f"fetched {plan['url']}")
         elif plan["action"] == "act":
             eng_name = _turn_engine(agent, style, state, line)
-            res = agent.act(line, root=state["root"], engine=eng_name, tier=state["tier"],
-                            allow_web=True,
-                            confirm=lambda action: _confirm(style, action),
-                            on_step=lambda r: _act_step(style, r))
+            mon = _ActMonitor(style, _REPL_ACT_STEPS)
+            try:
+                res = agent.act(line, root=state["root"], engine=eng_name, tier=state["tier"],
+                                max_steps=_REPL_ACT_STEPS, allow_web=True,
+                                confirm=mon.confirm, on_think=mon.think, on_step=mon.step)
+            finally:
+                mon.close()
             reply = res["answer"]
+            if mon.count:
+                style.out(f"  {style.dim(f'· {mon.count} step' + ('s' if mon.count != 1 else ''))}\n")
             if res.get("files_changed"):
                 style.out(f"  {style.good('✎')} {', '.join(res['files_changed'])}\n")
         elif plan["action"] == "genie":
@@ -622,13 +687,6 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
     # Token/cost KPIs ride the terminal title bar (a static "head"), not a fresh
     # line each turn — local turns are free, so the spend only moves on a remote.
     style.set_title(_usage_title())
-
-
-def _act_step(style: Any, rec: dict) -> None:
-    if rec.get("done"):
-        return
-    call = f"{rec['tool']}({', '.join(f'{k}={_short(v)}' for k, v in rec['args'].items())})"
-    style.out(f"  {style.dim(str(rec['n']).rjust(2))} {style.brand(call)}\n")
 
 
 def _confirm(style: Any, action: str) -> bool:
@@ -943,25 +1001,19 @@ def _do(loki: Any, style: Any, args: Any) -> int:
         mode += "+web"
     style.out(f"  {style.dim('root ' + args.root + '  ·  ' + mode)}\n\n")
 
-    def on_step(rec: dict) -> None:
-        if rec.get("done"):
-            return
-        call = f"{rec['tool']}({', '.join(f'{k}={_short(v)}' for k, v in rec['args'].items())})"
-        style.out(f"  {style.dim(str(rec['n']).rjust(2))} {style.brand(call)}\n")
-        if rec.get("thought"):
-            style.out(f"     {style.dim(_short(rec['thought']))}\n")
-        first = rec["observation"].splitlines()[0] if rec["observation"] else ""
-        style.out(f"     {style.dim('→ ' + _short(first))}\n")
-
+    mon = _ActMonitor(style, args.max_steps, verbose=True)
     try:
         result = loki.act(
             args.task, root=args.root, engine=args.engine, tier=args.tier, max_steps=args.max_steps,
             read_only=args.read_only, allow_shell=args.allow_shell, allow_web=args.allow_web,
-            on_step=None if args.json else on_step,
+            on_think=None if args.json else mon.think,
+            on_step=None if args.json else mon.step,
         )
     except (KeyError, RuntimeError) as exc:
         style.fail(exc.args[0] if exc.args else str(exc))
         return 1
+    finally:
+        mon.close()
 
     if args.json:
         style.out(_json(result) + "\n")

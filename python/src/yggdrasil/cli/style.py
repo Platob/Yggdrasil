@@ -248,6 +248,10 @@ class Spinner:
         self.frames = frames
         self.interval = interval
         self.color = color
+        #: Optional ``(current, total)`` — when set, a compact filled bar renders
+        #: between the spinner glyph and the text so a bounded task (an agent's
+        #: step budget, a multi-file pass) shows how far along it is, live.
+        self._progress: tuple[int, int] | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -266,12 +270,28 @@ class Spinner:
         while not self._stop_event.is_set():
             frame = next(cycle)
             colored = f"{_CSI}{self.color}m{frame}{_RESET}"
-            sys.stdout.write(f"\r{_CSI}2K  {colored} {self.text}")
+            sys.stdout.write(f"\r{_CSI}2K  {colored} {self._bar()}{self.text}")
             sys.stdout.flush()
             self._stop_event.wait(self.interval)
 
+    def _bar(self) -> str:
+        """A compact filled progress bar segment, or ``""`` when no progress is set."""
+        prog = self._progress
+        if prog is None or prog[1] <= 0:
+            return ""
+        current, total = prog
+        width = 12
+        filled = min(int(width * current / total), width)
+        bar = f"{_CSI}{self.color}m{'█' * filled}{_RESET}" + dim("░" * (width - filled))
+        return f"{bar} {dim(f'{min(current, total)}/{total}')}  "
+
     def update(self, text: str) -> None:
         self.text = text
+
+    def set_progress(self, current: int, total: int) -> None:
+        """Drive the inline progress bar (``current`` of ``total``). Renders on
+        the next animation frame; safe to call from the main thread mid-spin."""
+        self._progress = (current, total)
 
     def stop(self, final: str = "") -> None:
         self._stop_event.set()

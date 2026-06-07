@@ -101,5 +101,63 @@ class TestHardwareLine(unittest.TestCase):
         self.assertNotIn("NPU", line)
 
 
+class TestActMonitor(unittest.TestCase):
+    """The live cumulative step view for the autonomous ``act`` loop."""
+
+    def _drive(self, records, *, verbose=False, max_steps=12):
+        import io
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        from yggdrasil.cli import style
+
+        style.force_color(False)
+        buf = io.StringIO()
+        # Off-TTY: the spinner degrades to a printed line (no animation thread),
+        # which keeps the captured output deterministic.
+        with patch.object(style, "_IS_TTY", False), redirect_stdout(buf):
+            mon = cli._ActMonitor(style, max_steps, verbose=verbose)
+            for rec in records:
+                mon.think(rec["n"])
+                mon.step(rec)
+            mon.close()
+        return mon, style.strip(buf.getvalue())
+
+    def test_commits_each_tool_step_with_its_thought(self):
+        records = [
+            {"n": 1, "tool": "list_dir", "args": {"path": "."},
+             "thought": "scout the tree first", "observation": "a.py\nb.py"},
+            {"n": 2, "tool": "read_file", "args": {"path": "a.py"},
+             "thought": "inspect before editing", "observation": "print(1)"},
+            {"n": 3, "done": True, "answer": "done"},   # final turn commits nothing
+        ]
+        mon, out = self._drive(records)
+        self.assertEqual(mon.count, 2)                  # only the two tool steps
+        self.assertIn("list_dir(path=.)", out)
+        self.assertIn("read_file(path=a.py)", out)
+        self.assertIn("scout the tree first", out)      # the thinking is surfaced
+        self.assertIn("inspect before editing", out)
+
+    def test_verbose_adds_first_observation_line_only(self):
+        records = [{"n": 1, "tool": "read_file", "args": {"path": "a.py"},
+                    "thought": "look", "observation": "line one\nline two"}]
+        _, out = self._drive(records, verbose=True)
+        self.assertIn("line one", out)
+        self.assertNotIn("line two", out)               # only the first line
+
+    def test_confirm_pauses_spinner_and_delegates(self):
+        from unittest.mock import patch
+
+        from yggdrasil.cli import style
+
+        style.force_color(False)
+        with patch.object(style, "_IS_TTY", False):
+            mon = cli._ActMonitor(style, 12)
+            mon.think(1)                                 # spinner up
+            with patch("builtins.input", return_value="y"):
+                self.assertTrue(mon.confirm("delete it"))
+            self.assertIsNone(mon._spin)                 # spinner dropped for the prompt
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,36 @@ class TestLogo:
         assert art == style.logo("YGG")      # plain mark, no "YGGNOPE" subtitle
 
 
+class TestSpinnerProgress:
+    """The spinner's inline step-budget bar (used by the Loki act monitor)."""
+
+    def setup_method(self):
+        style.force_color(False)
+
+    def test_no_bar_until_progress_set(self):
+        assert style.Spinner("thinking")._bar() == ""
+
+    def test_bar_fills_proportionally(self):
+        sp = style.Spinner("thinking")
+        sp.set_progress(3, 12)
+        bar = style.strip(sp._bar())
+        assert bar.count("█") == 3            # 3/12 of a 12-wide bar
+        assert bar.count("░") == 9
+        assert "3/12" in bar
+
+    def test_bar_never_overflows_when_complete_or_past(self):
+        sp = style.Spinner("x")
+        sp.set_progress(20, 12)               # current past total
+        bar = style.strip(sp._bar())
+        assert bar.count("█") == 12 and bar.count("░") == 0
+        assert "12/12" in bar                 # current clamped in the count, too
+
+    def test_zero_total_is_safe(self):
+        sp = style.Spinner("x")
+        sp.set_progress(0, 0)
+        assert sp._bar() == ""
+
+
 class TestStripAndTitle:
     def test_strip_removes_ansi_color(self):
         assert style.strip(style.red("hi") + " " + style.dim("there")) == "hi there"

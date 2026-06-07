@@ -548,6 +548,7 @@ class Loki:
         allow_web: bool = False,
         confirm: "Optional[Callable[[str], bool]]" = None,
         toolbox: "Optional[Toolbox]" = None,
+        on_think: "Optional[Callable[[int], None]]" = None,
         on_step: "Optional[Callable[[dict[str, Any]], None]]" = None,
     ) -> dict[str, Any]:
         """Pursue *task* autonomously: discover, decide, and modify files.
@@ -566,7 +567,10 @@ class Loki:
         Returns a transcript: the resolved ``engine``, every ``step`` (its
         ``thought``/``tool``/``args``/``observation``), the final ``answer``,
         whether it ``completed``, and the ``files_changed`` list. Pass
-        ``on_step`` to stream progress (the CLI uses it to print each turn).
+        ``on_step`` to stream each completed turn, and ``on_think(n)`` to learn
+        when turn *n* is about to call the (slow) model — the CLI uses the pair
+        to keep a live spinner + step-budget bar running through the otherwise
+        silent reasoning between tool calls.
         """
         from .tools import filesystem_toolbox
 
@@ -599,6 +603,8 @@ class Loki:
         answer, completed = "", False
 
         for n in range(1, max_steps + 1):
+            if on_think:
+                on_think(n)
             reply = eng.complete(messages, system=system, max_tokens=4000, tier=tier).text
             decision = _parse_decision(reply)
             if decision is None:
