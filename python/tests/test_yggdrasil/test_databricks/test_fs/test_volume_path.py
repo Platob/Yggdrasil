@@ -2391,6 +2391,68 @@ class TestVolumeExternalAccessFlags:
         assert v.external_access(write=False) is True        # read still cached ok
 
 
+class TestVolumeCreateExternalLocationGate:
+    """``Volume.create`` validates an *inferred* EXTERNAL location against the
+    Unity Catalog external locations and falls back to MANAGED (with a warning)
+    when nothing accessible covers it."""
+
+    def _vol(self):
+        from yggdrasil.databricks.volume.volume import Volume
+        svc = MagicMock()  # plain mock — needs a navigable ``.client``
+        vol = Volume(service=svc, catalog_name="c", schema_name="s", volume_name="v")
+        return vol, svc
+
+    def _patches(self, Volume):
+        # ``read_info`` None → proceed to create; stat hooks are no-ops here.
+        return (
+            patch.object(Volume, "read_info", return_value=None),
+            patch.object(Volume, "_persist_stat_cache"),
+            patch.object(Volume, "_stat_uncached"),
+        )
+
+    def test_inferred_external_falls_back_to_managed_when_uncovered(self) -> None:
+        from databricks.sdk.service.catalog import VolumeType
+        from yggdrasil.databricks.volume.volume import Volume
+
+        vol, svc = self._vol()
+        svc.client.external_locations.find_url.return_value = None
+        uc = svc.client.workspace_client.return_value.volumes
+        ri, ps, su = self._patches(Volume)
+        with ri, ps, su, patch("yggdrasil.databricks.volume.volume.logger") as log:
+            vol.create(storage_location="s3://bkt/x/staging")
+        svc.client.external_locations.find_url.assert_called_once_with("s3://bkt/x/staging")
+        kw = uc.create.call_args.kwargs
+        assert kw["volume_type"] == VolumeType.MANAGED
+        assert "storage_location" not in kw          # downgraded — no location sent
+        log.warning.assert_called_once()
+
+    def test_inferred_external_kept_when_a_location_covers_it(self) -> None:
+        from databricks.sdk.service.catalog import VolumeType
+        from yggdrasil.databricks.volume.volume import Volume
+
+        vol, svc = self._vol()
+        svc.client.external_locations.find_url.return_value = MagicMock()  # covered
+        uc = svc.client.workspace_client.return_value.volumes
+        ri, ps, su = self._patches(Volume)
+        with ri, ps, su:
+            vol.create(storage_location="s3://bkt/x/staging")
+        kw = uc.create.call_args.kwargs
+        assert kw["volume_type"] == VolumeType.EXTERNAL
+        assert kw["storage_location"] == "s3://bkt/x/staging"
+
+    def test_explicit_external_skips_the_gate(self) -> None:
+        from yggdrasil.databricks.volume.volume import Volume
+
+        vol, svc = self._vol()
+        uc = svc.client.workspace_client.return_value.volumes
+        ri, ps, su = self._patches(Volume)
+        with ri, ps, su:
+            vol.create(storage_location="s3://bkt/x", volume_type="EXTERNAL")
+        # Pinned EXTERNAL → no external-location lookup; honored as-is.
+        svc.client.external_locations.find_url.assert_not_called()
+        assert uc.create.call_args.kwargs["storage_location"] == "s3://bkt/x"
+
+
 class TestLooksLikePermissionDenied:
     def test_stdlib_permission_error(self) -> None:
         from yggdrasil.databricks.fs.volume_path import _looks_like_permission_denied

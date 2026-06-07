@@ -856,6 +856,7 @@ class Volume(DatabricksPath):
 
         uc = self.client.workspace_client().volumes
         storage_location = str(storage_location) if storage_location else None
+        inferred = volume_type is None  # EXTERNAL/MANAGED derived from storage_location
 
         try:
             from databricks.sdk.service.catalog import VolumeType
@@ -866,6 +867,7 @@ class Volume(DatabricksPath):
                 volume_type = VolumeType[str(volume_type)]
 
             is_external = volume_type == VolumeType.EXTERNAL
+            managed_type: Any = VolumeType.MANAGED
         except Exception:
             if volume_type is None:
                 volume_type = "EXTERNAL" if storage_location else "MANAGED"
@@ -873,6 +875,31 @@ class Volume(DatabricksPath):
                 volume_type = str(volume_type).upper()
 
             is_external = volume_type == "EXTERNAL"
+            managed_type = "MANAGED"
+
+        # When EXTERNAL was *inferred* from a ``storage_location`` (not pinned by
+        # the caller), the location must sit under an accessible Unity Catalog
+        # **external location** for the create to be allowed — so verify it here
+        # rather than firing a create UC will reject. The lookup runs over the
+        # cached location list (:attr:`ExternalLocations.LIST_TTL`), so it's
+        # cheap on the hot staging-create path. Nothing covering it → fall back
+        # to a MANAGED volume and warn (an explicit ``volume_type="EXTERNAL"``
+        # is left untouched and allowed to fail loudly).
+        if is_external and inferred and storage_location:
+            try:
+                covering = self.client.external_locations.find_url(storage_location)
+            except Exception as exc:  # noqa: BLE001 — listing is best-effort
+                logger.debug("external-location lookup failed for %r: %s", self, exc)
+                covering = None
+            if covering is None:
+                logger.warning(
+                    "No accessible Unity Catalog external location covers %s; creating "
+                    "%r as a MANAGED volume (no direct cloud-storage staging). Register "
+                    "an external location over that prefix to enable the fast path.",
+                    storage_location, self,
+                )
+                volume_type = managed_type
+                is_external = False
 
         if not is_external:
             storage_location = None
