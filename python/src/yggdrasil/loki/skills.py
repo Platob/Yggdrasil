@@ -30,8 +30,8 @@ from .skill import LokiSkill, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentSkill", "EntsoeSkill", "PythonProjectSkill", "SetupSkill",
-           "WebSkill", "TabularSkill", "TransformSkill"]
+__all__ = ["AgentSkill", "DelegateSkill", "EntsoeSkill", "PythonProjectSkill",
+           "SetupSkill", "WebSkill", "TabularSkill", "TransformSkill"]
 
 
 @register
@@ -371,6 +371,53 @@ class TransformSkill(LokiSkill):
                 f"reuse:  loki.run('tabular', cache={str(cached_to)!r})",
                 f"store:  loki.run('tabular', cache={str(cached_to)!r}, store='out.parquet')",
             ],
+        }
+
+
+@register
+class DelegateSkill(LokiSkill):
+    """Fan a set of tasks out to background process agents and monitor them.
+
+    Loki's autonomy multiplier: each task runs as its own ``ygg loki do``
+    subprocess (an isolated act loop), so independent work runs in parallel while
+    Loki watches. Pass explicit ``tasks=[…]``, or a high-level ``goal=`` that the
+    engine decomposes into parallel-safe subtasks first. Returns one summary per
+    agent (status / elapsed / answer / files_changed). Runs anywhere an engine is
+    reachable (the sub-agents need one).
+    """
+
+    name = "delegate"
+    description = "Run independent tasks as parallel background agents and monitor them."
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        tasks: Optional[list] = None,
+        goal: Optional[str] = None,
+        root: str = ".",
+        engine: Optional[str] = None,
+        tier: Optional[str] = None,
+        max_steps: int = 8,
+        allow_web: bool = True,
+        allow_shell: bool = False,
+        read_only: bool = False,
+        timeout: Optional[float] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        if not tasks and goal:
+            tasks = agent.decompose(goal, engine=engine, tier=tier)
+        if not tasks:
+            raise ValueError("provide tasks=[…] or a goal= to decompose")
+        results = agent.delegate(
+            list(tasks), root=root, engine=engine, tier=tier, max_steps=max_steps,
+            allow_web=allow_web, allow_shell=allow_shell, read_only=read_only, timeout=timeout,
+        )
+        return {
+            "goal": goal,
+            "agents": results,
+            "completed": sum(1 for r in results if r["status"] == "done"),
+            "failed": sum(1 for r in results if r["status"] != "done"),
         }
 
 

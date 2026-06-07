@@ -797,6 +797,70 @@ class _ActMonitor:
             self._spin = None
 
 
+#: Spinner frames for the live fleet dashboard (one running agent per line).
+_FLEET_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+
+def _fleet_lines(style: Any, agents: list, frame: str) -> list[str]:
+    """Render one dashboard line per process agent — glyph, task, status, time."""
+    lines: list[str] = []
+    for a in agents:
+        if a.running:
+            glyph, st = style.brand(frame), style.dim("running")
+        elif a.ok:
+            glyph, st = style.good("✓"), style.good("done")
+        elif a.status == "timeout":
+            glyph, st = style.amber("⏱"), style.amber("timeout")
+        else:
+            glyph, st = style.bad("✗"), style.bad("failed")
+        if a.ok and a.files_changed:
+            tail = style.dim("✎ " + ", ".join(a.files_changed[:3]))
+        elif not a.running and not a.ok and a.stderr_tail:
+            tail = style.dim(_short_text(a.stderr_tail, 40))
+        else:
+            tail = ""
+        lines.append(
+            f"  {glyph} {style.dim('#' + str(a.id))} {_short_text(a.task, 44).ljust(45)} "
+            f"{st.ljust(8)} {style.dim(f'{a.elapsed:4.1f}s')}  {tail}"
+        )
+    return lines
+
+
+def _run_fleet(loki: Any, style: Any, state: dict, tasks: list) -> Any:
+    """Spawn a process agent per task and live-monitor the fleet to completion."""
+    from yggdrasil.loki.fleet import Fleet
+
+    style.out(f"  {style.brand('⛓ delegating')} {style.dim(str(len(tasks)) + ' parallel agents')} "
+              f"{style.dim('· ' + (state.get('engine') or 'auto') + ' · root ' + state['root'])}\n")
+    fleet = Fleet()
+    fleet.spawn_all(tasks, root=state["root"], engine=state.get("engine"),
+                    tier=state["tier"], allow_web=True)
+    live = style.LiveDisplay()
+    tick = {"i": 0}
+
+    def render(agents: list) -> None:
+        tick["i"] += 1
+        live.update(_fleet_lines(style, agents, _FLEET_FRAMES[tick["i"] % len(_FLEET_FRAMES)]))
+
+    try:
+        fleet.monitor(render, interval=0.12)
+    except KeyboardInterrupt:
+        fleet.cancel_all()
+        render(fleet.agents)
+        style.warn("fleet cancelled")
+    finally:
+        live.stop()
+
+    done = sum(1 for a in fleet.agents if a.ok)
+    failed = len(fleet.agents) - done
+    bits = [style.good(f"{done} done")] + ([style.bad(f"{failed} failed")] if failed else [])
+    style.out(f"  {style.dim('—')} {'  '.join(bits)}\n")
+    changed = sorted({f for a in fleet.agents for f in a.files_changed})
+    if changed:
+        style.out(f"  {style.good('✎')} {', '.join(changed)}\n")
+    return fleet
+
+
 def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
     plan = loki.plan(line)
 
@@ -1001,6 +1065,8 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
             f"  {style.bold('commands')}\n"
             f"    {style.brand('/engine')}   pick the session base engine (claude/databricks/openai/ollama/auto)\n"
             f"    {style.brand('/model')}    pick the model for this engine (lists presets · downloads with a bar)\n"
+            f"    {style.brand('/fleet')}    delegate tasks to parallel background agents:  /fleet t1 ;; t2 ;; t3\n"
+            f"    {style.brand('/swarm')}    autonomous: decompose a goal into subtasks + run them as a monitored fleet\n"
             f"    {style.brand('/engines')}  reasoning engines and adaptive models\n"
             f"    {style.brand('/setup')}    bootstrap a free local model (lazy-install on demand)\n"
             f"    {style.brand('/status')}   identity + backends + engines + skills\n"
@@ -1030,6 +1096,25 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
             style.warn(f"unknown engine {arg!r} — see /engines")
     elif cmd == "model":
         _choose_model(loki, style, state, arg)
+    elif cmd == "fleet":
+        tasks = [t.strip() for t in arg.split(";;") if t.strip()]
+        if not tasks:
+            style.warn("usage: /fleet <task1> ;; <task2> ;; …  (parallel background agents)")
+        else:
+            _run_fleet(loki, style, state, tasks)
+    elif cmd == "swarm":
+        eng = loki.engine(state["engine"]) if state.get("engine") else loki.engine()
+        if not arg:
+            style.warn("usage: /swarm <high-level goal>  (Loki decomposes + delegates it)")
+        elif eng is None or not eng.available():
+            style.warn("no engine available to decompose the goal — set one with /engine")
+        else:
+            with style.Spinner("decomposing the goal into parallel subtasks…"):
+                tasks = loki.decompose(arg, engine=state.get("engine"), tier=state["tier"])
+            style.out(f"  {style.bold('plan')} {style.dim(str(len(tasks)) + ' parallel subtasks')}\n")
+            for t in tasks:
+                style.out(f"    {style.brand('•')} {style.dim(_short_text(t, 70))}\n")
+            _run_fleet(loki, style, state, tasks)
     elif cmd == "status":
         loki.load_specialists()   # ensure the specialist fleet is listed even
         _status(loki, style)      # if the background warmer hasn't finished yet

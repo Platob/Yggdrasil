@@ -665,6 +665,64 @@ class Loki:
             "files_changed": list(box.changed),
         }
 
+    def delegate(
+        self,
+        tasks: list[str],
+        *,
+        root: str = ".",
+        engine: "Optional[str]" = None,
+        tier: "Optional[str]" = None,
+        max_steps: int = 8,
+        allow_web: bool = True,
+        allow_shell: bool = False,
+        read_only: bool = False,
+        timeout: "Optional[float]" = None,
+        on_update: "Optional[Callable[[list[Any]], None]]" = None,
+    ) -> list[dict[str, Any]]:
+        """Fan *tasks* out to background process agents and wait for them.
+
+        Each task runs as its own ``ygg loki do`` subprocess (an isolated act
+        loop), so independent work proceeds in parallel while Loki monitors them
+        — its autonomy multiplier. Returns one summary row per agent (status,
+        elapsed, answer, files_changed). ``on_update(agents)`` streams live
+        progress (the CLI renders the dashboard from it).
+        """
+        from .fleet import Fleet
+
+        fleet = Fleet()
+        fleet.spawn_all(tasks, root=root, engine=engine, tier=tier, max_steps=max_steps,
+                        allow_web=allow_web, allow_shell=allow_shell, read_only=read_only)
+        fleet.monitor(on_update, timeout=timeout)
+        return fleet.summary()
+
+    def decompose(self, goal: str, *, engine: "Optional[str]" = None,
+                  tier: "Optional[str]" = None, max_tasks: int = 6) -> list[str]:
+        """Break *goal* into independent subtasks an agent fleet can run in parallel.
+
+        Asks the reasoning engine for a JSON array of self-contained tasks
+        (parallel-safe — no ordering between them). Returns the parsed list,
+        capped at *max_tasks*; falls back to ``[goal]`` if nothing parses.
+        """
+        prompt = (
+            f"Break this goal into at most {max_tasks} INDEPENDENT subtasks that can "
+            f"run in parallel (no subtask depends on another's output). Each must be "
+            f"a single concrete instruction for an autonomous coding agent.\n\n"
+            f"GOAL: {goal}\n\n"
+            f"Reply with ONLY a JSON array of strings, nothing else."
+        )
+        reply = self.reason(prompt, engine=engine, tier=tier,
+                            system="You decompose goals into parallel-safe subtasks. Output JSON only.")
+        start, end = reply.find("["), reply.rfind("]")
+        if start != -1 and end > start:
+            try:
+                tasks = json.loads(reply[start : end + 1])
+            except json.JSONDecodeError:
+                tasks = []
+            cleaned = [str(t).strip() for t in tasks if str(t).strip()]
+            if cleaned:
+                return cleaned[:max_tasks]
+        return [goal]
+
     # -- reasoning planner -------------------------------------------------
 
     def plan(self, text: str) -> "AgentPlan":

@@ -336,6 +336,36 @@ def progress(current: int, total: int, label: str = "") -> None:
     sys.stdout.flush()
 
 
+# -- live multi-line display ----------------------------------------------
+
+class LiveDisplay:
+    """Render a block of lines that **updates in place** (a live dashboard).
+
+    Each :meth:`update` rewrites the block: the cursor jumps back to its top
+    (``CSI nF``), every line is cleared (``CSI 2K``) and redrawn, so a fleet of
+    agents shows live status without scrolling the transcript. TTY-only — off a
+    terminal the escapes are meaningless, so updates are dropped and the caller's
+    final summary (plain ``out``) carries the result instead.
+    """
+
+    def __init__(self) -> None:
+        self._n = 0          # lines drawn by the previous update
+
+    def update(self, lines: list[str]) -> None:
+        if not _IS_TTY:
+            return
+        parts: list[str] = []
+        if self._n:
+            parts.append(f"{_CSI}{self._n}F")        # cursor to top of the block
+        parts.extend(f"{_CSI}2K{ln}" for ln in lines)
+        sys.stdout.write("\n".join(parts) + "\n")
+        sys.stdout.flush()
+        self._n = len(lines)
+
+    def stop(self) -> None:
+        self._n = 0
+
+
 # -- typing animation ------------------------------------------------------
 
 def typing_dots(duration: float = 0.35, frames: int = 3) -> None:
