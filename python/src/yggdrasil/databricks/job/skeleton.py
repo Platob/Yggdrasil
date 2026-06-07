@@ -34,6 +34,7 @@ import functools
 import logging
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -272,8 +273,13 @@ class _Runnable:
             pyproject = find_pyproject(source)
             if pyproject is not None:
                 return str(pyproject.parent)
-        except Exception:  # noqa: BLE001 — not importable / no source tree → PyPI
-            pass
+        except (ImportError, AttributeError, OSError) as exc:
+            # Not importable / no ``__file__`` / no source tree on disk → ship
+            # the published distribution from PyPI instead. (Narrow on purpose:
+            # a bug like a missing import must surface, not silently degrade the
+            # deploy to PyPI — which is how a `Path` NameError once shipped stale
+            # published wheels instead of the live checkout.)
+            logger.debug("no local source for %r (%s); using PyPI", pkg, exc)
         return distribution_for(pkg)
 
     def _serverless_dependencies(self, client: Any) -> list[str]:

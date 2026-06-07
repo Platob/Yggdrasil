@@ -123,6 +123,33 @@ class TestCallRunsInProcess:
 # --------------------------------------------------------------------------- #
 # @flow — local orchestration + serverless rendering
 # --------------------------------------------------------------------------- #
+class TestProjectSpec:
+    def test_resolves_the_local_checkout_for_an_editable_package(self):
+        # A flow whose function lives in the editable yggdrasil checkout must
+        # deploy from *source* (its project dir), not the published PyPI name —
+        # otherwise the cluster runs stale published code. (Regression: a missing
+        # ``Path`` import made ``_project_spec`` silently fall back to PyPI.)
+        from pathlib import Path
+
+        from yggdrasil.databricks.table.auto_loader import auto_load
+
+        f = Flow(auto_load, name="x", command=["databricks", "table", "autoload"])
+        assert f.wheel_package() == "yggdrasil"
+        spec = Path(f._project_spec())
+        assert (spec / "pyproject.toml").is_file()           # a real local project dir
+        assert spec.name == "python" and spec.parent.name == "Yggdrasil"
+
+    def test_falls_back_to_distribution_name_when_not_importable(self):
+        from unittest.mock import patch
+
+        @flow(name="ghost")
+        def ghost(): ...
+
+        with patch.object(type(ghost), "wheel_package", return_value="no_such_pkg_xyz"):
+            # Not importable → PyPI distribution name, no exception leaks.
+            assert ghost._project_spec() == "no_such_pkg_xyz"
+
+
 class TestFlow:
     def test_flow_runs_tasks_locally(self):
         @task
