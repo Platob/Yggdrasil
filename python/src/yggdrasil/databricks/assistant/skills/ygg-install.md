@@ -8,7 +8,7 @@ The user asks to install or set up `ygg` / `yggdrasil`, or hits
 ## First, just import it
 
 This workspace ships a **pre-built ygg image** on the default serverless
-environment (seeded by `ygg databricks seed`). So the normal path is *no
+environment (seeded by `ygg databricks deploy`). So the normal path is *no
 install at all*:
 
 ```python

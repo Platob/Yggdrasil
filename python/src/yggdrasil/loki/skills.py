@@ -92,7 +92,7 @@ class SetupSkill(LokiSkill):
         res = agent.bootstrap_local(model=model, pull=pull)
         # What a lightweight model should hand heavier setup off to.
         res["redirects"] = {
-            "configure databricks": "ygg databricks configure   (host + token, then `ygg databricks seed`)",
+            "configure databricks": "ygg databricks configure   (host + token, then `ygg databricks deploy`)",
             "heavier local model": "loki.run('setup', model='qwen2.5:14b')   (or any larger ollama/HF id)",
             "stronger reasoning": "set ANTHROPIC_API_KEY / log into Claude Code, then heavy tasks escalate automatically",
         }

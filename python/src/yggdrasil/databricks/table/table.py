@@ -3148,7 +3148,7 @@ class Table(DatabricksPath):
                 canonical, version-pinned ygg image
                 (:func:`~yggdrasil.databricks.environments.service.environment_stem`,
                 ``ygg-<version>-py3XX``) — the same ``<name>.yml`` file
-                ``ygg databricks seed`` writes under ``/Workspace/Shared/
+                ``ygg databricks deploy`` writes under ``/Workspace/Shared/
                 environments``, so the job reuses the seeded wheel-built image
                 (or self-provisions the identical one). Pass an explicit name to
                 point at a different shared env; ``None`` inlines the dependency

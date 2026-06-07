@@ -115,7 +115,7 @@ class Clusters(DatabricksService):
 
         *python* is the cluster's ``"3.X"`` runtime Python (derived from its DBR
         in :meth:`all_purpose_cluster`); ``None`` falls back to the local
-        interpreter. Provisioned by ``ygg databricks seed``; an explicit
+        interpreter. Provisioned by ``ygg databricks deploy``; an explicit
         ``environment`` / ``libraries`` argument overrides it (and may be a PyPI
         spec to opt back into a pip resolve)."""
         from yggdrasil.databricks.environments.service import (

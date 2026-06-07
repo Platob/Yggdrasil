@@ -28,7 +28,6 @@ ygg databricks <group> <action> [flags]
 | [`fs`](#filesystem-fs) | Files across Workspace / Volumes / DBFS — ls/cat/write/put/get/mkdir/rm/stat/cp/mv |
 | [`wheel`](#wheels-wheel) | Wheel registry CRUD — create/find/update/delete/list in the workspace index |
 | [`deploy`](#deploy) | Deploy the current project — environment + default warehouse + cluster |
-| [`seed`](#seed) | One-shot readiness — check (and provision) wheels, environments, a default warehouse, instance pools, a cluster, and the Assistant bundle |
 
 ---
 
@@ -565,12 +564,12 @@ caught by `SystemParameters` (the union of `dbutils.widgets` and
 
 Compute is defaulted for you: `--cluster <id>` pins existing compute,
 otherwise the run goes **serverless**. The serverless environment is
-resolved automatically — `--environment <name>` selects a seeded base
+resolved automatically — `--environment <name>` selects a deployed base
 environment (or a `.yml` path) from the shared environment path, and the
 default picks up the **running client project's** environment when deployed,
-else the seeded **ygg** base environment
+else the deployed **ygg** base environment
 (`/Workspace/Shared/environment/ygg/ygg-<version>-py3XX.yml`), falling back to
-the workspace default serverless compute when none is seeded. Blocks until the
+the workspace default serverless compute when none is deployed. Blocks until the
 run finishes (`--timeout` seconds) unless `--no-wait` is given.
 
 ```bash
@@ -578,7 +577,7 @@ run finishes (`--timeout` seconds) unless `--no-wait` is given.
 ygg databricks fs run-notebook /Workspace/Shared/etl \
   --param date=2024-01-01 --param region=eu
 
-# run on a named, seeded serverless environment
+# run on a named, deployed serverless environment
 ygg databricks fs run-notebook /Workspace/Shared/Meteologica/databricks/espark_category.py \
   --environment meteologica --param category=wind
 
@@ -709,99 +708,7 @@ ygg databricks deploy --no-cluster             # env + warehouse only
 
 > The lower-level wheel/environment CRUD lives under the dedicated
 > [`ygg databricks wheel`](#wheels-wheel) and
-> [`ygg databricks environment`](#environments-environment) commands (and
-> `ygg databricks seed` provisions a workspace end-to-end).
-
----
-
-## Seed
-
-One command to answer *"is this workspace ready to run ygg, and if not,
-make it ready"*. `seed` walks seven areas and, by default, provisions
-anything missing:
-
-| Area | Checks | Provisions (default mode) |
-|---|---|---|
-| **config** | connectivity, host, current user, default catalog/schema, workspace id | — (read-only) |
-| **wheels** | the versioned ygg image wheel in the registry | builds + uploads it ([`wheel create`](#wheels-wheel)) |
-| **environments** | the version-pinned base environments (serverless + cluster) | assembles + writes them off the fresh wheel (zero-PyPI) |
-| **warehouses** | a SQL warehouse to execute against | ensures a default (creates a serverless one if none) |
-| **pools** | the default Light / Medium / Heavy instance pools | provisions them (lazy — no idle nodes); skip with `--no-pools` |
-| **cluster** | a default single-user (dedicated) all-purpose cluster | provisions it (pool-backed, generic env, autoterminating); skip with `--no-cluster` |
-| **assistant** | the Databricks Assistant skills + guidance bundle | deploys it to the workspace + user folders; skip with `--no-assistant` |
-
-```bash
-ygg databricks seed
-```
-
-| Flag | Purpose |
-|---|---|
-| `--check` | **Read-only**: report readiness, create/upload nothing. Exits `1` if anything is missing — use it as a CI gate. |
-| `--mode` | Idempotency policy — `auto` / `append` / `overwrite` (default `auto`). |
-| `--rebuild` | Force a fresh wheel build even if the version is already deployed. |
-| `--all-versions` | Seed a wheel + environment for every supported Python (3.10–3.13). |
-| `--no-pools` | Skip the default Light/Medium/Heavy instance pools step. |
-| `--no-cluster` | Skip the default single-user all-purpose cluster step. |
-| `--no-assistant` | Skip deploying the Databricks Assistant skills + guidance bundle. |
-| `--workspace-dir` | PyPI-like registry root (default `/Workspace/Shared/pypi`). |
-
-`--mode` sets what gets rebuilt vs. reused across the seed steps:
-
-| Mode | Wheels | Env config files / warehouse / pools / assistant | Cluster | Other steps |
-|---|---|---|---|---|
-| `overwrite` | rebuilt (all Pythons + bundle) | env files rewritten | — | **ends** after environments |
-| `append` | get-or-create | written / deployed **only if missing** | created if missing | run |
-| `auto` (default) | get-or-create | **create-or-update** (refreshed) | get-or-create | run |
-
-```bash
-ygg databricks seed                  # auto (the default)
-ygg databricks seed --mode append    # add only what's missing
-ygg databricks seed --mode overwrite # rebuild the image + rewrite envs, then end
-```
-
-### Assistant bundle
-
-The **assistant** step deploys the Databricks Assistant ("Genie")
-configuration packaged in `yggdrasil.databricks.assistant` — the workspace
-+ user guidance and the per-task Skills that teach the in-product Assistant
-to drive ygg **in Python on serverless, never via the CLI it can't run**.
-It uploads the bundle (and makes a best-effort attempt at any live
-Assistant-settings API):
-
-| Artifact | Lands at |
-|---|---|
-| Assistant guidance (workspace) | `/Workspace/Shared/.ygg/assistant/workspace_instructions.md` |
-| Workspace skills | `/Workspace/Shared/.ygg/assistant/skills/*.md` |
-| User guidance | `/Workspace/Users/<me>/.ygg/assistant/user_instructions.md` |
-| User skills | `/Workspace/Users/<me>/.ygg/assistant/skills/*.md` |
-
-The report is sectioned with status glyphs — `✓` ready, `▲` missing,
-`✗` errored:
-
-```text
-  ygg databricks seed  (check mode)
-  ●  config
-    host      https://ws.example.com
-    user      me@example.com
-    catalog   main
-  ✓  config reachable
-  ●  wheels
-  ▲  ygg 0.8.52 wheel not deployed under /Workspace/Shared/pypi/ygg
-  ●  environments
-  ✓  environment config resolvable
-  ●  warehouses
-  ✓  1 warehouse(s) available
-  ▲  prerequisites missing — run `ygg databricks seed` to provision
-```
-
-Connectivity is the gate: if the workspace can't be reached (bad host /
-token), `seed` reports the auth error and exits non-zero without touching
-anything else. Use it right after configuring a workspace, or in CI:
-
-```bash
-# fail the pipeline unless the workspace is fully provisioned
-ygg databricks --profile prod seed --check
-```
+> [`ygg databricks environment`](#environments-environment) commands.
 
 ---
 

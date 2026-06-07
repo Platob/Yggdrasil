@@ -1,15 +1,15 @@
-"""``ygg databricks deploy`` — deploy the current project to Databricks.
+"""``ygg databricks deploy`` — the single way to deploy a project to Databricks.
 
-``ygg databricks deploy [path]`` discovers the nearest ``pyproject.toml`` (from
-*path* or the cwd), builds the project's wheel, uploads it into the workspace's
-PyPI-like registry (``/Workspace/Shared/pypi/<dist>/``), writes a serverless
-base environment + classic-cluster requirements named for the project
-(``<name>-<version>``), and provisions the project's **default warehouse and
-cluster** wired to that env config — so a user's project runs on Databricks
-with one command.
+``ygg databricks deploy [path]`` builds the project at *path* (**the current
+working directory by default**, or a PyPI name) — its wheel + whole dependency
+closure as wheels (zero-PyPI) — writes the serverless base environment +
+classic-cluster requirements named for the project (``<name>-<version>``), and
+provisions the project's **default warehouse and cluster** wired to that env
+config. One command takes a project, ``ygg`` itself included, to Databricks.
 
-    ygg databricks deploy                 # deploy the project under the cwd
+    ygg databricks deploy                 # deploy the project in the cwd
     ygg databricks deploy ./my-app        # deploy the project under ./my-app
+    ygg databricks deploy ygg             # deploy a published project by name
     ygg databricks deploy --rebuild --no-cluster
 
 The environment bundles the project wheel + its whole dependency closure as
@@ -32,8 +32,8 @@ class DeployCommand:
             "deploy",
             help="Deploy the current project (environment + warehouse + cluster) to Databricks.",
         )
-        parser.add_argument("path", nargs="?", default=None,
-                            help="Project dir or pyproject.toml (default: discover from the cwd).")
+        parser.add_argument("path", nargs="?", default=".",
+                            help="Project dir or pyproject.toml (default: the current working directory).")
         parser.add_argument("--workspace-dir", dest="workspace_dir", default=None,
                             help="Environment root (default: /Workspace/Shared/environment).")
         parser.add_argument("--extra", action="append", default=None,
@@ -59,7 +59,7 @@ class DeployCommand:
 
         with style.Spinner("building project wheel + environment…"):
             env = client.environments.create(
-                args.path or ".", extras=extras,
+                args.path, extras=extras,
                 workspace_dir=args.workspace_dir, rebuild=args.rebuild,
             )
         project = env.project

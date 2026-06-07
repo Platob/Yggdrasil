@@ -207,7 +207,7 @@ def _resolve_submit_environment(client: DatabricksClient, environment: Any) -> A
         if spec_path is None:
             raise FileNotFoundError(
                 f"no serverless base environment {environment!r} found under "
-                f"{W.WORKSPACE_ENV_DIR} (seed one with `ygg databricks seed`, "
+                f"{W.WORKSPACE_ENV_DIR} (deploy one with `ygg databricks deploy`, "
                 f"pass a workspace path to its .yml, or a JobEnvironment)."
             )
         return JobEnvironment(

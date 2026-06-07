@@ -135,7 +135,7 @@ class DatabricksLoki(Loki):
         runtime ``ygg loki`` resolves to this DatabricksLoki). The job is
         upserted by name and returned; trigger it with ``job.run()``.
 
-        Requires a workspace seeded with ``ygg databricks seed`` (for the
+        Requires a workspace seeded with ``ygg databricks deploy`` (for the
         serverless ygg environment) and a ``ygg databricks configure`` session.
         """
         client = self.databricks

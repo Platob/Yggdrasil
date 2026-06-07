@@ -198,7 +198,7 @@ class PoolTier:
     A tier pins an opinionated ``(node_type_id, capacity, autotermination)``
     triple to a human-readable size name (``"Light"`` / ``"Medium"`` /
     ``"Heavy"``). :meth:`InstancePools.seed_default_pools` (driven by
-    ``ygg databricks seed``) materialises one pool per tier so a workspace
+    ``seed_default_pools``) materialises one pool per tier so a workspace
     gets a ready, sensibly-sized attach point for ygg's pool-backed compute
     out of the box.
 
@@ -231,7 +231,7 @@ class PoolTier:
         return f"{prefix} {self.tier}"
 
 
-#: The default Light / Medium / Heavy pools ``ygg databricks seed`` provisions.
+#: The default Light / Medium / Heavy pools ``seed_default_pools`` provisions.
 #: All three use the AWS r5d memory-optimized family (local NVMe), sized up per
 #: tier and lazy by default (``min_idle_instances=0`` → no cost until attached).
 DEFAULT_POOL_TIERS: "tuple[PoolTier, ...]" = (
@@ -364,7 +364,7 @@ class InstancePools(DatabricksService):
         per :class:`PoolTier` — by default the r5d-backed
         :data:`DEFAULT_POOL_TIERS` (``"Yggdrasil Light"`` /
         ``"Yggdrasil Medium"`` / ``"Yggdrasil Heavy"``). This is what
-        ``ygg databricks seed`` calls so a freshly-seeded workspace has ready,
+        ``seed_default_pools`` calls so a freshly-provisioned workspace has ready,
         sensibly-sized attach points for ygg's pool-backed compute.
 
         Each pool preloads ``preloaded_spark_versions`` (defaulting to the
