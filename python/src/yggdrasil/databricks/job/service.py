@@ -139,127 +139,52 @@ def _resolve_cluster_id(cluster: "Cluster | str | None") -> str | None:
     return cluster.cluster_id
 
 
-def _environment_spec_path(client: DatabricksClient, name: str) -> str | None:
-    """Resolve a base-environment *name* (or direct path) to its spec file.
-
-    A value carrying a ``/`` or a ``.yml`` / ``.yaml`` suffix is taken as a
-    direct workspace path to the serverless base-environment spec. A bare
-    name is looked up under the shared environment root
-    (:data:`~yggdrasil.databricks.environments.service.WORKSPACE_ENV_DIR`) in the
-    project-folder layout the seed writes — ``<proj>/<proj>-<version>-py3XX.yml``
-    for a version-tagged stem (the folder derived via
-    :func:`~yggdrasil.databricks.environments.service.environment_folder_of`), with the
-    legacy ``<name>/<name>.yml`` / flat / ``.env.yaml`` spellings as fallbacks.
-    Returns the first existing path, or ``None`` when nothing matches.
-    """
-    from yggdrasil.databricks.environments import service as W
-    from yggdrasil.databricks.path import DatabricksPath
-
-    if "/" in name or name.endswith((".yml", ".yaml")):
-        path = DatabricksPath.from_(name, client=client)
-        return path.full_path() if path.exists() else None
-
-    root = W.WORKSPACE_ENV_DIR.rstrip("/")
-    folder = W.environment_folder_of(name)
-    for rel in (
-        f"{folder}/{name}.yml",       # project folder + version-tagged stem
-        f"{folder}/{name}.env.yaml",
-        f"{name}/{name}.yml",         # legacy folder == name
-        f"{name}/{name}.env.yaml",
-        f"{name}.yml",                # legacy flat file
-        f"{name}.env.yaml",
-    ):
-        candidate = f"{root}/{rel}"
-        if DatabricksPath.from_(candidate, client=client).exists():
-            return candidate
-    return None
-
-
 def _resolve_submit_environment(client: DatabricksClient, environment: Any) -> Any:
     """Resolve a one-time-run *environment* argument into a ``JobEnvironment``.
 
-    Accepts:
+    Discovery is owned by :class:`~yggdrasil.databricks.environments.service.Environments`
+    (``dbc.environments``); this only maps its result onto the run's
+    ``JobEnvironment``. Accepts:
 
     - a :class:`JobEnvironment` — returned as-is;
-    - a ``str`` — a seeded serverless **base-environment** name (or a direct
-      workspace path to its ``.yml`` spec), referenced via
-      ``Environment.base_environment`` so the run reuses the shared, cached
-      image present in the workspace;
-    - ``None`` — **auto**, in priority order: the **running client project's**
-      own deployed environment (its ``pyproject.toml`` name/version, when
-      discoverable and seeded); else the seeded **ygg** base environment for the
-      current Python (``ygg-<version>-py3XX``); else ``None`` (the run falls back
-      to the workspace's default serverless compute).
+    - a ``str`` — a seeded serverless **base-environment** stem name (or a direct
+      workspace path to its ``.yml`` spec), reused via ``Environment.base_environment``
+      so the run shares the cached image;
+    - ``None`` — **auto**: the running client project's deployed environment, else
+      the seeded **ygg** base environment for the current Python, else ``None``
+      (the run falls back to the workspace's default serverless compute).
 
     A named environment that can't be found raises :class:`FileNotFoundError`
     — the miss is loud because the caller asked for a specific image.
     """
-    from databricks.sdk.service.compute import Environment
     from databricks.sdk.service.jobs import JobEnvironment
 
     if isinstance(environment, JobEnvironment):
         return environment
 
-    from yggdrasil.databricks.environments import service as W
+    envs = client.environments
 
     if isinstance(environment, str):
-        spec_path = _environment_spec_path(client, environment)
-        if spec_path is None:
+        env = envs.resolve(environment)
+        if env is None or not env.serverless:
+            from yggdrasil.databricks.environments import service as W
             raise FileNotFoundError(
                 f"no serverless base environment {environment!r} found under "
                 f"{W.WORKSPACE_ENV_DIR} (deploy one with `ygg databricks deploy`, "
                 f"pass a workspace path to its .yml, or a JobEnvironment)."
             )
-        return JobEnvironment(
-            environment_key="default",
-            spec=Environment(base_environment=spec_path),
-        )
+        return env.job_environment()
 
-    # ``None`` → auto. Prefer the running client project's own deployed env, then
-    # the seeded ygg base env, then the workspace default serverless compute.
-    spec_path = _client_project_spec_path(client)
-    if spec_path is not None:
-        LOGGER.info("defaulting to client project environment %s", spec_path)
-        return JobEnvironment(
-            environment_key="default",
-            spec=Environment(base_environment=spec_path),
-        )
-
-    name = W.environment_stem("ygg")
-    spec_path = _environment_spec_path(client, name)
-    if spec_path is None:
+    # ``None`` → auto: client project, then seeded ygg, then workspace default.
+    env = envs.resolve()
+    if env is None or not env.serverless:
         LOGGER.debug(
-            "no client-project or seeded ygg base environment (%s) under %s — "
+            "no client-project or seeded ygg base environment found — "
             "submitting on the workspace default serverless compute",
-            name, W.WORKSPACE_ENV_DIR,
         )
         return None
-    return JobEnvironment(
-        environment_key="default",
-        spec=Environment(base_environment=spec_path),
-    )
-
-
-def _client_project_spec_path(client: DatabricksClient) -> str | None:
-    """Resolve the **running client project's** deployed base-environment spec.
-
-    Discovers the caller's ``pyproject.toml`` (walking up from the cwd) and, from
-    its ``[project].name`` / ``version``, builds the version-tagged environment
-    stem for the local Python and looks it up under
-    :data:`~yggdrasil.databricks.environments.service.WORKSPACE_ENV_DIR`. Returns the spec
-    path when that project environment is deployed, else ``None`` — so a job run
-    from inside a project tree defaults to *that* project's image. Best-effort:
-    any failure (no pyproject, unreadable metadata) yields ``None`` and the
-    caller falls back to the ygg base environment.
-    """
-    from yggdrasil.databricks.environments import service as W
-
-    try:
-        meta = W.read_pyproject(W.find_pyproject())
-        stem = W.environment_stem(meta["name"], version=meta["version"])
-    except Exception:  # noqa: BLE001 — no/unreadable pyproject → no project default
-        return None
-    return _environment_spec_path(client, stem)
+    LOGGER.info("defaulting to base environment %s", env.serverless)
+    return env.job_environment()
 
 
 def _check_permission(

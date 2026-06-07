@@ -169,8 +169,9 @@ class TestCreateNotebook:
 class TestRunNotebook:
 
     def test_submits_notebook_task_with_string_params(self, workspace, client, service) -> None:
-        # No seeded environment present → auto-resolution finds nothing.
+        # No seeded environment present → auto-resolution (dbc.environments) finds nothing.
         workspace.workspace.get_status.side_effect = NotFound()
+        client.environments.resolve.return_value = None
         submitted = SimpleNamespace(run_id=555)
         workspace.jobs.submit.return_value = submitted
         workspace.jobs.get_run.return_value = SimpleNamespace(
@@ -192,6 +193,7 @@ class TestRunNotebook:
 
     def test_no_params_sends_none(self, workspace, client, service) -> None:
         workspace.workspace.get_status.side_effect = NotFound()
+        client.environments.resolve.return_value = None
         workspace.jobs.submit.return_value = SimpleNamespace(run_id=1)
         workspace.jobs.get_run.return_value = SimpleNamespace(
             run_id=1, job_id=None, run_page_url=None, state=None,
@@ -215,8 +217,13 @@ class TestRunNotebook:
         assert kwargs["environments"] is None
 
     def test_named_environment_resolves_base_environment(self, workspace, client, service) -> None:
-        # Every workspace path "exists" → the named env's .yml resolves.
-        workspace.workspace.get_status.return_value = _file_status(1)
+        from yggdrasil.databricks.environments.environment import Environment
+
+        # Discovery is owned by dbc.environments; run_notebook just wires its result.
+        spec = "/Workspace/Shared/environment/meteologica/1.0.0/meteologica-1.0.0-py311.yml"
+        client.environments.resolve.return_value = Environment(
+            name="meteologica-1.0.0-py311", serverless=spec,
+        )
         workspace.jobs.submit.return_value = SimpleNamespace(run_id=7)
         workspace.jobs.get_run.return_value = SimpleNamespace(
             run_id=7, job_id=None, run_page_url=None, state=None,
@@ -227,40 +234,32 @@ class TestRunNotebook:
         )
         p.run_notebook({"category": "wind"}, environment="meteologica", wait=False)
 
+        # The named env is resolved through the centralized service…
+        client.environments.resolve.assert_called_once_with("meteologica")
         kwargs = workspace.jobs.submit.call_args.kwargs
         (env,) = kwargs["environments"]
-        # A bare named env (no version/py tag) keeps the <name>/<name>.yml layout.
-        assert (
-            env.spec.base_environment
-            == "/Workspace/Shared/environment/meteologica/meteologica.yml"
-        )
-        # The task is wired to the resolved environment's key.
+        assert env.spec.base_environment == spec
+        # …and the task is wired to the resolved environment's key.
         (task,) = kwargs["tasks"]
         assert task.environment_key == env.environment_key
 
     def test_auto_environment_uses_seeded_ygg_env(self, workspace, client, service) -> None:
-        from yggdrasil.databricks.environments.service import (
-            WORKSPACE_ENV_DIR,
-            environment_folder,
-            environment_stem,
-        )
+        from yggdrasil.databricks.environments.environment import Environment
 
-        workspace.workspace.get_status.return_value = _file_status(1)  # seeded
+        # ``environment=None`` → auto: dbc.environments.resolve() with no reference.
+        spec = "/Workspace/Shared/environment/ygg/0.8.58/ygg-0.8.58-py311.yml"
+        client.environments.resolve.return_value = Environment(
+            name="ygg-0.8.58-py311", serverless=spec,
+        )
         workspace.jobs.submit.return_value = SimpleNamespace(run_id=8)
         workspace.jobs.get_run.return_value = SimpleNamespace(
             run_id=8, job_id=None, run_page_url=None, state=None,
         )
         p = WorkspacePath("/Workspace/Shared/etl", service=service)
         p.run_notebook(wait=False)
+        client.environments.resolve.assert_called_once_with()
         (env,) = workspace.jobs.submit.call_args.kwargs["environments"]
-        # Project-folder layout: environment/<proj>/<proj>-<version>-py3XX.yml.
-        # (Running inside the ygg repo, the client-project default resolves to the
-        # same ygg image.)
-        name = environment_stem('ygg')
-        assert (
-            env.spec.base_environment
-            == f"{WORKSPACE_ENV_DIR}/{environment_folder('ygg')}/{name}.yml"
-        )
+        assert env.spec.base_environment == spec
 
 
 class TestWrite:

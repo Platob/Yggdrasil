@@ -274,6 +274,45 @@ class Environments(DatabricksService):
         return self.create(project, ver, python=python, extras=extras,
                           workspace_dir=workspace_dir, overwrite=False)
 
+    def client_project(self, *, workspace_dir: "str | None" = None) -> "Optional[Environment]":
+        """The **running client project's** deployed environment — discovered
+        from the nearest ``pyproject.toml`` (walking up from the cwd), matched by
+        its ``[project].name`` / ``version`` for the local Python. ``None`` when
+        there's no pyproject or its environment isn't deployed (best-effort)."""
+        try:
+            meta = read_pyproject(find_pyproject())
+        except Exception:  # noqa: BLE001 — no/unreadable pyproject → no project default
+            return None
+        return self.get(meta["name"], meta["version"], workspace_dir=workspace_dir)
+
+    def resolve(self, ref: "str | None" = None, *,
+                workspace_dir: "str | None" = None) -> "Optional[Environment]":
+        """Resolve a base-environment *reference* to a deployed :class:`Environment`.
+
+        - a ``str`` carrying a ``/`` or a ``.yml`` / ``.yaml`` suffix — a **direct
+          workspace path** to a serverless spec (``None`` when it's absent);
+        - any other ``str`` — a deployed **stem name** (``ygg-<version>-py3XX``),
+          looked up among :meth:`list`;
+        - ``None`` — **auto**: the running :meth:`client_project`, else the ``ygg``
+          base environment for the current Python, else ``None``.
+        """
+        from ..path import DatabricksPath
+
+        if isinstance(ref, str) and ("/" in ref or ref.endswith((".yml", ".yaml"))):
+            path = DatabricksPath.from_(ref, client=self.client)
+            if not path.exists():
+                return None
+            full = path.full_path()
+            name = full.rsplit("/", 1)[-1].removesuffix(".yaml").removesuffix(".yml").removesuffix(".env")
+            return Environment(self, name=name, env_dir=full.rsplit("/", 1)[0], serverless=full)
+        if isinstance(ref, str):
+            for env in self.list(workspace_dir=workspace_dir):
+                if env.name == ref:
+                    return env
+            return None
+        return (self.client_project(workspace_dir=workspace_dir)
+                or self.get("ygg", workspace_dir=workspace_dir))
+
     # -- delete ------------------------------------------------------------
     def delete(self, project: "str | Path" = "ygg", version=None, *,
                workspace_dir: "str | None" = None) -> "list[Environment]":
