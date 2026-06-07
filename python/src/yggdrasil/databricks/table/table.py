@@ -3751,6 +3751,37 @@ class Table(DatabricksPath):
 
         return infos.storage_location
 
+    def external_location(self, *, refresh: bool = False) -> "Any | None":
+        """The Unity Catalog **external location** governing this table's
+        backing storage — the most specific one whose URL the table's
+        ``storage_location`` sits under (longest-prefix match over the cached
+        external-location list, :meth:`ExternalLocations.find_url`) — or
+        ``None`` when the table has no resolvable storage or no accessible
+        location covers it (e.g. a MANAGED table on governed
+        ``__unitystorage``). Never raises."""
+        loc = self.storage_location
+        if not loc:
+            return None
+        try:
+            return self.client.external_locations.find_url(loc, refresh=refresh)
+        except Exception as exc:  # noqa: BLE001 — listing is best-effort
+            logger.debug("external-location lookup failed for %r: %s", self, exc)
+            return None
+
+    def can_read(self, *, refresh: bool = False) -> bool:
+        """Global precheck — can this table's storage be **read** directly at
+        the cloud layer (bypassing the warehouse)? ``True`` when an accessible
+        external location covers it. Cheap and cached (no per-object probe) —
+        gate :meth:`delta` / :meth:`storage_path` bulk work on it."""
+        return self.external_location(refresh=refresh) is not None
+
+    def can_write(self, *, refresh: bool = False) -> bool:
+        """Global precheck — can this table's storage be **written** directly at
+        the cloud layer? ``True`` when a covering external location exists and
+        is not read-only."""
+        el = self.external_location(refresh=refresh)
+        return el is not None and not el.read_only
+
     def storage_path(self, *, write: "bool | None" = None) -> "Path | None":
         """Return the table's backing storage as an addressable :class:`Path`.
 

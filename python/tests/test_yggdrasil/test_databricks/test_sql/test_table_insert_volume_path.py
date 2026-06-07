@@ -144,6 +144,49 @@ class TestStagingVolume:
         assert loc == "s3://bkt/apps/team/_ygg_staging/volumes/tid-1"
 
 
+class TestTableAccessPrecheck:
+    """``Table.external_location`` / ``can_read`` / ``can_write`` — the cheap,
+    cached, external-location-governed read/write precheck (direct cloud
+    access, bypassing the warehouse)."""
+
+    def _infos(self, loc="s3://bkt/apps/team/tbl"):
+        from types import SimpleNamespace
+        return SimpleNamespace(storage_location=loc, table_id="tid-1")
+
+    def test_read_and_write_when_a_writable_location_covers(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        el = MagicMock(read_only=False)
+        tbl.service.client.external_locations.find_url.return_value = el
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            assert tbl.external_location() is el
+            assert tbl.can_read() is True
+            assert tbl.can_write() is True
+        tbl.service.client.external_locations.find_url.assert_called_with(
+            "s3://bkt/apps/team/tbl", refresh=False)
+
+    def test_read_only_location_blocks_write(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=True)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            assert tbl.can_read() is True
+            assert tbl.can_write() is False
+
+    def test_no_covering_location_means_no_direct_access(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = None
+        with patch.object(Table, "read_infos", return_value=self._infos("s3://bkt/__unitystorage/x")):
+            assert tbl.external_location() is None
+            assert tbl.can_read() is False
+            assert tbl.can_write() is False
+
+    def test_no_storage_location_is_safe_and_skips_lookup(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        with patch.object(Table, "read_infos", return_value=None):
+            assert tbl.external_location() is None
+            assert tbl.can_read() is False
+        tbl.service.client.external_locations.find_url.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Mocking — arrow_insert routes through insert_volume_path
 # ---------------------------------------------------------------------------

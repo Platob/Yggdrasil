@@ -300,6 +300,41 @@ class Volume(DatabricksPath):
             logger.debug("external storage root unavailable for %r: %s", self, exc)
             return None
 
+    # ── access precheck (external-location governed) ────────────────────────────
+
+    def external_location(self, *, refresh: bool = False) -> "Any | None":
+        """The Unity Catalog **external location** governing this volume's
+        backing storage — the most specific one whose URL the volume's
+        ``storage_location`` sits under (longest-prefix match over the cached
+        external-location list, :meth:`ExternalLocations.find_url`) — or
+        ``None`` when the volume has no resolvable storage or no accessible
+        location covers it. Never raises."""
+        try:
+            loc = self.storage_location
+        except Exception:
+            return None
+        if not loc:
+            return None
+        try:
+            return self.client.external_locations.find_url(loc, refresh=refresh)
+        except Exception as exc:  # noqa: BLE001 — listing is best-effort
+            logger.debug("external-location lookup failed for %r: %s", self, exc)
+            return None
+
+    def can_read(self, *, refresh: bool = False) -> bool:
+        """Global precheck — can this volume's storage be **read** at the cloud
+        layer? ``True`` when an accessible external location covers it. Cheap
+        and cached (no per-object probe); use it to gate bulk work before
+        paying for the first I/O."""
+        return self.external_location(refresh=refresh) is not None
+
+    def can_write(self, *, refresh: bool = False) -> bool:
+        """Global precheck — can this volume's storage be **written** at the
+        cloud layer? ``True`` when a covering external location exists and is
+        not read-only."""
+        el = self.external_location(refresh=refresh)
+        return el is not None and not el.read_only
+
     # ── identity ──────────────────────────────────────────────────────────────
 
     def full_name(self, safe: str | bool | None = None) -> str:

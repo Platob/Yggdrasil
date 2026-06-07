@@ -2453,6 +2453,49 @@ class TestVolumeCreateExternalLocationGate:
         assert uc.create.call_args.kwargs["storage_location"] == "s3://bkt/x"
 
 
+class TestVolumeAccessPrecheck:
+    """``Volume.external_location`` / ``can_read`` / ``can_write`` — the cheap,
+    cached, external-location-governed read/write precheck."""
+
+    def _vol(self, *, loc="s3://bkt/x"):
+        from yggdrasil.databricks.volume.volume import Volume
+        svc = MagicMock()
+        vol = Volume(service=svc, catalog_name="c", schema_name="s", volume_name="v")
+        vol._infos = _volume_info(storage_location=loc) if loc else None
+        vol._infos_fetched_at = time.time()
+        return vol, svc
+
+    def test_read_and_write_when_a_writable_location_covers(self) -> None:
+        vol, svc = self._vol()
+        el = MagicMock(read_only=False)
+        svc.client.external_locations.find_url.return_value = el
+        assert vol.external_location() is el
+        assert vol.can_read() is True
+        assert vol.can_write() is True
+        svc.client.external_locations.find_url.assert_called_with("s3://bkt/x", refresh=False)
+
+    def test_read_only_location_blocks_write(self) -> None:
+        vol, svc = self._vol()
+        svc.client.external_locations.find_url.return_value = MagicMock(read_only=True)
+        assert vol.can_read() is True
+        assert vol.can_write() is False
+
+    def test_no_covering_location_means_no_direct_access(self) -> None:
+        vol, svc = self._vol()
+        svc.client.external_locations.find_url.return_value = None
+        assert vol.external_location() is None
+        assert vol.can_read() is False
+        assert vol.can_write() is False
+
+    def test_no_storage_location_is_safe_and_skips_lookup(self) -> None:
+        from yggdrasil.databricks.volume.volume import Volume
+        vol, svc = self._vol(loc=None)
+        with patch.object(Volume, "read_info", return_value=None):
+            assert vol.external_location() is None
+            assert vol.can_read() is False
+        svc.client.external_locations.find_url.assert_not_called()
+
+
 class TestLooksLikePermissionDenied:
     def test_stdlib_permission_error(self) -> None:
         from yggdrasil.databricks.fs.volume_path import _looks_like_permission_denied
