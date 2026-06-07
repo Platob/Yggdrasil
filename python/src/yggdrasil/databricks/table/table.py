@@ -3119,18 +3119,19 @@ class Table(DatabricksPath):
 
         Args:
             source: Cloud path Auto Loader watches (``s3://…`` / ``/Volumes/…``).
-                ``None`` (default) uses this table's dedicated staging volume
-                (:attr:`staging_volume` ``/ STAGE_SUBPATH``), which resolves to
-                the volume's direct cloud-storage path (``s3://…``) when the
-                volume is EXTERNAL and reachable, else the governed Files-API
-                ``/Volumes/…`` path — so files staged there are ingested with no
-                explicit wiring.
+                ``None`` (default) uses this table's dedicated staging volume as
+                the governed ``/Volumes/<cat>/<sch>/<vol>/STAGE_SUBPATH`` path —
+                on-cluster ``cloudFiles`` reads it through Unity Catalog's own
+                optimized access, so it works for managed *and* external staging
+                volumes. (Uploads via :meth:`stage_insert` still take the direct
+                cloud-storage fast path when the volume is external.) Files staged
+                there are ingested with no explicit wiring.
             name: Job name override (default ``[YGG][AUTOLOADER] <full_name>``).
             file_format: ``cloudFiles.format`` (parquet / json / csv / avro / …).
             checkpoint: Streaming checkpoint + schema location. ``None`` (default)
                 on the zero-config path (when *source* also defaults) co-locates
-                it with the staging area on the same staging volume
-                (:attr:`staging_volume` ``/ CHECKPOINT_SUBPATH``) — kept off a
+                it with the staging area on the same staging volume — the
+                governed ``/Volumes/…/CHECKPOINT_SUBPATH`` path — kept off a
                 MANAGED *table*'s own governed ``__unitystorage`` storage, which
                 Unity Catalog forbids Auto Loader from writing into. With an
                 explicit *source*, ``None`` instead lets the on-cluster step
@@ -3196,22 +3197,23 @@ class Table(DatabricksPath):
 
         if source is None:
             # Zero-config path: both the watched source and the streaming
-            # checkpoint live on this table's dedicated **staging volume**.
-            # ``staging_volume / SUBPATH`` resolves to the volume's direct
-            # cloud-storage path (``s3://…``) when the volume is EXTERNAL and
-            # reachable — optimal for ``cloudFiles`` + the file-arrival trigger
-            # — and to the governed Files-API ``/Volumes/…`` path otherwise (a
-            # managed staging volume, still watchable + writable from the
-            # cluster). The checkpoint sits beside the staged data under
-            # ``.staging/`` (a sibling of the watched ``data/`` dir so it's
-            # never re-ingested). Either way this stays on the staging volume,
-            # so a MANAGED *table*'s own governed ``__unitystorage`` location
-            # — which Unity Catalog forbids Auto Loader from writing into
-            # (``LOCATION_OVERLAP`` on ``CheckPathAccess``) — is never touched.
+            # checkpoint live on this table's dedicated **staging volume**, as
+            # the governed ``/Volumes/<cat>/<sch>/<vol>/…`` path
+            # (:meth:`Volume.path`, NOT the ``/`` operator — which would resolve
+            # to a raw ``s3://`` URL for an external volume). On-cluster
+            # ``cloudFiles`` + the file-arrival trigger read the volume path
+            # through Unity Catalog's own optimized access, so it works for both
+            # managed and external staging volumes; the upload side
+            # (:meth:`stage_insert`) still takes the direct-S3 fast path when the
+            # volume is external. The checkpoint sits beside the staged data
+            # under ``.staging/`` (a sibling of the watched ``data/`` dir so it's
+            # never re-ingested), keeping a MANAGED *table*'s governed
+            # ``__unitystorage`` location (which UC forbids Auto Loader from
+            # writing into) untouched.
             self.staging_volume.get_or_create()
-            source = (self.staging_volume / self.STAGE_SUBPATH).full_path()
+            source = self.staging_volume.path(self.STAGE_SUBPATH).full_path()
             if checkpoint is None:
-                checkpoint = (self.staging_volume / self.CHECKPOINT_SUBPATH).full_path()
+                checkpoint = self.staging_volume.path(self.CHECKPOINT_SUBPATH).full_path()
 
         if file_arrival and trigger is None:
             from databricks.sdk.service.jobs import (
