@@ -69,6 +69,10 @@ __all__ = ["Volume"]
 
 logger = logging.getLogger(__name__)
 
+#: Sentinel for "external location not yet resolved" — distinct from a resolved
+#: ``None`` (no accessible location covers this volume).
+_UNRESOLVED: Any = object()
+
 
 class Volume(DatabricksPath):
     """A single Unity Catalog volume — metadata, credentials, storage path.
@@ -217,6 +221,10 @@ class Volume(DatabricksPath):
         # :meth:`VolumePath.storage_path`.
         self._external_readable: Optional[bool] = None
         self._external_writable: Optional[bool] = None
+        # Memoised covering external location (resolved once, reused by
+        # ``external_location`` / ``can_read`` / ``can_write``). ``_UNRESOLVED``
+        # until first looked up; a resolved value may legitimately be ``None``.
+        self._external_location: Any = _UNRESOLVED
         self._initialized = True
 
     # ── direct-storage access cache ─────────────────────────────────────────────
@@ -309,18 +317,28 @@ class Volume(DatabricksPath):
         ``storage_location`` sits under (longest-prefix match over the cached
         external-location list, :meth:`ExternalLocations.find_url`) — or
         ``None`` when the volume has no resolvable storage or no accessible
-        location covers it. Never raises."""
+        location covers it. Never raises.
+
+        **Memoised on the volume**: resolved once and reused (a resolved
+        ``None`` is cached too), so repeated ``external_location`` / ``can_read``
+        / ``can_write`` calls don't re-walk the location list. ``refresh=True``
+        re-resolves (and re-lists); the memo is dropped on any info refresh /
+        rebind (:meth:`_store_infos` / :meth:`_reset_cache`)."""
+        if not refresh and self._external_location is not _UNRESOLVED:
+            return self._external_location
         try:
             loc = self.storage_location
         except Exception:
-            return None
-        if not loc:
-            return None
-        try:
-            return self.client.external_locations.find_url(loc, refresh=refresh)
-        except Exception as exc:  # noqa: BLE001 — listing is best-effort
-            logger.debug("external-location lookup failed for %r: %s", self, exc)
-            return None
+            loc = None
+        result: ExternalLocation | None = None
+        if loc:
+            try:
+                result = self.client.external_locations.find_url(loc, refresh=refresh)
+            except Exception as exc:  # noqa: BLE001 — listing is best-effort
+                logger.debug("external-location lookup failed for %r: %s", self, exc)
+                result = None
+        self._external_location = result
+        return result
 
     def can_read(self, *, refresh: bool = False) -> bool:
         """Global precheck — can this volume's storage be **read** at the cloud
@@ -500,6 +518,7 @@ class Volume(DatabricksPath):
         self._storage_paths = {}
         self._catalog = None
         self._schema = None
+        self._external_location = _UNRESOLVED
         self._initialized = True
 
     # ── cache management ──────────────────────────────────────────────────────
@@ -519,9 +538,10 @@ class Volume(DatabricksPath):
             float(fetched_at) if fetched_at is not None else time.time()
         )
         # Storage location may have shifted (external volume rebind);
-        # drop the cached Path so the next call resolves against the
-        # fresh URL.
+        # drop the cached Path + memoised external location so the next call
+        # resolves against the fresh URL.
         self._storage_paths = {}
+        self._external_location = _UNRESOLVED
         # A successful info fetch proves the volume exists — seed the stat
         # cache (a volume is directory-like) in the same beat so a follow-up
         # ``exists`` / ``stat`` / ``is_dir`` reuses it instead of re-probing.
@@ -538,6 +558,7 @@ class Volume(DatabricksPath):
         self._storage_paths = {}
         self._catalog = None
         self._schema = None
+        self._external_location = _UNRESOLVED
         # The info and the stat snapshot describe the same object — drop
         # them together so a re-probe after a delete / rebind is honest.
         self._stat_cached = None

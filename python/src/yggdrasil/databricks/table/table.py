@@ -152,6 +152,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+#: Sentinel for "external location not yet resolved" — distinct from a resolved
+#: ``None`` (no accessible location covers this table).
+_UNRESOLVED: Any = object()
+
 _INVALID_COL_CHARS = set(" ,;{}()\n\t=")
 
 # URL path / free-text → identifier: collapse anything outside ``[0-9A-Za-z]``
@@ -801,6 +805,9 @@ class Table(DatabricksPath):
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
         self._staging_volume: Volume | None = None
+        # Memoised covering external location (reused by ``external_location`` /
+        # ``can_read`` / ``can_write``); ``_UNRESOLVED`` until first looked up.
+        self._external_location: Any = _UNRESOLVED
         self._initialized = True
 
     # ------------------------------------
@@ -1502,6 +1509,9 @@ class Table(DatabricksPath):
         """Populate the ``infos`` + ``columns`` caches."""
         self._infos_fetched_at = time.time()
         self._infos = infos
+        # Storage location may have shifted — drop the memoised external
+        # location so the next precheck resolves against the fresh URL.
+        self._external_location = _UNRESOLVED
         self._columns = [
             Column.from_api(table=self, infos=col_info)
             for col_info in (infos.columns or [])
@@ -3759,15 +3769,24 @@ class Table(DatabricksPath):
         external-location list, :meth:`ExternalLocations.find_url`) — or
         ``None`` when the table has no resolvable storage or no accessible
         location covers it (e.g. a MANAGED table on governed
-        ``__unitystorage``). Never raises."""
+        ``__unitystorage``). Never raises.
+
+        **Memoised on the table**: resolved once and reused (a resolved ``None``
+        is cached too) so repeated precheck calls don't re-walk the location
+        list. ``refresh=True`` re-resolves; the memo is dropped on any info
+        refresh (:meth:`_store_infos`)."""
+        if not refresh and self._external_location is not _UNRESOLVED:
+            return self._external_location
         loc = self.storage_location
-        if not loc:
-            return None
-        try:
-            return self.client.external_locations.find_url(loc, refresh=refresh)
-        except Exception as exc:  # noqa: BLE001 — listing is best-effort
-            logger.debug("external-location lookup failed for %r: %s", self, exc)
-            return None
+        result: ExternalLocation | None = None
+        if loc:
+            try:
+                result = self.client.external_locations.find_url(loc, refresh=refresh)
+            except Exception as exc:  # noqa: BLE001 — listing is best-effort
+                logger.debug("external-location lookup failed for %r: %s", self, exc)
+                result = None
+        self._external_location = result
+        return result
 
     def can_read(self, *, refresh: bool = False) -> bool:
         """Global precheck — can this table's storage be **read** directly at

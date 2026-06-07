@@ -186,6 +186,38 @@ class TestTableAccessPrecheck:
             assert tbl.can_read() is False
         tbl.service.client.external_locations.find_url.assert_not_called()
 
+    def test_external_location_is_memoised(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            tbl.external_location()
+            tbl.external_location()
+            tbl.can_read()
+            tbl.can_write()
+        tbl.service.client.external_locations.find_url.assert_called_once()
+
+    def test_refresh_re_resolves(self) -> None:
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            tbl.external_location()
+            tbl.external_location(refresh=True)
+        assert tbl.service.client.external_locations.find_url.call_count == 2
+
+    def test_info_refresh_drops_the_memo(self) -> None:
+        from types import SimpleNamespace
+        tbl = _table("cat", "sch", "tbl")
+        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        with patch.object(Table, "read_infos", return_value=self._infos()):
+            tbl.external_location()
+        # A fresh info store drops the memo → next lookup re-resolves.
+        tbl._store_infos(SimpleNamespace(
+            storage_location="s3://bkt/x", table_id="tid-1", columns=[],
+        ))
+        with patch.object(Table, "read_infos", return_value=self._infos("s3://bkt/x")):
+            tbl.external_location()
+        assert tbl.service.client.external_locations.find_url.call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # Mocking — arrow_insert routes through insert_volume_path

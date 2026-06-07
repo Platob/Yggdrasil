@@ -2495,6 +2495,31 @@ class TestVolumeAccessPrecheck:
             assert vol.can_read() is False
         svc.client.external_locations.find_url.assert_not_called()
 
+    def test_external_location_is_memoised(self) -> None:
+        vol, svc = self._vol()
+        svc.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        vol.external_location()
+        vol.external_location()
+        vol.can_read()
+        vol.can_write()
+        # Resolved once, reused — no re-walking the location list.
+        svc.client.external_locations.find_url.assert_called_once()
+
+    def test_refresh_re_resolves(self) -> None:
+        vol, svc = self._vol()
+        svc.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        vol.external_location()
+        vol.external_location(refresh=True)
+        assert svc.client.external_locations.find_url.call_count == 2
+
+    def test_info_refresh_drops_the_memo(self) -> None:
+        vol, svc = self._vol()
+        svc.client.external_locations.find_url.return_value = MagicMock(read_only=False)
+        vol.external_location()
+        vol._store_infos(_volume_info(storage_location="s3://bkt/x"))
+        vol.external_location()
+        assert svc.client.external_locations.find_url.call_count == 2
+
 
 class TestVolumePathAccessPrecheckDelegation:
     """``VolumePath`` surfaces the volume's external-location precheck."""
