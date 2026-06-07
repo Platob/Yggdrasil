@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.environments.environment import Environment
 from yggdrasil.databricks.environments.service import Environments
+from yggdrasil.version import VersionInfo
 
 
 def _service() -> Environments:
@@ -54,6 +55,45 @@ class TestResolveNamedStem:
         svc = _service()
         with patch.object(svc, "list", return_value=[]):
             assert svc.resolve("ghost-9.9.9-py311") is None
+
+
+class TestResolveByProjectName:
+    def test_project_name_resolves_latest_version(self) -> None:
+        # ``environment="meteologica"`` (a project name, not a version-tagged stem)
+        # → the latest deployed version for the current Python.
+        from yggdrasil.databricks.environments.service import environment_stem
+        from yggdrasil.databricks.wheels.service import environment_key_for
+
+        svc = _service()
+        key = environment_key_for()                     # the local interpreter's py3XX
+        old = Environment(name=f"meteologica-1.0.0-{key}",
+                          project="meteologica", version=VersionInfo(1, 0, 0),
+                          serverless="/ws/meteologica-1.0.0.yml")
+        new = Environment(name=f"meteologica-1.2.0-{key}",
+                          project="meteologica", version=VersionInfo(1, 2, 0),
+                          serverless="/ws/meteologica-1.2.0.yml")
+        with patch.object(svc, "list", return_value=[old, new]):
+            # The bare project name isn't an exact stem, so it falls through to a
+            # by-folder lookup that returns the highest version.
+            resolved = svc.resolve("meteologica")
+        assert resolved is new
+        assert str(environment_stem("meteologica", version="1.2.0")) == new.name
+
+    def test_project_name_filters_to_current_python(self) -> None:
+        from yggdrasil.databricks.wheels.service import environment_key_for
+
+        svc = _service()
+        key = environment_key_for()
+        other = "py399" if key != "py399" else "py398"   # a Python that isn't local
+        match = Environment(name=f"meteologica-2.0.0-{key}", project="meteologica",
+                            version=VersionInfo(2, 0, 0), serverless="/ws/m2.yml")
+        with patch.object(svc, "list", return_value=[
+            # A newer version built for a *different* Python must not be picked.
+            Environment(name=f"meteologica-9.9.9-{other}", project="meteologica",
+                        version=VersionInfo(9, 9, 9), serverless="/ws/m999.yml"),
+            match,
+        ]):
+            assert svc.resolve("meteologica") is match
 
 
 class TestResolveAuto:
