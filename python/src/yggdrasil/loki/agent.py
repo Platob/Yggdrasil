@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 from . import skill as _skill
@@ -34,7 +35,60 @@ if TYPE_CHECKING:
     from .engine import TokenEngine
     from .tools import Toolbox
 
-__all__ = ["Loki", "ROUTES"]
+__all__ = ["Loki", "ROUTES", "ActStep", "ActResult"]
+
+
+class _Mapping:
+    """Mapping compatibility for a dataclass — ``obj["x"]`` / ``obj.get("x")`` —
+    so the typed result drops in where the old plain dict was read (mirrors
+    :class:`~yggdrasil.loki.planning.AgentPlan`).
+
+    Declares empty ``__slots__`` so a ``slots=True`` subclass keeps its slots
+    (a non-slotted base would re-introduce a per-instance ``__dict__``)."""
+
+    __slots__ = ()
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError as exc:
+            raise KeyError(key) from exc
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ActStep(_Mapping):
+    """One turn of the autonomous loop — a tool call (or the final ``done``)."""
+
+    n: int
+    thought: str = ""
+    tool: str = ""
+    args: dict[str, Any] = field(default_factory=dict)
+    observation: str = ""
+    done: bool = False
+    answer: str = ""
+
+
+@dataclass(slots=True)
+class ActResult(_Mapping):
+    """The transcript of an :meth:`Loki.act` run (typed, mapping-compatible)."""
+
+    task: str
+    engine: str
+    root: str
+    steps: list[ActStep] = field(default_factory=list)
+    answer: str = ""
+    completed: bool = False
+    files_changed: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)                       # asdict recurses into the ActStep list
+        return d
 
 #: Raised when no reasoning engine is reachable (or every one failed in turn).
 _NO_ENGINE = (
@@ -649,7 +703,7 @@ class Loki:
             "summarize what changed and what you ran."
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": f"GOAL: {task}"}]
-        steps: list[dict[str, Any]] = []
+        steps: list[ActStep] = []
         answer, completed = "", False
 
         from .usage import METER
@@ -675,8 +729,8 @@ class Loki:
                 answer = str(decision.get("answer", "")).strip()
                 completed = True
                 if on_step:
-                    on_step({"n": n, "thought": decision.get("thought", ""), "done": True,
-                             "answer": answer})
+                    on_step(ActStep(n=n, thought=decision.get("thought", ""),
+                                    done=True, answer=answer))
                 break
 
             name = decision.get("tool", "")
@@ -684,8 +738,8 @@ class Loki:
             if not isinstance(args, dict):
                 args = {}
             observation = box.call(name, args)
-            record = {"n": n, "thought": decision.get("thought", ""),
-                      "tool": name, "args": args, "observation": observation}
+            record = ActStep(n=n, thought=decision.get("thought", ""),
+                             tool=name, args=args, observation=observation)
             steps.append(record)
             if on_step:
                 on_step(record)
@@ -695,15 +749,15 @@ class Loki:
         else:
             answer = "stopped: reached max_steps without finishing"
 
-        return {
-            "task": task,
-            "engine": eng.name,
-            "root": str(root),
-            "steps": steps,
-            "answer": answer,
-            "completed": completed,
-            "files_changed": list(box.changed),
-        }
+        return ActResult(
+            task=task,
+            engine=eng.name,
+            root=str(root),
+            steps=steps,
+            answer=answer,
+            completed=completed,
+            files_changed=list(box.changed),
+        )
 
     def delegate(
         self,

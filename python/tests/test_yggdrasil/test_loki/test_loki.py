@@ -212,6 +212,26 @@ class TestAgentAct(unittest.TestCase):
         self.assertEqual(len(result["steps"]), 1)
         self.assertEqual((pathlib.Path(self.dir) / "hi.txt").read_text(), "hello loki")
 
+    def test_act_returns_typed_slots_dataclass(self):
+        import json
+
+        from yggdrasil.loki.agent import ActResult, ActStep
+
+        loki, _ = self._loki([
+            json.dumps({"tool": "list_dir", "args": {"path": "."}}),
+            json.dumps({"done": True, "answer": "ok"}),
+        ])
+        res = loki.act("look", root=self.dir, max_steps=4)
+        self.assertIsInstance(res, ActResult)
+        self.assertIsInstance(res.steps[0], ActStep)
+        self.assertFalse(hasattr(res, "__dict__"))       # slots
+        self.assertFalse(hasattr(res.steps[0], "__dict__"))
+        # Attribute access, mapping compatibility, and JSON serialization all work.
+        self.assertEqual(res.completed, res["completed"])
+        self.assertEqual(res.steps[0].tool, res.steps[0]["tool"])
+        self.assertIn("steps", res.to_dict())
+        json.dumps(res.to_dict())
+
     def test_act_can_smoke_test_a_change_as_a_checkpoint(self):
         import json
         import pathlib

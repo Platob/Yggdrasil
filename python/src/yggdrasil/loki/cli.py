@@ -1125,8 +1125,30 @@ def _dispatch_skill(agent: Any, style: Any, skill: str, kwargs: dict) -> str:
     except Exception as exc:
         style.fail(f"{skill}: {exc.args[0] if exc.args else exc}")
         return f"{skill} failed: {exc}"
-    _print_dbx(style, res)
+    # A tabular-shaped result (entsoe and friends) renders through the aligned
+    # frame printer, not the generic key/value dump.
+    if isinstance(res, dict) and skill == "entsoe":
+        _print_entsoe(style, res)
+    else:
+        _print_dbx(style, res)
     return _short(_jsonable(res))
+
+
+def _print_entsoe(style: Any, res: dict) -> None:
+    """Pretty-print an ENTSO-E result — offline hint, or the cached frame."""
+    if not res.get("available"):
+        style.warn(res.get("hint", "ENTSO-E unavailable"))
+        return
+    head = f"{res['series']} · {res['zone']} ({res['eic']})"
+    style.out(f"  {style.good('⚡')} {style.bold(head)} "
+              f"{style.dim('· ' + str(res['rows']) + ' rows')}\n")
+    style.out(style.dim("  " + str(res["preview"]).replace("\n", "\n  ")) + "\n")
+    style.out(f"  {style.good('✎ cached')} {style.dim(res['cached_to'])}\n")
+    if res.get("stored"):
+        style.out(f"  {style.good('✎ stored')} {style.dim(res['stored'])}\n")
+    style.out(f"  {style.bold('next steps')} {style.dim('— reuse · resample · store')}\n")
+    for step in res.get("next_steps", []):
+        style.out(f"    {style.brand('›')} {style.dim(step)}\n")
 
 
 def _print_dbx(style: Any, res: Any) -> None:
@@ -1427,9 +1449,10 @@ def _do(loki: Any, style: Any, args: Any) -> int:
         from yggdrasil.loki.usage import METER
 
         t = METER.total()
-        result["usage"] = {"input_tokens": t.input_tokens, "output_tokens": t.output_tokens,
-                           "total_tokens": t.total_tokens, "cost_usd": round(METER.total_cost, 6)}
-        style.out(_json(result) + "\n")
+        payload = result.to_dict()
+        payload["usage"] = {"input_tokens": t.input_tokens, "output_tokens": t.output_tokens,
+                            "total_tokens": t.total_tokens, "cost_usd": round(METER.total_cost, 6)}
+        style.out(_json(payload) + "\n")
         return 0
 
     style.out("\n")

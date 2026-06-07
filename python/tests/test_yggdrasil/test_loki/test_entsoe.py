@@ -190,6 +190,35 @@ class TestInferAndRouting(unittest.TestCase):
         self.assertEqual(loki.plan("what is electricity").action, "reason")
 
 
+class TestEntsoeRendering(unittest.TestCase):
+    def _render(self, res):
+        import io
+        from contextlib import redirect_stdout
+
+        from yggdrasil.cli import style
+        from yggdrasil.loki import cli
+        style.force_color(False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli._print_entsoe(style, res)
+        return style.strip(buf.getvalue())
+
+    def test_online_result_renders_aligned_frame(self):
+        out = self._render({"available": True, "series": "day_ahead_prices", "zone": "FR",
+                            "eic": "10YFR-RTE------C", "rows": 2,
+                            "preview": "timestamp │ value\n──────────┼──────\n00:00 │ 40.5",
+                            "cached_to": "/c/x.parquet", "stored": None,
+                            "next_steps": ["reuse: …"]})
+        self.assertIn("day_ahead_prices · FR", out)
+        self.assertIn("2 rows", out)
+        self.assertIn("cached", out)
+        self.assertIn("│", out)                          # the frame preview, indented
+
+    def test_offline_shows_hint(self):
+        out = self._render({"available": False, "hint": "set ENTSOE_API_TOKEN"})
+        self.assertIn("ENTSOE_API_TOKEN", out)
+
+
 class TestEntsoeSkill(unittest.TestCase):
     def test_offline_safe_without_token(self):
         from yggdrasil.loki import Loki

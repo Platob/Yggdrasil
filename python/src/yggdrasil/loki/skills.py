@@ -480,7 +480,7 @@ class EntsoeSkill(LokiSkill):
         cdir = pathlib.Path(cache_dir) if cache_dir else (pathlib.Path.home() / ".loki" / "cache")
         cdir.mkdir(parents=True, exist_ok=True)
         eic = entsoe.resolve_zone(zone)
-        key = f"entsoe-{series}-{re.sub(r'[^0-9A-Za-z]+', '-', zone).strip('-').lower()}-{eic[-6:]}"
+        key = f"entsoe-{series}-{re.sub(r'[^0-9A-Za-z]+', '-', zone).strip('-').lower()}"
         cached_to = cdir / f"{key}.parquet"
         IO.from_(str(cached_to)).write_polars_frame(df)
 
