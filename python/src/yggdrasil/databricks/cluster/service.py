@@ -525,7 +525,7 @@ class Clusters(DatabricksService):
         ``ygg databricks deploy``. Resolves the existing cluster (no creation);
         ``None`` when it isn't deployed unless *raise_error*. The cluster sibling
         of ``dbc.environments.default()`` / ``warehouses.default()``."""
-        name = self.client.product_name or "Ygg"
+        name = self.client.product_name or "Yggdrasil"
         return self.find_cluster(cluster_name=name, raise_error=raise_error)
 
     def find_cluster(

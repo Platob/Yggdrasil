@@ -1114,18 +1114,15 @@ class DatabricksClient(Singleton, URLBased):
 
     @property
     def product_name(self) -> Optional[str]:
-        """A nice, capitalized display name for the client :attr:`project`,
-        **canonicalized through the distribution alias** so a project is named the
-        same no matter which alias it's referenced by — ``yggdrasil`` and ``ygg``
-        both display as ``Ygg`` (``my-app`` → ``My App``); ``None`` when unset. The
-        project's default warehouse and cluster are named for this, and
-        ``ygg databricks deploy`` provisions them under the same name — so
-        :meth:`compute.clusters.default <…>` resolves the deployed cluster whether
-        the client was bound by the name or its PyPI alias."""
-        from yggdrasil.databricks.wheels.service import distribution_for, project_display_name
+        """A nice, capitalized display name for the client :attr:`project` — the
+        **real project name** (``yggdrasil`` → ``Yggdrasil``, ``my-app`` → ``My
+        App``), or ``None`` when unset. The project's default warehouse and cluster
+        are named for this. The ``ygg`` PyPI alias is not applied here — it belongs
+        to the wheel / distribution layer, not the project's identity."""
+        from yggdrasil.databricks.wheels.service import project_display_name
 
         project = self.project
-        return project_display_name(distribution_for(project)) if project else None
+        return project_display_name(project) if project else None
 
     #: ``project_name`` is the same display name under the project vocabulary —
     #: :attr:`product` and :attr:`project` name one thing, so do their displays.

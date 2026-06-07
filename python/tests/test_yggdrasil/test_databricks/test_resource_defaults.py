@@ -76,9 +76,9 @@ class TestClustersDefault:
             assert svc.default() is sentinel
             fc.assert_called_once_with(cluster_name="Meteologica", raise_error=False)
 
-    def test_defaults_to_ygg_display_when_no_project(self) -> None:
+    def test_defaults_to_real_name_when_no_project(self) -> None:
         svc = Clusters(client=MagicMock())
         svc.client.product_name = None
         with patch.object(svc, "find_cluster", return_value=None) as fc:
             assert svc.default() is None
-            fc.assert_called_once_with(cluster_name="Ygg", raise_error=False)
+            fc.assert_called_once_with(cluster_name="Yggdrasil", raise_error=False)
