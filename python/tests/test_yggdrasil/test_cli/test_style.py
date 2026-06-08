@@ -251,3 +251,31 @@ class TestTrackAwaitable:
         monkeypatch.setattr(style, "_IS_TTY", False)
         with pytest.raises(RuntimeError, match="boom"):
             style.track(self._task(polls=1, fail=True), interval=0)
+
+
+class TestProgressBar:
+    def setup_method(self):
+        style.force_color(False)
+
+    def test_determinate_fills_and_shows_pct(self, monkeypatch, capsys):
+        monkeypatch.setattr(style, "_IS_TTY", True)
+        style.ProgressBar(total=10, label="idx").update(4)
+        out = style.strip(capsys.readouterr().out)
+        assert out.count("█") == int(24 * 0.4)       # 24-wide bar, 40% filled
+        assert "40%" in out and "idx" in out
+
+    def test_frac_directly(self, monkeypatch, capsys):
+        monkeypatch.setattr(style, "_IS_TTY", True)
+        style.ProgressBar(label="x").update(frac=1.0)
+        assert "100%" in style.strip(capsys.readouterr().out)
+
+    def test_indeterminate_has_no_pct(self, monkeypatch, capsys):
+        monkeypatch.setattr(style, "_IS_TTY", True)
+        style.ProgressBar(label="waiting").update()   # no total/frac
+        out = style.strip(capsys.readouterr().out)
+        assert "█" in out and "░" in out and "%" not in out
+
+    def test_noop_off_tty(self, monkeypatch, capsys):
+        monkeypatch.setattr(style, "_IS_TTY", False)
+        style.ProgressBar(total=10).update(5)
+        assert capsys.readouterr().out == ""

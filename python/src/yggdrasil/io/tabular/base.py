@@ -2593,7 +2593,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
         def cell(value: Any) -> str:
             if value is None:
-                text = ""
+                text = "·"                                # nulls read clearly
             elif isinstance(value, (dict, list, tuple)):     # nested → compact
                 text = _compact_nested(value)
             else:
@@ -2621,8 +2621,14 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
 
         lines = [line(header), rule_sep.join("─" * w for w in widths)]
         lines += [line(r) for r in body]
+        lines.append("─┴─".join("─" * w for w in widths))   # closing rule
+        # A footer: the truncation marker, or the shape that was shown.
         if len(rows) >= n:
             lines.append(f"… (first {n} rows)")
+        else:
+            cols = len(columns)
+            lines.append(f"{len(rows)} row{'s' * (len(rows) != 1)} × "
+                         f"{cols} col{'s' * (cols != 1)}")
         return "\n".join(lines)
 
     # ==================================================================

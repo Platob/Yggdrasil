@@ -108,6 +108,25 @@ class TestTabularDisplay(unittest.TestCase):
         # …while the text column stays left-aligned.
         self.assertTrue(lines[2].startswith("Paris"))
 
+    def test_closing_rule_footer_and_nulls(self):
+        try:
+            import polars  # noqa: F401
+        except Exception:
+            self.skipTest("polars not installed")
+        import tempfile
+        from pathlib import Path
+
+        from yggdrasil.io.holder import IO
+
+        p = Path(tempfile.mkdtemp()) / "d.csv"
+        p.write_text("city,pop\nParis,2161\nTokyo,\n")   # Tokyo pop is null
+        lines = IO.from_(str(p)).display().splitlines()
+        # A closing rule (┴) and a shape footer round out the table…
+        self.assertTrue(set(lines[-2]) <= {"─", "┴"})
+        self.assertEqual(lines[-1], "2 rows × 2 cols")
+        # …and a null renders as a clear dot, not blank.
+        self.assertIn("·", "\n".join(lines))
+
     def test_nested_values_are_compacted(self):
         try:
             import polars as pl
