@@ -140,3 +140,42 @@ class TestWarehouseReadOptions:
         table = result.read_arrow_table(columns=["id"])
         assert table.column_names == ["id"]
         assert table.column("id").to_pylist() == list(range(4))
+
+
+class TestWarehousePolarsPandas:
+    """polars / pandas reads funnel through ``_read_arrow_table``, so they
+    inherit the cast-once parallel fetch and the same read options."""
+
+    def test_polars_frame_reads_every_chunk(self) -> None:
+        result, http = _result(8)
+        frame = result.read_polars_frame()
+        assert frame.shape == (8, 2)
+        assert frame["id"].to_list() == list(range(8))
+        assert len(http.fetched) == 8
+
+    def test_polars_frame_honors_row_limit_pushdown(self) -> None:
+        result, http = _result(50)
+        frame = result.read_polars_frame(row_limit=4)
+        assert frame.shape == (4, 2)
+        assert frame["id"].to_list() == [0, 1, 2, 3]
+        assert len(http.fetched) < 50
+
+    def test_polars_frame_column_projection(self) -> None:
+        result, _ = _result(5)
+        frame = result.read_polars_frame(columns=["id"])
+        assert frame.columns == ["id"]
+        assert frame["id"].to_list() == list(range(5))
+
+    def test_pandas_frame_reads_every_chunk(self) -> None:
+        result, http = _result(8)
+        df = result.read_pandas_frame()
+        assert df.shape == (8, 2)
+        assert list(df["id"]) == list(range(8))
+        assert len(http.fetched) == 8
+
+    def test_pandas_frame_honors_row_limit_pushdown(self) -> None:
+        result, http = _result(50)
+        df = result.read_pandas_frame(row_limit=3)
+        assert df.shape == (3, 2)
+        assert list(df["id"]) == [0, 1, 2]
+        assert len(http.fetched) < 50
