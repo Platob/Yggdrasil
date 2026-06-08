@@ -30,7 +30,8 @@ out = saga.scan("users.parquet").filter("score > 80").select("name", "score").re
 |---|---|
 | [`Saga`][yggdrasil.saga.Saga] | Engine facade — parse SQL, live-resolve sources, build/execute lazy plans |
 | [`SagaSession`][yggdrasil.saga.SagaSession] | Local-disk staging area for result spill, auto-cleaned |
-| [`ExecutionResult`][yggdrasil.saga.ExecutionResult] | Lazy, awaitable handle to a plan run — a `Tabular` + `Awaitable` |
+| [`ExecutionResult`][yggdrasil.saga.ExecutionResult] | Lazy, awaitable handle to a plan run (`Tabular` + `Awaitable`); runs the plan as a parallel/sequential graph with `.tree()` / `.display()` |
+| [`LazyTabular`][yggdrasil.saga.LazyTabular] | Alias of `ExecutionResult` — an unstarted plan with the lazy transform builders |
 | [`col`][yggdrasil.saga.col] / [`lit`][yggdrasil.saga.lit] / [`Predicate`][yggdrasil.saga.Predicate] | Expression / predicate AST (`yggdrasil.saga.expr`) |
 | [`parse_sql`][yggdrasil.saga.plan.parse_sql] | Parse a SQL string into an executable plan node |
 | [`SQLQueryParser`][yggdrasil.saga.plan.sql_parser.SQLQueryParser] | The underlying parser |

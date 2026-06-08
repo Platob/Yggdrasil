@@ -22,9 +22,10 @@ metadata as a one-row table (for INSERT / MERGE).
 
 from __future__ import annotations
 
+import dataclasses
 from abc import abstractmethod
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar
 
 import pyarrow as pa
 
@@ -406,6 +407,37 @@ class SelectPlan(ExecutionPlan[O]):
         self._unique_by = self._resample = self._cast_options = self._limit = None
         self._group_by = self._having = self._order_by = self._ctes = self._offset = None
         return self
+
+    # -- Graph inputs ----------------------------------------------------
+
+    def input_tabulars(self) -> list["Tabular"]:
+        """The plan's independent input Tabulars, in graph order.
+
+        These are the leaves a graph executor can materialise in parallel:
+        the bound source, each join's right side, and each union's other
+        side. Reshaping (project / filter / aggregate / order) is the
+        *combine* step that runs once the inputs are ready.
+        """
+        out: list[Tabular] = []
+        if self._source is not None:
+            out.append(self._source)
+        out.extend(j.right for j in self._joins)
+        out.extend(u.other for u in self._unions)
+        return out
+
+    def map_inputs(self, fn: Callable[["Tabular"], "Tabular"]) -> "SelectPlan[O]":
+        """Return a copy with every input Tabular replaced by ``fn(input)``.
+
+        The combine step (this plan's projections / joins / unions) is
+        preserved; only the leaf inputs are swapped — e.g. a graph executor
+        substitutes each lazy input with its materialised result.
+        """
+        c = self.copy()
+        if c._source is not None:
+            c._source = fn(c._source)
+        c._joins = [dataclasses.replace(j, right=fn(j.right)) for j in c._joins]
+        c._unions = [dataclasses.replace(u, other=fn(u.other)) for u in c._unions]
+        return c
 
     # -- Execution -------------------------------------------------------
 

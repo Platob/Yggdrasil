@@ -78,6 +78,39 @@ saga.parse("SELECT * FROM t").submit(tables={"t": frame})
 A write-side plan (INSERT / MERGE / …) surfaces its `OperationResult` via
 `result.operation_result`; `collect()` renders it as a one-row metadata table.
 
+### LazyTabular is an unstarted ExecutionResult
+
+`LazyTabular` is an **alias** of `ExecutionResult` — a lazy tabular is just an
+execution plan that hasn't started. `tabular.lazy()` (and `saga.scan(...)`)
+returns one; the transform builders mutate the held `SelectPlan` while it is
+idle and the first read/await runs it:
+
+```python
+lz = users.lazy().filter("region = 'US'").select("name", "score")  # idle plan
+rows = lz.read_arrow_table()                                       # runs here
+```
+
+### Graph execution + display
+
+Because a plan is self-describing, the handle runs it as a **graph of inner
+`ExecutionResult`s**: each independent input — the bound source, every join's
+right side, every union's other side — becomes a child node. Independent
+children run in **parallel**; a chain of dependent plans nests and runs in
+**sequence**. Each node has an `id` and a live `state`:
+
+```python
+joined = left_lazy.join(right_lazy, on="id")
+print(joined.tree())
+# ○ #7defb9 SelectPlan [idle]
+# → sequential:
+#   └─ ○ #7defba SelectPlan [idle]
+
+joined.display(live=True)   # in-place dashboard while the graph resolves
+g = joined.graph()          # structured snapshot: ids, states, parallel/sequential
+```
+
+Pass `max_concurrency=1` to force a node's children to run sequentially.
+
 The lower-level building blocks stay available directly when you don't need a
 catalog:
 
