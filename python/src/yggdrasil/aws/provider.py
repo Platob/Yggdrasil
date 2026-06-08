@@ -111,12 +111,15 @@ class AwsCredentialsProvider(ABC):
     def aws_client(self, *, region: Optional[str] = None) -> "AWSClient":
         """Return the cached :class:`AWSClient` for this provider / region.
 
-        First call seeds a botocore :class:`RefreshableCredentials`
-        backed session by invoking ``self()`` once; subsequent calls
-        with the same *region* return the same live client (and
-        therefore share the connection pool, boto-client cache, and
-        in-flight refresh state). Different *region* values mint
-        different clients — boto region is a per-client concern.
+        First call builds an :class:`AWSClient` whose botocore
+        :class:`DeferredRefreshableCredentials` are wired to ``self`` but
+        **not** yet vended — credentials are fetched lazily on the first
+        signed request, so building the client (or asking for a new
+        region) never triggers a credential round-trip. Subsequent calls
+        with the same *region* return the same live client (sharing the
+        connection pool, boto-client cache, and in-flight refresh state).
+        Different *region* values mint different clients — boto region is a
+        per-client concern.
         """
         with self._client_cache_lock:
             existing = self._client_cache.get(region)

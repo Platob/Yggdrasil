@@ -252,7 +252,7 @@ class TestPicklable:
 
 class TestFromDatabricksSql:
 
-    def test_seed_and_refresher_installed(self) -> None:
+    def test_lazy_no_eager_query_and_refresher_installed(self) -> None:
         client = _fake_db_client([{
             "access_key_id": "AK_SEED",
             "secret_access_key": "secret_seed",
@@ -265,15 +265,24 @@ class TestFromDatabricksSql:
             region="us-east-1",
             endpoint_url="https://my-endpoint",
         )
-        # The seed snapshot was taken from the first row.
-        assert config.access_key_id == "AK_SEED"
-        assert config.secret_access_key == "secret_seed"
-        assert config.session_token == "tok_seed"
-        # And the refresher is wired up so botocore can re-fetch later.
+        # Lazy: building the client runs no SQL and seeds no static creds —
+        # botocore fetches on first use via DeferredRefreshableCredentials.
+        assert not client.sql.execute.called
+        assert config.access_key_id is None
+        assert config.secret_access_key is None
+        assert config.session_token is None
+        # The refresher is wired up so botocore can fetch / re-fetch later.
         assert config.has_refresher()
         assert isinstance(config.refresher, DatabricksSQLCredentialsRefresher)
         assert config.region == "us-east-1"
         assert config.endpoint_url == "https://my-endpoint"
+        # On demand the refresher resolves the row it was always going to.
+        assert config.refresh_metadata() == {
+            "access_key": "AK_SEED",
+            "secret_key": "secret_seed",
+            "token": "tok_seed",
+            "expiry_time": "2026-01-01T00:00:00Z",
+        }
 
     def test_columns_override_threads_through(self) -> None:
         client = _fake_db_client([{"k": "AK", "s": "shh"}])
@@ -282,14 +291,14 @@ class TestFromDatabricksSql:
             client=client,
             columns={"access_key_id": "k", "secret_access_key": "s"},
         )
-        assert config.access_key_id == "AK"
-        assert config.secret_access_key == "shh"
-        # The refresher carries the override forward for subsequent
-        # botocore refreshes.
+        # The refresher carries the override forward; creds resolve on demand.
         assert isinstance(config.refresher, DatabricksSQLCredentialsRefresher)
         assert config.refresher.columns == {
             "access_key_id": "k", "secret_access_key": "s",
         }
+        meta = config.refresh_metadata()
+        assert meta["access_key"] == "AK"
+        assert meta["secret_key"] == "shh"
 
     def test_refresh_metadata_round_trip(self) -> None:
         # AWSConfig.refresh_metadata() drives the end-to-end shape
@@ -323,6 +332,7 @@ class TestFromDatabricksSql:
             "AK": "ak", "SK": "sk", "ST": "st", "EXP": "2027-01-01T00:00:00Z",
         }])
         config = MyAWSClient.from_databricks_sql("Q", client=client)
-        assert config.access_key_id == "ak"
-        assert config.secret_access_key == "sk"
-        assert config.session_token == "st"
+        meta = config.refresh_metadata()
+        assert meta["access_key"] == "ak"
+        assert meta["secret_key"] == "sk"
+        assert meta["token"] == "st"
