@@ -36,17 +36,10 @@ def _compute_signals(ohlcv: dict) -> dict:
     the rolling windows run.
     """
     rows = ohlcv.get("data") or []
-    if len(rows) < 20:
-        return {
-            "signal": "HOLD",
-            "strength": 0.0,
-            "score": 0.0,
-            "reasons": [],
-            "indicators": {},
-            "prices": rows[-20:],
-        }
-    df = pl.DataFrame(rows).sort("ts")
-    return compute_signals(df)
+    if not rows:
+        return {"signal": "HOLD", "strength": 0.0, "score": 0.0, "reasons": [], "indicators": {}, "prices": []}
+    # compute_signals guards the <20-bar warmup case itself.
+    return compute_signals(pl.DataFrame(rows).sort("ts"))
 
 
 # ---------------------------------------------------------------------------
