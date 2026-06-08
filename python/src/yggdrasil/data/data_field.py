@@ -581,6 +581,13 @@ class Field(BaseChildrenFields):
     def __str__(self):
         return self.pretty_format()
 
+    def short(self) -> str:
+        """A compact ``name:dtype`` header tag — the dtype via
+        :meth:`~yggdrasil.data.types.base.DataType.short` (recursive for nested
+        types). Used for the column headers in
+        :meth:`yggdrasil.io.tabular.Tabular.display`."""
+        return f"{self.name}:{self.dtype.short()}"
+
     def __eq__(self, other: Any) -> bool:
         if other is self:
             return True

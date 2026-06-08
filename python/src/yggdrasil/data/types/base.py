@@ -202,6 +202,15 @@ DATA_TYPE_CLASSES: dict[int, type["DataType"]] = {}
 
 
 # ---------------------------------------------------------------------
+#: Max characters a (recursive) :meth:`DataType.short` tag may reach before it's
+#: elided — keeps a deeply-nested type from widening a display header forever.
+_SHORT_TAG_MAX = 44
+
+
+def _short_elide(tag: str) -> str:
+    return tag if len(tag) <= _SHORT_TAG_MAX else tag[: _SHORT_TAG_MAX - 2] + "…>"
+
+
 # Specialized fixed-width integer / float type-id tables.
 #
 # Mirrors :data:`yggdrasil.data.types.primitive.numeric._SPECIALIZED_INTEGER_TYPES`
@@ -650,6 +659,60 @@ class DataType(BaseChildrenFields, ABC):
         own line at ``level + 1``.
         """
         ...
+
+    def short(self, depth: int = 2) -> str:
+        """A compact, single-line type tag — recursive (bounded) for nested types.
+
+        Scalars render as ``i64`` / ``f64`` / ``str`` / ``bool`` / ``date`` /
+        ``ts`` / ``dec`` / ``bin`` / ``json``; nested types recurse through their
+        own children — ``list<i64>``, ``struct<x:i64, y:str>``, ``map<str,f64>``,
+        even ``list<struct<id:i64>>`` — until *depth* runs out (then a bare
+        ``list`` / ``struct`` / ``map``). Built from this type's
+        :attr:`type_id` + :attr:`children`, not any one engine. Struct fields are
+        capped and the whole tag is elided past :data:`_SHORT_TAG_MAX` chars, so
+        a deep schema can't widen a :meth:`yggdrasil.io.tabular.Tabular.display`
+        header forever.
+        """
+        tid = self.type_id
+        if tid == DataTypeId.STRUCT:
+            if depth <= 0:
+                return "struct"
+            kids = self.children
+            shown = ", ".join(f"{f.name}:{f.dtype.short(depth - 1)}" for f in kids[:4])
+            return _short_elide(f"struct<{shown}{', …' if len(kids) > 4 else ''}>")
+        if tid == DataTypeId.ARRAY:
+            if depth <= 0:
+                return "list"
+            kids = self.children
+            inner = kids[0].dtype.short(depth - 1) if kids else "?"
+            return _short_elide(f"list<{inner}>")
+        if tid == DataTypeId.MAP:
+            if depth <= 0:
+                return "map"
+            return _short_elide(f"map<{self.key_field.dtype.short(depth - 1)},"
+                                f"{self.value_field.dtype.short(depth - 1)}>")
+        # Scalars — derive from the type-id predicates + the physical width hint.
+        bits = self.byte_size * 8 if getattr(self, "byte_size", None) else None
+        if tid.is_integer:
+            return f"{'u' if tid.is_unsigned_integer else 'i'}{bits or 64}"
+        if tid.is_floating_point:
+            return f"f{bits or 64}"
+        if tid == DataTypeId.STRING:
+            return "str"
+        if tid.is_decimal:
+            return "dec"
+        if tid.is_boolean:
+            return "bool"
+        if tid.is_temporal:
+            return {DataTypeId.DATE: "date", DataTypeId.TIME: "time",
+                    DataTypeId.DURATION: "dur"}.get(tid, "ts")
+        if tid.is_json:
+            return "json"
+        if tid.is_bytes_like:
+            return "bin"
+        if tid == DataTypeId.NULL:
+            return "null"
+        return tid.name.lower()
 
     # ==================================================================
     # Classmethod plumbing — subclass dispatch helpers

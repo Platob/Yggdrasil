@@ -164,16 +164,19 @@ class TestTabularDisplay(unittest.TestCase):
         self.assertIn("rows:list<struct<k:i64, v:str>>", header)
 
     def test_deep_type_tag_is_elided(self):
-        from yggdrasil.io.tabular.base import _MAX_TYPE_TAG, _short_arrow_dtype
-
         try:
             import pyarrow as pa
         except Exception:
             self.skipTest("pyarrow not installed")
-        # A wide struct → the tag is capped (depth + field cap + length elision).
-        wide = pa.struct([(f"field_number_{i}", pa.int64()) for i in range(10)])
-        tag = _short_arrow_dtype(wide)
-        self.assertLessEqual(len(tag), _MAX_TYPE_TAG)
+        # The short tag lives on the project DataType (not engine code), and a
+        # wide struct is capped (depth + field cap + length elision).
+        from yggdrasil.data import DataType
+        from yggdrasil.data.types.base import _SHORT_TAG_MAX
+
+        wide = DataType.from_arrow_type(
+            pa.struct([(f"field_number_{i}", pa.int64()) for i in range(10)]))
+        tag = wide.short()
+        self.assertLessEqual(len(tag), _SHORT_TAG_MAX)
         self.assertTrue(tag.startswith("struct<"))
 
     def test_limit_marker(self):

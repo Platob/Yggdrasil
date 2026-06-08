@@ -87,68 +87,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-#: Max characters a (recursive) nested type tag may grow to before it's elided —
-#: keeps a deeply-nested column header from ballooning the table.
-_MAX_TYPE_TAG = 44
-
-
-def _short_arrow_dtype(t: "pa.DataType", *, depth: int = 2) -> str:
-    """A short type tag for a column header in :meth:`Tabular.display`.
-
-    Compact scalars — ``i64`` / ``f64`` / ``str`` / ``bool`` / ``date`` / ``ts``
-    / ``dec`` / ``bin`` — and **recursive, bounded** nested types so the header
-    *shows the shape* without ballooning: ``list<i64>``,
-    ``struct<x:i64, y:str>``, ``map<str,f64>``, even nested
-    ``list<struct<id:i64>>``. Recursion stops at *depth* (then a bare
-    ``list`` / ``struct`` / ``map``); struct fields are capped and the whole tag
-    is elided past :data:`_MAX_TYPE_TAG` chars.
-    """
-    if pa.types.is_integer(t):
-        return f"i{t.bit_width}"
-    if pa.types.is_floating(t):
-        return f"f{t.bit_width}"
-    if pa.types.is_string(t) or pa.types.is_large_string(t):
-        return "str"
-    if pa.types.is_boolean(t):
-        return "bool"
-    if pa.types.is_date(t):
-        return "date"
-    if pa.types.is_timestamp(t):
-        return "ts"
-    if pa.types.is_time(t):
-        return "time"
-    if pa.types.is_decimal(t):
-        return "dec"
-    if pa.types.is_binary(t) or pa.types.is_large_binary(t):
-        return "bin"
-    if pa.types.is_null(t):
-        return "null"
-    # Nested — recurse until the depth budget runs out, then go flat.
-    if pa.types.is_list(t) or pa.types.is_large_list(t):
-        if depth <= 0:
-            return "list"
-        return _elide(f"list<{_short_arrow_dtype(t.value_type, depth=depth - 1)}>")
-    if pa.types.is_struct(t):
-        if depth <= 0:
-            return "struct"
-        shown = [f"{t.field(i).name}:{_short_arrow_dtype(t.field(i).type, depth=depth - 1)}"
-                 for i in range(min(t.num_fields, 4))]
-        more = ", …" if t.num_fields > 4 else ""
-        return _elide(f"struct<{', '.join(shown)}{more}>")
-    if pa.types.is_map(t):
-        if depth <= 0:
-            return "map"
-        k = _short_arrow_dtype(t.key_type, depth=depth - 1)
-        v = _short_arrow_dtype(t.item_type, depth=depth - 1)
-        return _elide(f"map<{k},{v}>")
-    return str(t)[:8]
-
-
-def _elide(tag: str) -> str:
-    """Cap a (nested) type tag so a deep schema can't widen the header forever."""
-    return tag if len(tag) <= _MAX_TYPE_TAG else tag[: _MAX_TYPE_TAG - 2] + "…>"
-
-
 def _compact_nested(value: Any) -> str:
     """Render a nested cell (list / dict / tuple) compactly on one line."""
     import json
@@ -2590,31 +2528,33 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     def display(self, n: int = 10, *, max_width: int = 32) -> str:
         """Render the first *n* rows as an aligned, typed text table.
 
-        Each header carries a **short data type** (``col:i64`` / ``:str`` /
-        ``:ts`` …); columns are separated by ``│`` with a ``─┼─`` rule; nested
-        values (lists / structs / maps) are compacted (and their column type is
-        just ``list`` / ``struct``) so the output never balloons. Long cells are
-        truncated to *max_width*. Reads only enough Arrow batches to fill *n*
-        rows, then stops — cheap even on a large source.
+        Columns and their types come from this Tabular's own
+        :meth:`collect_schema` — each header carries the project
+        :class:`~yggdrasil.data.Field`'s short type tag
+        (:meth:`Field.short` → :meth:`DataType.short`, recursive for nested
+        types: ``col:i64`` / ``:str`` / ``tags:list<str>`` /
+        ``owner:struct<name:str, age:i64>``). Columns are separated by ``│``
+        with a ``─┼─`` rule; numbers/booleans right-align; nested cell values are
+        compacted to one line; long cells truncate to *max_width*. Reads only
+        enough Arrow batches to fill *n* rows, then stops.
 
             print(dbc.sql.execute("SELECT * FROM t").display())
             print(IO.from_("data.parquet").display(5))
         """
-        columns: "list[str] | None" = None
-        types: "list[str]" = []
+        schema = self.collect_schema()
+        fields = list(schema.children) if schema is not None else []
+        if not fields:  # empty source / no schema
+            return "(no rows)"
+        columns = [f.name for f in fields]
+
         rows: list[list] = []
         for batch in self.to_arrow_batches():
-            if columns is None:
-                columns = list(batch.schema.names)
-                types = [_short_arrow_dtype(batch.schema.field(c).type) for c in columns]
             for record in batch.to_pylist():
                 rows.append([record.get(c) for c in columns])
                 if len(rows) >= n:
                     break
             if len(rows) >= n:
                 break
-        if columns is None:  # empty source / no schema
-            return "(no rows)"
 
         def cell(value: Any) -> str:
             if value is None:
@@ -2625,16 +2565,15 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
                 text = str(value).replace("\n", " ")
             return text if len(text) <= max_width else text[: max_width - 1] + "…"
 
-        header = [f"{columns[i]}:{types[i]}" for i in range(len(columns))]
+        # Header tags + alignment derive from the project Field / DataType — the
+        # short type repr and a numeric/boolean test, not engine-specific code.
+        header = [f.short() for f in fields]
+        right = [f.dtype.type_id.is_numeric or f.dtype.type_id.is_boolean for f in fields]
         body = [[cell(v) for v in row] for row in rows]
         widths = [
             max([len(header[i])] + [len(r[i]) for r in body]) if body else len(header[i])
             for i in range(len(header))
         ]
-        # Numbers (and booleans) right-align so digits line up by place value —
-        # a real data table; text/temporal/nested stay left-aligned.
-        right = [t[:1] in ("i", "u", "f") or t in ("bool", "decimal") or t.startswith("dec")
-                 for t in types]
 
         def pad(text: str, i: int) -> str:
             return text.rjust(widths[i]) if right[i] else text.ljust(widths[i])
