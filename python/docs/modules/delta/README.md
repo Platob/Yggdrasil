@@ -142,7 +142,7 @@ folder = DeltaFolder(path="/data/events")
 folder.write_arrow_table(table, options=DeltaOptions(target=schema))
 
 # Reads auto-prune partitions from predicates
-from yggdrasil.execution.expr import col
+from yggdrasil.saga.expr import col
 filtered = folder.read_arrow_table(
     options=DeltaOptions(predicate=col("region") == "us"),
 )

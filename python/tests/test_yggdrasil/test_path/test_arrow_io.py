@@ -215,7 +215,7 @@ class TestCastOptions:
         assert result.column("c").to_pylist() == [5, 6]
 
     def test_read_with_predicate_filter(self, tmp_path: pathlib.Path) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
 
         leaf = _ipc_leaf(tmp_path)
         table = pa.table({"x": [1, 2, 3, 4, 5], "y": ["a", "b", "c", "d", "e"]})

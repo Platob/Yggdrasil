@@ -43,8 +43,8 @@ def _time_one(
 
 
 def bench_sql_parsing(repeat: int = 5) -> None:
-    from yggdrasil.plan.sql_parser import SQLQueryParser, _tokenize_query
-    from yggdrasil.plan.databricks import DatabricksSQLParser
+    from yggdrasil.saga.plan.sql_parser import SQLQueryParser, _tokenize_query
+    from yggdrasil.saga.plan.databricks import DatabricksSQLParser
     from yggdrasil.enums import Dialect
 
     print("\n=== SQL Parsing ===")
@@ -95,7 +95,7 @@ def bench_sql_parsing(repeat: int = 5) -> None:
 
 def bench_plan_execution(repeat: int = 5) -> None:
     from yggdrasil.arrow.tabular import ArrowTabular
-    from yggdrasil.plan import parse_sql
+    from yggdrasil.saga.plan import parse_sql
 
     print("\n=== Plan Execution (ArrowTabular) ===")
 
@@ -132,7 +132,7 @@ def bench_plan_execution(repeat: int = 5) -> None:
 def bench_folder_execution(repeat: int = 5) -> None:
     from yggdrasil.path.local_path import LocalPath
     from yggdrasil.path.folder import Folder
-    from yggdrasil.plan import parse_sql
+    from yggdrasil.saga.plan import parse_sql
 
     print("\n=== Plan Execution (Folder, disk-backed) ===")
 
@@ -163,7 +163,7 @@ def bench_folder_execution(repeat: int = 5) -> None:
 
 
 def bench_roundtrip(repeat: int = 5) -> None:
-    from yggdrasil.plan import parse_sql
+    from yggdrasil.saga.plan import parse_sql
 
     print("\n=== SQL Round-trip (parse → emit → re-parse) ===")
 
@@ -183,7 +183,7 @@ def bench_roundtrip(repeat: int = 5) -> None:
 
 
 def bench_registry(repeat: int = 5) -> None:
-    from yggdrasil.plan.func_registry import BUILTIN_REGISTRY
+    from yggdrasil.saga.plan.func_registry import BUILTIN_REGISTRY
 
     print("\n=== Function Registry Lookup ===")
 
@@ -197,8 +197,8 @@ def bench_registry(repeat: int = 5) -> None:
 
 def bench_udf_execution(repeat: int = 5) -> None:
     from yggdrasil.arrow.tabular import ArrowTabular
-    from yggdrasil.plan import parse_sql
-    from yggdrasil.plan.func_registry import BUILTIN_REGISTRY
+    from yggdrasil.saga.plan import parse_sql
+    from yggdrasil.saga.plan.func_registry import BUILTIN_REGISTRY
 
     print("\n=== UDF / Arrow Kernel Execution ===")
 

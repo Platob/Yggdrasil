@@ -155,7 +155,7 @@ class TestDeltaSparkReadPreparation(DeltaTestCase):
         self.assertEqual(snap.num_active_files(), 3)  # us, eu, ap
 
         from yggdrasil.io.delta.delta_folder import _partition_prune_values
-        from yggdrasil.execution.expr import col as expr_col
+        from yggdrasil.saga.expr import col as expr_col
 
         prune = _partition_prune_values(
             expr_col("region") == "us",

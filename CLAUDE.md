@@ -57,6 +57,25 @@ Treat a cross-language divergence as a bug.
 5. **Upsert by default** — create if name not found, update if it exists. ID is immutable once assigned.
 6. **Prefer uv over pip** — use `uv` for all Python tooling: `uv venv`, `uv pip install`, `uv build --wheel`. Reach for `pip` only when `uv` isn't on PATH. Run tests/scripts with `uv run`.
 
+## Saga
+
+`yggdrasil.saga` is the unified, autonomous, lazy data engine. It is the
+single home for schema-aware lazy compute over `Tabular` data and centralizes
+everything that used to live in `plan/` and `execution/expr/`:
+
+- `saga.expr` — the expression / predicate AST with multi-backend emitters
+  (python / arrow / polars / spark / sql).
+- `saga.plan` — mutable execution plans (`SelectPlan` / `InsertPlan` /
+  `MergePlan`), the immutable plan-node tree, `LazyTabular`, SQL
+  parse/emit across dialects, and the Arrow-native UDF registry.
+- `Saga` (`saga.engine`) — the engine facade: register a catalog of tables,
+  parse SQL from many dialects, and build / execute autonomous lazy plans.
+  Driven from code: `Saga(dialect=...).register(name, tab).sql(query)` /
+  `.scan(name).filter(...)` / `.parse(...)` / `.plan(...)`.
+
+Reach for `from yggdrasil.saga import Saga, col, lit, parse_sql, SelectPlan`.
+See `docs/guides/saga.md`.
+
 ## Databricks
 
 `yggdrasil.databricks` wraps the Databricks SDK behind `DatabricksClient` and
@@ -85,10 +104,12 @@ python/src/yggdrasil/
   data/                 Schema / Field / DataType, casting, statement results
   arrow/                Arrow helpers + ops
   io/                   Tabular IO (parquet, arrow IPC, xlsx, delta), Holder
-  plan/                 Execution plans + SQL parse/emit/execute
   http_/                HTTPSession + local/remote (Tabular) response cache
   pickle/               yggdrasil pickle + json (orjson) serialization
-  execution/expr/       Predicate / expression engine (polars/pyarrow/sql backends)
+  saga/                 Saga — the unified lazy data engine
+    engine.py           Saga facade — catalog + SQL + lazy plan execution
+    expr/               Predicate / expression engine (polars/pyarrow/sql backends)
+    plan/               Execution plans + SQL parse/emit/execute + UDF registry + LazyTabular
   databricks/           Databricks SDK integrations
     client.py           DatabricksClient + dbc.<service> accessors
     sql/ table/ volume/ warehouse/ compute/ cluster/ job/ secrets/ iam/ ai/

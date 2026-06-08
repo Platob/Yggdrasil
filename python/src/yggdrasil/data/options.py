@@ -90,7 +90,7 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
     from yggdrasil.data.data_field import Field
     from yggdrasil.data.schema import Schema
-    from yggdrasil.execution.expr import Predicate
+    from yggdrasil.saga.expr import Predicate
 
 # ``Field`` / ``Schema`` are imported lazily — top-level imports here
 # would form a cycle through ``yggdrasil.data.schema`` ↔
@@ -494,7 +494,7 @@ class CastOptions:
             return None
         cols = list(names)
         if self.predicate is not None:
-            from yggdrasil.execution.expr import free_columns
+            from yggdrasil.saga.expr import free_columns
             for c in (free_columns(self.predicate) or ()):
                 if c not in cols:
                     cols.append(c)
@@ -1112,7 +1112,7 @@ class CastOptions:
             # column already enforced by the path prune) would otherwise blow
             # up on the missing column — it's a no-op here, the filter already
             # ran where the columns existed.
-            from yggdrasil.execution.expr import free_columns
+            from yggdrasil.saga.expr import free_columns
             free = free_columns(self.predicate)
             if free is None or set(free).issubset(data.schema.names):
                 data = self.predicate.filter_arrow_batch(data)

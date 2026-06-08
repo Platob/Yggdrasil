@@ -28,14 +28,14 @@ from yggdrasil.dataclasses.awaitable import Awaitable
 from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.enums.mode import Mode
 from yggdrasil.enums.state import State
-from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
+from yggdrasil.saga.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from yggdrasil.path import Path
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.data import Field
     from yggdrasil.databricks.table.table import Table
-    from yggdrasil.execution.expr import Predicate
+    from yggdrasil.saga.expr import Predicate
     from yggdrasil.io.tabular.base import Tabular
 
 __all__ = [
@@ -469,7 +469,7 @@ def _alias_columns(expr, alias: str):
     ``T.foo``. Returns a new tree — the AST is immutable so we never mutate
     the caller's predicate.
     """
-    from yggdrasil.execution.expr.nodes import (
+    from yggdrasil.saga.expr.nodes import (
         Arithmetic,
         Between,
         Cast,

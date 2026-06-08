@@ -60,10 +60,10 @@ from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.enums import MimeTypes, MimeType, MediaType, MediaTypes, ModeLike, Mode, Scheme
 from yggdrasil.enums.engine_type import EngineType
-from yggdrasil.execution.expr import (
+from yggdrasil.saga.expr import (
     Predicate,
 )
-from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
+from yggdrasil.saga.expr.backends.sql import Dialect, to_sql as expr_to_sql
 from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.tabular import Tabular, O

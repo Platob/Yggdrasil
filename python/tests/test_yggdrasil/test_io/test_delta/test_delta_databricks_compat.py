@@ -176,28 +176,28 @@ class TestDataSkipping(DeltaTestCase):
         return d
 
     def test_skipping_matches_full_scan_gt(self) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.io.delta import DeltaOptions
         d = self._multi_file_table()
         out = d.read_arrow_table(options=DeltaOptions(predicate=col("id") > 50))
         self.assertEqual(sorted(out.column("id").to_pylist()), [100, 101, 102])
 
     def test_skipping_matches_full_scan_eq(self) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.io.delta import DeltaOptions
         d = self._multi_file_table()
         out = d.read_arrow_table(options=DeltaOptions(predicate=col("id") == 11))
         self.assertEqual(out.column("id").to_pylist(), [11])
 
     def test_skipping_empty_when_no_file_matches(self) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.io.delta import DeltaOptions
         d = self._multi_file_table()
         out = d.read_arrow_table(options=DeltaOptions(predicate=col("id") > 1000))
         self.assertEqual(out.num_rows, 0)
 
     def test_skipping_range_between(self) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.io.delta import DeltaOptions
         d = self._multi_file_table()
         out = d.read_arrow_table(
@@ -205,7 +205,7 @@ class TestDataSkipping(DeltaTestCase):
         self.assertEqual(sorted(out.column("id").to_pylist()), [10, 11, 12])
 
     def test_extract_constraints_conjunction(self) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.io.delta.delta_folder import _extract_range_constraints
         c = _extract_range_constraints((col("id") > 5) & (col("v") == "x"))
         self.assertIn("id", c)
@@ -213,7 +213,7 @@ class TestDataSkipping(DeltaTestCase):
         self.assertIn((">", 5), c["id"])
 
     def test_extract_constraints_disjunction_drops_bounds(self) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.io.delta.delta_folder import _extract_range_constraints
         # OR must not yield a binding bound — either branch could match.
         c = _extract_range_constraints((col("id") > 5) | (col("id") < 1))
@@ -282,7 +282,7 @@ class TestClusteringAwarePruning(DeltaTestCase):
 
     def test_clustering_predicate_prunes_files(self) -> None:
         import yggdrasil.io.delta.delta_folder as df
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.io.delta import DeltaOptions
         d = self._clustered_table()
 
@@ -305,7 +305,7 @@ class TestClusteringAwarePruning(DeltaTestCase):
         self.assertEqual(set(out.column("region").to_pylist()), {"us"})
 
     def test_clustering_pruning_matches_full_scan(self) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.io.delta import DeltaOptions
         d = self._clustered_table()
         pruned = d.read_arrow_table(

@@ -46,7 +46,7 @@ import time
 import pyarrow as pa
 
 from yggdrasil.enums import Mode
-from yggdrasil.execution.expr import Expression
+from yggdrasil.saga.expr import Expression
 from yggdrasil.io.delta import DeltaFolder, DeltaOptions
 
 

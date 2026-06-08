@@ -105,7 +105,7 @@ class SendConfig:
         cache. Returns ``(local_hashes, remote_hashes, misses)`` —
         full response rows are read on demand, not here.
         """
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
 
         local_hashes: set[int] = set()
         remote_hashes: set[int] = set()
@@ -142,7 +142,7 @@ class SendConfig:
             if cache.received_to is not None:
                 window.append(col("received_at") < cache.received_to)
             if window:
-                from yggdrasil.execution.expr import all_of
+                from yggdrasil.saga.expr import all_of
                 probe_predicate = all_of(predicate, *window)
             try:
                 table = holder.read_arrow_table(

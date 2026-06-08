@@ -85,7 +85,7 @@ if TYPE_CHECKING:
     from pyspark import StorageLevel
     from pyspark.sql import DataFrame as SparkDataFrame, SparkSession
     from yggdrasil.data.schema import Schema
-    from yggdrasil.execution.expr import Predicate
+    from yggdrasil.saga.expr import Predicate
 
 
 __all__ = ["SparkDataset", "SparkTabular"]
@@ -1207,7 +1207,7 @@ class SparkDataset(Tabular[CastOptions]):
         the existing schema is preserved (no re-cast needed); the
         ``byte_size`` cap only applies to the callable path.
         """
-        from yggdrasil.execution.expr import Expression
+        from yggdrasil.saga.expr import Expression
 
         # Predicate-like inputs route to the cross-engine
         # :meth:`Tabular.filter`. Recognised: yggdrasil Expression,

@@ -9,7 +9,7 @@ import pyarrow as pa
 import pytest
 
 from yggdrasil.enums import Mode
-from yggdrasil.execution.expr import col
+from yggdrasil.saga.expr import col
 from yggdrasil.path.folder import Folder, FolderOptions
 from yggdrasil.path.local_path import LocalPath
 

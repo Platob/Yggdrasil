@@ -443,14 +443,14 @@ class TestBuildWherePredicates:
         assert _build_where_predicates(None, target_alias="T") == []
 
     def test_simple_predicate_renders_aliased(self) -> None:
-        from yggdrasil.execution.expr import col as expr_col
+        from yggdrasil.saga.expr import col as expr_col
         out = _build_where_predicates(
             expr_col("region") == "us", target_alias="T",
         )
         assert out == ["`T`.`region` = 'us'"]
 
     def test_in_list_renders_aliased(self) -> None:
-        from yggdrasil.execution.expr import col as expr_col
+        from yggdrasil.saga.expr import col as expr_col
         out = _build_where_predicates(
             expr_col("partition_key").is_in([1, 2, 3]), target_alias="T",
         )

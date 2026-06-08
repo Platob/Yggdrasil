@@ -20,7 +20,7 @@ from __future__ import annotations
 import unittest
 
 from yggdrasil.enums import Mode
-from yggdrasil.execution.expr import col
+from yggdrasil.saga.expr import col
 from yggdrasil.io import parquet_file as _pfmod
 from yggdrasil.io.delta.tests import DeltaTestCase
 

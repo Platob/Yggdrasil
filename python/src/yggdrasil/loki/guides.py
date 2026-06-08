@@ -164,10 +164,10 @@ GUIDES: tuple[Guide, ...] = (
                  "postgres", "spark sql", "optimize query", "execution plan"),
         summary="Use the plan layer to parse, emit, and execute SQL across dialects "
                 "rather than string-building queries — one logical plan, many dialects.",
-        use=("yggdrasil.plan — execution plans + SQL parse/emit/execute",
-             "yggdrasil.execution.expr — predicate/expression engine "
+        use=("yggdrasil.saga.plan — execution plans + SQL parse/emit/execute",
+             "yggdrasil.saga.expr — predicate/expression engine "
              "(polars / pyarrow / sql backends), e.g. `col('x') > 1`"),
-        example="from yggdrasil.execution.expr import col\n"
+        example="from yggdrasil.saga.expr import col\n"
                 "predicate = (col('price') > 100) & col('active')   # → polars/pyarrow/SQL",
         avoid=("f-string SQL that only targets one dialect (and risks injection)",),
     ),

@@ -42,7 +42,7 @@ from typing import Callable
 import pyarrow as pa
 
 import yggdrasil.io.delta.delta_folder as delta_folder
-from yggdrasil.execution.expr import col
+from yggdrasil.saga.expr import col
 from yggdrasil.io.delta import DeltaFolder, DeltaOptions
 
 

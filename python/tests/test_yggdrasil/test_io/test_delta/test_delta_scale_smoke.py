@@ -18,7 +18,7 @@ See ``benchmarks/io/delta/bench_delta_scale.py`` for the timing profile.
 from __future__ import annotations
 
 from yggdrasil.enums import Mode
-from yggdrasil.execution.expr import Expression
+from yggdrasil.saga.expr import Expression
 from yggdrasil.io.delta import DeltaFolder, DeltaOptions
 from yggdrasil.io.delta.delta_folder import _data_skip_adds
 from yggdrasil.io.delta.snapshot import Snapshot

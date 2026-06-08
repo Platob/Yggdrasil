@@ -59,7 +59,7 @@ from yggdrasil.enums import Mode
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.primitive import Int64Type, StringType
 from yggdrasil.io.delta import DeltaFolder, DeltaOptions
-from yggdrasil.execution.expr import col as expr_col
+from yggdrasil.saga.expr import col as expr_col
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ def _extractor_scenarios(repeat: int) -> list[dict]:
     invocation regardless of how many batches the read produces — so
     the per-stream amortised cost shrinks linearly with stream length.
     """
-    from yggdrasil.execution.expr import extract_partition_filters
+    from yggdrasil.saga.expr import extract_partition_filters
 
     out: list[dict] = []
     pcols = ("region", "date")

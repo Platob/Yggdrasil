@@ -107,7 +107,7 @@ from yggdrasil.io.holder import _bootstrap_primitive_format_leaves
 _bootstrap_primitive_format_leaves()
 
 if TYPE_CHECKING:
-    from yggdrasil.execution.expr import Predicate
+    from yggdrasil.saga.expr import Predicate
     from yggdrasil.path import Path
 
 
@@ -856,7 +856,7 @@ class Folder(Path):
         if predicate is None:
             return None
         try:
-            from yggdrasil.execution.expr import (
+            from yggdrasil.saga.expr import (
                 extract_partition_filters,
             )
             extracted = extract_partition_filters(predicate, (column,))
@@ -1141,7 +1141,7 @@ class Folder(Path):
                 topmost = node
             node = getattr(node, "tabular_parent", None)
         try:
-            from yggdrasil.execution.expr import free_columns
+            from yggdrasil.saga.expr import free_columns
             cols = free_columns(predicate)
         except Exception:
             return None

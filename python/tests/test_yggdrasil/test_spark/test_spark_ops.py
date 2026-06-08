@@ -212,7 +212,7 @@ class TestSparkOps(SparkTestCase):
         assert [r.a for r in rows] == [3, 4]
 
     def test_dataset_filter_yggdrasil_expression_native_path(self) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.spark.tabular import SparkDataset
 
         df = self.spark.createDataFrame(

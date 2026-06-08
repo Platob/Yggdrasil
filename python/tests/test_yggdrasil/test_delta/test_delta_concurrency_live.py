@@ -247,7 +247,7 @@ class TestClusteringPruningLive(_DeltaSQLBase):
             self._purge(tbl)
 
     def test_clustering_predicate_prunes_and_matches_full_scan(self) -> None:
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         from yggdrasil.io.delta import DeltaOptions
         import yggdrasil.io.delta.delta_folder as df
 

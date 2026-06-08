@@ -394,7 +394,7 @@ class TestProjectionWithPredicate:
         return Folder(path=str(tmp_path / "c"))
 
     def test_predicate_on_projected_out_partition_column(self, tmp_path):
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         out = self._folder(tmp_path).read_arrow_table(
             predicate=col("partition_key").is_in([1]),
             columns=["request_public_hash"],
@@ -404,7 +404,7 @@ class TestProjectionWithPredicate:
         assert out.schema.field("request_public_hash").type == pa.int64()
 
     def test_empty_result_keeps_concrete_type_not_objecttype(self, tmp_path):
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         fp = self._folder(tmp_path)
         fp._schema_cache = ...   # cold cache → fallback resolves via merged
         out = fp.read_arrow_table(
@@ -419,7 +419,7 @@ class TestProjectionWithPredicate:
         import pyarrow.parquet as pq
         from yggdrasil.io.parquet_file import ParquetFile
         from yggdrasil.path.local_path import LocalPath
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
 
         path = str(tmp_path / "f.parquet")
         pq.write_table(pa.table({"x": [1, 2, 3], "y": [10, 20, 30]}), path)

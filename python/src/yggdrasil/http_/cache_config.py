@@ -10,7 +10,7 @@ import time
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Mapping, MutableMapping, Optional
 
 from yggdrasil.data.cast import any_to_timedelta
-from yggdrasil.execution.expr import Predicate
+from yggdrasil.saga.expr import Predicate
 from yggdrasil.data.cast.datetime import truncate_datetime
 from yggdrasil.enums import Mode
 
@@ -594,7 +594,7 @@ class CacheConfig:
             holder.write_arrow(data)
             return
 
-        from yggdrasil.execution.expr import col as _col
+        from yggdrasil.saga.expr import col as _col
         partition_keys = None
         try:
             if isinstance(data, (pa.RecordBatch, pa.Table)):
@@ -663,7 +663,7 @@ class CacheConfig:
     ) -> "Any | None":
         if request is None:
             return None
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
 
         value = request.match_value(MATCH_KEY)
         return col(MATCH_COLUMN).is_null() if value is None else col(MATCH_COLUMN) == value
@@ -677,7 +677,7 @@ class CacheConfig:
         Shape: ``partition_key == <req.partition_key>`` AND the
         per-request match clause.
         """
-        from yggdrasil.execution.expr import all_of, col
+        from yggdrasil.saga.expr import all_of, col
 
         clauses: list[Any] = []
         if request is not None:
@@ -700,7 +700,7 @@ class CacheConfig:
         Shape: ``partition_key IN (<distinct keys>)`` AND
         ``(req1_match) OR (req2_match) OR …``.
         """
-        from yggdrasil.execution.expr import (
+        from yggdrasil.saga.expr import (
             all_of,
             any_of,
             col,

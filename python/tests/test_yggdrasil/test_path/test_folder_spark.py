@@ -22,7 +22,7 @@ import pyarrow.parquet as pq  # noqa: E402
 from pyspark.sql import SparkSession  # noqa: E402
 
 from yggdrasil.enums import Mode  # noqa: E402
-from yggdrasil.execution.expr import col  # noqa: E402
+from yggdrasil.saga.expr import col  # noqa: E402
 from yggdrasil.path.folder import Folder, FolderOptions  # noqa: E402
 from yggdrasil.path.local_path import LocalPath  # noqa: E402
 from yggdrasil.spark.tests import SparkTestCase  # noqa: E402

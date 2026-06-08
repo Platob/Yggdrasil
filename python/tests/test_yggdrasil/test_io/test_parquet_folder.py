@@ -9,7 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from yggdrasil.enums import Mode, MimeTypes
-from yggdrasil.execution.expr import col
+from yggdrasil.saga.expr import col
 from yggdrasil.parquet import (
     ParquetFile, ParquetFolder, ParquetFolderOptions, ParquetOptions,
 )

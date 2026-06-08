@@ -35,7 +35,7 @@ def __getattr__(name: str):
         from yggdrasil.arrow.tabular import ArrowTabular
         return ArrowTabular
     if name == "LazyTabular":
-        from yggdrasil.plan.lazy import LazyTabular
+        from yggdrasil.saga.plan.lazy import LazyTabular
         return LazyTabular
     if name in ("SparkDataset", "SparkTabular"):
         from yggdrasil.spark.tabular import SparkDataset

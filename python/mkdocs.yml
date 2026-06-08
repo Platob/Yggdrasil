@@ -158,7 +158,7 @@ nav:
       - Casting: guides/casting.md
       - IO & HTTP: guides/io-http.md
       - Loki Agent: guides/loki.md
-      - Execution Plans & SQL: guides/plan.md
+      - Saga Engine (Plans & SQL): guides/saga.md
       - Databricks: guides/databricks.md
       - Databricks CLI: guides/databricks-cli.md
       - Development: guides/development.md
@@ -188,8 +188,8 @@ nav:
           - account: modules/databricks/account/README.md
       - Serialization:
           - pickle + json: modules/pickle/README.md
-      - Execution Plans:
-          - plan: modules/plan/README.md
+      - Saga Engine:
+          - saga: modules/saga/README.md
       - Engines:
           - polars / pandas / spark: modules/engines/README.md
       - Databricks (extended):

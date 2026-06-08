@@ -745,7 +745,7 @@ class TestLazyTabularVsDatabricksSQL(_DeltaSQLBase):
         sql_out = self._read_sql_arrow(
             f"SELECT * FROM {tbl.full_name()} WHERE id > 5"
         )
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         ygg_out = self._delta_folder(tbl).read_arrow_table(
             options=DeltaOptions(predicate=col("id") > 5),
         )
@@ -770,7 +770,7 @@ class TestLazyTabularVsDatabricksSQL(_DeltaSQLBase):
             f"SELECT * FROM {tbl.full_name()} "
             "WHERE id >= 5 AND id < 12"
         )
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         ygg_out = self._delta_folder(tbl).read_arrow_table(
             options=DeltaOptions(
                 predicate=(col("id") >= 5) & (col("id") < 12),
@@ -796,7 +796,7 @@ class TestLazyTabularVsDatabricksSQL(_DeltaSQLBase):
         sql_out = self._read_sql_arrow(
             f"SELECT * FROM {tbl.full_name()} WHERE id IN (2, 4)"
         )
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         ygg_out = self._delta_folder(tbl).read_arrow_table(
             options=DeltaOptions(predicate=col("id").is_in([2, 4])),
         )
@@ -820,7 +820,7 @@ class TestLazyTabularVsDatabricksSQL(_DeltaSQLBase):
         sql_out = self._read_sql_arrow(
             f"SELECT * FROM {tbl.full_name()} WHERE val IS NOT NULL"
         )
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         ygg_out = self._delta_folder(tbl).read_arrow_table(
             options=DeltaOptions(predicate=~col("val").is_null()),
         )
@@ -848,7 +848,7 @@ class TestLazyTabularVsDatabricksSQL(_DeltaSQLBase):
         sql_out = self._read_sql_arrow(
             f"SELECT * FROM {tbl.full_name()} WHERE region = 'us'"
         )
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         ygg_out = self._delta_folder(tbl).read_arrow_table(
             options=DeltaOptions(predicate=col("region") == "us"),
         )
@@ -877,7 +877,7 @@ class TestLazyTabularVsDatabricksSQL(_DeltaSQLBase):
             f"SELECT * FROM {tbl.full_name()} "
             "WHERE region = 'us' AND id > 1"
         )
-        from yggdrasil.execution.expr import col
+        from yggdrasil.saga.expr import col
         ygg_out = self._delta_folder(tbl).read_arrow_table(
             options=DeltaOptions(
                 predicate=(col("region") == "us") & (col("id") > 1),

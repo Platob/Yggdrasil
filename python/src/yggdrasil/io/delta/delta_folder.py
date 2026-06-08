@@ -45,7 +45,7 @@ from yggdrasil.io.delta.schema_codec import (
 from yggdrasil.io.delta.snapshot import Snapshot
 
 if TYPE_CHECKING:
-    from yggdrasil.execution.expr import Predicate
+    from yggdrasil.saga.expr import Predicate
 
 __all__ = ["ConcurrentDeltaCommitError", "DeltaFolder", "DeltaOptions"]
 
@@ -307,7 +307,7 @@ class DeltaFolder(Folder):
         row_filter: "Optional[Callable]" = None
         if options.predicate is not None:
             try:
-                from yggdrasil.execution.expr import free_columns
+                from yggdrasil.saga.expr import free_columns
                 available = set(partition_columns)
                 if target_schema is not None:
                     available |= set(target_schema.names)
@@ -1459,7 +1459,7 @@ def _collect_stats(batches: "list[pa.RecordBatch]", *,
 
 def _partition_prune_values(predicate: "Predicate", partition_columns: "List[str]") -> "Optional[dict]":
     if predicate is None or not partition_columns: return None
-    from yggdrasil.execution.expr import extract_partition_filters
+    from yggdrasil.saga.expr import extract_partition_filters
     return extract_partition_filters(predicate, partition_columns) or None
 
 
@@ -1481,10 +1481,10 @@ def _extract_range_constraints(predicate: "Predicate") -> "Optional[dict[str, li
     ``>=`` / ``IN`` / ``BETWEEN`` against a column on one side and a scalar
     literal on the other are understood.
     """
-    from yggdrasil.execution.expr.nodes import (
+    from yggdrasil.saga.expr.nodes import (
         Between, Column, Comparison, InList, Literal, Logical,
     )
-    from yggdrasil.execution.expr.operators import CompareOp, LogicalOp
+    from yggdrasil.saga.expr.operators import CompareOp, LogicalOp
 
     out: "dict[str, list[tuple[str, Any]]]" = {}
 

@@ -172,7 +172,7 @@ if TYPE_CHECKING:
     import polars as pl
     import pyarrow.dataset as pds
     from pyspark.sql import DataFrame as SparkDataFrame
-    from yggdrasil.execution.expr import Predicate, PredicateLike
+    from yggdrasil.saga.expr import Predicate, PredicateLike
     from yggdrasil.dataclasses.waiting import WaitingConfigArg
     from yggdrasil.io.holder import Holder
     from yggdrasil.spark.tabular import SparkDataset
@@ -254,7 +254,7 @@ def _coerce_predicate(value: Any) -> Any:
     :meth:`Tabular._filter` hook sees a single shape regardless of
     where the predicate came from.
     """
-    from yggdrasil.execution.expr import Expression, Predicate
+    from yggdrasil.saga.expr import Expression, Predicate
 
     if isinstance(value, Predicate):
         return value
@@ -793,7 +793,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             return True
         if free_cols is None:
             try:
-                from yggdrasil.execution.expr import free_columns
+                from yggdrasil.saga.expr import free_columns
                 free_cols = free_columns(predicate)
             except Exception:
                 return True
@@ -1042,7 +1042,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         """Delete rows matching *predicate*; return this tabular.
 
         *predicate* is a :class:`Predicate` from
-        :mod:`yggdrasil.execution.expr` or a SQL string that parses into
+        :mod:`yggdrasil.saga.expr` or a SQL string that parses into
         one (``"id IN (1,2,3)"``, ``"price > 100 AND region = 'EU'"``).
         ``None`` means "no filter" — every row is removed (``DELETE FROM t``
         with no ``WHERE``).
@@ -1061,7 +1061,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         make the predicate trivially false, and only rewrite the leaves
         that actually hold matched rows.
         """
-        from yggdrasil.execution.expr import Expression, Predicate
+        from yggdrasil.saga.expr import Expression, Predicate
 
         if predicate is not None:
             if isinstance(predicate, str):
@@ -2431,7 +2431,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         """Drop rows where *predicate* is false.
 
         ``predicate`` accepts every shape
-        :meth:`yggdrasil.execution.expr.Expression.from_`
+        :meth:`yggdrasil.saga.expr.Expression.from_`
         recognises:
 
         * a SQL predicate string (``"x > 0 AND y IS NOT NULL"``),
@@ -2551,6 +2551,6 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         ``join``, …) accumulate in an :class:`ExecutionPlan` without
         touching data.  Any ``read_*`` call materialises the plan.
         """
-        from yggdrasil.plan.lazy import LazyTabular
+        from yggdrasil.saga.plan.lazy import LazyTabular
 
         return LazyTabular(self)
