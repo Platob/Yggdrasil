@@ -1,0 +1,266 @@
+from __future__ import annotations
+
+import struct
+from typing import IO as TypingIO, Mapping
+
+from yggdrasil.io.holder import IO
+from yggdrasil.pickle.ser._scratch import _ScratchBuf
+from yggdrasil.pickle.ser.constants import HEADER_SIZE
+from yggdrasil.pickle.ser.errors import HeaderDecodeError, MetadataDecodeError
+
+__all__ = [
+    "Metadata",
+    "decode_metadata",
+    "encode_metadata",
+    "Header",
+]
+
+Metadata = dict[bytes, bytes] | None
+MAX_META_SIZE = 128 * 1024 * 1024
+MAX_PAYLOAD_SIZE = 2 * 1024 * 1024 * 1024
+MAX_METADATA_ENTRIES = 10_000
+MAX_METADATA_KEY_SIZE = 64 * 1024
+MAX_METADATA_VALUE_SIZE = 16 * 1024 * 1024
+
+# Pre-compiled struct codecs.
+# Header layout: tag:u16, codec:u16, size:u32, meta_size:u32 — 12 bytes BE.
+_HEADER_STRUCT = struct.Struct(">HHII")
+assert _HEADER_STRUCT.size == HEADER_SIZE
+_U32_BE = struct.Struct(">I")
+
+
+def encode_metadata(metadata: Mapping[bytes, bytes] | None) -> bytes:
+    """Encode metadata as length-prefixed key/value pairs.
+
+    Format:
+
+    ```text
+    [k_len:u32][key][v_len:u32][value]...
+    ```
+    """
+    if not metadata:
+        return b""
+
+    parts: list[bytes] = []
+    pack_u32 = _U32_BE.pack
+    for key, value in metadata.items():
+        if not isinstance(key, bytes):
+            raise TypeError(f"Metadata keys must be bytes, got {type(key)!r}")
+        if not isinstance(value, bytes):
+            raise TypeError(f"Metadata values must be bytes, got {type(value)!r}")
+
+        parts.append(pack_u32(len(key)))
+        parts.append(key)
+        parts.append(pack_u32(len(value)))
+        parts.append(value)
+    return b"".join(parts)
+
+
+def decode_metadata(blob: bytes) -> Metadata:
+    if not blob:
+        return None
+
+    pos = 0
+    size = len(blob)
+    out: dict[bytes, bytes] = {}
+    entries = 0
+    unpack_u32 = _U32_BE.unpack_from
+
+    while pos < size:
+        entries += 1
+        if entries > MAX_METADATA_ENTRIES:
+            raise MetadataDecodeError("Too many metadata entries")
+
+        if pos + 4 > size:
+            raise MetadataDecodeError("Unexpected EOF while reading metadata key length")
+        (k_len,) = unpack_u32(blob, pos)
+        pos += 4
+
+        if k_len > MAX_METADATA_KEY_SIZE:
+            raise MetadataDecodeError(f"Metadata key too large: {k_len}")
+
+        if pos + k_len > size:
+            raise MetadataDecodeError("Unexpected EOF while reading metadata key")
+        key = blob[pos : pos + k_len]
+        pos += k_len
+
+        if pos + 4 > size:
+            raise MetadataDecodeError("Unexpected EOF while reading metadata value length")
+        (v_len,) = unpack_u32(blob, pos)
+        pos += 4
+
+        if v_len > MAX_METADATA_VALUE_SIZE:
+            raise MetadataDecodeError(f"Metadata value too large: {v_len}")
+
+        if pos + v_len > size:
+            raise MetadataDecodeError("Unexpected EOF while reading metadata value")
+        value = blob[pos : pos + v_len]
+        pos += v_len
+
+        out[key] = value
+
+    return out
+
+
+class Header:
+    """Binary header for a serialized payload.
+
+    Layout:
+        tag:u16
+        codec:u16
+        size:u32
+        meta_size:u32
+        metadata:meta_size bytes
+        payload:size bytes
+    """
+
+    __slots__ = ("tag", "codec", "size", "meta_size", "start", "metadata", "_meta_blob")
+
+    def __init__(
+        self,
+        tag: int,
+        codec: int,
+        size: int,
+        meta_size: int,
+        start: int,
+        metadata: Metadata = None,
+        *,
+        _meta_blob: bytes | None = None,
+    ) -> None:
+        self.tag = tag
+        self.codec = codec
+        self.size = size
+        self.meta_size = meta_size
+        self.start = start
+        self.metadata = metadata
+        self._meta_blob = _meta_blob
+
+    @property
+    def header_start(self) -> int:
+        return self.start - HEADER_SIZE - self.meta_size
+
+    @property
+    def payload_end(self) -> int:
+        return self.start + self.size
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        tag: int,
+        codec: int,
+        size: int,
+        metadata: Mapping[bytes, bytes] | None = None,
+        start: int = 0,
+    ) -> "Header":
+        """Build a header from semantic fields."""
+        encoded = encode_metadata(metadata)
+        return cls(
+            tag=tag,
+            codec=codec,
+            size=size,
+            meta_size=len(encoded),
+            start=start + HEADER_SIZE + len(encoded),
+            metadata=dict(metadata) if metadata else None,
+            _meta_blob=encoded,
+        )
+
+    @classmethod
+    def read_from(
+        cls,
+        buffer: IO,
+        *,
+        pos: int | None = None,
+    ) -> "Header":
+        """Parse a header from a buffer without materializing the payload."""
+        if pos is None:
+            pos = buffer.tell()
+
+        fixed = buffer.pread(HEADER_SIZE, pos=pos)
+        if len(fixed) != HEADER_SIZE:
+            raise HeaderDecodeError(
+                f"Expected {HEADER_SIZE} header bytes at pos={pos}, got {len(fixed)}"
+            )
+
+        # One unpack instead of four int.from_bytes calls.
+        tag, codec, size, meta_size = _HEADER_STRUCT.unpack(fixed)
+
+        if meta_size > MAX_META_SIZE:
+            raise HeaderDecodeError(f"Metadata too large: {meta_size}")
+
+        if size > MAX_PAYLOAD_SIZE:
+            raise HeaderDecodeError(f"Payload too large: {size}")
+
+        meta_blob = b""
+        if meta_size:
+            meta_blob = buffer.pread(meta_size, pos=pos + HEADER_SIZE)
+            if len(meta_blob) != meta_size:
+                raise HeaderDecodeError(
+                    f"Expected {meta_size} metadata bytes at pos={pos + HEADER_SIZE}, "
+                    f"got {len(meta_blob)}"
+                )
+
+        metadata = decode_metadata(meta_blob)
+        return cls(
+            tag=tag,
+            codec=codec,
+            size=size,
+            meta_size=meta_size,
+            start=pos + HEADER_SIZE + meta_size,
+            metadata=metadata,
+            _meta_blob=meta_blob,
+        )
+
+    def payload_view(self, buffer: "IO | _ScratchBuf") -> "IO | _ScratchBuf":
+        """Return a buffer over the payload sub-range ``[start, start+size)``.
+
+        A :class:`_ScratchBuf` slices in place (its own zero-copy ``view``); a
+        yggdrasil :class:`IO` is read directly (``pread``) into a fresh
+        :class:`_ScratchBuf` — the pickle module's lightweight read surface —
+        which is exactly what the bounded ``IO.view`` did before."""
+        if isinstance(buffer, _ScratchBuf):
+            return buffer.view(pos=self.start, size=self.size)
+        return _ScratchBuf(buffer.pread(self.size, self.start))
+
+    def write_to(
+        self,
+        data: bytes | bytearray | memoryview,
+        *,
+        buffer: "IO | TypingIO[bytes] | None" = None,
+    ) -> "IO | TypingIO[bytes]":
+        """Write header + payload into a buffer and return that buffer.
+
+        Streams via the universal :class:`IO[bytes].write` method so a
+        stdlib ``io.BytesIO`` or any open file handle works as a sink —
+        not just the yggdrasil :class:`IO`. Avoids the extra
+        ``to_bytes()`` materialization that previous shapes incurred.
+        """
+        if buffer is None:
+            buffer = _ScratchBuf()
+
+        payload = memoryview(data)
+        if len(payload) != self.size:
+            raise ValueError(
+                f"Payload size mismatch: header.size={self.size}, actual={len(payload)}"
+            )
+
+        # Use cached blob; compute once and store if not already set.
+        metadata_blob = self._meta_blob
+        if metadata_blob is None:
+            metadata_blob = encode_metadata(self.metadata)
+            self._meta_blob = metadata_blob
+        if len(metadata_blob) != self.meta_size:
+            raise ValueError(
+                f"Metadata size mismatch: header.meta_size={self.meta_size}, "
+                f"actual={len(metadata_blob)}"
+            )
+
+        # Single struct.pack for the fixed 12-byte header.
+        fixed = _HEADER_STRUCT.pack(self.tag, self.codec, self.size, self.meta_size)
+
+        write = buffer.write
+        write(fixed)
+        if metadata_blob:
+            write(metadata_blob)
+        write(payload)
+        return buffer

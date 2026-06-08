@@ -1,0 +1,326 @@
+import datetime as dt
+import random
+import time
+from dataclasses import dataclass
+from typing import Optional, Union
+
+__all__ = ["WaitingConfig", "WaitingConfigArg", "DEFAULT_WAITING_CONFIG"]
+
+
+def _safe_seconds_tick(ticks: Union[int, float, dt.timedelta]):
+    if isinstance(ticks, dt.timedelta):
+        return ticks.total_seconds()
+    return ticks
+
+
+_JITTER_RNG = random.Random()
+DEFAULT_TIMEOUT_TICKS = float(20 * 60) # 20 minutes
+WaitingConfigArg = Union["WaitingConfig", dict, int, float, dt.datetime, bool]
+
+
+@dataclass(frozen=True, slots=True)
+class WaitingConfig:
+    timeout: float = DEFAULT_TIMEOUT_TICKS
+    interval: float = 0.5
+    backoff: float = 1.5
+    max_interval: float = 10.0
+    retries: int = 4
+    max_attempts: Optional[int] = 4
+
+    def __getstate__(self) -> dict:
+        return {
+            "timeout": self.timeout,
+            "interval": self.interval,
+            "backoff": self.backoff,
+            "max_interval": self.max_interval,
+            "retries": self.retries,
+            "max_attempts": self.max_attempts,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        # Bypass immutability during unpickling
+        object.__setattr__(self, "timeout", state.get("timeout", DEFAULT_TIMEOUT_TICKS))
+        object.__setattr__(self, "interval", state.get("interval", 1.5))
+        object.__setattr__(self, "backoff", state.get("backoff", 1.0))
+        object.__setattr__(self, "max_interval", state.get("max_interval", 10.0))
+        object.__setattr__(self, "retries", state.get("retries", 8))
+        object.__setattr__(self, "max_attempts", state.get("max_attempts", 4))
+
+    def __bool__(self):
+        return self.timeout > 0
+
+    @property
+    def total_try_count(self) -> int:
+        return max(self.retries + 1, 1)
+
+    @property
+    def timeout_total_seconds(self) -> float:
+        return self.timeout
+
+    @property
+    def timeout_timedelta(self) -> dt.timedelta:
+        return dt.timedelta(seconds=self.timeout)
+
+    @property
+    def timeout_pool(self):
+        from yggdrasil.http_.timeout import Timeout
+
+        if not self.timeout:
+            return Timeout(
+                total=None,
+                connect=None,
+                read=None
+            )
+
+        return Timeout(
+            total=self.timeout * 2,
+            connect=min(self.timeout, 30.0),
+            read=self.timeout
+        )
+
+    @classmethod
+    def default(cls):
+        return DEFAULT_WAITING_CONFIG
+
+    @staticmethod
+    def _to_seconds(value) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, dt.timedelta):
+            return float(value.total_seconds())
+        if isinstance(value, (int, float)):
+            return float(value)
+        raise TypeError(f"Expected seconds as int/float/timedelta, got {type(value)!r}")
+
+    @staticmethod
+    def _deadline_to_timeout(deadline: dt.datetime) -> float:
+        if not isinstance(deadline, dt.datetime):
+            raise TypeError(f"deadline must be datetime, got {type(deadline)!r}")
+        now = dt.datetime.now(tz=deadline.tzinfo) if deadline.tzinfo else dt.datetime.now()
+        return (deadline - now).total_seconds()
+
+    @classmethod
+    def from_(
+        cls,
+        arg: WaitingConfigArg = None,
+        timeout: Optional[Union[int, float, dt.timedelta]] = None,
+        interval: Optional[Union[int, float, dt.timedelta]] = None,
+        backoff: Optional[Union[int, float, dt.timedelta]] = None,
+        max_interval: Optional[Union[int, float, dt.timedelta]] = None,
+        retries: int | None = None,
+        max_attempts: int | None = ...,
+    ) -> "WaitingConfig":
+        # Hot paths — every backend ``wait`` / ``raise_error`` plumbing
+        # routes through here. Cache the three trivial coercions
+        # (``None`` / ``True`` / ``False``) so the steady-state lookup
+        # is one isinstance + one dict-style branch with no allocation.
+        if arg is None and timeout is None and max_attempts is ...:
+            return DEFAULT_WAITING_CONFIG
+        if arg is True and timeout is None and interval is None and backoff is None and max_interval is None and retries is None and max_attempts is ...:
+            return _TRUE_WAITING_CONFIG
+        if arg is False and timeout is None and interval is None and backoff is None and max_interval is None and retries is None and max_attempts is ...:
+            return _FALSE_WAITING_CONFIG
+
+        base_timeout: float | None = None
+        base_interval: float | None = None
+        base_backoff: float | None = None
+        base_max_interval: float | None = None
+        base_retries: int | None = None
+        base_max_attempts: int | None = ...
+
+        if arg is not None:
+            if isinstance(arg, cls):
+                if timeout is None and interval is None and backoff is None and max_interval is None and max_attempts is ...:
+                    return arg
+
+                base_timeout = arg.timeout
+                base_interval = arg.interval
+                base_backoff = arg.backoff
+                base_max_interval = arg.max_interval
+                base_retries = arg.retries
+                base_max_attempts = arg.max_attempts
+
+            elif isinstance(arg, bool):
+                base_timeout = DEFAULT_TIMEOUT_TICKS if arg else 0.0
+                base_interval = 0.5
+                base_backoff = 1.5
+                base_max_interval = 10.0
+                base_retries = 8
+
+            elif isinstance(arg, (int, float, dt.timedelta)):
+                base_timeout = cls._to_seconds(arg)
+
+            elif isinstance(arg, dt.datetime):
+                base_timeout = float(cls._deadline_to_timeout(arg))
+
+            elif isinstance(arg, dict):
+                if "deadline" in arg and "timeout" in arg:
+                    raise ValueError("Provide only one of 'deadline' or 'timeout' in WaitingOptions dict.")
+
+                if "deadline" in arg and arg["deadline"] is not None:
+                    base_timeout = float(cls._deadline_to_timeout(arg["deadline"]))
+                else:
+                    base_timeout = cls._to_seconds(arg.get("timeout"))
+
+                base_interval = cls._to_seconds(arg.get("interval"))
+                base_backoff = cls._to_seconds(arg.get("backoff"))
+                base_max_interval = cls._to_seconds(arg.get("max_interval"))
+                if "max_attempts" in arg:
+                    base_max_attempts = arg["max_attempts"]
+
+            else:
+                raise TypeError(f"Unsupported WaitingOptions arg type: {type(arg)!r}")
+
+        # explicit kwargs win
+        final_timeout = cls._to_seconds(timeout) if timeout is not None else base_timeout
+        final_interval = cls._to_seconds(interval) if interval is not None else base_interval
+        final_backoff = cls._to_seconds(backoff) if backoff is not None else base_backoff
+        final_max_interval = cls._to_seconds(max_interval) if max_interval is not None else base_max_interval
+        final_retries = retries if retries is not None else base_retries
+        final_max_attempts = max_attempts if max_attempts is not ... else base_max_attempts
+
+        # defaults to match non-Optional signature
+        if final_timeout is None:
+            final_timeout = 0.0
+        elif final_timeout < 0:
+            final_timeout = 0.0
+
+        if final_interval is None:
+            final_interval = 0.5
+
+        if final_backoff is None:
+            final_backoff = 1.5
+        elif final_backoff < 1:
+            final_backoff = 1.5
+
+        if final_max_interval is None:
+            final_max_interval = 10.0
+
+        if final_retries is None:
+            final_retries = 8
+        elif final_retries < 0:
+            final_retries = 0
+
+        if final_max_attempts is ...:
+            final_max_attempts = 4
+
+        return cls(
+            timeout=float(final_timeout),
+            interval=float(final_interval),
+            backoff=float(final_backoff),
+            max_interval=float(final_max_interval),
+            retries=int(final_retries),
+            max_attempts=final_max_attempts,
+        )
+
+    def is_expired(self, start: float):
+        if not start:
+            return False
+
+        return time.time() - start > self.timeout_total_seconds
+
+    def get_delay(
+        self,
+        iteration: int,
+        start: float | None = None,
+        max_interval: Optional[float] = None,
+    ) -> float:
+        if iteration < 0:
+            raise ValueError(f"iteration must be >= 0, got {iteration}")
+        if self.interval == 0:
+            return 0.0
+        sleep_s = self.interval * (self.backoff ** iteration)
+        cap = max_interval or self.max_interval
+        if cap > 0:
+            sleep_s = min(sleep_s, cap)
+        if sleep_s <= 0:
+            return 0.0
+        if start is not None and self.timeout > 0:
+            remaining = self.timeout - (time.time() - float(start))
+            if remaining <= 0:
+                return 0.0
+            sleep_s = min(sleep_s, remaining)
+        return sleep_s
+
+    def sleep(
+        self,
+        iteration: int,
+        start: float | None = None,
+        max_interval: Optional[float] = None,
+    ) -> None:
+        """
+        iteration is 0-based (first wait => iteration=0)
+
+        Backoff sleep strategy:
+        - interval == 0 => no sleep
+        - backoff >= 1 => interval * backoff**iteration
+        - max_interval == 0 => no cap, else cap sleep to max_interval
+        - if start is provided and timeout > 0:
+            * raise TimeoutError if already out of time
+            * cap sleep so we don't oversleep past timeout
+        """
+        if iteration < 0:
+            raise ValueError(f"iteration must be >= 0, got {iteration}")
+
+        if self.interval == 0:
+            return
+
+        growth_exp = self.backoff ** iteration
+
+        sleep_s = self.interval * growth_exp
+        max_interval = max_interval or self.max_interval
+
+        if max_interval > 0:
+            sleep_s = min(sleep_s, max_interval)
+
+        if sleep_s <= 0:
+            return
+
+        if start is not None and self.timeout > 0:
+            elapsed = time.time() - float(start)
+            remaining = self.timeout - elapsed
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting after {self.timeout:.3f}s")
+
+            # Always cap to remaining so we don't oversleep past the
+            # deadline — better to undershoot and let the next loop
+            # observe the timeout than to land past it.
+            sleep_s = min(sleep_s, remaining)
+
+        time.sleep(sleep_s)
+
+    def jittered_sleep(self, iteration: int = 0) -> None:
+        if self.max_interval <= 0:
+            return
+
+        if not iteration:
+            iteration = 1
+        else:
+            iteration += 1
+
+        max_interval = min(120, self.max_interval * iteration)
+
+        delay = _JITTER_RNG.uniform(0, max_interval)
+        if delay > 0:
+            time.sleep(delay)
+
+
+DEFAULT_WAITING_CONFIG = WaitingConfig()
+# Pre-built results for ``WaitingConfig.from_(True)`` and
+# ``WaitingConfig.from_(False)`` — every executor ``wait`` /
+# ``raise_error`` hop runs through one of these.
+_TRUE_WAITING_CONFIG = WaitingConfig(
+    timeout=DEFAULT_TIMEOUT_TICKS,
+    interval=0.5,
+    backoff=1.5,
+    max_interval=10.0,
+    retries=8,
+)
+_FALSE_WAITING_CONFIG = WaitingConfig(
+    timeout=0.0,
+    interval=0.5,
+    backoff=1.5,
+    max_interval=10.0,
+    retries=8,
+)
+

@@ -1,0 +1,213 @@
+"""Live :class:`S3Path` integration — driven through a Databricks
+**external volume**.
+
+S3Path needs a real bucket + credentials. Rather than wire a standalone
+AWS account, we borrow Unity Catalog's: create an EXTERNAL volume (its
+storage location is a real ``s3://`` prefix), vend short-lived AWS
+credentials for it via ``temporary_volume_credentials``, and point a
+plain :class:`S3Path` at that prefix. So the same pure-HTTP S3 data plane
+that runs against any bucket is exercised here against the object store
+backing the volume — no mocks.
+
+Skips (not fails) when the environment can't support it:
+
+* no ``DATABRICKS_HOST`` (base class),
+* the identity can't CREATE SCHEMA / CREATE VOLUME,
+* the identity lacks ``EXTERNAL USE SCHEMA`` (and can't self-grant it),
+  so temporary credentials can't be minted,
+* the volume is backed by Azure / GCP (no ``aws_temp_credentials``), or
+* the S3 endpoint isn't reachable from the runner's network.
+
+Provisions a dedicated ``ygg_integration_<hex>`` scratch schema under
+``trading_tgp_dev`` and a dedicated EXTERNAL volume inside it, dropped
+via the :meth:`safe_drop_schema` guard on teardown.
+"""
+from __future__ import annotations
+
+import secrets
+import unittest
+from typing import ClassVar
+
+import pyarrow as pa
+from databricks.sdk.errors import DatabricksError
+from databricks.sdk.errors.platform import PermissionDenied
+
+from yggdrasil.aws.fs.path import S3Path
+from yggdrasil.enums import Mode
+from yggdrasil.io.io_stats import IOKind
+
+from .. import DatabricksIntegrationCase
+
+
+__all__ = ["TestS3PathViaExternalVolume"]
+
+
+class TestS3PathViaExternalVolume(DatabricksIntegrationCase):
+    """Round-trip real S3 objects via an external volume's storage + creds."""
+
+    schema: ClassVar
+    volume: ClassVar
+    s3_service: ClassVar
+    base_url: ClassVar[str]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.schema = cls.scratch_schema()
+        try:
+            cls.volume = cls.client.volumes(
+                catalog_name=cls.INTEGRATION_CATALOG,
+                schema_name=cls.schema.schema_name,
+            ).create(volume_name="ygg_s3_ext", volume_type="EXTERNAL")
+            storage = cls.volume.storage_location.rstrip("/")
+        except (DatabricksError, PermissionDenied) as exc:
+            cls.safe_drop_schema(cls.schema)
+            raise unittest.SkipTest(
+                f"cannot provision external volume: {exc}"
+            ) from exc
+
+        if not storage.startswith("s3://"):
+            cls.safe_drop_schema(cls.schema)
+            raise unittest.SkipTest(
+                f"external volume is not S3-backed ({storage!r}); "
+                f"S3Path coverage needs an AWS workspace."
+            )
+
+        from yggdrasil.databricks.aws import AWSDatabricksVolumeCredentials
+
+        provider = AWSDatabricksVolumeCredentials(str(cls.volume.volume_id), client=cls.client)
+        try:
+            # Force a credential mint now (the lazy refresher would defer it to
+            # first S3 byte) so a missing EXTERNAL USE SCHEMA grant — or a
+            # non-S3 backing — degrades to a skip instead of erroring mid-test.
+            provider.get_credentials(mode=Mode.OVERWRITE)
+            cls.s3_service = provider.aws_client(mode=Mode.OVERWRITE).s3
+        except (PermissionDenied, RuntimeError) as exc:
+            cls.safe_drop_schema(cls.schema)
+            raise unittest.SkipTest(
+                f"cannot mint S3 credentials for the external volume "
+                f"(needs EXTERNAL USE SCHEMA, S3 backing): {exc}"
+            ) from exc
+        except ImportError as exc:
+            # The credential refresher rides botocore's RefreshableCredentials
+            # even though the S3 data plane is pure-HTTP — skip when the aws
+            # extra (boto3 / botocore) isn't installed.
+            cls.safe_drop_schema(cls.schema)
+            raise unittest.SkipTest(f"aws extra not installed: {exc}") from exc
+
+        cls.base_url = f"{storage}/_ygg_s3_{secrets.token_hex(4)}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            cls.safe_drop_schema(getattr(cls, "schema", None))
+        finally:
+            super().tearDownClass()
+
+    def _path(self, leaf: str) -> S3Path:
+        p = S3Path(f"{self.base_url}/{leaf}", service=self.s3_service)
+        p.invalidate_singleton()
+        return p
+
+    # -- bytes ---------------------------------------------------------
+    def test_write_read_bytes_roundtrip(self) -> None:
+        payload = b"s3-via-uc-" + secrets.token_bytes(24)
+        p = self._path("bytes.bin")
+        try:
+            p.write_bytes(payload)
+            self.assertTrue(p.exists())
+            self.assertEqual(p.stat().kind, IOKind.FILE)
+            self.assertEqual(bytes(self._path("bytes.bin").read_bytes()), payload)
+        finally:
+            p.unlink(missing_ok=True)
+
+    def test_stat_carries_metadata(self) -> None:
+        # The HEAD probe folds object identity / versioning headers into
+        # ``IOStats.metadata`` (etag, version id, content-type, …).
+        p = self._path("meta.bin")
+        try:
+            p.write_bytes(b"with-metadata")
+            stat = self._path("meta.bin").stat()
+            self.assertIsInstance(stat.metadata, dict)
+            self.assertIn("etag", stat.metadata)
+        finally:
+            p.unlink(missing_ok=True)
+
+    def test_overwrite_replaces_contents(self) -> None:
+        p = self._path("overwrite.bin")
+        try:
+            p.write_bytes(b"first")
+            p.write_bytes(b"second-longer")
+            self.assertEqual(bytes(self._path("overwrite.bin").read_bytes()), b"second-longer")
+        finally:
+            p.unlink(missing_ok=True)
+
+    # -- opened handles (write coalescing on the whole-blob path) ------
+    def test_open_write_then_read(self) -> None:
+        try:
+            with self._path("opened.bin").open("wb") as io:
+                io.write(b"opened-")
+                io.write(b"payload")
+            self.assertEqual(bytes(self._path("opened.bin").read_bytes()), b"opened-payload")
+        finally:
+            self._path("opened.bin").unlink(missing_ok=True)
+
+    def test_open_append(self) -> None:
+        # Append-at-EOF needs a reliable up-front size; this store under-reports
+        # Content-Length on HEAD, so S3Path falls back to a Content-Range probe
+        # (see ``_size_via_content_range``) — the cursor parks at the real EOF.
+        p = self._path("append.bin")
+        try:
+            p.write_bytes(b"head-")
+            with self._path("append.bin").open("ab") as io:
+                io.write(b"tail")
+            self.assertEqual(bytes(self._path("append.bin").read_bytes()), b"head-tail")
+        finally:
+            p.unlink(missing_ok=True)
+
+    # -- tabular -------------------------------------------------------
+    def test_parquet_roundtrip(self) -> None:
+        table = pa.table({"id": pa.array(range(2000), pa.int64()),
+                          "v": pa.array([f"r{i}" for i in range(2000)], pa.string())})
+        p = self._path("t.parquet")
+        try:
+            p.write_table(table)
+            got = self._path("t.parquet").read_arrow_table()
+            self.assertEqual(got.num_rows, 2000)
+            self.assertEqual(got.column("id").to_pylist()[:3], [0, 1, 2])
+        finally:
+            p.unlink(missing_ok=True)
+
+    def test_zip_ranged_entry_read(self) -> None:
+        """A zip on S3 reads its directory + entries via ranged block fetches
+        — never the whole archive — exactly like the volume path."""
+        import io as _io
+        import zipfile as _zf
+        raw = _io.BytesIO()
+        with _zf.ZipFile(raw, "w", _zf.ZIP_STORED) as z:
+            z.writestr("a.txt", b"alpha")
+            z.writestr("big.bin", secrets.token_bytes(1_500_000))
+            z.writestr("meta.json", b"{}")
+        big = _zf.ZipFile(_io.BytesIO(raw.getvalue())).read("big.bin")
+        p = self._path("arc.zip")
+        try:
+            p.write_bytes(raw.getvalue())
+            z = self._path("arc.zip").as_media("zip")
+            self.assertEqual(set(z.list_entries()), {"a.txt", "big.bin", "meta.json"})
+            self.assertEqual(bytes(z.child("a.txt").read_bytes()), b"alpha")
+            self.assertEqual(bytes(z.child("big.bin").read_bytes()), big)
+        finally:
+            p.unlink(missing_ok=True)
+
+    # -- navigation ----------------------------------------------------
+    def test_iterdir_and_unlink(self) -> None:
+        leaf = self._path("listing/entry.bin")
+        try:
+            leaf.write_bytes(b"x")
+            names = {c.name for c in self._path("listing").iterdir()}
+            self.assertIn("entry.bin", names)
+            leaf.unlink()
+            leaf.invalidate_singleton()
+            self.assertIs(leaf.stat().kind, IOKind.MISSING)
+        finally:
+            leaf.unlink(missing_ok=True)

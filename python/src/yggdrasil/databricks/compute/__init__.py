@@ -1,0 +1,25 @@
+"""Compute helpers for Databricks instance pools and remote execution.
+
+Cluster resources and the :class:`Clusters` service live at
+:mod:`yggdrasil.databricks.cluster`; this package now owns the
+:class:`Compute` aggregator and the instance-pool / remote-execution
+helpers.
+"""
+
+__all__ = [
+    "databricks_remote_compute",
+    "databricks_pool_remote_compute",
+    "ExecutionContext",
+    "InstancePool",
+    "InstancePools",
+    "InstancePoolDefaults",
+]
+
+from .execution_context import ExecutionContext
+from .instance_pool import (
+    InstancePool,
+    InstancePoolDefaults,
+    InstancePools,
+    databricks_pool_remote_compute,
+)
+from .remote import databricks_remote_compute

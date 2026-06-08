@@ -1,0 +1,200 @@
+"""Backend detection — what can Loki reach from where it's running.
+
+Loki is the global yggdrasil agent. It adapts to wherever it wakes up: a
+Databricks notebook/job, a workstation with a configured Databricks
+session, a running yggdrasil node, or just a bare shell. :func:`detect`
+sniffs the environment **offline** (no network, never raises) and reports
+the backends Loki can lean on, so the agent can reason about its own
+capabilities before it acts.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import socket
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+__all__ = ["Backend", "detect", "detect_databricks", "detect_aws", "detect_local"]
+
+
+@dataclass
+class Backend:
+    """A capability surface Loki can drive (e.g. Databricks, a node)."""
+
+    name: str
+    available: bool
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return self.available
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "available": self.available, "detail": self.detail}
+
+
+def detect_databricks() -> Backend:
+    """Detect a usable Databricks session **without** a network round-trip.
+
+    Looks for the signals that mean "credentials are resolvable": the
+    Databricks runtime, ``DATABRICKS_*`` env vars, a ``~/.databrickscfg``,
+    or a session remembered by ``ygg databricks configure``. Only when one
+    is present does it resolve a client (offline — host/auth from config),
+    so it never pollutes the process-global client with a credential-less
+    instance.
+    """
+    home = pathlib.Path.home()
+    signals = {
+        "runtime": os.getenv("DATABRICKS_RUNTIME_VERSION") is not None,
+        "env_host": bool(os.getenv("DATABRICKS_HOST")),
+        "env_token": bool(os.getenv("DATABRICKS_TOKEN")),
+        "env_oauth": bool(os.getenv("DATABRICKS_CLIENT_ID")),
+        "cfg": (home / ".databrickscfg").exists(),
+        "session": _has_remembered_session(home),
+    }
+    if not any(signals.values()):
+        return Backend("databricks", available=False, detail={"signals": signals})
+
+    detail: dict[str, Any] = {"signals": signals}
+    # Resolve host/catalog/schema cheaply — env, the `ygg databricks configure`
+    # session snapshot, or ~/.databrickscfg — so the common case never pays the
+    # ~0.85s ``import databricks.sdk`` just to *detect* the workspace. The heavy
+    # client (and SDK) load is deferred to when Databricks is actually used.
+    cheap = _cheap_databricks_detail(home)
+    if cheap.get("host"):
+        detail.update(cheap)
+        return Backend("databricks", available=True, detail=detail)
+
+    # Signalled but host not resolvable cheaply (exotic auth — Azure MSI, an
+    # OAuth flow with no cached host, …): fall back to the full SDK client to
+    # resolve it precisely, paying the heavier import only in this rare case.
+    try:
+        from yggdrasil.databricks import DatabricksClient
+
+        client = DatabricksClient.current()
+        detail["host"] = client.base_url
+        detail["auth_type"] = getattr(client, "auth_type", None)
+        detail["catalog"] = client.catalog_name
+        detail["schema"] = client.schema_name
+        available = bool(detail.get("host"))
+    except Exception as exc:  # offline detection must never raise
+        detail["error"] = f"{type(exc).__name__}: {exc}"
+        available = False
+    return Backend("databricks", available=available, detail=detail)
+
+
+def _cheap_databricks_detail(home: pathlib.Path) -> dict[str, Any]:
+    """Best-effort host/catalog/schema/auth **without** importing the SDK.
+
+    Reads the same sources the client would, cheaply: the remembered
+    ``ygg databricks configure`` session snapshot, the ``DATABRICKS_*``
+    environment, then ``~/.databrickscfg``. Returns ``{}`` when none yields a
+    host (the caller then falls back to the full client)."""
+    sess = _databricks_session_snapshot(home)
+    if sess and sess.get("host"):
+        return {"host": sess.get("host"), "auth_type": sess.get("auth_type"),
+                "catalog": sess.get("catalog"), "schema": sess.get("schema")}
+    host = os.getenv("DATABRICKS_HOST")
+    if host:
+        auth = ("pat" if os.getenv("DATABRICKS_TOKEN")
+                else "oauth-m2m" if os.getenv("DATABRICKS_CLIENT_ID") else None)
+        return {"host": host, "auth_type": auth,
+                "catalog": os.getenv("DATABRICKS_CATALOG"),
+                "schema": os.getenv("DATABRICKS_SCHEMA")}
+    cfg = home / ".databrickscfg"
+    if cfg.is_file():
+        import configparser
+
+        cp = configparser.ConfigParser()
+        try:
+            cp.read(cfg)
+            for sec in ("DEFAULT", *cp.sections()):
+                if cp.has_option(sec, "host"):
+                    return {"host": cp.get(sec, "host"),
+                            "auth_type": "pat" if cp.has_option(sec, "token") else None,
+                            "catalog": None, "schema": None}
+        except configparser.Error:
+            pass
+    return {}
+
+
+def _databricks_session_snapshot(home: pathlib.Path) -> Optional[dict[str, Any]]:
+    """The newest ``ygg databricks configure`` session snapshot, read directly
+    (this host's, else the most recent) — no SDK / ``yggdrasil.databricks``
+    import. Mirrors :mod:`yggdrasil.databricks.loki.session`."""
+    d = home / ".config" / "databricks-sdk-py" / "sessions"
+    if not d.is_dir():
+        return None
+    host = "".join(c if (c.isalnum() or c in "-_.") else "-"
+                   for c in (socket.gethostname() or "default"))
+    preferred = d / f"{host}.json"
+    files = [preferred] if preferred.is_file() else sorted(
+        d.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files:
+        try:
+            return json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _has_remembered_session(home: pathlib.Path) -> bool:
+    sessions = home / ".config" / "databricks-sdk-py" / "sessions"
+    try:
+        return sessions.is_dir() and any(sessions.glob("*.json"))
+    except OSError:
+        return False
+
+
+def detect_aws() -> Backend:
+    """Detect a usable AWS session **without** a network round-trip.
+
+    Looks for the signals that mean "boto3 can resolve credentials": the
+    ``AWS_*`` env vars, an ``AWS_PROFILE``, a web-identity token (IRSA), or a
+    ``~/.aws`` config/credentials file. Offline only — never calls STS, so it
+    never blocks or raises.
+    """
+    home = pathlib.Path.home()
+    signals = {
+        "env_key": bool(os.getenv("AWS_ACCESS_KEY_ID")),
+        "env_profile": bool(os.getenv("AWS_PROFILE")),
+        "env_region": bool(os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")),
+        "web_identity": bool(os.getenv("AWS_WEB_IDENTITY_TOKEN_FILE")),
+        "config": (home / ".aws" / "credentials").exists() or (home / ".aws" / "config").exists(),
+    }
+    if not any(signals.values()):
+        return Backend("aws", available=False, detail={"signals": signals})
+    return Backend(
+        "aws",
+        available=True,
+        detail={
+            "signals": signals,
+            "region": os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
+            "profile": os.getenv("AWS_PROFILE"),
+        },
+    )
+
+
+def detect_local() -> Backend:
+    """The local machine — always available."""
+    import getpass
+    import socket
+
+    return Backend(
+        "local",
+        available=True,
+        detail={"user": _safe(getpass.getuser), "host": _safe(socket.gethostname)},
+    )
+
+
+def _safe(fn) -> str:
+    try:
+        return fn()
+    except Exception:
+        return "unknown"
+
+
+def detect() -> list[Backend]:
+    """Every backend Loki can see from here, in priority order."""
+    return [detect_databricks(), detect_aws(), detect_local()]
