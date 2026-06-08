@@ -739,23 +739,4 @@ class ArrowTabular(Tabular[CastOptions]):
                 n += len(tbl.column(0).chunks)
         return n
 
-    def _resolve_save_mode(self, mode: Any) -> Mode:
-        m = Mode.from_(mode, default=Mode.AUTO)
-        if m in (Mode.AUTO, Mode.OVERWRITE, Mode.TRUNCATE):
-            return Mode.OVERWRITE
-        if m is Mode.IGNORE:
-            return Mode.IGNORE if not self.is_empty() else Mode.OVERWRITE
-        if m is Mode.ERROR_IF_EXISTS:
-            if not self.is_empty():
-                raise FileExistsError(
-                    f"{type(self).__name__} write with Mode.ERROR_IF_EXISTS "
-                    f"but buffer is non-empty ({self.num_rows} row(s))."
-                )
-            return Mode.OVERWRITE
-        if m is Mode.APPEND:
-            return Mode.APPEND
-        raise ValueError(
-            f"{type(self).__name__} does not support Mode.{m.name}; "
-            f"valid: AUTO, OVERWRITE, TRUNCATE, APPEND, IGNORE, ERROR_IF_EXISTS."
-        )
 

@@ -905,6 +905,14 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
                 return Holder.for_holder(path, media_type=media_type, **kwargs)
             return path
 
+        # In-memory engine frames (pyarrow / polars / pandas / pyspark)
+        # route to their native in-memory Tabular before the file-like /
+        # IO fallbacks — IO is for *serialized* sources (paths, URLs,
+        # byte streams), not live frames.
+        framed = cls._inmemory_tabular(obj, **kwargs)
+        if framed is not ...:
+            return framed
+
         read = getattr(obj, "read", None)
         if callable(read):
             if media_type is None:
@@ -930,6 +938,64 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             "Pass a Tabular, a path / URL (str or os.PathLike), or "
             "a file-like object with media_type=."
         )
+
+    @classmethod
+    def _inmemory_tabular(cls, obj: Any, *, schema: Any = None, **kwargs: Any) -> Any:
+        """Wrap an in-memory engine frame in its native Tabular.
+
+        Returns the holder for a pyarrow / polars / pandas / pyspark
+        frame, or ``...`` (Ellipsis) when *obj* is not one — letting
+        callers fall through to other dispatch. Engine detection mirrors
+        :meth:`_write_table`: isinstance for pyarrow (already imported),
+        module-name sniffing for the optional engines so importing this
+        module never drags in polars / pandas / pyspark.
+        """
+        if isinstance(obj, (pa.Table, pa.RecordBatch, pa.RecordBatchReader)):
+            from yggdrasil.arrow.tabular import ArrowTabular
+            return ArrowTabular(obj, schema=schema, **kwargs)
+
+        from yggdrasil.pickle.serde import ObjectSerde
+        ns, name = ObjectSerde.module_and_name(obj)
+        if ns.startswith("polars"):
+            from yggdrasil.polars.tabular import PolarsTabular
+            # PolarsTabular holds an eager DataFrame; collect a LazyFrame.
+            frame = obj.collect() if name == "LazyFrame" else obj
+            return PolarsTabular(frame, schema=schema, **kwargs)
+        if ns.startswith("pandas"):
+            from yggdrasil.pandas.tabular import PandasTabular
+            return PandasTabular(obj, schema=schema, **kwargs)
+        if ns.startswith("pyspark"):
+            from yggdrasil.spark.tabular import SparkDataset
+            return SparkDataset(frame=obj, schema=schema, **kwargs)
+        return ...
+
+    @classmethod
+    def new(cls, data: Any = None, *, schema: Any = None, **kwargs: Any) -> "Tabular":
+        """Build an in-memory :class:`Tabular` for *data* by engine type.
+
+        - pyarrow ``Table`` / ``RecordBatch`` / ``RecordBatchReader`` →
+          :class:`~yggdrasil.arrow.tabular.ArrowTabular`
+        - polars ``DataFrame`` / ``LazyFrame`` →
+          :class:`~yggdrasil.polars.tabular.PolarsTabular`
+        - pandas ``DataFrame`` →
+          :class:`~yggdrasil.pandas.tabular.PandasTabular`
+        - pyspark ``DataFrame`` →
+          :class:`~yggdrasil.spark.tabular.SparkDataset`
+        - another :class:`Tabular` → returned as-is
+        - ``dict`` / ``list`` / ``None`` / iterable → in-memory
+          :class:`ArrowTabular`
+
+        Unlike :meth:`from_`, this never touches the IO layer — it builds
+        a live in-memory holder. Use :meth:`from_` when the input may be a
+        path / URL / serialized source.
+        """
+        if isinstance(data, Tabular):
+            return data
+        framed = cls._inmemory_tabular(data, schema=schema, **kwargs)
+        if framed is not ...:
+            return framed
+        from yggdrasil.arrow.tabular import ArrowTabular
+        return ArrowTabular(data, schema=schema, **kwargs)
 
     # ==================================================================
     # Options
@@ -1561,6 +1627,36 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             return self.read_spark_dataset(options)
 
         return self.read_arrow_tabular(options)
+
+    def _resolve_save_mode(self, mode: Any) -> "Mode":
+        """Collapse a requested write *mode* to OVERWRITE / APPEND / IGNORE.
+
+        Shared by the in-memory holders (Arrow / polars / pandas / Spark)
+        whose ``_write_*`` hooks only branch three ways. AUTO / TRUNCATE
+        behave as OVERWRITE; ERROR_IF_EXISTS raises on a non-empty buffer;
+        IGNORE no-ops on a non-empty buffer (and overwrites an empty one).
+        Subclasses define :meth:`is_empty`.
+        """
+        from yggdrasil.enums import Mode
+
+        m = Mode.from_(mode, default=Mode.AUTO)
+        if m in (Mode.AUTO, Mode.OVERWRITE, Mode.TRUNCATE):
+            return Mode.OVERWRITE
+        if m is Mode.IGNORE:
+            return Mode.IGNORE if not self.is_empty() else Mode.OVERWRITE
+        if m is Mode.ERROR_IF_EXISTS:
+            if not self.is_empty():
+                raise FileExistsError(
+                    f"{type(self).__name__} write with Mode.ERROR_IF_EXISTS "
+                    f"but buffer is non-empty ({self.num_rows} row(s))."
+                )
+            return Mode.OVERWRITE
+        if m is Mode.APPEND:
+            return Mode.APPEND
+        raise ValueError(
+            f"{type(self).__name__} does not support Mode.{m.name}; "
+            f"valid: AUTO, OVERWRITE, TRUNCATE, APPEND, IGNORE, ERROR_IF_EXISTS."
+        )
 
     def write_table(
         self,

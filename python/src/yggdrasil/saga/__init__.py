@@ -24,7 +24,7 @@ one import::
 > (``expr/`` + ``plan/`` + the engine facade) file-for-file.
 """
 
-from .engine import Saga
+from .engine import Saga, SagaSession
 from .expr import (
     Alias,
     Arithmetic,
@@ -125,6 +125,7 @@ __all__ = [
     "PredicateLike",
     "ResampleOp",
     "Saga",
+    "SagaSession",
     "ScanNode",
     "SelectNode",
     "SelectPlan",

@@ -9,40 +9,46 @@ core `Tabular` / `Field` / `DataType` model and adds three layers, all under
 - `yggdrasil.saga.plan` — mutable execution plans (`SelectPlan` / `InsertPlan`
   / `MergePlan`), the immutable plan-node tree, `LazyTabular`, SQL
   parse/emit across dialects, and the Arrow-native UDF registry.
-- `Saga` — the engine facade: register a catalog of tables, parse SQL from
-  many dialects, and build / execute autonomous lazy plans.
+- `Saga` — the engine facade. It holds **no catalog** (named-table
+  registration comes later): it parses the `FROM` sources out of the SQL and
+  **live-builds** them — path/URL sources via the IO layer, in-memory engine
+  frames via `Tabular.new`. Execution runs entirely through Saga's own plan
+  executor. Each engine owns a `SagaSession` whose local-disk staging area
+  (`~/.saga/<session>/staging`) spills large results, auto-cleaned on close.
 
 ## Quick Start
 
 ```python
 from yggdrasil.saga import Saga
-from yggdrasil.arrow.tabular import ArrowTabular
-import pyarrow as pa
 
-# Create a table
-users = ArrowTabular(pa.table({
-    "id": [1, 2, 3, 4, 5],
-    "name": ["alice", "bob", "carol", "dave", "eve"],
-    "region": ["US", "EU", "US", "EU", "US"],
-    "score": [90, 80, 95, 70, 85],
-}))
+saga = Saga(dialect="databricks")
 
-# The engine: register tables, then run SQL from any dialect
-saga = Saga(dialect="databricks").register("users", users)
-result = saga.sql("SELECT name, score FROM users WHERE score > 80 ORDER BY score DESC")
+# FROM resolves a path / URL source live — no registration needed
+result = saga.sql("SELECT name, score FROM 'users.parquet' "
+                  "WHERE score > 80 ORDER BY score DESC")
 print(result.read_arrow_table().to_pylist())
-# [{'name': 'carol', 'score': 95}, {'name': 'alice', 'score': 90}, {'name': 'eve', 'score': 85}]
 
-# Deferred lazy pipeline — nothing runs until the read
-out = (saga.scan("users")
+# Ad-hoc named sources for one query (raw frames are coerced via Tabular.new)
+import polars as pl
+res = saga.sql("SELECT id, name FROM users WHERE id = 3",
+               tables={"users": pl.DataFrame({"id": [1, 2, 3], "name": ["a", "b", "c"]})})
+
+# Deferred lazy pipeline over any source (Tabular, path/URL, or raw frame)
+out = (saga.scan("users.parquet")
            .filter("region = 'US'")
            .select("name", "score")
            .limit(5)
            .read_arrow_table())
 
 # Parse without executing (immutable node tree, or mutable ExecutionPlan)
-node = saga.parse("SELECT * FROM users")
-plan = saga.plan("INSERT INTO archive SELECT * FROM users")
+node = saga.parse("SELECT * FROM 't.parquet'")
+plan = saga.plan("INSERT INTO 'archive.parquet' SELECT * FROM 't.parquet'")
+
+# Collect a large result, spilling to the session's local-disk staging area
+with Saga() as s:
+    big = s.collect("SELECT * FROM 'huge.parquet'", spill=True)
+    # ... use big ...
+# staging tree auto-cleaned on exit
 ```
 
 The lower-level building blocks stay available directly when you don't need a

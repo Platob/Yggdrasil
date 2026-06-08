@@ -1522,26 +1522,6 @@ class SparkDataset(Tabular[CastOptions]):
     # Internal helpers
     # ==================================================================
 
-    def _resolve_save_mode(self, mode: Any) -> Mode:
-        m = Mode.from_(mode, default=Mode.AUTO)
-        if m in (Mode.AUTO, Mode.OVERWRITE, Mode.TRUNCATE):
-            return Mode.OVERWRITE
-        if m is Mode.IGNORE:
-            return Mode.IGNORE if self._frame is not None else Mode.OVERWRITE
-        if m is Mode.ERROR_IF_EXISTS:
-            if self._frame is not None:
-                raise FileExistsError(
-                    f"{type(self).__name__} write with Mode.ERROR_IF_EXISTS "
-                    "but buffer is non-empty."
-                )
-            return Mode.OVERWRITE
-        if m is Mode.APPEND:
-            return Mode.APPEND
-        raise ValueError(
-            f"{type(self).__name__} does not support Mode.{m.name}; "
-            f"valid: AUTO, OVERWRITE, TRUNCATE, APPEND, IGNORE, ERROR_IF_EXISTS."
-        )
-
     def _require_spark(self) -> "SparkSession":
         if self._spark is None:
             if self._frame is not None:

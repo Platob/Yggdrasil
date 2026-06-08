@@ -68,13 +68,24 @@ everything that used to live in `plan/` and `execution/expr/`:
 - `saga.plan` — mutable execution plans (`SelectPlan` / `InsertPlan` /
   `MergePlan`), the immutable plan-node tree, `LazyTabular`, SQL
   parse/emit across dialects, and the Arrow-native UDF registry.
-- `Saga` (`saga.engine`) — the engine facade: register a catalog of tables,
-  parse SQL from many dialects, and build / execute autonomous lazy plans.
-  Driven from code: `Saga(dialect=...).register(name, tab).sql(query)` /
-  `.scan(name).filter(...)` / `.parse(...)` / `.plan(...)`.
+- `Saga` (`saga.engine`) — the engine facade. Holds **no catalog**
+  (named-table registration comes later): it parses the `FROM` sources and
+  **live-builds** them — path/URL via the IO layer, in-memory frames via
+  `Tabular.new`. Runs on Saga's own plan executor (no statement executors).
+  Each engine owns a `SagaSession` with a local-disk staging area
+  (`~/.saga/<session>/staging`) for spilling results, auto-cleaned on close.
+  Driven from code: `Saga(dialect=...).sql("SELECT ... FROM 'x.parquet'")` /
+  `.scan(source).filter(...)` / `.parse(...)` / `.plan(...)` /
+  `.collect(query, spill=True)`.
 
 Reach for `from yggdrasil.saga import Saga, col, lit, parse_sql, SelectPlan`.
 See `docs/guides/saga.md`.
+
+In-memory Tabulars: `ArrowTabular` (`arrow/`), `PolarsTabular` (`polars/`),
+`PandasTabular` (`pandas/`), `SparkDataset` (`spark/`). `Tabular.new(data)`
+and `Tabular.from_(obj)` dispatch a raw engine frame to its native in-memory
+Tabular (arrow / polars / pandas / spark); `from_` otherwise falls back to the
+IO layer, which is specialized on serialized data (paths, URLs, byte streams).
 
 ## Databricks
 
