@@ -183,6 +183,18 @@ class TestFleet(unittest.TestCase):
         self.assertIsNone(untested.validated)
         self.assertEqual(fleet.kpis().validated, 1)   # only the green smoke counts
 
+    def test_kpis_count_shared_mesh_keys(self):
+        import tempfile
+
+        from yggdrasil.loki.mesh import MeshStore
+
+        d = tempfile.mkdtemp()
+        fleet = Fleet(mesh_dir=d)
+        self.assertEqual(fleet.kpis().mesh, 0)
+        MeshStore(d + "/mesh-kv.json").put("ingest", "x.py")
+        MeshStore(d + "/mesh-kv.json").put("api", {"ws": "/ws"})
+        self.assertEqual(fleet.kpis().mesh, 2)          # peers' published results show in KPIs
+
     def test_spawn_sets_mesh_env_for_agents(self):
         import tempfile
 

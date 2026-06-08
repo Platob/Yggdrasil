@@ -846,6 +846,8 @@ def _fleet_kpi_line(style: Any, fleet: Any) -> str:
         bits.append(style.dim(f"{k.queued} queued"))
     if k.validated:
         bits.append(style.good(f"{k.validated} tested"))
+    if k.mesh:
+        bits.append(style.brand(f"{k.mesh} shared"))
     cost = f"${k.cost:.4f}" + (f"/${fleet.cost_cap:.2f}" if fleet.cost_cap else "")
     tail = f"{k.steps} steps · {k.tokens:,} tok · {cost} · {k.elapsed:.1f}s"
     return f"  {style.dim('agents')} {'  '.join(bits)}  {style.dim('· ' + tail)}"

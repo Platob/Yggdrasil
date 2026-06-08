@@ -38,6 +38,7 @@ class FleetKPIs:
     failed: int = 0
     queued: int = 0
     validated: int = 0          # agents that passed a smoke checkpoint
+    mesh: int = 0               # results published to the shared mesh
     steps: int = 0
     tokens: int = 0
     cost: float = 0.0
@@ -287,6 +288,17 @@ class Fleet:
     def spent(self) -> float:
         return round(sum(h.cost for h in self.agents), 6)
 
+    def mesh_keys(self) -> int:
+        """How many results peers have published to the shared mesh (0 if none)."""
+        if not self.mesh_dir:
+            return 0
+        try:
+            from .mesh import MeshStore
+
+            return len(MeshStore(os.path.join(self.mesh_dir, "mesh-kv.json")).all())
+        except Exception:
+            return 0
+
     def queued(self) -> int:
         return len(self._pending)
 
@@ -371,6 +383,7 @@ class Fleet:
             failed=sum(1 for h in self.agents if not h.running and not h.ok),
             queued=self.queued(),
             validated=sum(1 for h in self.agents if h.validated is True),
+            mesh=self.mesh_keys(),
             steps=sum(h.steps for h in self.agents),
             tokens=sum(h.tokens for h in self.agents),
             cost=round(sum(h.cost for h in self.agents), 6),
