@@ -217,3 +217,37 @@ class TestImportLeavesLoggingUnconfigured:
         )
         assert "HIDDEN_INFO" not in out.stderr, out.stderr
         assert "SHOWN_WARNING" in out.stderr, out.stderr
+
+
+class TestTrackAwaitable:
+    """style.track drives an Awaitable behind a spinner/progress bar."""
+
+    def setup_method(self):
+        style.force_color(False)
+
+    def _task(self, polls=3, fail=False):
+        from yggdrasil.dataclasses.awaitable import Awaitable
+        from yggdrasil.enums.state import State
+
+        class _T(Awaitable):
+            def __init__(s): s._n = 0
+            def _start(s): s._state = State.RUNNING
+            def _poll(s):
+                s._n += 1
+                if s._n >= polls:
+                    s._state = State.FAILED if fail else State.SUCCEEDED
+            def _error_for_status(s): return RuntimeError("boom")
+            def progress(s): return min(s._n / polls, 1.0)
+        return _T()
+
+    def test_track_drives_to_done(self, monkeypatch):
+        monkeypatch.setattr(style, "_IS_TTY", False)
+        task = self._task(polls=2)
+        out = style.track(task, "working…", interval=0)
+        assert out is task and task.is_done and task.is_succeeded
+
+    def test_track_surfaces_failure(self, monkeypatch):
+        import pytest
+        monkeypatch.setattr(style, "_IS_TTY", False)
+        with pytest.raises(RuntimeError, match="boom"):
+            style.track(self._task(polls=1, fail=True), interval=0)

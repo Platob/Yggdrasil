@@ -324,6 +324,37 @@ def progress_bar(current: int, total: int, width: int = 30, label: str = "") -> 
     return f"  [{bar}] {pct} {label}"
 
 
+def track(awaitable: object, label: str = "", *, interval: float = 0.1) -> object:
+    """Drive an :class:`~yggdrasil.dataclasses.awaitable.Awaitable` to completion
+    behind a live spinner — upgraded to a **progress bar** when it reports a
+    fraction (``awaitable.progress()``).
+
+    The bridge from any awaitable — a SQL statement, a Databricks job run, an
+    agent batch — to the terminal styling::
+
+        style.track(dbc.sql.execute(query), "running query…")
+        style.track(batch, "fetching shards…")
+
+    Returns the (now-finished) awaitable; surfaces its failure like ``wait``.
+    """
+    spin = Spinner(label or "working…").start()
+
+    def on_tick(a: object) -> None:
+        getter = getattr(a, "progress", None)
+        frac = getter() if callable(getter) else None
+        if frac is not None:
+            spin.set_progress(int(max(0.0, min(frac, 1.0)) * 100), 100)
+
+    try:
+        awaitable.watch(on_tick, interval=interval, raise_error=False)
+    finally:
+        spin.stop()
+    raise_for = getattr(awaitable, "raise_for_status", None)
+    if callable(raise_for):
+        raise_for()
+    return awaitable
+
+
 def progress(current: int, total: int, label: str = "") -> None:
     """Render/refresh a download-style progress bar **in place** on the current
     line (TTY only — a redirected log would fill with ``\\r`` junk otherwise).

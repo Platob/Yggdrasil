@@ -2606,10 +2606,18 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             max([len(header[i])] + [len(r[i]) for r in body]) if body else len(header[i])
             for i in range(len(header))
         ]
+        # Numbers (and booleans) right-align so digits line up by place value —
+        # a real data table; text/temporal/nested stay left-aligned.
+        right = [t[:1] in ("i", "u", "f") or t in ("bool", "decimal") or t.startswith("dec")
+                 for t in types]
+
+        def pad(text: str, i: int) -> str:
+            return text.rjust(widths[i]) if right[i] else text.ljust(widths[i])
+
         sep, rule_sep = " │ ", "─┼─"
 
         def line(cells: "list[str]") -> str:
-            return sep.join(c.ljust(widths[i]) for i, c in enumerate(cells))
+            return sep.join(pad(c, i) for i, c in enumerate(cells))
 
         lines = [line(header), rule_sep.join("─" * w for w in widths)]
         lines += [line(r) for r in body]

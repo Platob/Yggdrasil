@@ -98,8 +98,15 @@ class TestTabularDisplay(unittest.TestCase):
         self.assertIn("│", lines[0])
         # The rule row uses the box-drawing rule, aligned to the columns.
         self.assertTrue(set(lines[1]) <= {"─", "┼"})
-        # Columns align: the 2nd column header and its values share an offset.
-        self.assertEqual(lines[0].index("pop:i64"), lines[2].index("2161"))
+        # Numeric columns right-align (digits line up by place value): the header
+        # and every value in the `pop` column share a right edge — the last
+        # column, so each line ends with it and all lines share a width.
+        self.assertEqual(len({len(line) for line in lines[:4]}), 1)   # uniform width
+        self.assertTrue(lines[0].rstrip().endswith("pop:i64"))
+        self.assertTrue(lines[2].rstrip().endswith("2161"))
+        self.assertTrue(lines[3].rstrip().endswith("13960"))
+        # …while the text column stays left-aligned.
+        self.assertTrue(lines[2].startswith("Paris"))
 
     def test_nested_values_are_compacted(self):
         try:
