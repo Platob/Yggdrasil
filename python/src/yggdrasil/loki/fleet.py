@@ -20,10 +20,12 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
-__all__ = ["AgentHandle", "Fleet", "FleetKPIs", "LOCAL_ENGINES"]
+from .result import DictResult
+
+__all__ = ["AgentHandle", "AgentSummary", "Fleet", "FleetKPIs", "LOCAL_ENGINES"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +45,20 @@ class FleetKPIs:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class AgentSummary(DictResult):
+    """One delegated agent's outcome (mapping-compatible; ``to_dict`` for JSON)."""
+
+    id: int
+    task: str
+    status: str
+    elapsed: float = 0.0
+    steps: int = 0
+    answer: str = ""
+    files_changed: list[str] = field(default_factory=list)
+    error: str = ""
 
 #: Engines that run on the single local accelerator — only one such agent should
 #: run at a time (the GPU/NPU is one resource), while remote agents fan out.
@@ -218,11 +234,14 @@ class Fleet:
         err = tempfile.NamedTemporaryFile(prefix="loki-agent-", suffix=".err", delete=False)
         out.close()
         err.close()
+        agent_env = dict(env or {})
+        if self.mesh_dir:                            # let the agent reach the shared mesh
+            agent_env.setdefault("LOKI_MESH", os.path.join(self.mesh_dir, "mesh-kv.json"))
         proc = subprocess.Popen(
             command,
             stdout=open(out.name, "w", encoding="utf-8"),
             stderr=open(err.name, "w", encoding="utf-8"),
-            env={**os.environ, **(env or {})},
+            env={**os.environ, **agent_env},
         )
         handle = AgentHandle(len(self.agents) + 1, task, command, proc, out.name, err.name,
                              engine=kw.get("engine"))
@@ -290,7 +309,8 @@ class Fleet:
         try:
             os.makedirs(self.mesh_dir, exist_ok=True)
             with open(os.path.join(self.mesh_dir, "mesh.json"), "w", encoding="utf-8") as fh:
-                json.dump({"agents": self.summary(), "kpis": self.kpis().to_dict()}, fh, indent=2)
+                json.dump({"agents": [a.to_dict() for a in self.summary()],
+                           "kpis": self.kpis().to_dict()}, fh, indent=2)
         except OSError:
             pass
 
@@ -357,12 +377,12 @@ class Fleet:
             elapsed=round(max((h.elapsed for h in self.agents), default=0.0), 1),
         )
 
-    def summary(self) -> list[dict[str, Any]]:
-        """A JSON-able rollup — one row per agent (for ``--json`` / the skill)."""
+    def summary(self) -> list[AgentSummary]:
+        """One typed row per agent (mapping-compatible; ``to_dict`` for JSON)."""
         return [
-            {"id": h.id, "task": h.task, "status": h.status,
-             "elapsed": round(h.elapsed, 2), "steps": h.steps,
-             "answer": h.answer, "files_changed": h.files_changed,
-             "error": h.stderr_tail if not h.ok else ""}
+            AgentSummary(id=h.id, task=h.task, status=h.status,
+                         elapsed=round(h.elapsed, 2), steps=h.steps,
+                         answer=h.answer, files_changed=h.files_changed,
+                         error=h.stderr_tail if not h.ok else "")
             for h in self.agents
         ]

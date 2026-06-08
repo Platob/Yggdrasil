@@ -66,14 +66,19 @@ class TestFleet(unittest.TestCase):
         self.assertIn("boom", b.stderr_tail)
 
     def test_summary_rows(self):
+        from yggdrasil.loki.fleet import AgentSummary
+
         fleet = Fleet()
         fleet.spawn("one", cmd=_ok_cmd())
         fleet.monitor(interval=0.02)
         row = fleet.summary()[0]
-        self.assertEqual(row["status"], "done")
-        self.assertEqual(row["id"], 1)
-        self.assertEqual(row["files_changed"], ["a.py"])
+        self.assertIsInstance(row, AgentSummary)
+        self.assertFalse(hasattr(row, "__dict__"))       # slots
+        self.assertEqual(row.status, "done")             # attribute access
+        self.assertEqual(row["id"], 1)                   # …and still mapping-compatible
+        self.assertEqual(row.files_changed, ["a.py"])
         self.assertIn("elapsed", row)
+        self.assertEqual(row.to_dict()["status"], "done")
 
     def test_timeout_cancels_survivors(self):
         fleet = Fleet()
@@ -177,6 +182,19 @@ class TestFleet(unittest.TestCase):
         self.assertIs(failed.validated, False)
         self.assertIsNone(untested.validated)
         self.assertEqual(fleet.kpis().validated, 1)   # only the green smoke counts
+
+    def test_spawn_sets_mesh_env_for_agents(self):
+        import tempfile
+
+        d = tempfile.mkdtemp()
+        fleet = Fleet(mesh_dir=d)
+        # The agent should see LOKI_MESH pointing at the shared store.
+        cmd = [sys.executable, "-c",
+               "import os, json; print(json.dumps({'completed': True, "
+               "'answer': os.environ.get('LOKI_MESH', 'none')}))"]
+        fleet.spawn("peek", cmd=cmd)
+        fleet.monitor(interval=0.02)
+        self.assertTrue(fleet.agents[0].answer.endswith("mesh-kv.json"))
 
     def test_mesh_json_written_to_shared_dir(self):
         import json as _json

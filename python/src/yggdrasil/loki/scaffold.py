@@ -16,11 +16,29 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-__all__ = ["LANGUAGES", "PRESETS", "CLOUD", "scaffold_project",
+from .result import DictResult
+
+__all__ = ["LANGUAGES", "PRESETS", "CLOUD", "ScaffoldResult", "scaffold_project",
            "resolve_languages", "resolve_preset", "resolve_cloud"]
+
+
+@dataclass(slots=True)
+class ScaffoldResult(DictResult):
+    """What a scaffold produced (mapping-compatible; ``to_dict`` for JSON)."""
+
+    name: str
+    path: str
+    preset: str
+    languages: list[str] = field(default_factory=list)
+    cloud: list[str] = field(default_factory=list)
+    unknown_languages: list[str] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
+    git: bool = False
+    push: str = ""
 
 _PYPROJECT = """\
 [project]
@@ -406,7 +424,7 @@ def scaffold_project(
     base_dir: Optional[str] = None,
     description: Optional[str] = None,
     git: bool = True,
-) -> dict[str, Any]:
+) -> ScaffoldResult:
     """Create a ready-to-push project tree, then ``git init`` + initial commit.
 
     ``preset="lib"`` (default) lays down one ``<language>/`` folder per language
@@ -476,17 +494,17 @@ def scaffold_project(
     written += [".gitignore", "README.md"]
 
     committed = _git_init(root) if git else False
-    return {
-        "name": name,
-        "path": str(root),
-        "preset": preset,
-        "languages": langs,
-        "cloud": cloud,
-        "unknown_languages": unknown,
-        "files": sorted(written),
-        "git": committed,
-        "push": "git remote add origin <url> && git push -u origin main",
-    }
+    return ScaffoldResult(
+        name=name,
+        path=str(root),
+        preset=preset,
+        languages=langs,
+        cloud=cloud,
+        unknown_languages=unknown,
+        files=sorted(written),
+        git=committed,
+        push="git remote add origin <url> && git push -u origin main",
+    )
 
 
 def _manifest(lang: str) -> str:

@@ -16,6 +16,7 @@ run can report exactly which files it created or edited.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 import subprocess
@@ -235,6 +236,35 @@ def filesystem_toolbox(
     box.add(Tool("read_table", "Parse a local tabular file (CSV/Parquet/Arrow/XLSX/JSON) "
                  "to a DataFrame preview via the io handlers.",
                  {"path": "file path", "rows": "preview rows, default 10"}, read_table))
+
+    # When this agent is part of a fleet mesh (LOKI_MESH set), give it a tool to
+    # read peers' published results and publish its own — shared memory the swarm
+    # coordinates through, so agents reuse results instead of recomputing them.
+    mesh_path = os.environ.get("LOKI_MESH")
+    if mesh_path:
+        def mesh(action: str = "list", key: str = "", value: str = "") -> str:
+            from .mesh import MeshStore
+
+            store = MeshStore(mesh_path)
+            if action == "list":
+                data = store.all()
+                import json as _json
+                return _json.dumps(data, indent=2, default=str)[:MAX_READ_BYTES] if data else "(mesh empty)"
+            if action == "get":
+                import json as _json
+                return _json.dumps(store.get(key), default=str) if key in store.all() else f"(no mesh key {key!r})"
+            if action == "put":
+                store.put(key, value)
+                return f"published {key!r} to the mesh"
+            if action == "append":
+                store.append(key, value)
+                return f"appended to {key!r} in the mesh"
+            return "ERROR: action must be one of list | get | put | append"
+
+        box.add(Tool("mesh", "Coordinate with peer agents through shared memory — read "
+                     "their published results before redundant work, and publish yours.",
+                     {"action": "list | get | put | append", "key": "entry key (get/put/append)",
+                      "value": "value to publish (put/append)"}, mesh))
 
     if not read_only:
         def write_file(path: str, content: str) -> str:

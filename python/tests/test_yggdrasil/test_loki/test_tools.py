@@ -45,6 +45,19 @@ class TestFilesystemToolbox(unittest.TestCase):
     def test_run_python_absent_when_read_only(self):
         self.assertNotIn("run_python", filesystem_toolbox(self.dir, read_only=True).names())
 
+    def test_mesh_tool_present_only_when_in_a_mesh(self):
+        import os
+        from unittest.mock import patch
+
+        self.assertNotIn("mesh", filesystem_toolbox(self.dir).names())   # not in a mesh
+        mesh_path = os.path.join(self.dir, "mesh-kv.json")
+        with patch.dict(os.environ, {"LOKI_MESH": mesh_path}):
+            box = filesystem_toolbox(self.dir)
+            self.assertIn("mesh", box.names())
+            self.assertIn("published", box.call("mesh", {"action": "put", "key": "k", "value": "v"}))
+            self.assertIn("v", box.call("mesh", {"action": "get", "key": "k"}))
+            self.assertIn("k", box.call("mesh", {"action": "list"}))
+
     def test_smoke_and_bench_are_default_validation_tools(self):
         names = filesystem_toolbox(self.dir).names()
         self.assertIn("smoke", names)

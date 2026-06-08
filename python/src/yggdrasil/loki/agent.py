@@ -19,11 +19,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 from . import skill as _skill
 from .capability import Backend, detect
+from .result import DictResult
 
 #: Engine fallback / skip notices ride this logger; ``ygg loki`` routes it to
 #: the terminal (``style.install_logging``) so a skipped engine is visible.
@@ -38,31 +39,8 @@ if TYPE_CHECKING:
 __all__ = ["Loki", "ROUTES", "ActStep", "ActResult"]
 
 
-class _Mapping:
-    """Mapping compatibility for a dataclass — ``obj["x"]`` / ``obj.get("x")`` —
-    so the typed result drops in where the old plain dict was read (mirrors
-    :class:`~yggdrasil.loki.planning.AgentPlan`).
-
-    Declares empty ``__slots__`` so a ``slots=True`` subclass keeps its slots
-    (a non-slotted base would re-introduce a per-instance ``__dict__``)."""
-
-    __slots__ = ()
-
-    def __getitem__(self, key: str) -> Any:
-        try:
-            return getattr(self, key)
-        except AttributeError as exc:
-            raise KeyError(key) from exc
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key, default)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
 @dataclass(slots=True)
-class ActStep(_Mapping):
+class ActStep(DictResult):
     """One turn of the autonomous loop — a tool call (or the final ``done``)."""
 
     n: int
@@ -75,7 +53,7 @@ class ActStep(_Mapping):
 
 
 @dataclass(slots=True)
-class ActResult(_Mapping):
+class ActResult(DictResult):
     """The transcript of an :meth:`Loki.act` run (typed, mapping-compatible)."""
 
     task: str
@@ -85,10 +63,6 @@ class ActResult(_Mapping):
     answer: str = ""
     completed: bool = False
     files_changed: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)                       # asdict recurses into the ActStep list
-        return d
 
 #: Raised when no reasoning engine is reachable (or every one failed in turn).
 _NO_ENGINE = (
@@ -701,6 +675,11 @@ class Loki:
             "NOT declare done until a `smoke` test passes; in your final answer say "
             "what you validated. Stop as soon as the goal is met and verified, and "
             "summarize what changed and what you ran."
+            + ("\nMesh: you are one of several agents sharing a workspace. FIRST "
+               "`mesh` (action='list') to see peers' published results and avoid "
+               "redundant work; when you produce something reusable (a file path, an "
+               "API, a decision) publish it with `mesh` (action='put', key, value)."
+               if "mesh" in box.tools else "")
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": f"GOAL: {task}"}]
         steps: list[ActStep] = []
