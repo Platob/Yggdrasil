@@ -1,0 +1,92 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0a0e1a;
+  --surface: #111827;
+  --border: #1f2937;
+  --accent: #3b82f6;
+  --green: #10b981;
+  --red: #ef4444;
+  --muted: #6b7280;
+  --text: #f9fafb;
+  --text-muted: #9ca3af;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+a { color: inherit; text-decoration: none; }
+
+/* --- reusable card --- */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+}
+
+/* --- signal badges --- */
+.badge-buy  { background: #064e3b; color: #10b981; border: 1px solid #065f46; }
+.badge-sell { background: #450a0a; color: #ef4444; border: 1px solid #7f1d1d; }
+.badge-hold { background: #1c1f2e; color: #9ca3af; border: 1px solid #374151; }
+
+.badge-buy, .badge-sell, .badge-hold {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+/* --- change colours --- */
+.pos { color: #10b981; }
+.neg { color: #ef4444; }
+.neu { color: #9ca3af; }
+
+/* --- table --- */
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; color: var(--text-muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; }
+td { padding: 8px 8px; border-bottom: 1px solid #0f1623; font-variant-numeric: tabular-nums; }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: #0f1929; }
+
+/* --- inputs & buttons --- */
+input, select {
+  background: #0a0e1a;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 6px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+}
+input:focus, select:focus { border-color: var(--accent); }
+
+button {
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 16px;
+  transition: opacity 0.15s;
+}
+button:hover { opacity: 0.85; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-buy  { background: #065f46; color: #10b981; }
+.btn-sell { background: #7f1d1d; color: #ef4444; }
+.btn-blue { background: var(--accent); color: #fff; }

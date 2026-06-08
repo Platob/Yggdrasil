@@ -1,69 +1,104 @@
-"""Benchmark the v2 API hot endpoints: /ping, /stats, /backend, /audit.
+"""Benchmark the v2 API hot endpoints: /ping, /health, /stats, /backend.
 
-Spins up the in-process FastAPI app (no uvicorn round-trip cost) and
-hits each endpoint N times with httpx.AsyncClient. Reports p50/p99 in
-microseconds plus throughput in req/s. Designed as the canonical
-before/after probe for backend perf work.
+Spins up the in-process FastAPI app (no uvicorn round-trip cost) and hits
+each endpoint N times with httpx's ASGI transport. Reports p50/p99 in
+microseconds plus throughput in req/s. Designed as the canonical before/after
+probe for backend perf work.
 
 Usage::
 
     PYTHONPATH=src python benchmarks/bot/bench_v2_endpoints.py
+    PYTHONPATH=src python benchmarks/bot/bench_v2_endpoints.py --repeat 7 --inner 200
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import statistics
 import time
+from pathlib import Path
 
 import httpx
 
-from yggdrasil.node.api.app import create_api
 
+REPEAT = 5
+INNER = 100
 
 ENDPOINTS = [
-    ("/api/ping",        "ping       "),
-    ("/api/v2/stats",    "stats      "),
-    ("/api/v2/backend",  "backend    "),
-    ("/api/v2/backend/summary", "back/sum   "),
-    ("/api/v2/health",   "health     "),
-    ("/api/v2/audit?limit=20", "audit      "),
-    ("/api/v2/pyfunc",   "pyfunc/list"),
-    ("/api/v2/pyenv",    "pyenv/list "),
+    ("/api/ping",       "ping        "),
+    ("/api/v2/health",  "health      "),
+    ("/api/v2/stats",   "stats       "),
+    ("/api/v2/backend", "backend     "),
 ]
 
-
-async def time_endpoint(client: httpx.AsyncClient, path: str, n: int) -> tuple[list[float], int]:
-    samples: list[float] = []
-    status_seen = 0
-    for _ in range(n):
-        t0 = time.perf_counter()
-        r = await client.get(path)
-        elapsed = (time.perf_counter() - t0) * 1_000_000  # microseconds
-        samples.append(elapsed)
-        status_seen = r.status_code
-    return samples, status_seen
+_HDR = f"{'endpoint':<40}  {'p50 µs':>10}  {'p99 µs':>10}  {'req/s':>10}"
+_SEP = "-" * len(_HDR)
 
 
-async def main(iterations: int = 500) -> None:
-    app = create_api()
+def _fmt(label: str, samples: list[float]) -> str:
+    p50 = statistics.median(samples) * 1e6
+    p99 = statistics.quantiles(samples, n=100)[98] * 1e6
+    rps = 1.0 / statistics.median(samples) if samples else 0
+    return f"{label:<40}  {p50:>10.1f}  {p99:>10.1f}  {rps:>10.0f}"
+
+
+async def _bench(repeat: int, inner: int) -> None:
+    from yggdrasil.node import create_app, Settings
+
+    app = create_app(Settings())
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # Warm-up: hit each endpoint a few times to fill caches.
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        # warm-up
         for path, _ in ENDPOINTS:
-            for _ in range(5):
+            for _ in range(min(inner, 20)):
                 await client.get(path)
 
-        print(f"\n  endpoint     n     p50us    p99us    avgus    req/s    status")
-        print(f"  {'-' * 70}")
+        print()
+        print("=" * 80)
+        print(f"  yggdrasil.node v2 endpoint benchmark  (repeat={repeat}, inner={inner})")
+        print("=" * 80)
+        print()
+        print(_HDR)
+        print(_SEP)
+
         for path, label in ENDPOINTS:
-            samples, status = await time_endpoint(client, path, iterations)
-            samples.sort()
-            p50 = samples[len(samples) // 2]
-            p99 = samples[int(len(samples) * 0.99)]
-            avg = statistics.mean(samples)
-            rps = 1_000_000 / avg if avg > 0 else 0
-            print(f"  {label}  {iterations:>4d}  {p50:>7.0f}  {p99:>7.0f}  {avg:>7.0f}  {rps:>7.0f}    {status}")
+            all_samples: list[float] = []
+            for _ in range(repeat):
+                t0 = time.perf_counter()
+                for _ in range(inner):
+                    await client.get(path)
+                elapsed = time.perf_counter() - t0
+                all_samples.extend([elapsed / inner] * inner)
+            print(_fmt(label.strip() or path, all_samples))
+
+        # Parallel burst: 10 concurrent /api/ping
+        print()
+        print("--- concurrent burst (10 parallel /api/ping) ---")
+        burst_samples: list[float] = []
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            for _ in range(inner // 10):
+                await asyncio.gather(*[client.get("/api/ping") for _ in range(10)])
+            elapsed = time.perf_counter() - t0
+            burst_samples.extend([elapsed / inner] * inner)
+        print(_fmt("10× parallel /api/ping", burst_samples))
+
+        print()
+        print("=" * 80)
+        print()
+
+
+def run(repeat: int = REPEAT, inner: int = INNER) -> None:
+    asyncio.run(_bench(repeat, inner))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repeat", type=int, default=REPEAT)
+    parser.add_argument("--inner", type=int, default=INNER)
+    args = parser.parse_args()
+
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+    run(args.repeat, args.inner)
