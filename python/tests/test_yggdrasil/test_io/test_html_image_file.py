@@ -92,21 +92,39 @@ class TestTabularDisplay(unittest.TestCase):
         p = Path(tempfile.mkdtemp()) / "d.csv"
         p.write_text("city,pop\nParis,2161\nTokyo,13960\n")
         lines = IO.from_(str(p)).display().splitlines()
-        # Header carries short data types and a │ column delimiter.
-        self.assertIn("city:str", lines[0])
-        self.assertIn("pop:i64", lines[0])
+        # Two-row header: names, then type tags, then a │-delimited rule.
+        self.assertIn("city", lines[0])
+        self.assertIn("pop", lines[0])
+        self.assertIn("str", lines[1])
+        self.assertIn("i64", lines[1])
         self.assertIn("│", lines[0])
-        # The rule row uses the box-drawing rule, aligned to the columns.
-        self.assertTrue(set(lines[1]) <= {"─", "┼"})
-        # Numeric columns right-align (digits line up by place value): the header
-        # and every value in the `pop` column share a right edge — the last
-        # column, so each line ends with it and all lines share a width.
-        self.assertEqual(len({len(line) for line in lines[:4]}), 1)   # uniform width
-        self.assertTrue(lines[0].rstrip().endswith("pop:i64"))
-        self.assertTrue(lines[2].rstrip().endswith("2161"))
-        self.assertTrue(lines[3].rstrip().endswith("13960"))
+        self.assertTrue(set(lines[2]) <= {"─", "┼"})           # the rule row
+        # Numeric columns right-align: the name, the type, and every value in the
+        # `pop` column share a right edge (last column → each line ends with it).
+        self.assertEqual(len({len(line) for line in lines[:5]}), 1)   # uniform width
+        self.assertTrue(lines[0].rstrip().endswith("pop"))
+        self.assertTrue(lines[1].rstrip().endswith("i64"))
+        self.assertTrue(lines[3].rstrip().endswith("2161"))
+        self.assertTrue(lines[4].rstrip().endswith("13960"))
         # …while the text column stays left-aligned.
-        self.assertTrue(lines[2].startswith("Paris"))
+        self.assertTrue(lines[3].startswith("Paris"))
+
+    def test_long_values_are_clipped_not_ballooned(self):
+        try:
+            import polars  # noqa: F401
+        except Exception:
+            self.skipTest("polars not installed")
+        import tempfile
+        from pathlib import Path
+
+        from yggdrasil.io.holder import IO
+
+        p = Path(tempfile.mkdtemp()) / "d.csv"
+        p.write_text("id,token\n1," + "x" * 200 + "\n")        # a 200-char secret
+        lines = IO.from_(str(p)).display(max_width=24).splitlines()
+        # No line balloons: every column (and the long value) is bounded.
+        self.assertTrue(all(len(line) < 60 for line in lines), [len(line_) for line_ in lines])
+        self.assertIn("…", "\n".join(lines))                   # the value was clipped
 
     def test_closing_rule_footer_and_nulls(self):
         try:
@@ -140,12 +158,12 @@ class TestTabularDisplay(unittest.TestCase):
         p = Path(tempfile.mkdtemp()) / "n.parquet"
         pl.DataFrame({"id": [1], "tags": [["a", "b"]], "meta": [{"x": 1}]}).write_parquet(p)
         lines = IO.from_(str(p)).display().splitlines()
-        # Nested columns get a RECURSIVE, bounded type tag showing their shape …
-        self.assertIn("tags:list<str>", lines[0])
-        self.assertIn("meta:struct<x:i64>", lines[0])
-        # … and nested values render compactly on one line.
-        self.assertIn('["a","b"]', lines[2])
-        self.assertIn('{"x":1}', lines[2])
+        # Nested columns get a RECURSIVE, bounded type tag on the types row …
+        self.assertIn("list<str>", lines[1])
+        self.assertIn("struct<x:i64>", lines[1])
+        # … and nested values render compactly on one line (first data row).
+        self.assertIn('["a","b"]', lines[3])
+        self.assertIn('{"x":1}', lines[3])
 
     def test_nested_type_tags_recurse_and_are_bounded(self):
         try:
@@ -159,9 +177,9 @@ class TestTabularDisplay(unittest.TestCase):
 
         p = Path(tempfile.mkdtemp()) / "deep.parquet"
         pl.DataFrame({"rows": [[{"k": 1, "v": "a"}]]}).write_parquet(p)
-        header = IO.from_(str(p)).display().splitlines()[0]
+        types_row = IO.from_(str(p)).display().splitlines()[1]   # the type-tags row
         # list<struct<…>> — the recursion shows nested shape, not a flat "list".
-        self.assertIn("rows:list<struct<k:i64, v:str>>", header)
+        self.assertIn("list<struct<k:i64, v:str>>", types_row)
 
     def test_deep_type_tag_is_elided(self):
         try:

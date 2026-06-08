@@ -2529,14 +2529,15 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         """Render the first *n* rows as an aligned, typed text table.
 
         Columns and their types come from this Tabular's own
-        :meth:`collect_schema` — each header carries the project
-        :class:`~yggdrasil.data.Field`'s short type tag
-        (:meth:`Field.short` → :meth:`DataType.short`, recursive for nested
-        types: ``col:i64`` / ``:str`` / ``tags:list<str>`` /
-        ``owner:struct<name:str, age:i64>``). Columns are separated by ``│``
-        with a ``─┼─`` rule; numbers/booleans right-align; nested cell values are
-        compacted to one line; long cells truncate to *max_width*. Reads only
-        enough Arrow batches to fill *n* rows, then stops.
+        :meth:`collect_schema` — the header is **two rows**: the column names,
+        then their type tags (the project :class:`~yggdrasil.data.Field`'s
+        :meth:`Field.short` → :meth:`DataType.short`, recursive for nested types
+        — ``i64`` / ``str`` / ``list<str>`` / ``struct<name:str, age:i64>``).
+        Columns are separated by ``│`` with a ``─┼─`` rule; numbers/booleans
+        right-align; nested cell values are compacted to one line. **Long values
+        and headers are clipped** (cells to *max_width*, type/name tags to a
+        slightly larger cap) so one long string or column name can't balloon the
+        table. Reads only enough Arrow batches to fill *n* rows, then stops.
 
             print(dbc.sql.execute("SELECT * FROM t").display())
             print(IO.from_("data.parquet").display(5))
@@ -2556,6 +2557,9 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             if len(rows) >= n:
                 break
 
+        def clip(text: str, cap: int) -> str:
+            return text if len(text) <= cap else text[: cap - 1] + "…"
+
         def cell(value: Any) -> str:
             if value is None:
                 text = "·"                                # nulls read clearly
@@ -2563,27 +2567,25 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
                 text = _compact_nested(value)
             else:
                 text = str(value).replace("\n", " ")
-            return text if len(text) <= max_width else text[: max_width - 1] + "…"
+            return clip(text, max_width)                  # long values never balloon
 
-        # Header tags + alignment derive from the project Field / DataType — the
-        # short type repr and a numeric/boolean test, not engine-specific code.
-        header = [f.short() for f in fields]
+        # Two-row header (names, then type tags) + alignment all derive from the
+        # project Field / DataType — recursive short type repr + a numeric test.
+        head_cap = max(max_width, 44)
+        names = [clip(f.name, head_cap) for f in fields]
+        types = [clip(f.dtype.short(), head_cap) for f in fields]
         right = [f.dtype.type_id.is_numeric or f.dtype.type_id.is_boolean for f in fields]
         body = [[cell(v) for v in row] for row in rows]
-        widths = [
-            max([len(header[i])] + [len(r[i]) for r in body]) if body else len(header[i])
-            for i in range(len(header))
-        ]
+        widths = [max([len(names[i]), len(types[i])] + [len(r[i]) for r in body])
+                  for i in range(len(columns))]
 
         def pad(text: str, i: int) -> str:
             return text.rjust(widths[i]) if right[i] else text.ljust(widths[i])
 
-        sep, rule_sep = " │ ", "─┼─"
-
         def line(cells: "list[str]") -> str:
-            return sep.join(pad(c, i) for i, c in enumerate(cells))
+            return " │ ".join(pad(c, i) for i, c in enumerate(cells))
 
-        lines = [line(header), rule_sep.join("─" * w for w in widths)]
+        lines = [line(names), line(types), "─┼─".join("─" * w for w in widths)]
         lines += [line(r) for r in body]
         lines.append("─┴─".join("─" * w for w in widths))   # closing rule
         # A footer: the truncation marker, or the shape that was shown.
