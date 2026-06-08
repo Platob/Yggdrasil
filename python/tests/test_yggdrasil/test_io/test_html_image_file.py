@@ -140,12 +140,41 @@ class TestTabularDisplay(unittest.TestCase):
         p = Path(tempfile.mkdtemp()) / "n.parquet"
         pl.DataFrame({"id": [1], "tags": [["a", "b"]], "meta": [{"x": 1}]}).write_parquet(p)
         lines = IO.from_(str(p)).display().splitlines()
-        # Nested columns get a flat type tag (not the whole inner schema) …
-        self.assertIn("tags:list", lines[0])
-        self.assertIn("meta:struct", lines[0])
+        # Nested columns get a RECURSIVE, bounded type tag showing their shape …
+        self.assertIn("tags:list<str>", lines[0])
+        self.assertIn("meta:struct<x:i64>", lines[0])
         # … and nested values render compactly on one line.
         self.assertIn('["a","b"]', lines[2])
         self.assertIn('{"x":1}', lines[2])
+
+    def test_nested_type_tags_recurse_and_are_bounded(self):
+        try:
+            import polars as pl
+        except Exception:
+            self.skipTest("polars not installed")
+        import tempfile
+        from pathlib import Path
+
+        from yggdrasil.io.holder import IO
+
+        p = Path(tempfile.mkdtemp()) / "deep.parquet"
+        pl.DataFrame({"rows": [[{"k": 1, "v": "a"}]]}).write_parquet(p)
+        header = IO.from_(str(p)).display().splitlines()[0]
+        # list<struct<…>> — the recursion shows nested shape, not a flat "list".
+        self.assertIn("rows:list<struct<k:i64, v:str>>", header)
+
+    def test_deep_type_tag_is_elided(self):
+        from yggdrasil.io.tabular.base import _MAX_TYPE_TAG, _short_arrow_dtype
+
+        try:
+            import pyarrow as pa
+        except Exception:
+            self.skipTest("pyarrow not installed")
+        # A wide struct → the tag is capped (depth + field cap + length elision).
+        wide = pa.struct([(f"field_number_{i}", pa.int64()) for i in range(10)])
+        tag = _short_arrow_dtype(wide)
+        self.assertLessEqual(len(tag), _MAX_TYPE_TAG)
+        self.assertTrue(tag.startswith("struct<"))
 
     def test_limit_marker(self):
         try:

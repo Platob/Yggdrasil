@@ -499,6 +499,20 @@ class StatementResult(Tabular, Awaitable, Generic[PS]):
     def failed(self) -> bool:
         return self.state.is_failed
 
+    def progress(self) -> "float | None":
+        """Completion fraction for a progress bar (``style.track``).
+
+        A warehouse doesn't report a running query's % mid-flight, so execution
+        is *indeterminate* (``None`` → an animated sweep): ``0.0`` before it
+        starts, ``None`` while it runs, ``1.0`` once it's succeeded.
+        """
+        state = self.state
+        if state.is_succeeded:
+            return 1.0
+        if state.is_idle:
+            return 0.0
+        return None
+
     @abstractmethod
     def refresh_status(self) -> None:
         ...

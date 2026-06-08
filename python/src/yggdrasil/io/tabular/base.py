@@ -87,13 +87,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _short_arrow_dtype(t: "pa.DataType") -> str:
+#: Max characters a (recursive) nested type tag may grow to before it's elided —
+#: keeps a deeply-nested column header from ballooning the table.
+_MAX_TYPE_TAG = 44
+
+
+def _short_arrow_dtype(t: "pa.DataType", *, depth: int = 2) -> str:
     """A short type tag for a column header in :meth:`Tabular.display`.
 
-    Compact and stable — ``i64`` / ``f64`` / ``str`` / ``bool`` / ``date`` /
-    ``ts`` / ``list`` / ``struct`` / ``map`` / ``dec`` / ``bin`` — and crucially
-    *flat* for nested types (a struct shows ``struct``, not its whole inner
-    schema), so the header never balloons.
+    Compact scalars — ``i64`` / ``f64`` / ``str`` / ``bool`` / ``date`` / ``ts``
+    / ``dec`` / ``bin`` — and **recursive, bounded** nested types so the header
+    *shows the shape* without ballooning: ``list<i64>``,
+    ``struct<x:i64, y:str>``, ``map<str,f64>``, even nested
+    ``list<struct<id:i64>>``. Recursion stops at *depth* (then a bare
+    ``list`` / ``struct`` / ``map``); struct fields are capped and the whole tag
+    is elided past :data:`_MAX_TYPE_TAG` chars.
     """
     if pa.types.is_integer(t):
         return f"i{t.bit_width}"
@@ -109,19 +117,36 @@ def _short_arrow_dtype(t: "pa.DataType") -> str:
         return "ts"
     if pa.types.is_time(t):
         return "time"
-    if pa.types.is_list(t) or pa.types.is_large_list(t):
-        return "list"
-    if pa.types.is_struct(t):
-        return "struct"
-    if pa.types.is_map(t):
-        return "map"
     if pa.types.is_decimal(t):
         return "dec"
     if pa.types.is_binary(t) or pa.types.is_large_binary(t):
         return "bin"
     if pa.types.is_null(t):
         return "null"
+    # Nested — recurse until the depth budget runs out, then go flat.
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        if depth <= 0:
+            return "list"
+        return _elide(f"list<{_short_arrow_dtype(t.value_type, depth=depth - 1)}>")
+    if pa.types.is_struct(t):
+        if depth <= 0:
+            return "struct"
+        shown = [f"{t.field(i).name}:{_short_arrow_dtype(t.field(i).type, depth=depth - 1)}"
+                 for i in range(min(t.num_fields, 4))]
+        more = ", …" if t.num_fields > 4 else ""
+        return _elide(f"struct<{', '.join(shown)}{more}>")
+    if pa.types.is_map(t):
+        if depth <= 0:
+            return "map"
+        k = _short_arrow_dtype(t.key_type, depth=depth - 1)
+        v = _short_arrow_dtype(t.item_type, depth=depth - 1)
+        return _elide(f"map<{k},{v}>")
     return str(t)[:8]
+
+
+def _elide(tag: str) -> str:
+    """Cap a (nested) type tag so a deep schema can't widen the header forever."""
+    return tag if len(tag) <= _MAX_TYPE_TAG else tag[: _MAX_TYPE_TAG - 2] + "…>"
 
 
 def _compact_nested(value: Any) -> str:
