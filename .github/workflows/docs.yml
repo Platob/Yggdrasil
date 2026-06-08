@@ -71,6 +71,17 @@ jobs:
         with:
           fetch-depth: 0  # for git-revision-date-localized if added later
 
+      - name: Enable GitHub Pages
+        # Idempotent self-enable (source = GitHub Actions) using the pages:write
+        # token, so the deploy job can publish without a manual
+        # "Settings -> Pages -> Source: GitHub Actions" step. continue-on-error
+        # keeps the build green if the token can't enable Pages (manual fallback).
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
