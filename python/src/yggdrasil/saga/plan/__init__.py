@@ -24,6 +24,7 @@ Public surface:
 """
 
 from .execution_plan import ExecutionPlan, InsertPlan, MergePlan, SelectPlan
+from .execution_result import ExecutionResult
 from .func_registry import BUILTIN_REGISTRY, FunctionMeta, FunctionRegistry
 from .lazy import LazyTabular
 from .nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
@@ -34,6 +35,7 @@ __all__ = [
     "BUILTIN_REGISTRY",
     "CTE",
     "ExecutionPlan",
+    "ExecutionResult",
     "FunctionMeta",
     "FunctionRegistry",
     "GroupByOp",

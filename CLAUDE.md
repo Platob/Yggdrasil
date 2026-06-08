@@ -66,8 +66,10 @@ everything that used to live in `plan/` and `execution/expr/`:
 - `saga.expr` — the expression / predicate AST with multi-backend emitters
   (python / arrow / polars / spark / sql).
 - `saga.plan` — mutable execution plans (`SelectPlan` / `InsertPlan` /
-  `MergePlan`), the immutable plan-node tree, `LazyTabular`, SQL
-  parse/emit across dialects, and the Arrow-native UDF registry.
+  `MergePlan`), the immutable plan-node tree, `LazyTabular`, `ExecutionResult`
+  (a lazy, awaitable `Tabular`+`Awaitable` handle to a plan run — read-side
+  sibling of `StatementResult`), SQL parse/emit across dialects, and the
+  Arrow-native UDF registry.
 - `Saga` (`saga.engine`) — the engine facade. Holds **no catalog**
   (named-table registration comes later): it parses the `FROM` sources and
   **live-builds** them — path/URL via the IO layer, in-memory frames via

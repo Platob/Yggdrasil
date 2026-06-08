@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from yggdrasil.enums import Dialect
     from yggdrasil.saga.expr import Predicate, PredicateLike
     from .nodes import InsertNode, MergeNode
+    from .execution_result import ExecutionResult
 
 O = TypeVar("O", bound=CastOptions)
 
@@ -131,6 +132,14 @@ class ExecutionPlan(Tabular[O], Generic[O]):
     ) -> "Tabular | OperationResult":
         """Run the plan; returns a :class:`Tabular` (SELECT) or
         :class:`OperationResult` (INSERT / MERGE / …)."""
+
+    def submit(self) -> "ExecutionResult[O]":
+        """Wrap this plan in a lazy, awaitable :class:`ExecutionResult`.
+
+        The plan is bound (carries its own source / target), so nothing
+        runs until the returned handle is read / awaited / started."""
+        from .execution_result import ExecutionResult
+        return ExecutionResult(self)
 
     @abstractmethod
     def copy(self) -> "ExecutionPlan[O]": ...

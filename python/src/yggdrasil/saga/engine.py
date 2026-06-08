@@ -41,7 +41,7 @@ from .plan.nodes import PlanNode
 if TYPE_CHECKING:
     from yggdrasil.enums import Dialect
 
-    from .plan import FunctionRegistry, LazyTabular
+    from .plan import ExecutionResult, FunctionRegistry, LazyTabular
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +245,31 @@ class Saga:
             resolved = {k: Tabular.new(v) for k, v in tables.items()} if tables else None
             return plan.execute(tables=resolved)
         raise TypeError(f"Cannot execute {type(plan).__name__}; expected PlanNode or ExecutionPlan")
+
+    def submit(
+        self,
+        query: str | PlanNode | ExecutionPlan,
+        *,
+        dialect: Dialect | str | None = None,
+        tables: dict[str, Tabular] | None = None,
+    ) -> ExecutionResult:
+        """Build a lazy, awaitable :class:`ExecutionResult` for *query*.
+
+        Parses (if a SQL string) and wraps the plan without running it —
+        the handle executes on a background thread the first time it is
+        read, awaited, or :meth:`~ExecutionResult.start`-ed. Ad-hoc
+        *tables* are coerced live via :meth:`Tabular.new`.
+        """
+        from .plan import ExecutionResult
+
+        if isinstance(query, str):
+            node = self.parse(query, dialect=dialect)
+        else:
+            node = query
+        if isinstance(node, ExecutionPlan):
+            return ExecutionResult(node)
+        resolved = {k: Tabular.new(v) for k, v in tables.items()} if tables else None
+        return ExecutionResult(node, tables=resolved)
 
     def collect(
         self,

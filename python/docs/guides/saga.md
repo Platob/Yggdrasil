@@ -51,6 +51,33 @@ with Saga() as s:
 # staging tree auto-cleaned on exit
 ```
 
+### Lazy, awaitable results
+
+`submit()` returns an `ExecutionResult` — a handle that is **both** a `Tabular`
+and an `Awaitable` (the read-side sibling of a `StatementResult`). It holds the
+`ExecutionPlan` and runs it on a background thread the first time it is read,
+awaited, or started, so it slots into the same lifecycle as warehouse
+statements and job runs:
+
+```python
+r = saga.submit("SELECT name, score FROM 'users.parquet' WHERE score > 80")
+r.state        # idle — nothing has run yet
+r.start(wait=False)          # kick off in the background
+r.wait()                     # ... or block until done
+rows = r.read_arrow_table()  # reading also triggers/awaits execution
+
+# In async code:
+result = await saga.submit("SELECT COUNT(*) AS n FROM 'events.parquet'")
+print(result.collect().read_arrow_table().to_pylist())
+
+# A plan or parsed node can produce one directly:
+saga.plan("SELECT * FROM 't.parquet'").submit()
+saga.parse("SELECT * FROM t").submit(tables={"t": frame})
+```
+
+A write-side plan (INSERT / MERGE / …) surfaces its `OperationResult` via
+`result.operation_result`; `collect()` renders it as a one-row metadata table.
+
 The lower-level building blocks stay available directly when you don't need a
 catalog:
 

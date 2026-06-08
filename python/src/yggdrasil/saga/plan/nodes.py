@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from yggdrasil.saga.expr import Expression, Predicate
     from yggdrasil.io.tabular import Tabular
 
+    from .execution_result import ExecutionResult
+
 from .ops import CTE, FromItem, JoinClause, LateralViewItem, SetOp, SubqueryRef, TableRef
 
 
@@ -56,6 +58,16 @@ class PlanNode:
     ) -> "Tabular":
         from .execute import execute_plan
         return execute_plan(self, tables=tables or {})
+
+    def submit(
+        self,
+        tables: "dict[str, Tabular] | None" = None,
+    ) -> "ExecutionResult":
+        """Wrap this node in a lazy, awaitable :class:`ExecutionResult`.
+
+        Nothing runs until the handle is read / awaited / started."""
+        from .execution_result import ExecutionResult
+        return ExecutionResult(self, tables=tables)
 
 
 # ---------------------------------------------------------------------------
