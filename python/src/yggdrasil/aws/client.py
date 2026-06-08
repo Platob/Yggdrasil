@@ -75,7 +75,6 @@ from .config import (
     CredentialsRefresher,
     DATABRICKS_SQL_CREDENTIAL_COLUMNS,
     DatabricksSQLCredentialsRefresher,
-    _coerce_refresher_output,
     _refresher_to_metadata,
 )
 
@@ -212,7 +211,8 @@ class AWSClient(Singleton):
 
     # Live boto handles and lazy caches — excluded from pickling.
     _TRANSIENT_STATE_ATTRS: ClassVar[frozenset[str]] = frozenset({
-        "_session", "_client_cache", "_s3", "_account_id", "_was_connected",
+        "_session", "_session_lock", "_client_cache", "_s3",
+        "_account_id", "_was_connected",
     })
 
     # Snapshot of the default Databricks SQL credential-column aliases,
@@ -353,6 +353,10 @@ class AWSClient(Singleton):
 
         # Lazy / transient state.
         self._session: Any = None
+        # Guards the lazy ``session`` build so concurrent first-touch
+        # callers mint exactly one boto Session (and one refreshable
+        # credential object) instead of racing.
+        self._session_lock: threading.Lock = threading.Lock()
         self._client_cache: dict = {}
         self._s3: Optional["S3Service"] = None
         self._account_id: Optional[str] = None
@@ -380,6 +384,7 @@ class AWSClient(Singleton):
             return
         self.__dict__.update(state)
         self._session = None
+        self._session_lock = threading.Lock()
         self._client_cache = {}
         self._s3 = None
         self._account_id = None
@@ -566,21 +571,35 @@ class AWSClient(Singleton):
         refresher_key: Optional[str] = None,
         **kwargs: Any,
     ) -> TC:
-        """Build a self-refreshing :class:`AWSClient` from a credentials callback."""
-        seed = _coerce_refresher_output(refresher())
-        if isinstance(seed, AwsCredentials):
-            access_key_id = seed.access_key_id
-            secret_access_key = seed.secret_access_key
-            session_token = seed.session_token
-        else:
-            access_key_id = seed.get("access_key")
-            secret_access_key = seed.get("secret_key")
-            session_token = seed.get("token")
+        """Build a self-refreshing :class:`AWSClient` from a credentials callback.
 
+        The refresher is **not** invoked here. botocore's
+        :class:`DeferredRefreshableCredentials` fetches credentials lazily
+        on the first signed request (and refreshes them thereafter, under
+        its own lock), so constructing the client costs no STS / SQL round
+        trip and is safe to do on a hot path.
+
+        Identity: when *refresher_key* is omitted the singleton keys on the
+        refresher's own identity — a provider's stable ``key`` if it has
+        one, else object identity — instead of on vended credentials.
+        There are none to key on until first use, and keying on rotating
+        temporary creds is exactly what fragments the client cache.
+        """
+        if refresher_key is None:
+            provider_key = getattr(refresher, "key", None)
+            refresher_key = (
+                f"{type(refresher).__name__}:{provider_key}"
+                if provider_key is not None
+                else f"{type(refresher).__name__}:{id(refresher):x}"
+            )
+
+        # No seed credentials — explicit ``None`` keeps them None (vs ``...``
+        # which would fall through to the static-cred env vars and let an
+        # unrelated AWS_ACCESS_KEY_ID leak onto a refresher-backed client).
         return cls(
-            access_key_id=access_key_id,
-            secret_access_key=secret_access_key,
-            session_token=session_token,
+            access_key_id=None,
+            secret_access_key=None,
+            session_token=None,
             region=region,
             endpoint_url=endpoint_url,
             refresher=refresher,
@@ -700,9 +719,15 @@ class AWSClient(Singleton):
         - :meth:`has_sso` → boto3-native SSO token provider via
           a transient profile.
         - Otherwise → static / profile / default-chain creds.
+
+        Built once under :attr:`_session_lock` (double-checked) so a
+        burst of concurrent first-touch callers share a single boto
+        Session rather than each racing to build their own.
         """
         if self._session is None:
-            self._session = self._build_session()
+            with self._session_lock:
+                if self._session is None:
+                    self._session = self._build_session()
         return self._session
 
     def client(self, service: str, **overrides: Any) -> "BaseClient":
@@ -849,13 +874,12 @@ class AWSClient(Singleton):
             )
             return metadata
 
-        refreshable = (
-            botocore.credentials.RefreshableCredentials
-            .create_from_metadata(
-                metadata=refresh(),
-                refresh_using=refresh,
-                method="ygg-refresher",
-            )
+        # Deferred: ``refresh`` fires on the first signed request, not now,
+        # and DeferredRefreshableCredentials serializes that fetch (and every
+        # later renewal) under its own lock — lazy + thread-safe for free.
+        refreshable = botocore.credentials.DeferredRefreshableCredentials(
+            refresh_using=refresh,
+            method="ygg-refresher",
         )
 
         botocore_session = botocore.session.get_session()
@@ -967,13 +991,12 @@ class AWSClient(Singleton):
                 "expiry_time": expiry_str,
             }
 
-        refreshable = (
-            botocore.credentials.RefreshableCredentials
-            .create_from_metadata(
-                metadata=refresh(),
-                refresh_using=refresh,
-                method="sts-assume-role",
-            )
+        # Deferred: the first AssumeRole call happens on the first signed
+        # request, not at session-build time, and is serialized (with later
+        # renewals) under DeferredRefreshableCredentials' own lock.
+        refreshable = botocore.credentials.DeferredRefreshableCredentials(
+            refresh_using=refresh,
+            method="sts-assume-role",
         )
 
         botocore_session = botocore.session.get_session()

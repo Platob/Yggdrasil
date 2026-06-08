@@ -349,3 +349,90 @@ class TestBatchCoerceAliasSubstitution:
         coerced = batch._coerce(stmt)
         # No substitution → same object returned (no unnecessary copy).
         assert coerced is stmt
+
+
+# ---------------------------------------------------------------------------
+# Temporary staged-volume cleanup — fire-once guard
+# ---------------------------------------------------------------------------
+
+
+class TestClearTemporaryResourcesFireOnce:
+    """A temporary staged VolumePath must be unlinked exactly once, even
+    when the same path object is reachable from several registries — a
+    shallow-copied statement (``_coerce``) sharing the dict, or a
+    synchronously-completed submit that clears via both ``send`` and
+    ``_start``. The path-level ``_cleanup_unlinked`` guard, not the
+    per-object ``external_volume_paths = None`` reset, is what enforces
+    this."""
+
+    @staticmethod
+    def _counting_job(monkeypatch):
+        """Patch ``Job`` so ``fire_and_forget`` runs the unlink inline."""
+        import yggdrasil.databricks.warehouse.statement as st
+
+        class _Job:
+            def __init__(self, fn, *a, **k):
+                self.fn, self.a, self.k = fn, a, k
+
+            @classmethod
+            def make(cls, fn, *a, **k):
+                return cls(fn, *a, **k)
+
+            def fire_and_forget(self):
+                self.fn(*self.a, **self.k)
+
+        monkeypatch.setattr(st, "Job", _Job)
+
+    @staticmethod
+    def _temp_path():
+        path = MagicMock()
+        path.temporary = True
+        path.unlink = MagicMock()
+        # MagicMock would auto-create ``_cleanup_unlinked`` truthy on first
+        # read; back it with a real attribute so the guard sees False first.
+        path._cleanup_unlinked = False
+        return path
+
+    def test_shared_path_unlinked_once_across_statements(self, monkeypatch) -> None:
+        self._counting_job(monkeypatch)
+        path = self._temp_path()
+
+        # Two statements pointing at the SAME path instance (the shallow-copy
+        # / send+_start shape).
+        s1 = WarehousePreparedStatement("SELECT 1")
+        s1.external_volume_paths = {"x": path}
+        s2 = WarehousePreparedStatement("SELECT 1")
+        s2.external_volume_paths = {"x": path}
+
+        s1.clear_temporary_resources()
+        s2.clear_temporary_resources()
+        s1.clear_temporary_resources()  # repeat call is a no-op
+
+        assert path.unlink.call_count == 1
+        assert path._cleanup_unlinked is True
+
+    def test_distinct_paths_each_unlinked_once(self, monkeypatch) -> None:
+        self._counting_job(monkeypatch)
+        a, b = self._temp_path(), self._temp_path()
+        stmt = WarehousePreparedStatement("SELECT 1")
+        stmt.external_volume_paths = {"a": a, "b": b}
+        stmt.clear_temporary_resources()
+        assert a.unlink.call_count == 1
+        assert b.unlink.call_count == 1
+
+    def test_batch_super_and_wide_sweep_share_one_unlink(self, monkeypatch) -> None:
+        self._counting_job(monkeypatch)
+        path = self._temp_path()
+
+        # Same path mirrored both per-statement (via a result) and batch-wide.
+        batch = WarehouseStatementBatch(
+            executor=_warehouse(),
+            external_paths={"src": path},
+        )
+        stmt = WarehousePreparedStatement("SELECT * FROM {src}")
+        stmt.external_volume_paths = {"src": path}
+        result = WarehouseStatementResult(executor=_warehouse(), statement=stmt)
+        batch.results[stmt.key] = result
+
+        batch.clear_temporary_resources()
+        assert path.unlink.call_count == 1

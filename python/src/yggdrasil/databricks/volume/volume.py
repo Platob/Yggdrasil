@@ -60,7 +60,6 @@ if TYPE_CHECKING:
     from databricks.sdk.service.catalog import VolumeType
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.catalog.catalog import UCCatalog
-    from yggdrasil.databricks.external.location.resource import ExternalLocation
     from yggdrasil.databricks.fs.volume_path import VolumePath
     from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.databricks.volume.volumes import Volumes
@@ -68,10 +67,6 @@ if TYPE_CHECKING:
 __all__ = ["Volume"]
 
 logger = logging.getLogger(__name__)
-
-#: Sentinel for "external location not yet resolved" — distinct from a resolved
-#: ``None`` (no accessible location covers this volume).
-_UNRESOLVED: Any = object()
 
 
 class Volume(DatabricksPath):
@@ -221,10 +216,6 @@ class Volume(DatabricksPath):
         # :meth:`VolumePath.storage_path`.
         self._external_readable: Optional[bool] = None
         self._external_writable: Optional[bool] = None
-        # Memoised covering external location (resolved once, reused by
-        # ``external_location`` / ``can_read`` / ``can_write``). ``_UNRESOLVED``
-        # until first looked up; a resolved value may legitimately be ``None``.
-        self._external_location: Any = _UNRESOLVED
         self._initialized = True
 
     # ── direct-storage access cache ─────────────────────────────────────────────
@@ -308,51 +299,6 @@ class Volume(DatabricksPath):
         except Exception as exc:  # type / location / credential resolution
             logger.debug("external storage root unavailable for %r: %s", self, exc)
             return None
-
-    # ── access precheck (external-location governed) ────────────────────────────
-
-    def external_location(self, *, refresh: bool = False) -> ExternalLocation | None:
-        """The Unity Catalog **external location** governing this volume's
-        backing storage — the most specific one whose URL the volume's
-        ``storage_location`` sits under (longest-prefix match over the cached
-        external-location list, :meth:`ExternalLocations.find_url`) — or
-        ``None`` when the volume has no resolvable storage or no accessible
-        location covers it. Never raises.
-
-        **Memoised on the volume**: resolved once and reused (a resolved
-        ``None`` is cached too), so repeated ``external_location`` / ``can_read``
-        / ``can_write`` calls don't re-walk the location list. ``refresh=True``
-        re-resolves (and re-lists); the memo is dropped on any info refresh /
-        rebind (:meth:`_store_infos` / :meth:`_reset_cache`)."""
-        if not refresh and self._external_location is not _UNRESOLVED:
-            return self._external_location
-        try:
-            loc = self.storage_location
-        except Exception:
-            loc = None
-        result: ExternalLocation | None = None
-        if loc:
-            try:
-                result = self.client.external_locations.find_url(loc, refresh=refresh)
-            except Exception as exc:  # noqa: BLE001 — listing is best-effort
-                logger.debug("external-location lookup failed for %r: %s", self, exc)
-                result = None
-        self._external_location = result
-        return result
-
-    def can_read(self, *, refresh: bool = False) -> bool:
-        """Global precheck — can this volume's storage be **read** at the cloud
-        layer? ``True`` when an accessible external location covers it. Cheap
-        and cached (no per-object probe); use it to gate bulk work before
-        paying for the first I/O."""
-        return self.external_location(refresh=refresh) is not None
-
-    def can_write(self, *, refresh: bool = False) -> bool:
-        """Global precheck — can this volume's storage be **written** at the
-        cloud layer? ``True`` when a covering external location exists and is
-        not read-only."""
-        el = self.external_location(refresh=refresh)
-        return el is not None and not el.read_only
 
     # ── identity ──────────────────────────────────────────────────────────────
 
@@ -518,7 +464,6 @@ class Volume(DatabricksPath):
         self._storage_paths = {}
         self._catalog = None
         self._schema = None
-        self._external_location = _UNRESOLVED
         self._initialized = True
 
     # ── cache management ──────────────────────────────────────────────────────
@@ -538,10 +483,8 @@ class Volume(DatabricksPath):
             float(fetched_at) if fetched_at is not None else time.time()
         )
         # Storage location may have shifted (external volume rebind);
-        # drop the cached Path + memoised external location so the next call
-        # resolves against the fresh URL.
+        # drop the cached Path so the next call resolves against the fresh URL.
         self._storage_paths = {}
-        self._external_location = _UNRESOLVED
         # A successful info fetch proves the volume exists — seed the stat
         # cache (a volume is directory-like) in the same beat so a follow-up
         # ``exists`` / ``stat`` / ``is_dir`` reuses it instead of re-probing.
@@ -558,7 +501,6 @@ class Volume(DatabricksPath):
         self._storage_paths = {}
         self._catalog = None
         self._schema = None
-        self._external_location = _UNRESOLVED
         # Drop the per-mode direct-storage verdicts too: a delete / rebind can
         # flip a volume between EXTERNAL and MANAGED, so a stale "usable" /
         # "denied" flag would mis-route the next read or write.
@@ -918,7 +860,6 @@ class Volume(DatabricksPath):
 
         uc = self.client.workspace_client().volumes
         storage_location = str(storage_location) if storage_location else None
-        inferred = volume_type is None  # EXTERNAL/MANAGED derived from storage_location
 
         try:
             from databricks.sdk.service.catalog import VolumeType
@@ -929,7 +870,6 @@ class Volume(DatabricksPath):
                 volume_type = VolumeType[str(volume_type)]
 
             is_external = volume_type == VolumeType.EXTERNAL
-            managed_type: Any = VolumeType.MANAGED
         except Exception:
             if volume_type is None:
                 volume_type = "EXTERNAL" if storage_location else "MANAGED"
@@ -937,31 +877,6 @@ class Volume(DatabricksPath):
                 volume_type = str(volume_type).upper()
 
             is_external = volume_type == "EXTERNAL"
-            managed_type = "MANAGED"
-
-        # When EXTERNAL was *inferred* from a ``storage_location`` (not pinned by
-        # the caller), the location must sit under an accessible Unity Catalog
-        # **external location** for the create to be allowed — so verify it here
-        # rather than firing a create UC will reject. The lookup runs over the
-        # cached location list (:attr:`ExternalLocations.LIST_TTL`), so it's
-        # cheap on the hot staging-create path. Nothing covering it → fall back
-        # to a MANAGED volume and warn (an explicit ``volume_type="EXTERNAL"``
-        # is left untouched and allowed to fail loudly).
-        if is_external and inferred and storage_location:
-            try:
-                covering = self.client.external_locations.find_url(storage_location)
-            except Exception as exc:  # noqa: BLE001 — listing is best-effort
-                logger.debug("external-location lookup failed for %r: %s", self, exc)
-                covering = None
-            if covering is None:
-                logger.warning(
-                    "No accessible Unity Catalog external location covers %s; creating "
-                    "%r as a MANAGED volume (no direct cloud-storage staging). Register "
-                    "an external location over that prefix to enable the fast path.",
-                    storage_location, self,
-                )
-                volume_type = managed_type
-                is_external = False
 
         if not is_external:
             storage_location = None

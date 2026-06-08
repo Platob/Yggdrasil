@@ -333,16 +333,17 @@ class TestRefresherKeyPersistsSingleton:
     def _rotating_refresher():
         import datetime as dt
         from yggdrasil.aws.config import AwsCredentials
-        n = {"i": 0}
 
         def refresher():
-            n["i"] += 1
+            refresher.calls += 1
+            i = refresher.calls
             return AwsCredentials(
-                access_key_id=f"AKIA-{n['i']}",
-                secret_access_key=f"secret-{n['i']}",
-                session_token=f"token-{n['i']}",
+                access_key_id=f"AKIA-{i}",
+                secret_access_key=f"secret-{i}",
+                session_token=f"token-{i}",
                 expiration=dt.datetime(2099, 1, 1, tzinfo=dt.timezone.utc).isoformat(),
             )
+        refresher.calls = 0
         return refresher
 
     def test_rotating_seed_creds_collapse_to_one_client(self) -> None:
@@ -361,13 +362,22 @@ class TestRefresherKeyPersistsSingleton:
             refresher, region="us-east-1", refresher_key="X:tid-A:OVERWRITE")
         assert c_read is not c_write
 
-    def test_no_refresher_key_still_keys_on_creds(self) -> None:
-        # Without a refresher_key the seed creds remain the identity (legacy
-        # behaviour for ad-hoc refresher clients) — distinct creds, distinct
-        # clients.
+    def test_no_refresher_key_keys_on_refresher_identity(self) -> None:
+        # Without a refresher_key the singleton keys on the refresher's own
+        # identity (the creds are vended lazily, so there are none to key on
+        # at build time). The same refresher object therefore collapses to
+        # one client — and is never invoked just to construct it.
         refresher = self._rotating_refresher()
         c1 = AWSClient.from_refresher(refresher, region="us-east-1")
         c2 = AWSClient.from_refresher(refresher, region="us-east-1")
+        assert c1 is c2
+        assert refresher.calls == 0  # lazy: not fetched at construction
+
+    def test_distinct_refresher_objects_stay_distinct(self) -> None:
+        # Two different ad-hoc refreshers (no key) must not collapse onto
+        # each other — object identity discriminates them.
+        c1 = AWSClient.from_refresher(self._rotating_refresher(), region="us-east-1")
+        c2 = AWSClient.from_refresher(self._rotating_refresher(), region="us-east-1")
         assert c1 is not c2
 
 
