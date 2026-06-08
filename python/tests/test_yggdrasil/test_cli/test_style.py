@@ -34,6 +34,36 @@ class TestLogo:
         assert art == style.logo("YGG")      # plain mark, no "YGGNOPE" subtitle
 
 
+class TestSpinnerProgress:
+    """The spinner's inline step-budget bar (used by the Loki act monitor)."""
+
+    def setup_method(self):
+        style.force_color(False)
+
+    def test_no_bar_until_progress_set(self):
+        assert style.Spinner("thinking")._bar() == ""
+
+    def test_bar_fills_proportionally(self):
+        sp = style.Spinner("thinking")
+        sp.set_progress(3, 12)
+        bar = style.strip(sp._bar())
+        assert bar.count("█") == 3            # 3/12 of a 12-wide bar
+        assert bar.count("░") == 9
+        assert "3/12" in bar
+
+    def test_bar_never_overflows_when_complete_or_past(self):
+        sp = style.Spinner("x")
+        sp.set_progress(20, 12)               # current past total
+        bar = style.strip(sp._bar())
+        assert bar.count("█") == 12 and bar.count("░") == 0
+        assert "12/12" in bar                 # current clamped in the count, too
+
+    def test_zero_total_is_safe(self):
+        sp = style.Spinner("x")
+        sp.set_progress(0, 0)
+        assert sp._bar() == ""
+
+
 class TestStripAndTitle:
     def test_strip_removes_ansi_color(self):
         assert style.strip(style.red("hi") + " " + style.dim("there")) == "hi there"
@@ -187,3 +217,65 @@ class TestImportLeavesLoggingUnconfigured:
         )
         assert "HIDDEN_INFO" not in out.stderr, out.stderr
         assert "SHOWN_WARNING" in out.stderr, out.stderr
+
+
+class TestTrackAwaitable:
+    """style.track drives an Awaitable behind a spinner/progress bar."""
+
+    def setup_method(self):
+        style.force_color(False)
+
+    def _task(self, polls=3, fail=False):
+        from yggdrasil.dataclasses.awaitable import Awaitable
+        from yggdrasil.enums.state import State
+
+        class _T(Awaitable):
+            def __init__(s): s._n = 0
+            def _start(s): s._state = State.RUNNING
+            def _poll(s):
+                s._n += 1
+                if s._n >= polls:
+                    s._state = State.FAILED if fail else State.SUCCEEDED
+            def _error_for_status(s): return RuntimeError("boom")
+            def progress(s): return min(s._n / polls, 1.0)
+        return _T()
+
+    def test_track_drives_to_done(self, monkeypatch):
+        monkeypatch.setattr(style, "_IS_TTY", False)
+        task = self._task(polls=2)
+        out = style.track(task, "working…", interval=0)
+        assert out is task and task.is_done and task.is_succeeded
+
+    def test_track_surfaces_failure(self, monkeypatch):
+        import pytest
+        monkeypatch.setattr(style, "_IS_TTY", False)
+        with pytest.raises(RuntimeError, match="boom"):
+            style.track(self._task(polls=1, fail=True), interval=0)
+
+
+class TestProgressBar:
+    def setup_method(self):
+        style.force_color(False)
+
+    def test_determinate_fills_and_shows_pct(self, monkeypatch, capsys):
+        monkeypatch.setattr(style, "_IS_TTY", True)
+        style.ProgressBar(total=10, label="idx").update(4)
+        out = style.strip(capsys.readouterr().out)
+        assert out.count("█") == int(24 * 0.4)       # 24-wide bar, 40% filled
+        assert "40%" in out and "idx" in out
+
+    def test_frac_directly(self, monkeypatch, capsys):
+        monkeypatch.setattr(style, "_IS_TTY", True)
+        style.ProgressBar(label="x").update(frac=1.0)
+        assert "100%" in style.strip(capsys.readouterr().out)
+
+    def test_indeterminate_has_no_pct(self, monkeypatch, capsys):
+        monkeypatch.setattr(style, "_IS_TTY", True)
+        style.ProgressBar(label="waiting").update()   # no total/frac
+        out = style.strip(capsys.readouterr().out)
+        assert "█" in out and "░" in out and "%" not in out
+
+    def test_noop_off_tty(self, monkeypatch, capsys):
+        monkeypatch.setattr(style, "_IS_TTY", False)
+        style.ProgressBar(total=10).update(5)
+        assert capsys.readouterr().out == ""

@@ -67,6 +67,7 @@ PRICING: dict[tuple[str, str], ModelPricing] = {
     ("databricks", "*"): ModelPricing(0.20, 0.60),
     # Local engines run on this workstation — free, no per-token cost.
     ("transformers", "*"): ModelPricing(0.0, 0.0),
+    ("openvino", "*"): ModelPricing(0.0, 0.0),
     ("ollama", "*"): ModelPricing(0.0, 0.0),
 }
 

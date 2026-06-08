@@ -87,53 +87,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _short_arrow_dtype(t: "pa.DataType") -> str:
-    """A short type tag for a column header in :meth:`Tabular.display`.
-
-    Compact and stable — ``i64`` / ``f64`` / ``str`` / ``bool`` / ``date`` /
-    ``ts`` / ``list`` / ``struct`` / ``map`` / ``dec`` / ``bin`` — and crucially
-    *flat* for nested types (a struct shows ``struct``, not its whole inner
-    schema), so the header never balloons.
-    """
-    if pa.types.is_integer(t):
-        return f"i{t.bit_width}"
-    if pa.types.is_floating(t):
-        return f"f{t.bit_width}"
-    if pa.types.is_string(t) or pa.types.is_large_string(t):
-        return "str"
-    if pa.types.is_boolean(t):
-        return "bool"
-    if pa.types.is_date(t):
-        return "date"
-    if pa.types.is_timestamp(t):
-        return "ts"
-    if pa.types.is_time(t):
-        return "time"
-    if pa.types.is_list(t) or pa.types.is_large_list(t):
-        return "list"
-    if pa.types.is_struct(t):
-        return "struct"
-    if pa.types.is_map(t):
-        return "map"
-    if pa.types.is_decimal(t):
-        return "dec"
-    if pa.types.is_binary(t) or pa.types.is_large_binary(t):
-        return "bin"
-    if pa.types.is_null(t):
-        return "null"
-    return str(t)[:8]
-
-
-def _compact_nested(value: Any) -> str:
-    """Render a nested cell (list / dict / tuple) compactly on one line."""
-    import json
-
-    try:
-        return json.dumps(value, separators=(",", ":"), default=str, ensure_ascii=False)
-    except Exception:
-        return str(value).replace("\n", " ")
-
-
 #: Placeholder column-name prefix pyarrow uses for pandas index levels
 #: that had no ``name`` on the source DataFrame (``__index_level_0__``
 #: for an unnamed top level, ``__index_level_1__`` for the second level
@@ -2565,57 +2518,27 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
     def display(self, n: int = 10, *, max_width: int = 32) -> str:
         """Render the first *n* rows as an aligned, typed text table.
 
-        Each header carries a **short data type** (``col:i64`` / ``:str`` /
-        ``:ts`` …); columns are separated by ``│`` with a ``─┼─`` rule; nested
-        values (lists / structs / maps) are compacted (and their column type is
-        just ``list`` / ``struct``) so the output never balloons. Long cells are
-        truncated to *max_width*. Reads only enough Arrow batches to fill *n*
-        rows, then stops — cheap even on a large source.
+        Columns and their types come from this Tabular's own
+        :meth:`collect_schema` — the header is **two rows**: the column names,
+        then their type tags (the project :class:`~yggdrasil.data.Field`'s
+        :meth:`Field.short` → :meth:`DataType.short`, recursive for nested types
+        — ``i64`` / ``str`` / ``list<str>`` / ``struct<name:str, age:i64>``).
+        Columns are separated by ``│`` with a ``─┼─`` rule; numbers/booleans
+        right-align; nested cell values are compacted to one line. **Long values
+        and headers are clipped** (cells to *max_width*, type/name tags to a
+        slightly larger cap) so one long string or column name can't balloon the
+        table. The ``n`` rows are pushed down as a ``row_limit`` so no more than
+        that is ever read.
 
             print(dbc.sql.execute("SELECT * FROM t").display())
             print(IO.from_("data.parquet").display(5))
         """
-        columns: "list[str] | None" = None
-        types: "list[str]" = []
-        rows: list[list] = []
-        for batch in self.to_arrow_batches():
-            if columns is None:
-                columns = list(batch.schema.names)
-                types = [_short_arrow_dtype(batch.schema.field(c).type) for c in columns]
-            for record in batch.to_pylist():
-                rows.append([record.get(c) for c in columns])
-                if len(rows) >= n:
-                    break
-            if len(rows) >= n:
-                break
-        if columns is None:  # empty source / no schema
-            return "(no rows)"
+        from yggdrasil.arrow.display import arrow_display
 
-        def cell(value: Any) -> str:
-            if value is None:
-                text = ""
-            elif isinstance(value, (dict, list, tuple)):     # nested → compact
-                text = _compact_nested(value)
-            else:
-                text = str(value).replace("\n", " ")
-            return text if len(text) <= max_width else text[: max_width - 1] + "…"
-
-        header = [f"{columns[i]}:{types[i]}" for i in range(len(columns))]
-        body = [[cell(v) for v in row] for row in rows]
-        widths = [
-            max([len(header[i])] + [len(r[i]) for r in body]) if body else len(header[i])
-            for i in range(len(header))
-        ]
-        sep, rule_sep = " │ ", "─┼─"
-
-        def line(cells: "list[str]") -> str:
-            return sep.join(c.ljust(widths[i]) for i, c in enumerate(cells))
-
-        lines = [line(header), rule_sep.join("─" * w for w in widths)]
-        lines += [line(r) for r in body]
-        if len(rows) >= n:
-            lines.append(f"… (first {n} rows)")
-        return "\n".join(lines)
+        # n + 1 rows pushed down as a row_limit so we read no further than we
+        # render and arrow_display can tell "exactly n" from "more follow".
+        table = self.read_arrow_table(row_limit=n + 1)
+        return arrow_display(table, self.collect_schema(), n=n, max_width=max_width)
 
     # ==================================================================
     # Lazy execution plan

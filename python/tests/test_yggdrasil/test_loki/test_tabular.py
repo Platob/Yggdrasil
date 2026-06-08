@@ -168,6 +168,16 @@ class TestPlanning(unittest.TestCase):
         self.assertIn("tabular", p.required_skills)
         self.assertTrue(p.persona_prompt())  # data-analyst persona has a prompt
 
+    def test_autonomous_routing_to_scaffold_and_delegate(self):
+        loki = _loki()
+        # Plain-language intents route to the new actions — no slash command.
+        self.assertEqual(loki.plan("create a new python project called acme").action, "scaffold")
+        self.assertEqual(loki.plan("scaffold a rust + go cli from scratch").action, "scaffold")
+        self.assertEqual(loki.plan("do these in parallel: add tests and fix lint").action, "delegate")
+        self.assertEqual(loki.plan("swarm: refactor each module").action, "delegate")
+        # A plain question with no scaffold/delegate/data/databricks signal reasons.
+        self.assertEqual(loki.plan("what is the capital of France").action, "reason")
+
 
 if __name__ == "__main__":
     unittest.main()

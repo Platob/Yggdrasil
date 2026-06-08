@@ -44,6 +44,22 @@ def _brief(exc: object, limit: int = 200) -> str:
     return msg if len(msg) <= limit else msg[: limit - 1] + "…"
 
 
+#: Substrings (and the ``OSError`` type) that mark a load failure as a *corrupt
+#: or partial download* rather than a runtime/device problem — the only case
+#: that warrants a force re-fetch. A device-placement error (GPU not usable)
+#: must NOT match, so it falls back to CPU instead of re-downloading the weights
+#: on every run (the "it redownloads the model every time" pain).
+_CORRUPT_SIGNALS = (
+    "could not load", "safetensors", "corrupt", "incomplete", "truncat",
+    "checkpoint", "no such file", "errno", "unexpectedly", "eof",
+)
+
+
+def _looks_corrupt(exc: BaseException) -> bool:
+    """Whether *exc* looks like a corrupt/partial download (vs a device error)."""
+    return isinstance(exc, OSError) or any(s in str(exc).lower() for s in _CORRUPT_SIGNALS)
+
+
 class TransformersEngine(LocalEngine):
     """Reason with a local HuggingFace model (``transformers`` pipeline)."""
 
@@ -111,11 +127,18 @@ class TransformersEngine(LocalEngine):
     def _pipeline(self, model: str) -> Any:
         """The cached text-generation pipeline for *model*, built on first use.
 
-        The build is the slow, silent part on a fresh box — weights download
-        then load — so it's bracketed with progress logs (see :data:`_log`).
+        **The HuggingFace cache is reused** — a model downloaded once is *not*
+        re-downloaded on a later run (the default load only fetches files that
+        are missing). Two failure modes are handled distinctly so a transient
+        problem never triggers a needless multi-GB re-download:
+
+        - a **device** error (the GPU can't host the model) → fall back to CPU,
+          keeping the cached weights;
+        - a **corrupt / partial** download → repair with exactly one force
+          re-fetch, then retry.
+
         A build that already failed this process is **not retried**: it raises
-        the remembered cause straight away, so a doomed load doesn't re-run its
-        slow download on every turn.
+        the remembered cause straight away.
         """
         pipe = self._PIPES.get(model)
         if pipe is not None:
@@ -128,8 +151,8 @@ class TransformersEngine(LocalEngine):
         # Windows has no symlinks in the HF cache by default, so a download
         # falls back to *copies* — an interrupted weights fetch then leaves a
         # truncated file that loads as the generic "Could not load model … with
-        # any of the following classes". Quiet the symlink warning here; on a
-        # load failure below we re-fetch the repo once to repair exactly that.
+        # any of the following classes"; the corrupt-cache repair below re-fetches
+        # exactly that. Quiet the (expected) symlink warning here.
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         # Xet is HuggingFace's newer CAS transfer; behind a corporate proxy its
         # endpoint (cas-server.xethub.hf.co) is often blocked — a 403 there
@@ -149,48 +172,66 @@ class TransformersEngine(LocalEngine):
         # the model uses the GPU instead of the CPU. torch must be importable
         # first, hence after load("torch").
         device = self.resolve_device()
-        _log.info("loading local model %s on %s — first run downloads weights, "
-                  "this can take a while…", model, device or "cpu")
+        _log.info("loading local model %s on %s — a first run downloads the weights "
+                  "(cached for next time, with a progress bar), then runs locally…",
+                  model, device or "cpu")
         if device is None and resources.has_npu():
-            _log.info("an Intel NPU (AI Boost) was detected but the HF pipeline "
-                      "runs on CPU — install optimum-intel + openvino to offload "
-                      "the model onto the NPU.")
-        try:
-            pipe = transformers.pipeline(
-                "text-generation", model=model,
-                device=device, trust_remote_code=False,
-            )
-        except Exception as first:
-            # The common failure — chiefly on Windows — is a half-downloaded /
-            # corrupt cache. Re-fetch the whole repo (config + tokenizer +
-            # weights) once with force_download to repair it, then rebuild.
-            _log.warning("local model %s failed to load (%s: %s) — re-fetching "
-                         "the weights to repair a partial download, retrying "
-                         "once…", model, type(first).__name__, _brief(first))
-            try:
-                load("huggingface_hub").snapshot_download(model, force_download=True)
-                pipe = transformers.pipeline(
-                    "text-generation", model=model,
-                    device=device, trust_remote_code=False,
-                )
-            except Exception as exc:
-                # transformers masks the real reason behind a generic "Could not
-                # load model …" — unwrap the underlying cause so the log says
-                # *why* (corrupt download, torch mismatch, OOM), and remember the
-                # failure so the slow, doomed load isn't re-attempted every turn.
-                # The cause string can itself embed nested tracebacks — brief it.
-                cause = exc.__cause__ or exc.__context__ or exc
-                err = RuntimeError(
-                    f"could not load local model {model!r}: "
-                    f"{type(cause).__name__}: {_brief(cause)}. Pin a smaller model "
-                    f"with YGG_LOKI_HF_MODEL, or clear the HuggingFace cache and retry."
-                )
-                self._FAILED[model] = err
-                _log.warning("local model %s failed to load — %s", model, err)
-                raise err from exc
+            _log.info("an Intel NPU (AI Boost) was detected but the torch pipeline "
+                      "runs on CPU — switch to the 'openvino' engine (ygg loki "
+                      "/engine openvino) to run the model on the NPU.")
+        pipe = self._build(load, transformers, model, device)
         self._PIPES[model] = pipe
         _log.info("local model %s ready", model)
         return pipe
+
+    def _build(self, load: Any, transformers: Any, model: str, device: Optional[str]) -> Any:
+        """Build the text-generation pipeline, reusing the cache.
+
+        The plain build reuses any cached weights (HF fetches only what's
+        missing). On a **device** failure it retries on CPU; on a **corrupt**
+        cache it force-re-fetches once and retries. Any final failure is
+        remembered (:attr:`_FAILED`) and re-raised with the unwrapped cause.
+        """
+        try:
+            return transformers.pipeline("text-generation", model=model,
+                                         device=device, trust_remote_code=False)
+        except Exception as first:
+            # A GPU placement failure (xpu/cuda/mps unusable for this model) →
+            # run on CPU instead of re-downloading the weights. Skip when the
+            # error already looks like a bad download (handled just below).
+            if device is not None and not _looks_corrupt(first):
+                _log.warning("local model %s couldn't load on %s (%s) — falling back "
+                             "to CPU (weights kept, not re-downloaded)",
+                             model, device, _brief(first))
+                try:
+                    return transformers.pipeline("text-generation", model=model,
+                                                 device=None, trust_remote_code=False)
+                except Exception as cpu_exc:
+                    first = cpu_exc
+            # A corrupt / partial download (chiefly on Windows) → repair the repo
+            # once with a force re-fetch, then retry on CPU.
+            if _looks_corrupt(first):
+                _log.warning("local model %s failed to load (%s: %s) — re-fetching the "
+                             "weights to repair a partial download, retrying once…",
+                             model, type(first).__name__, _brief(first))
+                try:
+                    load("huggingface_hub").snapshot_download(model, force_download=True)
+                    return transformers.pipeline("text-generation", model=model,
+                                                 device=None, trust_remote_code=False)
+                except Exception as exc:
+                    first = exc
+            # transformers masks the real reason behind a generic "Could not load
+            # model …" — unwrap the cause so the log says *why*, and remember the
+            # failure so the doomed load isn't re-attempted every turn.
+            cause = first.__cause__ or first.__context__ or first
+            err = RuntimeError(
+                f"could not load local model {model!r}: "
+                f"{type(cause).__name__}: {_brief(cause)}. Pin a smaller model "
+                f"with YGG_LOKI_HF_MODEL, or clear the HuggingFace cache and retry."
+            )
+            self._FAILED[model] = err
+            _log.warning("local model %s failed to load — %s", model, err)
+            raise err from first
 
     def complete(
         self,

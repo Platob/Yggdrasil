@@ -1248,3 +1248,66 @@ class TestRepr:
         t = _InstantTask()
         assert "_InstantTask" in repr(t)
         assert "idle" in repr(t)
+
+
+# ── progress / watch (UI bridge) ─────────────────────────────────────────────
+
+
+class _ProgressTask(Awaitable):
+    """A task that reports a 0..1 fraction as it polls."""
+
+    def __init__(self, polls: int = 4):
+        self._polls = 0
+        self._target = polls
+
+    def _start(self):
+        self._state = State.RUNNING
+
+    def _poll(self):
+        self._polls += 1
+        if self._polls >= self._target:
+            self._state = State.SUCCEEDED
+
+    def _error_for_status(self):
+        return RuntimeError("failed")
+
+    def progress(self):
+        return min(self._polls / self._target, 1.0)
+
+
+class TestProgressAndWatch:
+    def test_base_progress_is_none(self):
+        assert _InstantTask().progress() is None
+
+    def test_watch_drives_to_done_and_ticks(self):
+        task = _ProgressTask(polls=3)
+        seen: list = []
+        task.watch(lambda a: seen.append(a.progress()), interval=0)
+        assert task.is_done and task.is_succeeded
+        assert seen and seen[-1] == 1.0          # progressed to complete
+        assert seen == sorted(seen)              # monotonic
+
+    def test_watch_raises_on_failure(self):
+        class _Boom(Awaitable):
+            def _start(self): self._state = State.RUNNING
+            def _poll(self): self._state = State.FAILED
+            def _error_for_status(self): return ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            _Boom().watch(interval=0)
+
+    def test_batch_progress_is_fraction_done(self):
+        kids = [_SlowTask(1), _SlowTask(1), _SlowTask(1)]
+        batch = _Batch(kids)
+        batch.start(wait=False)
+        # Before completion the fraction is between 0 and 1; after, exactly 1.
+        batch.wait()
+        assert batch.progress() == 1.0
+
+
+class _Batch(AwaitableBatch):
+    def __init__(self, kids):
+        self._kids = kids
+
+    def awaitables(self):
+        return iter(self._kids)

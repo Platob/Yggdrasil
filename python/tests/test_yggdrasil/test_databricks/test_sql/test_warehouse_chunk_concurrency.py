@@ -148,3 +148,26 @@ class TestWarehouseChunkConcurrency:
         assert http.max_concurrent >= _PARTIES
         # ``ordered=True`` keeps chunk order despite the concurrent fetch.
         assert rows == list(range(_N_CHUNKS))
+
+    def test_read_arrow_table_fetches_concurrently_and_casts_once(self) -> None:
+        # The optimized whole-result path fans the *same* parallel chunk fetch
+        # out across the pool, then assembles one table cast in a single pass —
+        # so a serial fetch would still deadlock on the barrier, and every
+        # chunk's row lands in order.
+        result, http = _multi_chunk_result()
+
+        table = result.read_arrow_table()
+
+        assert http.max_concurrent >= _PARTIES
+        assert table.num_rows == _N_CHUNKS
+        assert table.column("id").to_pylist() == list(range(_N_CHUNKS))
+
+    def test_read_arrow_tabular_uses_cast_once_table(self) -> None:
+        # ``read_arrow_tabular`` wraps the cast-once table in an in-memory
+        # ArrowTabular — same concurrent fetch, all rows present.
+        result, http = _multi_chunk_result()
+
+        tabular = result.read_arrow_tabular()
+
+        assert http.max_concurrent >= _PARTIES
+        assert tabular.read_arrow_table().column("id").to_pylist() == list(range(_N_CHUNKS))

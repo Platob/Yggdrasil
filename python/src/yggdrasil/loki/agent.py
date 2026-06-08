@@ -19,10 +19,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 from . import skill as _skill
 from .capability import Backend, detect
+from .result import DictResult
 
 #: Engine fallback / skip notices ride this logger; ``ygg loki`` routes it to
 #: the terminal (``style.install_logging``) so a skipped engine is visible.
@@ -34,7 +36,33 @@ if TYPE_CHECKING:
     from .engine import TokenEngine
     from .tools import Toolbox
 
-__all__ = ["Loki", "ROUTES"]
+__all__ = ["Loki", "ROUTES", "ActStep", "ActResult"]
+
+
+@dataclass(slots=True)
+class ActStep(DictResult):
+    """One turn of the autonomous loop — a tool call (or the final ``done``)."""
+
+    n: int
+    thought: str = ""
+    tool: str = ""
+    args: dict[str, Any] = field(default_factory=dict)
+    observation: str = ""
+    done: bool = False
+    answer: str = ""
+
+
+@dataclass(slots=True)
+class ActResult(DictResult):
+    """The transcript of an :meth:`Loki.act` run (typed, mapping-compatible)."""
+
+    task: str
+    engine: str
+    root: str
+    steps: list[ActStep] = field(default_factory=list)
+    answer: str = ""
+    completed: bool = False
+    files_changed: list[str] = field(default_factory=list)
 
 #: Raised when no reasoning engine is reachable (or every one failed in turn).
 _NO_ENGINE = (
@@ -70,6 +98,33 @@ ROUTES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+#: "Make me a new project" phrasing → the ``scaffold`` action (no slash command
+#: needed — Loki routes it itself).
+SCAFFOLD_SIGNALS: tuple[str, ...] = (
+    "scaffold", "new project", "create a project", "create a repo", "new repo",
+    "bootstrap a project", "from scratch", "starter project", "boilerplate",
+    "project template", "set up a repo", "set up a project", "ready to push",
+    "new app", "spin up a project",
+    # full-app phrasings (pair with the scaffold presets)
+    "full-stack", "fullstack", "full stack", "web app", "webapp",
+    "realtime app", "real-time app", "streaming app", "dashboard app",
+)
+
+#: "Run these in parallel" phrasing → the ``delegate`` action (a monitored fleet
+#: of background process agents).
+DELEGATE_SIGNALS: tuple[str, ...] = (
+    "in parallel", "delegate", "swarm", "spawn agents", "concurrently",
+    "at the same time", "simultaneously", "fan out", "parallel agents",
+    "multiple agents", "several agents", "background agents",
+)
+
+#: Power-market phrasing → the ``entsoe`` skill (autonomous energy-data path).
+ENERGY_SIGNALS: tuple[str, ...] = (
+    "entso", "electricity price", "power price", "power prices", "electricity",
+    "day-ahead", "day ahead", "spot price", "power market", "energy market",
+    "grid load", "power generation", "power demand", "megawatt", "mwh", "bidding zone",
+)
+
 #: Meta/advice phrasing that asks *how to build* something rather than to do it
 #: now — routed to the ``guide`` skill when paired with a yggdrasil mention.
 GUIDE_SIGNALS: tuple[str, ...] = (
@@ -101,7 +156,7 @@ class Loki:
     #: capable remote APIs first, then free local engines as a fallback.
     #: :meth:`select` overrides this for simple work on a capable workstation.
     ENGINE_PREFERENCE: tuple[str, ...] = (
-        "claude", "openai", "databricks", "ollama", "transformers",
+        "claude", "openai", "databricks", "ollama", "openvino", "transformers",
     )
 
     _CURRENT: "Optional[Loki]" = None
@@ -254,6 +309,7 @@ class Loki:
                 DatabricksServingEngine,
                 OllamaEngine,
                 OpenAIEngine,
+                OpenVINOEngine,
                 TransformersEngine,
             )
 
@@ -265,6 +321,8 @@ class Loki:
                 # the heavy load is deferred to an actual serving completion.
                 "databricks": DatabricksServingEngine(available=self.has("databricks")),
                 "ollama": OllamaEngine(),
+                # Intel NPU (AI Boost) via OpenVINO/optimum-intel, else GPU/CPU.
+                "openvino": OpenVINOEngine(),
                 "transformers": TransformersEngine(),
             }
         return self._engines
@@ -425,7 +483,13 @@ class Loki:
                 chain.append(eng)
         return chain
 
-    def bootstrap_local(self, *, model: "Optional[str]" = None, pull: bool = True) -> dict[str, Any]:
+    def bootstrap_local(
+        self,
+        *,
+        model: "Optional[str]" = None,
+        pull: bool = True,
+        on_progress: "Optional[Callable[[dict[str, Any]], None]]" = None,
+    ) -> dict[str, Any]:
         """Ready a free **local** reasoning engine, lazily installing on demand.
 
         Prefers a reachable Ollama server — ensures the model **sized to this
@@ -441,7 +505,7 @@ class Loki:
         oll = OllamaEngine()
         if oll.available():
             target = model or oll.bootstrap_model
-            receipt = oll.ensure(target) if pull else {
+            receipt = oll.ensure(target, on_progress=on_progress) if pull else {
                 "model": target, "was_present": oll.has_model(target),
                 "status": "skipped (pull=False)",
             }
@@ -451,12 +515,20 @@ class Loki:
             return {"engine": "transformers", "ready": True,
                     "model": model or tf.bootstrap_model, "was_present": False,
                     "status": "ready (weights lazy-download on first use)"}
+        # A box with an Intel GPU should install the GPU (XPU) torch build, not
+        # the stock CPU wheel — so the local model runs on the GPU from the start.
+        from .resources import XPU_TORCH_INDEX, intel_gpu_present
+
+        torch_hint = (f"pip install transformers && pip install --index-url {XPU_TORCH_INDEX} torch"
+                      "  (HF local engine, on the Intel GPU)"
+                      if intel_gpu_present() else
+                      "or: pip install transformers torch  (HF local engine)")
         return {
             "engine": None, "ready": False,
             "install": [
                 "install Ollama (https://ollama.com), then it auto-pulls "
                 f"{OllamaEngine().bootstrap_model!r} (sized to this box)",
-                "or: pip install transformers torch  (HF local engine)",
+                torch_hint,
             ],
         }
 
@@ -548,6 +620,7 @@ class Loki:
         allow_web: bool = False,
         confirm: "Optional[Callable[[str], bool]]" = None,
         toolbox: "Optional[Toolbox]" = None,
+        on_think: "Optional[Callable[[int], None]]" = None,
         on_step: "Optional[Callable[[dict[str, Any]], None]]" = None,
     ) -> dict[str, Any]:
         """Pursue *task* autonomously: discover, decide, and modify files.
@@ -566,7 +639,10 @@ class Loki:
         Returns a transcript: the resolved ``engine``, every ``step`` (its
         ``thought``/``tool``/``args``/``observation``), the final ``answer``,
         whether it ``completed``, and the ``files_changed`` list. Pass
-        ``on_step`` to stream progress (the CLI uses it to print each turn).
+        ``on_step`` to stream each completed turn, and ``on_think(n)`` to learn
+        when turn *n* is about to call the (slow) model — the CLI uses the pair
+        to keep a live spinner + step-budget bar running through the otherwise
+        silent reasoning between tool calls.
         """
         from .tools import filesystem_toolbox
 
@@ -591,14 +667,34 @@ class Loki:
             '  to use a tool:  {"thought": "...", "tool": "<name>", "args": {...}}\n'
             '  when finished:  {"thought": "...", "done": true, "answer": "<summary>"}\n\n'
             "Rules: take the smallest useful step; read a file before editing "
-            "it; `edit_file` needs `old` to be unique, else write the whole "
-            "file; stop as soon as the goal is met and summarize what changed."
+            "it; `edit_file` needs `old` to be unique, else write the whole file.\n"
+            "Validation discipline (checkpoints): after each meaningful change, run a "
+            "quick `smoke` test to confirm it still works before moving on — never "
+            "stack unverified changes. At a bigger milestone (a feature done, a module "
+            "reshaped) run `bench` to validate performance, not just correctness. Do "
+            "NOT declare done until a `smoke` test passes; in your final answer say "
+            "what you validated. Stop as soon as the goal is met and verified, and "
+            "summarize what changed and what you ran."
+            + ("\nMesh: you are one of several agents sharing a workspace. FIRST "
+               "`mesh` (action='list') to see peers' published results and avoid "
+               "redundant work; when you produce something reusable (a file path, an "
+               "API, a decision) publish it with `mesh` (action='put', key, value)."
+               if "mesh" in box.tools else "")
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": f"GOAL: {task}"}]
-        steps: list[dict[str, Any]] = []
+        steps: list[ActStep] = []
         answer, completed = "", False
 
+        from .usage import METER
+
         for n in range(1, max_steps + 1):
+            # Cost cap (set via the meter, e.g. `ygg loki do --budget`) — stop
+            # before the next paid turn rather than blowing through it.
+            if METER.over_budget():
+                answer = f"stopped: cost budget reached (${METER.total_cost:.4f})"
+                break
+            if on_think:
+                on_think(n)
             reply = eng.complete(messages, system=system, max_tokens=4000, tier=tier).text
             decision = _parse_decision(reply)
             if decision is None:
@@ -612,8 +708,8 @@ class Loki:
                 answer = str(decision.get("answer", "")).strip()
                 completed = True
                 if on_step:
-                    on_step({"n": n, "thought": decision.get("thought", ""), "done": True,
-                             "answer": answer})
+                    on_step(ActStep(n=n, thought=decision.get("thought", ""),
+                                    done=True, answer=answer))
                 break
 
             name = decision.get("tool", "")
@@ -621,8 +717,8 @@ class Loki:
             if not isinstance(args, dict):
                 args = {}
             observation = box.call(name, args)
-            record = {"n": n, "thought": decision.get("thought", ""),
-                      "tool": name, "args": args, "observation": observation}
+            record = ActStep(n=n, thought=decision.get("thought", ""),
+                             tool=name, args=args, observation=observation)
             steps.append(record)
             if on_step:
                 on_step(record)
@@ -632,15 +728,73 @@ class Loki:
         else:
             answer = "stopped: reached max_steps without finishing"
 
-        return {
-            "task": task,
-            "engine": eng.name,
-            "root": str(root),
-            "steps": steps,
-            "answer": answer,
-            "completed": completed,
-            "files_changed": list(box.changed),
-        }
+        return ActResult(
+            task=task,
+            engine=eng.name,
+            root=str(root),
+            steps=steps,
+            answer=answer,
+            completed=completed,
+            files_changed=list(box.changed),
+        )
+
+    def delegate(
+        self,
+        tasks: list[str],
+        *,
+        root: str = ".",
+        engine: "Optional[str]" = None,
+        tier: "Optional[str]" = None,
+        max_steps: int = 8,
+        allow_web: bool = True,
+        allow_shell: bool = False,
+        read_only: bool = False,
+        timeout: "Optional[float]" = None,
+        on_update: "Optional[Callable[[list[Any]], None]]" = None,
+    ) -> list[dict[str, Any]]:
+        """Fan *tasks* out to background process agents and wait for them.
+
+        Each task runs as its own ``ygg loki do`` subprocess (an isolated act
+        loop), so independent work proceeds in parallel while Loki monitors them
+        — its autonomy multiplier. Returns one summary row per agent (status,
+        elapsed, answer, files_changed). ``on_update(agents)`` streams live
+        progress (the CLI renders the dashboard from it).
+        """
+        from .fleet import Fleet
+
+        fleet = Fleet()
+        fleet.spawn_all(tasks, root=root, engine=engine, tier=tier, max_steps=max_steps,
+                        allow_web=allow_web, allow_shell=allow_shell, read_only=read_only)
+        fleet.monitor(on_update, timeout=timeout)
+        return fleet.summary()
+
+    def decompose(self, goal: str, *, engine: "Optional[str]" = None,
+                  tier: "Optional[str]" = None, max_tasks: int = 6) -> list[str]:
+        """Break *goal* into independent subtasks an agent fleet can run in parallel.
+
+        Asks the reasoning engine for a JSON array of self-contained tasks
+        (parallel-safe — no ordering between them). Returns the parsed list,
+        capped at *max_tasks*; falls back to ``[goal]`` if nothing parses.
+        """
+        prompt = (
+            f"Break this goal into at most {max_tasks} INDEPENDENT subtasks that can "
+            f"run in parallel (no subtask depends on another's output). Each must be "
+            f"a single concrete instruction for an autonomous coding agent.\n\n"
+            f"GOAL: {goal}\n\n"
+            f"Reply with ONLY a JSON array of strings, nothing else."
+        )
+        reply = self.reason(prompt, engine=engine, tier=tier,
+                            system="You decompose goals into parallel-safe subtasks. Output JSON only.")
+        start, end = reply.find("["), reply.rfind("]")
+        if start != -1 and end > start:
+            try:
+                tasks = json.loads(reply[start : end + 1])
+            except json.JSONDecodeError:
+                tasks = []
+            cleaned = [str(t).strip() for t in tasks if str(t).strip()]
+            if cleaned:
+                return cleaned[:max_tasks]
+        return [goal]
 
     # -- reasoning planner -------------------------------------------------
 
@@ -675,6 +829,33 @@ class Loki:
             return made("guide", "guide",
                         why="how-to: the optimized yggdrasil implementation path")
 
+        # Autonomy: route "make a new project" / "do these in parallel" to the
+        # scaffold / delegate actions directly — no slash command needed.
+        if any(s in low for s in DELEGATE_SIGNALS):
+            return made("files", "delegate",
+                        why="delegate independent tasks to a monitored parallel agent fleet")
+        # Scaffold: an explicit signal, or a "<create-verb> … <project-noun>" phrase
+        # (so "create a new python project" routes even with words in between).
+        if any(s in low for s in SCAFFOLD_SIGNALS) or (
+            re.search(r"\b(new|create|start|bootstrap|scaffold|generate|spin up|set up|build|make)\b", low)
+            and re.search(r"\b(project|repo|repository|app|package|library|service|microservice|cli|tool)\b", low)
+        ):
+            return made("files", "scaffold",
+                        why="scaffold a ready-to-push project from scratch")
+        # Power-market data → the entsoe skill, with series/zone inferred. Gate on
+        # a data word (or an explicit ENTSO-E mention) so "what is electricity"
+        # stays a plain question.
+        if (not re.search(r"https?://", text) and any(s in low for s in ENERGY_SIGNALS)
+                and ("entso" in low or any(w in low for w in (
+                    "price", "load", "demand", "consumption", "generation",
+                    "production", "spot", "market")))):
+            from .entsoe import infer_query
+
+            p = made("data", "skill", why="ENTSO-E power-market data → entsoe skill")
+            p.skill = "entsoe"
+            p.skill_kwargs = infer_query(text)
+            return p
+
         # With a live Databricks session, a precise NL request ("list catalogs",
         # "tables in cat.sch", "describe cat.sch.tbl", "who am i") dispatches the
         # specialized databricks-* skill directly rather than just reasoning.
@@ -689,6 +870,22 @@ class Loki:
                 skill, kw = hit
                 p = made("databricks", "skill", specialist="databricks",
                          why=f"databricks request → {skill}")
+                p.skill = skill
+                p.skill_kwargs = {k: v for k, v in kw.items() if v is not None}
+                return p
+
+        # Same for AWS: a precise NL read request ("list my s3 buckets", "show
+        # ec2 instances", "who am i on aws") dispatches the right aws-* skill.
+        if self.has("aws") and not re.search(r"https?://", text):
+            try:
+                from yggdrasil.aws.loki.router import route as _aws_route
+
+                hit = _aws_route(text)
+            except Exception:
+                hit = None
+            if hit is not None:
+                skill, kw = hit
+                p = made("aws", "skill", why=f"aws request → {skill}")
                 p.skill = skill
                 p.skill_kwargs = {k: v for k, v in kw.items() if v is not None}
                 return p
@@ -777,15 +974,20 @@ class Loki:
         return _skill.get(name)
 
 
-    def run(self, name: str, **kwargs: Any) -> Any:
-        """Dispatch skill *name* with *kwargs*, using self as the provider."""
-        s = self.skill(name)
+    def run(self, skill_name: str, **kwargs: Any) -> Any:
+        """Dispatch skill *skill_name* with *kwargs*, using self as the provider.
+
+        The first parameter is ``skill_name`` (not ``name``) so a skill that
+        itself takes a ``name=`` kwarg — e.g. ``scaffold(name=…)`` — can be
+        dispatched as ``loki.run("scaffold", name="acme")`` without a clash.
+        """
+        s = self.skill(skill_name)
         if s is None:
             known = ", ".join(x.name for x in self.skills()) or "(none)"
-            raise KeyError(f"unknown skill {name!r}; registered: {known}")
+            raise KeyError(f"unknown skill {skill_name!r}; registered: {known}")
         if not s.available(self):
             raise RuntimeError(
-                f"skill {name!r} needs backend {s.requires!r}, "
+                f"skill {skill_name!r} needs backend {s.requires!r}, "
                 f"which is not available here"
             )
         return s.run(self, **kwargs)

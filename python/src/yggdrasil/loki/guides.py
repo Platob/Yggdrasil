@@ -204,6 +204,26 @@ GUIDES: tuple[Guide, ...] = (
                 "loki.run('tabular', url='https://host/data.csv')",
         avoid=("a bespoke LLM client when an engine + skill already exist",),
     ),
+    Guide(
+        id="energy-markets",
+        title="Pull power-market data (ENTSO-E) into frames",
+        signals=("entso", "entsoe", "power", "electricity", "energy", "grid",
+                 "day-ahead", "day ahead", "spot price", "bidding zone", "load",
+                 "generation", "mwh", "megawatt", "utility", "commodity"),
+        summary="Fetch European day-ahead prices / load / generation for a bidding "
+                "zone with the `entsoe` skill — it parses the Transparency Platform "
+                "XML into a tidy timestamp/value polars frame and caches it through "
+                "the io handlers, ready for the usual frame analytics.",
+        use=("loki.run('entsoe', series='day_ahead_prices', zone='DE_LU', days=7)",
+             "yggdrasil.loki.entsoe.fetch_frame / parse_timeseries_xml / build_query",
+             "ZONES alias map (DE_LU, FR, NL …) or any EIC; ENTSOE_API_TOKEN to auth",
+             "then the frame path: transform (cast/tz), cache, store Parquet/Delta"),
+        example="loki.run('entsoe', series='day_ahead_prices', zone='FR', days=7)\n"
+                "df = entsoe.fetch_frame('load', 'DE_LU', '2024-01-01', '2024-01-08')\n"
+                "df.group_by_dynamic('timestamp', every='1d').agg(pl.col('value').mean())",
+        avoid=("hand-rolled ENTSO-E XML parsing or a bespoke HTTP client — use the "
+               "entsoe helpers over HTTPSession",),
+    ),
 )
 
 

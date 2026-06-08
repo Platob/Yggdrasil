@@ -248,6 +248,10 @@ class Spinner:
         self.frames = frames
         self.interval = interval
         self.color = color
+        #: Optional ``(current, total)`` — when set, a compact filled bar renders
+        #: between the spinner glyph and the text so a bounded task (an agent's
+        #: step budget, a multi-file pass) shows how far along it is, live.
+        self._progress: tuple[int, int] | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -266,12 +270,28 @@ class Spinner:
         while not self._stop_event.is_set():
             frame = next(cycle)
             colored = f"{_CSI}{self.color}m{frame}{_RESET}"
-            sys.stdout.write(f"\r{_CSI}2K  {colored} {self.text}")
+            sys.stdout.write(f"\r{_CSI}2K  {colored} {self._bar()}{self.text}")
             sys.stdout.flush()
             self._stop_event.wait(self.interval)
 
+    def _bar(self) -> str:
+        """A compact filled progress bar segment, or ``""`` when no progress is set."""
+        prog = self._progress
+        if prog is None or prog[1] <= 0:
+            return ""
+        current, total = prog
+        width = 12
+        filled = min(int(width * current / total), width)
+        bar = f"{_CSI}{self.color}m{'█' * filled}{_RESET}" + dim("░" * (width - filled))
+        return f"{bar} {dim(f'{min(current, total)}/{total}')}  "
+
     def update(self, text: str) -> None:
         self.text = text
+
+    def set_progress(self, current: int, total: int) -> None:
+        """Drive the inline progress bar (``current`` of ``total``). Renders on
+        the next animation frame; safe to call from the main thread mid-spin."""
+        self._progress = (current, total)
 
     def stop(self, final: str = "") -> None:
         self._stop_event.set()
@@ -302,6 +322,143 @@ def progress_bar(current: int, total: int, width: int = 30, label: str = "") -> 
     if _COLOR:
         return f"  {_CSI}36m{bar}{_RESET} {pct} {dim(label)}"
     return f"  [{bar}] {pct} {label}"
+
+
+class ProgressBar:
+    """A live single-line progress-bar component.
+
+    **Determinate** when a fraction is known (``update(frac=0.4)`` or
+    ``update(current, total)``) — a filled bar with a percentage; otherwise
+    **indeterminate** — an animated sweep, so it's useful even when the total
+    isn't known yet. TTY-only (off a terminal it stays quiet, like the spinner).
+    Drives :func:`track`, the bridge from an
+    :class:`~yggdrasil.dataclasses.awaitable.Awaitable`.
+
+        with ProgressBar(total=len(files), label="indexing") as bar:
+            for i, f in enumerate(files, 1):
+                index(f); bar.update(i)
+    """
+
+    def __init__(self, total: "int | None" = None, label: str = "",
+                 *, width: int = 24, color: str = "36") -> None:
+        self.total = total
+        self.label = label
+        self.width = width
+        self.color = color
+        self._frac: "float | None" = None
+        self._sweep = 0
+
+    def update(self, current: "float | None" = None, total: "int | None" = None,
+               *, frac: "float | None" = None, label: "str | None" = None) -> None:
+        if total is not None:
+            self.total = total
+        if label is not None:
+            self.label = label
+        if frac is not None:
+            self._frac = max(0.0, min(frac, 1.0))
+        elif current is not None and self.total:
+            self._frac = max(0.0, min(current / self.total, 1.0))
+        self._render()
+
+    def _render(self) -> None:
+        if not _IS_TTY:
+            return
+        if self._frac is None:                       # indeterminate sweep
+            self._sweep = (self._sweep + 1) % self.width
+            cells = ["░"] * self.width
+            for i in range(max(1, self.width // 4)):
+                cells[(self._sweep + i) % self.width] = "█"
+            bar, pct = "".join(cells), ""
+        else:
+            filled = int(self.width * self._frac)
+            bar = "█" * filled + "░" * (self.width - filled)
+            pct = f" {self._frac * 100:4.0f}%"
+        colored = f"{_CSI}{self.color}m{bar}{_RESET}" if _COLOR else f"[{bar}]"
+        sys.stdout.write(f"\r{_CSI}2K  {colored}{pct} {dim(self.label)}")
+        sys.stdout.flush()
+
+    def stop(self, final: str = "") -> None:
+        if _IS_TTY:
+            clear_line()
+        if final:
+            out(f"  {final}\n")
+
+    def __enter__(self) -> "ProgressBar":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+
+def track(awaitable: object, label: str = "", *, interval: float = 0.1) -> object:
+    """Drive an :class:`~yggdrasil.dataclasses.awaitable.Awaitable` to completion
+    behind a live :class:`ProgressBar` — a real bar when it reports a fraction
+    (``awaitable.progress()``), an animated sweep while it doesn't.
+
+    The bridge from any awaitable — a SQL statement, a Databricks job run, an
+    agent batch — to the terminal styling::
+
+        style.track(dbc.sql.execute(query), "running query…")
+        style.track(batch, "fetching shards…")
+
+    Returns the (now-finished) awaitable; surfaces its failure like ``wait``.
+    """
+    bar = ProgressBar(label=label or "working…")
+
+    def on_tick(a: object) -> None:
+        getter = getattr(a, "progress", None)
+        bar.update(frac=getter() if callable(getter) else None)
+
+    try:
+        awaitable.watch(on_tick, interval=interval, raise_error=False)
+    finally:
+        bar.stop()
+    raise_for = getattr(awaitable, "raise_for_status", None)
+    if callable(raise_for):
+        raise_for()
+    return awaitable
+
+
+def progress(current: int, total: int, label: str = "") -> None:
+    """Render/refresh a download-style progress bar **in place** on the current
+    line (TTY only — a redirected log would fill with ``\\r`` junk otherwise).
+
+    Drives long downloads (an Ollama ``pull``) so the bytes-so-far show live.
+    Call :func:`clear_line` (or print a newline) when the work finishes."""
+    if not _IS_TTY or total <= 0:
+        return
+    sys.stdout.write(f"{_CSI}2K\r" + progress_bar(current, total, label=label))
+    sys.stdout.flush()
+
+
+# -- live multi-line display ----------------------------------------------
+
+class LiveDisplay:
+    """Render a block of lines that **updates in place** (a live dashboard).
+
+    Each :meth:`update` rewrites the block: the cursor jumps back to its top
+    (``CSI nF``), every line is cleared (``CSI 2K``) and redrawn, so a fleet of
+    agents shows live status without scrolling the transcript. TTY-only — off a
+    terminal the escapes are meaningless, so updates are dropped and the caller's
+    final summary (plain ``out``) carries the result instead.
+    """
+
+    def __init__(self) -> None:
+        self._n = 0          # lines drawn by the previous update
+
+    def update(self, lines: list[str]) -> None:
+        if not _IS_TTY:
+            return
+        parts: list[str] = []
+        if self._n:
+            parts.append(f"{_CSI}{self._n}F")        # cursor to top of the block
+        parts.extend(f"{_CSI}2K{ln}" for ln in lines)
+        sys.stdout.write("\n".join(parts) + "\n")
+        sys.stdout.flush()
+        self._n = len(lines)
+
+    def stop(self) -> None:
+        self._n = 0
 
 
 # -- typing animation ------------------------------------------------------

@@ -19,7 +19,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from typing import Any, Sequence
+
+#: Tool-call budget for an autonomous turn inside the interactive session (the
+#: ``ygg loki do`` CLI takes its own ``--max-steps``). Kept here so the live
+#: step-budget bar and the ``act`` call agree on the denominator.
+_REPL_ACT_STEPS = 12
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -51,6 +57,7 @@ def _build_parser() -> argparse.ArgumentParser:
     do.add_argument("--engine", default=None, help="Force an engine (claude/openai/databricks).")
     do.add_argument("--tier", default=None, choices=["fast", "deep"], help="Force a model tier (default: adaptive).")
     do.add_argument("--max-steps", type=int, default=12, help="Tool-call budget (default 12).")
+    do.add_argument("--budget", type=float, default=None, help="USD cost cap — stop before exceeding it.")
     do.add_argument("--read-only", action="store_true", help="Discovery only — no file writes.")
     do.add_argument("--allow-shell", action="store_true", help="Also give the agent a shell tool.")
     do.add_argument("--allow-web", action="store_true", help="Also give the agent web fetch/table/image tools.")
@@ -200,9 +207,14 @@ def _print_hardware(style: Any) -> None:
 
     snap = resources.snapshot()
     accel = {"cuda": "NVIDIA GPU (cuda)", "xpu": "Intel GPU (xpu)",
-             "mps": "Apple GPU (mps)"}.get(snap.get("accelerator") or "", "CPU only")
-    bits = [f"{snap['cpu']} cores", f"{snap['ram_gb']:g} GB", accel]
-    if snap.get("npu"):
+             "mps": "Apple GPU (mps)"}.get(snap.accelerator or "", None)
+    if accel is None:
+        # Present but torch can't drive it yet — name it and point at the fix,
+        # so the GPU shows instead of a flat "CPU only".
+        accel = (style.brand("Intel GPU") + style.dim(" (present · pip install intel-extension-for-pytorch to use)")
+                 if snap.intel_gpu else "CPU only")
+    bits = [f"{snap.cpu} cores", f"{snap.ram_gb:g} GB", accel]
+    if snap.npu:
         bits.append(style.brand("Intel NPU"))
     style.out(f"  {style.cyan('compute')} {style.dim(' · '.join(str(b) for b in bits))}\n")
 
@@ -219,6 +231,24 @@ def _engines(loki: Any, style: Any) -> int:
     return 0
 
 
+def _pull_bar(style: Any) -> Any:
+    """A progress callback for a model download → renders a live byte bar.
+
+    Ollama's pull streams ``{status, completed, total}`` events; show a filled
+    bar with a short byte readout while bytes flow, and just the status line
+    (manifest / verifying / writing) for the non-byte phases."""
+    def on_progress(ev: dict) -> None:
+        status = str(ev.get("status", "")).split()[0] if ev.get("status") else ""
+        total, completed = ev.get("total"), ev.get("completed")
+        if total and completed is not None:
+            mb = f"{completed / 1e6:.0f}/{total / 1e6:.0f} MB"
+            style.progress(int(completed), int(total), label=f"{status} {mb}")
+        elif status:
+            style.clear_line()
+            style.out(f"  {style.dim('▹ ' + status)}\r")
+    return on_progress
+
+
 def _setup(loki: Any, style: Any, arg: str) -> int:
     """Bootstrap a free local model — lazily install it on demand.
 
@@ -228,7 +258,8 @@ def _setup(loki: Any, style: Any, arg: str) -> int:
     """
     model = arg.strip() or None
     style.out(f"  {style.dim('readying a free local model — this may download on first run…')}\n")
-    res = loki.bootstrap_local(model=model)
+    res = loki.bootstrap_local(model=model, on_progress=_pull_bar(style))
+    style.clear_line()
     if res.get("ready"):
         was = res.get("was_present")
         verb = "already installed" if was else "installed"
@@ -239,7 +270,88 @@ def _setup(loki: Any, style: Any, arg: str) -> int:
         style.warn("no local engine yet — install one of:")
         for hint in res.get("install", []):
             style.out(f"    {style.brand('›')} {style.dim(hint)}\n")
+    _enable_intel_npu(style)
+    _enable_intel_gpu(style)
     return 0
+
+
+def _enable_intel_npu(style: Any) -> None:
+    """Turn a *detected* Intel NPU into a *usable* one — the ``openvino`` engine.
+
+    The NPU (AI Boost) runs LLMs through OpenVINO / optimum-intel, not torch.
+    When the NPU is present but those packages aren't installed, offer to install
+    ``optimum[openvino]`` so ``/engine openvino`` can run a model on it; when they
+    are, just point at the engine.
+    """
+    import importlib.util
+    import subprocess
+    import sys
+
+    from yggdrasil.loki import resources
+
+    if not resources.has_npu():
+        return
+    if (importlib.util.find_spec("openvino") is not None
+            and importlib.util.find_spec("optimum") is not None):
+        style.out(f"  {style.brand('▸ Intel NPU')} {style.dim('detected — run a model on it with')} "
+                  f"{style.brand('/engine openvino')}\n")
+        return
+    cmd = [sys.executable, "-m", "pip", "install", "optimum[openvino]"]
+    style.out(f"  {style.brand('▸ Intel NPU')} {style.dim('detected — enable the NPU (openvino) engine:')}\n")
+    style.out(f"    {style.brand(' '.join(cmd))}\n")
+    try:
+        ans = input("  install the NPU engine now? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if ans not in ("y", "yes"):
+        return
+    with style.Spinner("installing optimum[openvino] for the NPU…"):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "see pip output"
+        style.fail(f"NPU engine install failed — {_short(tail)}")
+        return
+    style.ok("NPU engine installed — use /engine openvino (restart `ygg loki` if it's not listed yet)")
+
+
+def _enable_intel_gpu(style: Any) -> None:
+    """Turn a *detected* Intel GPU into a *usable* one.
+
+    The Intel GPU shows in ``status`` as soon as the OS sees it, but a local
+    model only runs on it (through torch) once torch can target the XPU backend —
+    which the stock CPU/CUDA wheel can't. When the GPU is present but not yet
+    usable, offer to install the GPU (XPU) torch build from the dedicated PyTorch
+    index. (The NPU is handled by :func:`_enable_intel_npu`.)
+    """
+    import subprocess
+    import sys
+
+    from yggdrasil.loki import resources
+
+    if not resources.intel_gpu_present() or resources.accelerator() == "xpu":
+        return                                   # no Intel GPU, or it's already usable
+    cmd = [sys.executable, "-m", "pip", "install", "--index-url",
+           resources.XPU_TORCH_INDEX, "torch"]
+    style.out(f"  {style.brand('▸ Intel GPU')} {style.dim('detected but not yet usable by torch (CPU build)')}\n")
+    style.out(f"  {style.dim('enable it with:')}\n    {style.brand(' '.join(cmd))}\n")
+    try:
+        ans = input(f"  install the GPU torch build now? {style.dim('(~1 GB download)')} [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if ans not in ("y", "yes"):
+        return
+    with style.Spinner("installing GPU torch (xpu) — this downloads ~1 GB…"):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "see pip output"
+        style.fail(f"GPU torch install failed — {_short(tail)}")
+        return
+    # torch may already be imported (CPU) in this process — a reinstall can't
+    # swap the live module, so a fresh `ygg loki` is what actually picks it up.
+    if "torch" not in sys.modules and resources.accelerator() == "xpu":
+        style.ok("Intel GPU enabled — local models now run on the GPU (xpu)")
+    else:
+        style.ok("GPU torch installed — restart `ygg loki` to run local models on the Intel GPU")
 
 
 # -- interactive session ---------------------------------------------------
@@ -377,6 +489,10 @@ def _choose_session(style: Any) -> Any:
 
 def _prompt(style: Any, state: dict) -> str:
     tag = f"{state.get('engine') or 'auto'}·{state['tier'] or 'auto'}"
+    model = state.get("model")           # show a pinned model (from /model) compactly
+    if model:
+        short = model.split("/")[-1]
+        tag += "·" + (short if len(short) <= 18 else short[:17] + "…")
     return f"  {style.brand('⟢')} {style.dim(tag)} {style.bold('›')} "
 
 
@@ -426,28 +542,118 @@ def _select_engine(loki: Any, style: Any, state: dict) -> None:
     style.ok(f"engine → {state['engine']}")
 
 
+def _choose_model(loki: Any, style: Any, state: dict, arg: str = "") -> None:
+    """Pick the model for the session's engine — pin it for every later turn.
+
+    ``/model <id>`` pins directly. With no argument it lists the engine's preset
+    models (the resource-sized ladder for a local engine, the fast/deep tiers
+    for a remote one) plus any already-pulled Ollama models, marks the current
+    and recommended ones, and lets you pick by number or type a custom id. For a
+    local engine it then offers to download the choice now, with a progress bar.
+    """
+    name = state.get("engine")
+    if not name:
+        style.warn("no engine selected — pick one with /engine first")
+        return
+    eng = loki.engine(name)
+    if arg:
+        eng.model = arg
+        state["model"] = arg
+        style.ok(f"model → {style.brand(arg)} {style.dim('(' + name + ')')}")
+        return
+
+    current = None
+    try:
+        current = eng.resolve_model()
+    except Exception:
+        pass
+    # The engine's preset ids (resource ladder or tier map), then any models the
+    # local Ollama server has already pulled — deduped, first note wins.
+    notes: dict[str, str] = {}
+    for tier, mid in {**getattr(eng, "RESOURCE_MODELS", {}), **getattr(eng, "MODELS", {})}.items():
+        notes.setdefault(mid, tier)
+    if hasattr(eng, "installed_models"):
+        try:
+            for mid in eng.installed_models():
+                notes.setdefault(mid, "installed")
+        except Exception:
+            pass
+    options = list(notes.items())
+    if not options:
+        style.out(f"  {style.dim(f'engine {name} has no presets — pin one with /model <id>')}\n")
+        return
+
+    recommended = eng.bootstrap_model if eng.local else (getattr(eng, "MODELS", {}) or {}).get("deep")
+    style.out(f"  {style.bold('models')} {style.dim('· ' + name + ' · current ' + (current or 'auto'))}\n")
+    for i, (mid, note) in enumerate(options, 1):
+        marks = [m for m, on in (("current", mid == current), ("recommended", mid == recommended)) if on]
+        tail = style.dim(" (" + ", ".join(marks) + ")") if marks else ""
+        style.out(f"    {style.brand(str(i))}  {mid.ljust(28)} {style.dim(note)}{tail}\n")
+    try:
+        ans = input(f"  pick [1-{len(options)}], type an id, or Enter to keep: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not ans:
+        return
+    chosen = options[int(ans) - 1][0] if ans.isdigit() and 1 <= int(ans) <= len(options) else ans
+    eng.model = chosen
+    state["model"] = chosen
+    style.ok(f"model → {style.brand(chosen)} {style.dim('(' + name + ')')}")
+    if eng.local:
+        try:
+            go = input("  download / ready it now? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            go = ""
+        if go in ("y", "yes"):
+            _ready_model(loki, style, name, chosen)
+
+
+def _ready_model(loki: Any, style: Any, engine: str, model: str) -> None:
+    """Download/ready *model* now, with a progress bar — Ollama streams a byte
+    bar; the HF transformers engine shows its own download bar as it fetches."""
+    if engine == "ollama":
+        res = loki.bootstrap_local(model=model, on_progress=_pull_bar(style))
+        style.clear_line()
+        if res.get("ready"):
+            style.ok(f"{res['engine']} ready · {res['model']} ({res.get('status', 'ok')})")
+        else:
+            style.warn("could not ready it — see /setup")
+        return
+    # transformers: warm() builds the pipeline, downloading weights on first use
+    # (HF prints the download progress); it swallows errors, so confirm after.
+    style.out(f"  {style.dim('downloading ' + model + ' — progress below…')}\n")
+    eng = loki.engine(engine)
+    eng.warm(model)
+    if getattr(eng, "ready", lambda _m: False)(model):
+        style.ok(f"{engine} ready · {model}")
+    else:
+        style.warn(f"could not ready {model} — check the log above or try /setup")
+
+
 def _local_load_notice(agent: Any, style: Any, engine: "str | None") -> None:
-    """Warn that a local transformers model is about to load (slow + silent).
+    """Warn that a local model is about to load (slow + silent on a first run).
 
     The first turn on a fresh box downloads weights and builds the pipeline
     before a single token streams; say so up front so the wait isn't a black
-    box (the engine then logs the load itself via the routed loki logger)."""
-    if engine != "transformers":
+    box (the engine then logs the load itself via the routed loki logger). Covers
+    both local pipeline engines — ``transformers`` (torch) and ``openvino``."""
+    if engine not in ("transformers", "openvino"):
         return
-    eng = agent.engine("transformers")
+    eng = agent.engine(engine)
     model = eng.resolve_model()
     if not eng.ready(model):
-        # Name the device it'll actually load on (auto-detected Intel GPU / cuda
-        # / mps, else CPU) so the user sees the accelerator is in play.
+        # Name the device it'll actually load on so the accelerator is visible:
+        # torch's cuda/xpu/mps, or OpenVINO's NPU/GPU/CPU.
         device = None
         try:
             device = eng.resolve_device()
         except Exception:
             pass
-        where = {"cuda": "the NVIDIA GPU", "xpu": "the Intel GPU",
-                 "mps": "the Apple GPU"}.get(device or "", "CPU")
+        where = {"cuda": "the NVIDIA GPU", "xpu": "the Intel GPU", "mps": "the Apple GPU",
+                 "NPU": "the Intel NPU", "GPU": "the Intel GPU", "CPU": "CPU"}.get(device or "", "CPU")
+        extra = " (and converts to OpenVINO IR)" if engine == "openvino" else ""
         style.out(f"  {style.dim('▹ loading local model')} {style.brand(model)} "
-                  f"{style.dim(f'· first run downloads weights, then runs on {where} — this can take a while')}\n")
+                  f"{style.dim(f'· first run downloads weights{extra}, then runs on {where} — this can take a while')}\n")
 
 
 def _stream_reply(agent: Any, style: Any, line: str, state: dict,
@@ -480,7 +686,7 @@ def _stream_reply(agent: Any, style: Any, line: str, state: dict,
     threading.Thread(target=produce, daemon=True).start()   # submit
 
     parts: list[str] = []
-    spin = style.Spinner("thinking…").start()
+    spin = style.Spinner(f"{engine} · thinking…" if engine else "thinking…").start()
     try:
         while True:
             chunk = q.get()                    # yield as tokens land
@@ -538,6 +744,219 @@ def _short_text(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+class _ActMonitor:
+    """Live view of the autonomous ``act`` loop.
+
+    A spinner + step-budget bar runs through the model's otherwise-silent
+    "thinking" (``on_think``), then each finished turn is *committed* as a clean
+    line to the scrollback (``on_step``). The cursor line always shows what's
+    happening **now**; the transcript above it accumulates the important steps —
+    each with the one-line *thought* that drove it. ``confirm`` pauses the
+    spinner so an approval prompt never fights the animation.
+    """
+
+    def __init__(self, style: Any, max_steps: int, *, verbose: bool = False) -> None:
+        self.style = style
+        self.max = max_steps
+        self.verbose = verbose          # the `do` CLI shows observations; the REPL stays terse
+        self.count = 0                  # tool steps committed (the visible "important steps")
+        self._spin: Any = None
+
+    def think(self, n: int) -> None:
+        """Turn *n* is about to call the model — spin on it, advancing the bar."""
+        label = f"{self.style.dim(f'step {n}/{self.max}')} {self.style.dim('· thinking…')}"
+        if self._spin is None:
+            self._spin = self.style.Spinner(label).start()
+        else:
+            self._spin.update(label)
+        self._spin.set_progress(n - 1, self.max)
+
+    def step(self, rec: dict) -> None:
+        """A turn finished — drop the spinner and commit the step (cumulative)."""
+        self._drop()
+        if rec.get("done"):
+            return                       # the final answer is printed by the caller
+        self.count += 1
+        call = f"{rec['tool']}({', '.join(f'{k}={_short(v)}' for k, v in rec['args'].items())})"
+        self.style.out(f"  {self.style.dim(str(rec['n']).rjust(2))} {self.style.brand(call)}\n")
+        if rec.get("thought"):           # the thinking behind the step — the bit worth seeing
+            self.style.out(f"     {self.style.dim('↳ ' + _short_text(rec['thought'], 110))}\n")
+        if self.verbose and rec.get("observation"):
+            first = rec["observation"].splitlines()[0]
+            self.style.out(f"     {self.style.dim('→ ' + _short(first))}\n")
+
+    def confirm(self, action: str) -> bool:
+        """Approve a destructive op — pausing the spinner so the prompt is clean."""
+        self._drop()
+        return _confirm(self.style, action)
+
+    def close(self) -> None:
+        self._drop()
+
+    def _drop(self) -> None:
+        if self._spin is not None:
+            self._spin.stop()
+            self._spin = None
+
+
+#: Spinner frames for the live fleet dashboard (one running agent per line).
+_FLEET_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+
+def _fleet_lines(style: Any, agents: list, frame: str) -> list[str]:
+    """Render one dashboard line per process agent — glyph, task, status, time."""
+    lines: list[str] = []
+    for a in agents:
+        if a.running:
+            glyph, st = style.brand(frame), style.dim("running")
+        elif a.ok:
+            glyph, st = style.good("✓"), style.good("done")
+        elif a.status == "timeout":
+            glyph, st = style.amber("⏱"), style.amber("timeout")
+        else:
+            glyph, st = style.bad("✗"), style.bad("failed")
+        if a.ok and a.files_changed:
+            tail = style.dim("✎ " + ", ".join(a.files_changed[:3]))
+        elif not a.running and not a.ok and a.stderr_tail:
+            tail = style.dim(_short_text(a.stderr_tail, 40))
+        else:
+            tail = ""
+        # Validation badge — did this agent self-check with a passing smoke test?
+        if not a.running:
+            badge = ({True: style.good("✓test"), False: style.bad("✗test")}
+                     .get(a.validated, style.amber("untested")))
+        else:
+            badge = ""
+        lines.append(
+            f"  {glyph} {style.dim('#' + str(a.id))} {_short_text(a.task, 40).ljust(41)} "
+            f"{st.ljust(8)} {badge.ljust(8)} {style.dim(f'{a.elapsed:4.1f}s')}  {tail}"
+        )
+    return lines
+
+
+def _fleet_kpi_line(style: Any, fleet: Any) -> str:
+    """A one-line KPI footer for the live fleet dashboard."""
+    k = fleet.kpis()
+    bits = [style.good(f"{k.done} done")]
+    if k.failed:
+        bits.append(style.bad(f"{k.failed} failed"))
+    if k.running:
+        bits.append(style.brand(f"{k.running} running"))
+    if k.queued:
+        bits.append(style.dim(f"{k.queued} queued"))
+    if k.validated:
+        bits.append(style.good(f"{k.validated} tested"))
+    if k.mesh:
+        bits.append(style.brand(f"{k.mesh} shared"))
+    cost = f"${k.cost:.4f}" + (f"/${fleet.cost_cap:.2f}" if fleet.cost_cap else "")
+    tail = f"{k.steps} steps · {k.tokens:,} tok · {cost} · {k.elapsed:.1f}s"
+    return f"  {style.dim('agents')} {'  '.join(bits)}  {style.dim('· ' + tail)}"
+
+
+def _fleet_cap_prompt(style: Any, kpis: Any) -> "float | None":
+    """The fleet hit its cost cap with work queued — raise it, or stop. Returns
+    the new cap, or ``None`` to stop launching and let runners finish."""
+    style.warn(f"fleet cost ${kpis.cost:.4f} reached the cap — "
+               f"{kpis.done} done, {kpis.queued} still queued")
+    try:
+        ans = input("  go further? raise cap to $N · Enter for +$1 · stop [s]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if ans in ("s", "stop", "n", "no"):
+        return None
+    amt = _usd(ans)
+    return amt if amt is not None else round(kpis.cost + 1.0, 2)
+
+
+def _run_fleet(loki: Any, style: Any, state: dict, tasks: list, *,
+               max_parallel: "int | None" = None) -> Any:
+    """Spawn a process agent per task and live-monitor the mesh to completion."""
+    from yggdrasil.loki.fleet import Fleet
+    from yggdrasil.loki.usage import METER
+
+    note = (f" · ≤{max_parallel} at once" if max_parallel else "") + " · local×1"
+    style.out(f"  {style.brand('⛓ delegating')} {style.dim(str(len(tasks)) + ' mesh agents')} "
+              f"{style.dim('· ' + (state.get('engine') or 'auto') + ' · root ' + state['root'] + note)}\n")
+    # Shared workspace (mesh files + mesh.json roster); aggregate cost cap from the
+    # session budget — the fleet asks before going past it.
+    fleet = Fleet(max_parallel=max_parallel, cost_cap=METER.cost_limit, mesh_dir=state["root"])
+    fleet.spawn_all(tasks, root=state["root"], engine=state.get("engine"),
+                    tier=state["tier"], allow_web=True)
+    live = style.LiveDisplay()
+    tick = {"i": 0}
+
+    def render(agents: list) -> None:
+        tick["i"] += 1
+        frame = _FLEET_FRAMES[tick["i"] % len(_FLEET_FRAMES)]
+        live.update(_fleet_lines(style, agents, frame) + [_fleet_kpi_line(style, fleet)])
+
+    try:
+        fleet.monitor(render, interval=0.12, on_cap=lambda k: _fleet_cap_prompt(style, k))
+    except KeyboardInterrupt:
+        fleet.cancel_all()
+        render(fleet.agents)
+        style.warn("fleet cancelled")
+    finally:
+        live.stop()
+
+    done = sum(1 for a in fleet.agents if a.ok)
+    failed = len(fleet.agents) - done
+    bits = [style.good(f"{done} done")] + ([style.bad(f"{failed} failed")] if failed else [])
+    style.out(f"  {style.dim('—')} {'  '.join(bits)}\n")
+    changed = sorted({f for a in fleet.agents for f in a.files_changed})
+    if changed:
+        style.out(f"  {style.good('✎')} {', '.join(changed)}\n")
+    return fleet
+
+
+def _scaffold_args(text: str) -> dict:
+    """Extract scaffold kwargs (name, languages, preset, cloud) from free text."""
+    from yggdrasil.loki import scaffold
+
+    # "called X" / "named X" are reliable; "project"/"app"/"repo" are usually
+    # nouns ("a python project"), so they don't introduce the name.
+    m = re.search(r"\b(?:called|named)\s+['\"]?([A-Za-z][\w.-]{1,40})['\"]?", text)
+    if not m:
+        m = re.search(r"['\"]([A-Za-z][\w .-]{1,40})['\"]", text)        # a quoted name
+    name = (m.group(1).strip().replace(" ", "-") if m else "new-project")
+    return {
+        "name": name,
+        "languages": scaffold.resolve_languages(text) or ["python"],
+        "preset": scaffold.resolve_preset(text),
+        "cloud": scaffold.resolve_cloud(text),
+        "description": text.strip(),
+    }
+
+
+def _delegate_tasks(agent: Any, style: Any, state: dict, text: str) -> list:
+    """Turn a delegate/swarm request into a task list — split an explicit list,
+    else let the engine decompose a single high-level goal."""
+    body = re.sub(r"^\s*(please\s+)?(delegate|swarm|spawn|launch|run|do)\b[:,]?\s*", "", text, flags=re.I)
+    body = re.sub(r"\b(in parallel|concurrently|at the same time|simultaneously|"
+                  r"as (parallel|multiple|several|background) agents|fan out)\b", "", body, flags=re.I)
+    body = body.strip(" .,;:")
+    parts = [p.strip(" .,;:") for p in re.split(r"\s*;\s*|\s+and\s+|\s*,\s*", body) if p.strip(" .,;:")]
+    if len(parts) >= 2:
+        return parts
+    with style.Spinner("decomposing into parallel subtasks…"):
+        return agent.decompose(body or text, engine=state.get("engine"), tier=state["tier"])
+
+
+def _print_scaffold(style: Any, res: dict) -> None:
+    kind = res["preset"] if res["preset"] != "lib" else ", ".join(res["languages"])
+    cloud = (" · cloud " + ", ".join(res["cloud"])) if res.get("cloud") else ""
+    style.out(f"  {style.good('✦')} {style.bold(res['name'])} {style.dim('· ' + kind + cloud)}\n")
+    style.out(f"  {style.dim('at ' + res['path'])}\n")
+    for f in res["files"][:14]:
+        style.out(f"    {style.good('+')} {style.dim(f)}\n")
+    if len(res["files"]) > 14:
+        style.out(f"    {style.dim('… +' + str(len(res['files']) - 14) + ' more')}\n")
+    git = (style.good("git ✓ initial commit on main") if res["git"]
+           else style.amber("git not initialised — commit when ready"))
+    style.out(f"  {git}\n")
+    style.out(f"  {style.brand('→ push')} {style.dim(res['push'])}\n")
+
+
 def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
     plan = loki.plan(line)
 
@@ -567,13 +986,38 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
             reply = res.get("answer") or style.dim(f"fetched {plan['url']}")
         elif plan["action"] == "act":
             eng_name = _turn_engine(agent, style, state, line)
-            res = agent.act(line, root=state["root"], engine=eng_name, tier=state["tier"],
-                            allow_web=True,
-                            confirm=lambda action: _confirm(style, action),
-                            on_step=lambda r: _act_step(style, r))
+            mon = _ActMonitor(style, _REPL_ACT_STEPS)
+            try:
+                res = agent.act(line, root=state["root"], engine=eng_name, tier=state["tier"],
+                                max_steps=_REPL_ACT_STEPS, allow_web=True,
+                                confirm=mon.confirm, on_think=mon.think, on_step=mon.step)
+            finally:
+                mon.close()
             reply = res["answer"]
+            if mon.count:
+                style.out(f"  {style.dim(f'· {mon.count} step' + ('s' if mon.count != 1 else ''))}\n")
             if res.get("files_changed"):
                 style.out(f"  {style.good('✎')} {', '.join(res['files_changed'])}\n")
+        elif plan["action"] == "scaffold":
+            args = _scaffold_args(line)
+            kind = args["preset"] if args["preset"] != "lib" else ", ".join(args["languages"])
+            with style.Spinner(f"scaffolding {args['name']} ({kind})…"):
+                res = agent.run("scaffold", **args)
+            _print_scaffold(style, res)
+            reply = f"Scaffolded {res['name']} ({', '.join(res['languages'])}) → {res['path']}"
+            streamed = True
+        elif plan["action"] == "delegate":
+            tasks = _delegate_tasks(agent, style, state, line)
+            if not tasks:
+                reply = style.dim("nothing to delegate")
+            else:
+                style.out(f"  {style.bold('plan')} {style.dim(str(len(tasks)) + ' parallel subtasks')}\n")
+                for t in tasks:
+                    style.out(f"    {style.brand('•')} {style.dim(_short_text(t, 70))}\n")
+                fleet = _run_fleet(loki, style, state, tasks)
+                done = sum(1 for a in fleet.agents if a.ok)
+                reply = f"{done}/{len(fleet.agents)} agents completed"
+            streamed = True
         elif plan["action"] == "genie":
             with style.Spinner("asking Genie…"):
                 res = agent.run("genie", question=line)
@@ -622,13 +1066,6 @@ def _repl_turn(loki: Any, style: Any, state: dict, line: str) -> None:
     # Token/cost KPIs ride the terminal title bar (a static "head"), not a fresh
     # line each turn — local turns are free, so the spend only moves on a remote.
     style.set_title(_usage_title())
-
-
-def _act_step(style: Any, rec: dict) -> None:
-    if rec.get("done"):
-        return
-    call = f"{rec['tool']}({', '.join(f'{k}={_short(v)}' for k, v in rec['args'].items())})"
-    style.out(f"  {style.dim(str(rec['n']).rjust(2))} {style.brand(call)}\n")
 
 
 def _confirm(style: Any, action: str) -> bool:
@@ -690,8 +1127,30 @@ def _dispatch_skill(agent: Any, style: Any, skill: str, kwargs: dict) -> str:
     except Exception as exc:
         style.fail(f"{skill}: {exc.args[0] if exc.args else exc}")
         return f"{skill} failed: {exc}"
-    _print_dbx(style, res)
+    # A tabular-shaped result (entsoe and friends) renders through the aligned
+    # frame printer, not the generic key/value dump.
+    if isinstance(res, dict) and skill == "entsoe":
+        _print_entsoe(style, res)
+    else:
+        _print_dbx(style, res)
     return _short(_jsonable(res))
+
+
+def _print_entsoe(style: Any, res: dict) -> None:
+    """Pretty-print an ENTSO-E result — offline hint, or the cached frame."""
+    if not res.get("available"):
+        style.warn(res.get("hint", "ENTSO-E unavailable"))
+        return
+    head = f"{res['series']} · {res['zone']} ({res['eic']})"
+    style.out(f"  {style.good('⚡')} {style.bold(head)} "
+              f"{style.dim('· ' + str(res['rows']) + ' rows')}\n")
+    style.out(style.dim("  " + str(res["preview"]).replace("\n", "\n  ")) + "\n")
+    style.out(f"  {style.good('✎ cached')} {style.dim(res['cached_to'])}\n")
+    if res.get("stored"):
+        style.out(f"  {style.good('✎ stored')} {style.dim(res['stored'])}\n")
+    style.out(f"  {style.bold('next steps')} {style.dim('— reuse · resample · store')}\n")
+    for step in res.get("next_steps", []):
+        style.out(f"    {style.brand('›')} {style.dim(step)}\n")
 
 
 def _print_dbx(style: Any, res: Any) -> None:
@@ -743,6 +1202,9 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
         style.out(
             f"  {style.bold('commands')}\n"
             f"    {style.brand('/engine')}   pick the session base engine (claude/databricks/openai/ollama/auto)\n"
+            f"    {style.brand('/model')}    pick the model for this engine (lists presets · downloads with a bar)\n"
+            f"    {style.brand('/fleet')}    delegate tasks to parallel background agents:  /fleet t1 ;; t2 ;; t3\n"
+            f"    {style.brand('/swarm')}    autonomous: decompose a goal into subtasks + run them as a monitored fleet\n"
             f"    {style.brand('/engines')}  reasoning engines and adaptive models\n"
             f"    {style.brand('/setup')}    bootstrap a free local model (lazy-install on demand)\n"
             f"    {style.brand('/status')}   identity + backends + engines + skills\n"
@@ -770,6 +1232,27 @@ def _repl_command(loki: Any, style: Any, state: dict, line: str) -> bool:
                 style.ok(f"engine → {arg}")
         else:
             style.warn(f"unknown engine {arg!r} — see /engines")
+    elif cmd == "model":
+        _choose_model(loki, style, state, arg)
+    elif cmd == "fleet":
+        tasks = [t.strip() for t in arg.split(";;") if t.strip()]
+        if not tasks:
+            style.warn("usage: /fleet <task1> ;; <task2> ;; …  (parallel background agents)")
+        else:
+            _run_fleet(loki, style, state, tasks)
+    elif cmd == "swarm":
+        eng = loki.engine(state["engine"]) if state.get("engine") else loki.engine()
+        if not arg:
+            style.warn("usage: /swarm <high-level goal>  (Loki decomposes + delegates it)")
+        elif eng is None or not eng.available():
+            style.warn("no engine available to decompose the goal — set one with /engine")
+        else:
+            with style.Spinner("decomposing the goal into parallel subtasks…"):
+                tasks = loki.decompose(arg, engine=state.get("engine"), tier=state["tier"])
+            style.out(f"  {style.bold('plan')} {style.dim(str(len(tasks)) + ' parallel subtasks')}\n")
+            for t in tasks:
+                style.out(f"    {style.brand('•')} {style.dim(_short_text(t, 70))}\n")
+            _run_fleet(loki, style, state, tasks)
     elif cmd == "status":
         loki.load_specialists()   # ensure the specialist fleet is listed even
         _status(loki, style)      # if the background warmer hasn't finished yet
@@ -943,28 +1426,35 @@ def _do(loki: Any, style: Any, args: Any) -> int:
         mode += "+web"
     style.out(f"  {style.dim('root ' + args.root + '  ·  ' + mode)}\n\n")
 
-    def on_step(rec: dict) -> None:
-        if rec.get("done"):
-            return
-        call = f"{rec['tool']}({', '.join(f'{k}={_short(v)}' for k, v in rec['args'].items())})"
-        style.out(f"  {style.dim(str(rec['n']).rjust(2))} {style.brand(call)}\n")
-        if rec.get("thought"):
-            style.out(f"     {style.dim(_short(rec['thought']))}\n")
-        first = rec["observation"].splitlines()[0] if rec["observation"] else ""
-        style.out(f"     {style.dim('→ ' + _short(first))}\n")
+    if args.budget is not None:                       # self-cap this agent's spend
+        from yggdrasil.loki.usage import METER
 
+        METER.set_limit(args.budget)
+
+    mon = _ActMonitor(style, args.max_steps, verbose=True)
     try:
         result = loki.act(
             args.task, root=args.root, engine=args.engine, tier=args.tier, max_steps=args.max_steps,
             read_only=args.read_only, allow_shell=args.allow_shell, allow_web=args.allow_web,
-            on_step=None if args.json else on_step,
+            on_think=None if args.json else mon.think,
+            on_step=None if args.json else mon.step,
         )
     except (KeyError, RuntimeError) as exc:
         style.fail(exc.args[0] if exc.args else str(exc))
         return 1
+    finally:
+        mon.close()
 
     if args.json:
-        style.out(_json(result) + "\n")
+        # Attach this agent's token/cost usage so a parent fleet can aggregate
+        # live KPIs across the agents it delegated to.
+        from yggdrasil.loki.usage import METER
+
+        t = METER.total()
+        payload = result.to_dict()
+        payload["usage"] = {"input_tokens": t.input_tokens, "output_tokens": t.output_tokens,
+                            "total_tokens": t.total_tokens, "cost_usd": round(METER.total_cost, 6)}
+        style.out(_json(payload) + "\n")
         return 0
 
     style.out("\n")

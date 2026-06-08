@@ -45,6 +45,65 @@ class TestFilesystemToolbox(unittest.TestCase):
     def test_run_python_absent_when_read_only(self):
         self.assertNotIn("run_python", filesystem_toolbox(self.dir, read_only=True).names())
 
+    def test_mesh_tool_present_only_when_in_a_mesh(self):
+        import os
+        from unittest.mock import patch
+
+        self.assertNotIn("mesh", filesystem_toolbox(self.dir).names())   # not in a mesh
+        mesh_path = os.path.join(self.dir, "mesh-kv.json")
+        with patch.dict(os.environ, {"LOKI_MESH": mesh_path}):
+            box = filesystem_toolbox(self.dir)
+            self.assertIn("mesh", box.names())
+            self.assertIn("published", box.call("mesh", {"action": "put", "key": "k", "value": "v"}))
+            self.assertIn("v", box.call("mesh", {"action": "get", "key": "k"}))
+            self.assertIn("k", box.call("mesh", {"action": "list"}))
+
+    def test_smoke_and_bench_are_default_validation_tools(self):
+        names = filesystem_toolbox(self.dir).names()
+        self.assertIn("smoke", names)
+        self.assertIn("bench", names)
+        ro = filesystem_toolbox(self.dir, read_only=True).names()
+        self.assertNotIn("smoke", ro)        # pair with the write tools
+
+    def test_smoke_code_runs_assertion(self):
+        box = filesystem_toolbox(self.dir)
+        ok = box.call("smoke", {"code": "assert 2 + 2 == 4; print('green')"})
+        self.assertIn("exit=0", ok)
+        self.assertIn("green", ok)
+        bad = box.call("smoke", {"code": "assert 1 == 2, 'boom'"})
+        self.assertNotIn("exit=0", bad)      # a failing checkpoint is visible
+
+    def test_smoke_auto_discovers_pytest_with_src_importable(self):
+        import pathlib
+
+        root = pathlib.Path(self.dir)
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "mod.py").write_text("def add(a, b):\n    return a + b\n")
+        (root / "tests").mkdir(exist_ok=True)
+        (root / "tests" / "test_mod.py").write_text(
+            "from mod import add\n\ndef test_add():\n    assert add(2, 3) == 5\n")
+        out = filesystem_toolbox(self.dir).call("smoke", {})
+        self.assertIn("exit=0", out)
+        self.assertIn("passed", out)
+
+    def test_smoke_byte_compiles_when_no_tests(self):
+        import pathlib
+
+        (pathlib.Path(self.dir) / "thing.py").write_text("x = 1\n")
+        out = filesystem_toolbox(self.dir).call("smoke", {})
+        self.assertIn("compiled OK", out)
+
+    def test_bench_runs_a_script(self):
+        import pathlib
+
+        (pathlib.Path(self.dir) / "b.py").write_text(
+            'import argparse\np = argparse.ArgumentParser()\n'
+            'p.add_argument("--repeat", type=int, default=5)\n'
+            'print("reps", p.parse_args().repeat)\n')
+        out = filesystem_toolbox(self.dir).call("bench", {"path": "b.py", "repeat": 3})
+        self.assertIn("exit=0", out)
+        self.assertIn("reps 3", out)
+
     def test_confirm_gates_overwrite_of_existing_nontemp_file(self):
         (self.root / "keep.txt").write_text("original")
         calls = []

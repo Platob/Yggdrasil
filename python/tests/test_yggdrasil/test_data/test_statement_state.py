@@ -101,3 +101,17 @@ class TestStateDelegation:
         # caller asked for and didn't get.
         r = _result(State.CANCELED)
         assert r.state.is_canceled
+
+
+class TestProgress:
+    """StatementResult.progress() drives a style.track progress bar."""
+
+    def test_idle_is_zero(self) -> None:
+        assert _result(State.IDLE).progress() == 0.0
+
+    def test_running_is_indeterminate(self) -> None:
+        assert _result(State.RUNNING).progress() is None      # → animated sweep
+        assert _result(State.PENDING).progress() is None
+
+    def test_succeeded_is_full(self) -> None:
+        assert _result(State.SUCCEEDED).progress() == 1.0

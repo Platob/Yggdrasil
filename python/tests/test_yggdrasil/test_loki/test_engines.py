@@ -16,6 +16,7 @@ from yggdrasil.loki.engines import (
     DatabricksServingEngine,
     OllamaEngine,
     OpenAIEngine,
+    OpenVINOEngine,
     TransformersEngine,
 )
 
@@ -333,11 +334,11 @@ class TestTransformersEngine(unittest.TestCase):
         eng = TransformersEngine()
         # Local models are bounded by the box → sized to resources, not the
         # remote fast/deep cost tier (which is ignored here).
-        with patch.object(resources, "snapshot", return_value={"cpu": 8, "ram_gb": 12, "gpu": False}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=8, ram_gb=12, gpu=False)):
             self.assertEqual(eng.resolve_model(tier="deep"), "Qwen/Qwen2.5-1.5B-Instruct")
-        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": False}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=16, ram_gb=64, gpu=False)):
             self.assertEqual(eng.resolve_model(tier="fast"), "Qwen/Qwen2.5-7B-Instruct")
-        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": True}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=16, ram_gb=64, gpu=True)):
             self.assertEqual(eng.bootstrap_model, "Qwen/Qwen2.5-14B-Instruct")
 
     def test_explicit_model_pin_overrides_resource_sizing(self):
@@ -460,6 +461,40 @@ class TestTransformersEngine(unittest.TestCase):
         self.assertIn("m", str(first.exception))
         self.assertIn("Could not load model X", str(first.exception))
         self.assertIs(first.exception, second.exception)
+
+    def test_gpu_failure_falls_back_to_cpu_without_redownload(self):
+        # The reported bug: a model on a GPU that torch can't actually drive
+        # failed, and the old code force-re-downloaded the whole model *every
+        # run*. Now a device error falls back to CPU and keeps the cached weights.
+        from yggdrasil.loki import resources
+
+        pipe = MagicMock(return_value=[{"generated_text": [
+            {"role": "assistant", "content": "ok"}]}])
+        fake = types.ModuleType("transformers")
+        fake.pipeline = MagicMock(side_effect=[RuntimeError("XPU backend not available"), pipe])
+        fake_torch = types.ModuleType("torch")
+        hub = self._fake_hub()
+        TransformersEngine._PIPES.clear()
+        TransformersEngine._FAILED.clear()
+        eng = TransformersEngine(model="m")
+        with patch.object(resources, "accelerator", return_value="xpu"), \
+                patch.dict(sys.modules, {"transformers": fake, "torch": fake_torch,
+                                         "huggingface_hub": hub}):
+            out = eng.generate("hi")
+        self.assertEqual(out, "ok")
+        # First call targets the GPU, second falls back to CPU (device=None) …
+        self.assertEqual(fake.pipeline.call_args_list[0].kwargs["device"], "xpu")
+        self.assertIsNone(fake.pipeline.call_args_list[1].kwargs["device"])
+        # … and crucially the weights are NOT re-downloaded.
+        hub.snapshot_download.assert_not_called()
+
+    def test_device_error_is_not_mistaken_for_corruption(self):
+        from yggdrasil.loki.engines.transformers_engine import _looks_corrupt
+
+        self.assertFalse(_looks_corrupt(RuntimeError("XPU backend not available")))
+        self.assertFalse(_looks_corrupt(RuntimeError("CUDA out of memory")))
+        self.assertTrue(_looks_corrupt(OSError("truncated safetensors")))
+        self.assertTrue(_looks_corrupt(ValueError("Could not load model X")))
 
     def test_partial_download_is_repaired_and_retried(self):
         # The Windows failure mode: a truncated first download, then a clean
@@ -592,11 +627,11 @@ class TestOllamaEngine(unittest.TestCase):
         from yggdrasil.loki import resources
 
         eng = OllamaEngine()
-        with patch.object(resources, "snapshot", return_value={"cpu": 8, "ram_gb": 12, "gpu": False}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=8, ram_gb=12, gpu=False)):
             self.assertEqual(eng.bootstrap_model, "qwen2.5:3b")    # modest box → small
-        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": False}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=16, ram_gb=64, gpu=False)):
             self.assertEqual(eng.bootstrap_model, "qwen2.5:14b")   # big box → larger
-        with patch.object(resources, "snapshot", return_value={"cpu": 16, "ram_gb": 64, "gpu": True}):
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=16, ram_gb=64, gpu=True)):
             self.assertEqual(eng.bootstrap_model, "qwen2.5:32b")   # GPU → xlarge
 
     def test_installed_models_and_has_model(self):
@@ -621,11 +656,11 @@ class TestOllamaEngine(unittest.TestCase):
         from yggdrasil.loki import resources
 
         eng = OllamaEngine()
-        with patch.object(resources, "snapshot", return_value={"cpu": 8, "ram_gb": 12, "gpu": False}), \
+        with patch.object(resources, "snapshot", return_value=resources.Resources(cpu=8, ram_gb=12, gpu=False)), \
              patch.object(OllamaEngine, "has_model", return_value=False), \
              patch.object(OllamaEngine, "pull", return_value="success") as pull:
             receipt = eng.ensure()
-        pull.assert_called_once_with("qwen2.5:3b")    # default = resource-sized model
+        pull.assert_called_once_with("qwen2.5:3b", on_progress=None)   # default = resource-sized model
         self.assertEqual((receipt["was_present"], receipt["status"]), (False, "success"))
 
     def test_pull_posts_and_returns_final_status(self):
@@ -636,6 +671,51 @@ class TestOllamaEngine(unittest.TestCase):
         # The pull rides HTTPSession.post with the non-streaming body.
         kwargs = sess.post.call_args.kwargs
         self.assertEqual(kwargs["json"], {"name": "qwen2.5:3b", "stream": False})
+
+    def test_streaming_pull_reports_progress_and_returns_status(self):
+        # With an on_progress callback the pull streams Ollama's NDJSON events;
+        # each tick is reported and the final status is returned.
+        events = [
+            b'{"status":"pulling manifest"}\n',
+            b'{"status":"downloading","total":100,"completed":40}\n{"status":"down',
+            b'loading","total":100,"completed":100}\n',
+            b'{"status":"success"}\n',
+        ]
+        resp = MagicMock()
+        resp.stream = MagicMock(return_value=iter(events))
+        sess = MagicMock()
+        sess.post.return_value = resp
+        ticks = []
+        with patch.object(OllamaEngine, "_session", return_value=sess):
+            status = OllamaEngine().pull("qwen2.5:3b", on_progress=ticks.append)
+        self.assertEqual(status, "success")
+        # The request opted into streaming (body un-preloaded) …
+        kwargs = sess.post.call_args.kwargs
+        self.assertEqual(kwargs["json"], {"name": "qwen2.5:3b", "stream": True})
+        self.assertEqual(kwargs["send_config"], {"stream": True})
+        # … and every event surfaced, including the one split across two chunks.
+        self.assertEqual([e.get("completed") for e in ticks if e.get("completed")], [40, 100])
+        self.assertEqual(ticks[-1]["status"], "success")
+
+    def test_streaming_pull_raises_on_error_event(self):
+        resp = MagicMock()
+        resp.stream = MagicMock(return_value=iter([b'{"error":"manifest not found"}\n']))
+        sess = MagicMock()
+        sess.post.return_value = resp
+        with patch.object(OllamaEngine, "_session", return_value=sess):
+            with self.assertRaises(RuntimeError) as ctx:
+                OllamaEngine().pull("nope", on_progress=lambda e: None)
+        self.assertIn("manifest not found", str(ctx.exception))
+
+    def test_iter_ndjson_buffers_across_chunks_and_skips_junk(self):
+        from yggdrasil.loki.engines.ollama_engine import _iter_ndjson
+
+        resp = MagicMock()
+        resp.stream = MagicMock(return_value=iter([
+            b'{"a":1}\n{"b":', b'2}\n\n', b'not json\n', b'{"c":3}',
+        ]))
+        out = list(_iter_ndjson(resp))
+        self.assertEqual(out, [{"a": 1}, {"b": 2}, {"c": 3}])
 
     def test_complete_posts_chat_and_records_provider_tokens(self):
         from yggdrasil.loki.usage import METER
@@ -794,7 +874,7 @@ class TestBootstrapLocal(unittest.TestCase):
             res = loki.bootstrap_local()
         self.assertEqual((res["engine"], res["ready"], res["model"]),
                          ("ollama", True, "qwen2.5:3b"))
-        fake.ensure.assert_called_once_with("qwen2.5:3b")
+        fake.ensure.assert_called_once_with("qwen2.5:3b", on_progress=None)
 
     def test_falls_back_to_transformers(self):
         loki = Loki()
@@ -875,6 +955,136 @@ class TestEngineSelection(unittest.TestCase):
             self.assertEqual(set(loki.available_engines()), {"good"})
 
 
+class TestOpenVINOEngine(unittest.TestCase):
+    """The local OpenVINO engine — a model on the Intel NPU (else GPU/CPU)."""
+
+    def setUp(self):
+        OpenVINOEngine._PIPES.clear()
+        OpenVINOEngine._FAILED.clear()
+
+    @staticmethod
+    def _stub_pipe():
+        return MagicMock(return_value=[{"generated_text": [
+            {"role": "assistant", "content": "ov reply"}]}])
+
+    def _fakes(self, *, devices=("NPU", "CPU"), from_pretrained=None, pipe=None):
+        ov = types.ModuleType("openvino")
+        ov.Core = lambda: types.SimpleNamespace(available_devices=list(devices))
+        optimum_parent = types.ModuleType("optimum")
+        optimum = types.ModuleType("optimum.intel")
+        optimum.OVModelForCausalLM = types.SimpleNamespace(
+            from_pretrained=from_pretrained or MagicMock(return_value="ovmodel"))
+        transformers = types.ModuleType("transformers")
+        transformers.AutoTokenizer = types.SimpleNamespace(
+            from_pretrained=MagicMock(return_value="tok"))
+        transformers.logging = types.SimpleNamespace(set_verbosity_error=MagicMock())
+        transformers.pipeline = MagicMock(return_value=pipe or self._stub_pipe())
+        return {"openvino": ov, "optimum": optimum_parent, "optimum.intel": optimum,
+                "transformers": transformers}
+
+    def test_is_local(self):
+        self.assertTrue(OpenVINOEngine.local)
+        self.assertEqual(OpenVINOEngine.name, "openvino")
+
+    def test_available_needs_packages_and_an_accelerator(self):
+        eng = OpenVINOEngine()
+        with patch("importlib.util.find_spec", return_value=object()), \
+                patch.object(eng, "_devices", return_value=["NPU", "CPU"]):
+            self.assertTrue(eng.available())                 # NPU present → offer it
+        with patch("importlib.util.find_spec", return_value=object()), \
+                patch.object(eng, "_devices", return_value=["GPU.0", "CPU"]):
+            self.assertTrue(eng.available())                 # an Intel GPU counts too
+        with patch("importlib.util.find_spec", return_value=object()), \
+                patch.object(eng, "_devices", return_value=["CPU"]):
+            self.assertFalse(eng.available())                # CPU-only → leave to others
+        with patch("importlib.util.find_spec", return_value=None), \
+                patch.object(eng, "_devices", return_value=["NPU"]):
+            self.assertFalse(eng.available())                # packages missing
+
+    def test_devices_lists_openvino_core_and_memoizes(self):
+        ov = types.ModuleType("openvino")
+        calls = []
+        ov.Core = lambda: (calls.append(1), types.SimpleNamespace(
+            available_devices=["NPU", "GPU", "CPU"]))[1]
+        eng = OpenVINOEngine()
+        with patch.dict(sys.modules, {"openvino": ov}):
+            self.assertEqual(eng._devices(), ["NPU", "GPU", "CPU"])
+            eng._devices()                                   # memoized — no second Core()
+        self.assertEqual(len(calls), 1)
+
+    def test_device_chain_prefers_npu_then_gpu_then_cpu(self):
+        eng = OpenVINOEngine()
+        with patch.object(eng, "_devices", return_value=["GPU.0", "CPU"]):
+            self.assertEqual(eng._device_chain(), ["GPU", "CPU"])
+        with patch.object(eng, "_devices", return_value=["NPU", "GPU.0", "CPU"]):
+            self.assertEqual(eng._device_chain(), ["NPU", "GPU", "CPU"])
+            self.assertEqual(eng.resolve_device(), "NPU")     # NPU is the whole point
+        self.assertEqual(OpenVINOEngine(device="CPU")._device_chain(), ["CPU"])  # pin wins
+
+    def test_pipeline_loads_on_npu_without_converting_an_ov_model(self):
+        fakes = self._fakes(devices=("NPU", "CPU"))
+        eng = OpenVINOEngine(model="OpenVINO/Qwen2.5-1.5B-Instruct-int4-ov")
+        with patch.dict(sys.modules, fakes):
+            eng.generate("hi")
+        load = fakes["optimum.intel"].OVModelForCausalLM.from_pretrained
+        self.assertEqual(load.call_args.kwargs["device"], "NPU")
+        self.assertFalse(load.call_args.kwargs["export"])    # already OpenVINO IR
+
+    def test_pipeline_converts_a_plain_hf_model(self):
+        fakes = self._fakes(devices=("NPU", "CPU"))
+        eng = OpenVINOEngine(model="Qwen/Qwen2.5-1.5B-Instruct")
+        with patch.dict(sys.modules, fakes):
+            eng.generate("hi")
+        load = fakes["optimum.intel"].OVModelForCausalLM.from_pretrained
+        self.assertTrue(load.call_args.kwargs["export"])     # convert to OV IR
+
+    def test_pipeline_falls_back_npu_to_gpu_to_cpu(self):
+        from_pretrained = MagicMock(side_effect=[
+            RuntimeError("NPU compile failed"),
+            RuntimeError("GPU out of memory"),
+            "ovmodel",                                       # CPU succeeds
+        ])
+        fakes = self._fakes(devices=("NPU", "GPU", "CPU"), from_pretrained=from_pretrained)
+        eng = OpenVINOEngine(model="OpenVINO/m-int4-ov")
+        with patch.dict(sys.modules, fakes):
+            out = eng.generate("hi")
+        self.assertEqual(out, "ov reply")
+        tried = [c.kwargs["device"] for c in from_pretrained.call_args_list]
+        self.assertEqual(tried, ["NPU", "GPU", "CPU"])       # walked the chain
+        fakes["transformers"].pipeline.assert_called_once()  # built once, on CPU
+
+    def test_failed_load_is_remembered_not_retried(self):
+        from_pretrained = MagicMock(side_effect=RuntimeError("boom"))
+        fakes = self._fakes(devices=("NPU", "CPU"), from_pretrained=from_pretrained)
+        eng = OpenVINOEngine(model="OpenVINO/m-int4-ov")
+        with patch.dict(sys.modules, fakes):
+            with self.assertRaises(RuntimeError):
+                eng.generate("hi")
+            calls_after_first = from_pretrained.call_count
+            with self.assertRaises(RuntimeError):
+                eng.generate("again")
+        # The second turn fast-fails on the remembered error — no new load attempts.
+        self.assertEqual(from_pretrained.call_count, calls_after_first)
+
+    def test_complete_is_free(self):
+        from yggdrasil.loki.usage import METER
+
+        METER.reset()
+        fakes = self._fakes(devices=("NPU", "CPU"))
+        with patch.dict(sys.modules, fakes):
+            out = OpenVINOEngine(model="OpenVINO/m-int4-ov").generate("hi", system="s")
+        self.assertEqual(out, "ov reply")
+        self.assertGreater(METER.total_tokens, 0)
+        self.assertEqual(METER.total_cost, 0.0)              # local → free
+
+    def test_env_overrides_model_and_device(self):
+        with patch.dict(os.environ, {"YGG_LOKI_OV_MODEL": "my/ov-model",
+                                     "YGG_LOKI_OV_DEVICE": "GPU"}):
+            eng = OpenVINOEngine()
+        self.assertEqual(eng.resolve_model(), "my/ov-model")
+        self.assertEqual(eng.resolve_device(), "GPU")        # pin wins over autodetect
+
+
 class TestResourceAccelerator(unittest.TestCase):
     """The accelerator probe spans CUDA, Intel GPU (xpu), and Apple mps; the
     Intel NPU is detected and reported separately."""
@@ -919,16 +1129,19 @@ class TestResourceAccelerator(unittest.TestCase):
         with patch.object(resources, "accelerator", return_value="xpu"), \
                 patch.object(resources, "has_npu", return_value=True):
             snap = resources.snapshot()
-        self.assertEqual(snap["accelerator"], "xpu")
-        self.assertTrue(snap["npu"])
-        self.assertFalse(snap["gpu"])  # gpu stays the CUDA-only xlarge driver
+        self.assertEqual(snap.accelerator, "xpu")
+        self.assertTrue(snap.npu)
+        self.assertFalse(snap.gpu)  # gpu stays the CUDA-only xlarge driver
+        # snapshot() is a typed slots dataclass, not a loose dict.
+        self.assertIsInstance(snap, resources.Resources)
+        self.assertFalse(hasattr(snap, "__dict__"))
+        self.assertEqual(snap.to_dict()["accelerator"], "xpu")
 
     def test_intel_gpu_enables_local_without_big_ram(self):
         from yggdrasil.loki import resources
 
         # An Intel GPU box can host a local model even on modest CPU/RAM.
-        snap = {"cpu": 2, "ram_gb": 4, "gpu": False,
-                "accelerator": "xpu", "npu": False}
+        snap = resources.Resources(cpu=2, ram_gb=4, gpu=False, accelerator="xpu", npu=False)
         self.assertTrue(resources.can_run_local(snap))
 
     def test_has_npu_detects_intel_npu_via_openvino(self):
@@ -938,17 +1151,62 @@ class TestResourceAccelerator(unittest.TestCase):
         ov.Core = lambda: types.SimpleNamespace(available_devices=["CPU", "GPU", "NPU"])
         with patch.dict(sys.modules, {"openvino": ov}):
             self.assertTrue(resources.has_npu())
-        # No NPU listed → False.
+        # No NPU listed → falls through to the OS probe (stubbed off here so the
+        # result is deterministic on a host that actually has an NPU).
         ov.Core = lambda: types.SimpleNamespace(available_devices=["CPU", "GPU"])
-        with patch.dict(sys.modules, {"openvino": ov}):
+        with patch.dict(sys.modules, {"openvino": ov}), \
+                patch.object(resources, "_os_has_npu", return_value=False):
             self.assertFalse(resources.has_npu())
 
-    def test_has_npu_false_when_openvino_missing(self):
+    def test_has_npu_falls_back_to_os_probe_without_openvino(self):
         from yggdrasil.loki import resources
 
-        # Importing a guaranteed-absent module name fails → best-effort False.
-        with patch.dict(sys.modules, {"openvino": None}):
+        # No OpenVINO, but the OS reports the intel_vpu accel device → True.
+        with patch.dict(sys.modules, {"openvino": None}), \
+                patch.object(resources, "_os_has_npu", return_value=True):
+            self.assertTrue(resources.has_npu())
+        with patch.dict(sys.modules, {"openvino": None}), \
+                patch.object(resources, "_os_has_npu", return_value=False):
             self.assertFalse(resources.has_npu())
+
+    def test_os_has_npu_matches_intel_vpu_accel_device(self):
+        from yggdrasil.loki import resources
+
+        # A /sys/class/accel/accel0 whose driver is intel_vpu → NPU present.
+        with patch.object(resources.glob, "glob",
+                          side_effect=lambda p: ["/sys/class/accel/accel0"] if "accel" in p else []), \
+                patch.object(resources.os, "readlink", return_value="/.../bus/pci/drivers/intel_vpu"):
+            self.assertTrue(resources._os_has_npu())
+        # Nothing present anywhere → False.
+        with patch.object(resources.glob, "glob", return_value=[]):
+            self.assertFalse(resources._os_has_npu())
+
+    def test_intel_gpu_present_reads_drm_vendor(self):
+        from unittest.mock import mock_open
+
+        from yggdrasil.loki import resources
+
+        with patch.object(resources.glob, "glob",
+                          return_value=["/sys/class/drm/card0/device/vendor"]), \
+                patch("builtins.open", mock_open(read_data="0x8086\n")):
+            self.assertTrue(resources.intel_gpu_present())
+        # A non-Intel vendor id (NVIDIA 0x10de) → not an Intel GPU.
+        with patch.object(resources.glob, "glob",
+                          return_value=["/sys/class/drm/card0/device/vendor"]), \
+                patch("builtins.open", mock_open(read_data="0x10de\n")):
+            self.assertFalse(resources.intel_gpu_present())
+
+    def test_snapshot_reports_present_intel_gpu_even_without_torch(self):
+        from yggdrasil.loki import resources
+
+        # torch can't drive it (accelerator None) but the OS sees the iGPU.
+        with patch.object(resources, "accelerator", return_value=None), \
+                patch.object(resources, "intel_gpu_present", return_value=True), \
+                patch.object(resources, "has_npu", return_value=False):
+            snap = resources.snapshot()
+        self.assertTrue(snap.intel_gpu)
+        self.assertIsNone(snap.accelerator)
+        self.assertFalse(snap.gpu)
 
 
 if __name__ == "__main__":

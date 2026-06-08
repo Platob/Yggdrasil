@@ -272,6 +272,45 @@ class Awaitable(ABC):
             self._wait(wc, raise_error=raise_error)
         return self
 
+    # ── progress / UI bridge ─────────────────────────────────────────────
+
+    def progress(self) -> "float | None":
+        """A 0..1 completion fraction for a progress bar, or ``None`` if unknown.
+
+        A UI hook: a generic awaitable can't know its fraction, so the base
+        returns ``None`` (drive a *spinner*, not a bar). Subclasses that do know
+        — a batch's children done, a statement's rows fetched — override this.
+        Consumed by :func:`yggdrasil.cli.style.track`.
+        """
+        return None
+
+    def watch(
+        self,
+        on_tick: "Any" = None,
+        *,
+        interval: float = 0.1,
+        raise_error: bool = True,
+    ) -> "Awaitable":
+        """Drive to completion, calling ``on_tick(self)`` each poll.
+
+        The hook a UI (spinner / progress bar) connects to **without this trait
+        importing any UI** — keeping the layering clean. Starts the awaitable if
+        it hasn't been, polls until done, then surfaces a failure (unless
+        *raise_error* is ``False``). Pairs with :func:`yggdrasil.cli.style.track`.
+        """
+        if not self.started:
+            self.start(wait=False)
+        while True:
+            self.wait(wait=False, raise_error=False)
+            if on_tick is not None:
+                on_tick(self)
+            if self.is_done:
+                break
+            time.sleep(interval)
+        if raise_error:
+            self.raise_for_status()
+        return self
+
     @classmethod
     def as_completed(
         cls,
@@ -396,6 +435,13 @@ class AwaitableBatch(Awaitable):
     @property
     def max_concurrency(self) -> int:
         return 1
+
+    def progress(self) -> "float | None":
+        """Fraction of child awaitables finished — drives a real progress bar."""
+        children = getattr(self, "_children", None)
+        if not children:
+            return None
+        return sum(1 for c in children if c.is_done) / len(children)
 
     def _error_for_status(self) -> BaseException | None:
         children = getattr(self, "_children", ())

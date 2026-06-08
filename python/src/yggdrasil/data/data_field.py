@@ -581,6 +581,24 @@ class Field(BaseChildrenFields):
     def __str__(self):
         return self.pretty_format()
 
+    def short(self) -> str:
+        """A compact ``name:dtype`` header tag — the dtype via
+        :meth:`~yggdrasil.data.types.base.DataType.short` (recursive for nested
+        types). Used for the column headers in
+        :meth:`yggdrasil.io.tabular.Tabular.display`."""
+        return f"{self.name}:{self.dtype.short()}"
+
+    def markers(self) -> str:
+        """The main schema markers for a preview header, space-joined (``""``
+        when none): the key / layout flags (``PK`` / ``FK`` / ``CK`` /
+        ``partition`` / ``cluster`` / ``sorted`` / ``IK``) and a ``*`` for a
+        non-nullable (required) column. The compact cousin of
+        :meth:`_pretty_markers`."""
+        tokens = [label for tag, label in self._PRETTY_TAG_FLAGS if self._tag_flag(tag)]
+        if not self.nullable:
+            tokens.append("*")
+        return " ".join(tokens)
+
     def __eq__(self, other: Any) -> bool:
         if other is self:
             return True

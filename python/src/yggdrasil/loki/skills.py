@@ -5,6 +5,11 @@ These run anywhere Loki runs (no cloud session required):
 - :class:`WebSkill` — reach and *drive* the internet (browse, tables, forms).
 - :class:`TabularSkill` / :class:`TransformSkill` — the data path: fetch a
   source into a frame through the io handlers, cache it, reshape it.
+- :class:`EntsoeSkill` — the energy-data path: pull ENTSO-E power-market series
+  (prices / load / generation) for a bidding zone into a cached frame.
+- :class:`ScaffoldSkill` — create a ready-to-push project from scratch (README,
+  .gitignore, per-language ``src``/``tests``, manifest, git-init).
+- :class:`DelegateSkill` — fan independent tasks out to parallel process agents.
 - :class:`PythonProjectSkill` — scaffold a Python project, write code into it
   (provided, or reasoned from a task via the agent's engine), and run it.
 - :class:`SetupSkill` — bootstrap a free local model on demand.
@@ -28,8 +33,8 @@ from .skill import LokiSkill, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentSkill", "PythonProjectSkill", "SetupSkill",
-           "WebSkill", "TabularSkill", "TransformSkill"]
+__all__ = ["AgentSkill", "DelegateSkill", "EntsoeSkill", "PythonProjectSkill",
+           "ScaffoldSkill", "SetupSkill", "WebSkill", "TabularSkill", "TransformSkill"]
 
 
 @register
@@ -370,6 +375,176 @@ class TransformSkill(LokiSkill):
                 f"store:  loki.run('tabular', cache={str(cached_to)!r}, store='out.parquet')",
             ],
         }
+
+
+@register
+class DelegateSkill(LokiSkill):
+    """Fan a set of tasks out to background process agents and monitor them.
+
+    Loki's autonomy multiplier: each task runs as its own ``ygg loki do``
+    subprocess (an isolated act loop), so independent work runs in parallel while
+    Loki watches. Pass explicit ``tasks=[…]``, or a high-level ``goal=`` that the
+    engine decomposes into parallel-safe subtasks first. Returns one summary per
+    agent (status / elapsed / answer / files_changed). Runs anywhere an engine is
+    reachable (the sub-agents need one).
+    """
+
+    name = "delegate"
+    description = "Run independent tasks as parallel background agents and monitor them."
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        tasks: Optional[list] = None,
+        goal: Optional[str] = None,
+        root: str = ".",
+        engine: Optional[str] = None,
+        tier: Optional[str] = None,
+        max_steps: int = 8,
+        allow_web: bool = True,
+        allow_shell: bool = False,
+        read_only: bool = False,
+        timeout: Optional[float] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        if not tasks and goal:
+            tasks = agent.decompose(goal, engine=engine, tier=tier)
+        if not tasks:
+            raise ValueError("provide tasks=[…] or a goal= to decompose")
+        results = agent.delegate(
+            list(tasks), root=root, engine=engine, tier=tier, max_steps=max_steps,
+            allow_web=allow_web, allow_shell=allow_shell, read_only=read_only, timeout=timeout,
+        )
+        return {
+            "goal": goal,
+            "agents": results,
+            "completed": sum(1 for r in results if r["status"] == "done"),
+            "failed": sum(1 for r in results if r["status"] != "done"),
+        }
+
+
+@register
+class EntsoeSkill(LokiSkill):
+    """Pull European power-market data (ENTSO-E) into a cached frame.
+
+    The energy-data path: fetch day-ahead **prices**, actual **load**, or
+    **generation** for a bidding zone from the ENTSO-E Transparency Platform,
+    parse the publication XML into a tidy timestamp/value frame
+    (:mod:`yggdrasil.loki.entsoe`), **cache it as Parquet** through the io
+    handlers, and return the preview plus reuse/transform/store next steps —
+    the same data loop as :class:`TabularSkill`, sourced from the power markets.
+
+    Token-gated: set ``ENTSOE_API_TOKEN``. Runs anywhere (no cloud session); with
+    no token it returns an offline-safe hint instead of raising. Defaults to the
+    last 24h of day-ahead prices for ``DE_LU`` when nothing is specified.
+    """
+
+    name = "entsoe"
+    description = "Fetch ENTSO-E power-market data (prices/load/generation) for a zone as a cached frame."
+    preprompt = (
+        "You are a power-market analyst. Reason only from the fetched frame; "
+        "day-ahead prices are EUR/MWh, load/generation are MW, timestamps are "
+        "UTC. Be precise with units, zones, and the time window."
+    )
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        series: str = "day_ahead_prices",
+        zone: str = "DE_LU",
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        days: int = 1,
+        store: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        import datetime as dt
+
+        from yggdrasil.io.holder import IO
+
+        from . import entsoe
+
+        if entsoe.token() is None:
+            return {"available": False, "series": series, "zone": zone,
+                    "hint": "set ENTSOE_API_TOKEN (free, from transparency.entsoe.eu) "
+                            "to fetch power-market data."}
+        # Default window: the trailing *days* up to now (UTC), aligned to the day.
+        now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        start_v = start or (now - dt.timedelta(days=days))
+        end_v = end or now
+        df = entsoe.fetch_frame(series, zone, start_v, end_v)
+
+        cdir = pathlib.Path(cache_dir) if cache_dir else (pathlib.Path.home() / ".loki" / "cache")
+        cdir.mkdir(parents=True, exist_ok=True)
+        eic = entsoe.resolve_zone(zone)
+        key = f"entsoe-{series}-{re.sub(r'[^0-9A-Za-z]+', '-', zone).strip('-').lower()}"
+        cached_to = cdir / f"{key}.parquet"
+        IO.from_(str(cached_to)).write_polars_frame(df)
+
+        stored = None
+        if store:
+            IO.from_(store).write_polars_frame(df)
+            stored = store
+
+        return {
+            "available": True,
+            "series": series,
+            "zone": zone,
+            "eic": eic,
+            "rows": df.height,
+            "columns": list(df.columns),
+            "preview": IO.from_(str(cached_to)).display(),
+            "cached_to": str(cached_to),
+            "stored": stored,
+            "next_steps": [
+                f"reuse:  loki.run('tabular', cache={str(cached_to)!r})",
+                f"resample to daily mean:  loki.run('transform', cache={str(cached_to)!r}) "
+                f"then group by date  (or polars: df.group_by_dynamic('timestamp', every='1d'))",
+                f"store as Parquet/Arrow/CSV/Delta:  loki.run('entsoe', series={series!r}, "
+                f"zone={zone!r}, store='out.parquet')",
+            ],
+        }
+
+
+@register
+class ScaffoldSkill(LokiSkill):
+    """Create a ready-to-push project from scratch — README, .gitignore, per-language tree.
+
+    Lays down a clean git-initialised repo: a ``README``, a composed
+    ``.gitignore``, and one ``<language>/`` folder per language (each with
+    ``src/`` + ``tests/`` and a pre-built manifest — ``pyproject.toml`` for
+    Python, ``package.json`` for TypeScript, ``Cargo.toml`` for Rust, ``go.mod``
+    for Go) — then makes the initial commit so it only needs a remote +
+    ``git push``. Runs anywhere (no engine/backend). Polyglot: pass
+    ``languages=["python","rust"]``; defaults to Python.
+    """
+
+    name = "scaffold"
+    description = "Create a ready-to-push project from scratch (README, .gitignore, per-language src/tests, manifest, git-init)."
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        name: str = "new-project",
+        languages: Optional[list] = None,
+        preset: str = "lib",
+        cloud: Optional[list] = None,
+        base_dir: Optional[str] = None,
+        description: Optional[str] = None,
+        git: bool = True,
+        **_: Any,
+    ) -> dict[str, Any]:
+        from . import scaffold
+
+        return scaffold.scaffold_project(
+            name, list(languages) if languages else ["python"],
+            preset=preset, cloud=list(cloud) if cloud else None,
+            base_dir=base_dir, description=description, git=git,
+        )
 
 
 @register
