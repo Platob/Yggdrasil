@@ -61,6 +61,7 @@ dispatch on :class:`URLBased`.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -119,16 +120,6 @@ def _clip_width(text: str, cap: int) -> str:
         out.append(ch)
         width += cw
     return "".join(out) + "…"
-
-
-def _compact_nested(value: Any) -> str:
-    """Render a nested cell (list / dict / tuple) compactly on one line."""
-    import json
-
-    try:
-        return json.dumps(value, separators=(",", ":"), default=str, ensure_ascii=False)
-    except Exception:
-        return str(value).replace("\n", " ")
 
 
 #: Placeholder column-name prefix pyarrow uses for pandas index levels
@@ -2571,67 +2562,72 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         right-align; nested cell values are compacted to one line. **Long values
         and headers are clipped** (cells to *max_width*, type/name tags to a
         slightly larger cap) so one long string or column name can't balloon the
-        table. Reads only enough Arrow batches to fill *n* rows, then stops.
+        table. The ``n`` rows are pushed down as a ``row_limit`` so no more than
+        that is ever read.
 
             print(dbc.sql.execute("SELECT * FROM t").display())
             print(IO.from_("data.parquet").display(5))
         """
-        schema = self.collect_schema()
-        fields = list(schema.children) if schema is not None else []
-        if not fields:  # empty source / no schema
+        fields = list(self.collect_schema().children)
+        if not fields:                                       # empty / no schema
             return "(no rows)"
-        columns = [f.name for f in fields]
 
-        rows: list[list] = []
-        for batch in self.to_arrow_batches():
-            for record in batch.to_pylist():
-                rows.append([record.get(c) for c in columns])
-                if len(rows) >= n:
-                    break
-            if len(rows) >= n:
-                break
+        # The first *n* rows — pushed down as a ``row_limit`` (n + 1 so we can
+        # tell "exactly n" from "more follow") so we read no further than we
+        # render. Records are name→value dicts in schema order.
+        records: list[dict[str, Any]] = []
+        for batch in self.read_arrow_batches(row_limit=n + 1):
+            records.extend(batch.to_pylist())
+        truncated = len(records) > n
+        del records[n:]
 
-        def cell(value: Any) -> str:
-            if value is None:
-                text = "·"                                # nulls read clearly
-            elif isinstance(value, (dict, list, tuple)):     # nested → compact
-                text = _compact_nested(value)
-            else:
-                text = str(value).translate(_WS_TRANS)    # no tabs/newlines to skew columns
-            return _clip_width(text, max_width)           # long values never balloon
-
-        # Two-row header (names, then type tags + the field's main schema markers)
-        # — all from the project Field / DataType: recursive short type repr, the
-        # markers (PK / partition / required), and a numeric test for alignment.
-        def type_tag(f: _Field) -> str:
-            marks = f.markers()
-            return f"{f.dtype.short()} {marks}" if marks else f.dtype.short()
-
+        # Build the grid one column at a time, leaning on the project Field for
+        # everything the header needs: the recursive short type tag and its main
+        # schema markers (PK / partition / required), plus whether the type
+        # right-aligns (numbers / booleans). Each cell is clipped to *max_width*
+        # (headers a touch wider) so one long value or name can never balloon
+        # the table; nested values compact to a single line, nulls read as a dot.
         head_cap = max(max_width, 44)
-        names = [_clip_width(f.name, head_cap) for f in fields]
-        types = [_clip_width(type_tag(f), head_cap) for f in fields]
-        right = [f.dtype.type_id.is_numeric or f.dtype.type_id.is_boolean for f in fields]
-        body = [[cell(v) for v in row] for row in rows]
-        widths = [max([_disp_width(names[i]), _disp_width(types[i])]
-                      + [_disp_width(r[i]) for r in body])
-                  for i in range(len(columns))]
+        grid: list[list[str]] = []          # per column: [name, type, *values]
+        right: list[bool] = []
+        for field in fields:
+            marks = field.markers()
+            tag = f"{field.dtype.short()} {marks}" if marks else field.dtype.short()
+            column = [_clip_width(field.name, head_cap), _clip_width(tag, head_cap)]
+            for record in records:
+                value = record.get(field.name)
+                if value is None:
+                    text = "·"
+                elif isinstance(value, (dict, list, tuple)):
+                    text = json.dumps(value, separators=(",", ":"),
+                                      default=str, ensure_ascii=False)
+                else:
+                    text = str(value).translate(_WS_TRANS)
+                column.append(_clip_width(text, max_width))
+            grid.append(column)
+            right.append(field.dtype.type_id.is_numeric or field.dtype.type_id.is_boolean)
 
-        def pad(text: str, i: int) -> str:
-            gap = " " * max(0, widths[i] - _disp_width(text))   # pad by display width
-            return (gap + text) if right[i] else (text + gap)
-
-        def line(cells: list[str]) -> str:
-            return " │ ".join(pad(c, i) for i, c in enumerate(cells))
-
-        lines = [line(names), line(types), "─┼─".join("─" * w for w in widths)]
-        lines += [line(r) for r in body]
-        lines.append("─┴─".join("─" * w for w in widths))   # closing rule
-        # A footer: the truncation marker, or the shape that was shown.
-        if len(rows) >= n:
+        # Column width = the widest cell it must fit, measured by *display*
+        # width so CJK / accented / emoji glyphs align on what the terminal
+        # actually shows. Then pad each cell (right for numbers, else left),
+        # join with │; a ─┼─ rule under the two-row header, a ─┴─ rule to close.
+        widths = [max(_disp_width(cell) for cell in column) for column in grid]
+        lines: list[str] = []
+        for r in range(2 + len(records)):
+            row = []
+            for c, column in enumerate(grid):
+                cell = column[r]
+                gap = " " * (widths[c] - _disp_width(cell))
+                row.append(gap + cell if right[c] else cell + gap)
+            lines.append(" │ ".join(row))
+            if r == 1:
+                lines.append("─┼─".join("─" * w for w in widths))
+        lines.append("─┴─".join("─" * w for w in widths))
+        if truncated:
             lines.append(f"… (first {n} rows)")
         else:
-            cols = len(columns)
-            lines.append(f"{len(rows)} row{'s' * (len(rows) != 1)} × "
+            cols = len(fields)
+            lines.append(f"{len(records)} row{'s' * (len(records) != 1)} × "
                          f"{cols} col{'s' * (cols != 1)}")
         return "\n".join(lines)
 
