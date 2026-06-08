@@ -144,90 +144,14 @@ class TestStagingVolume:
         assert loc == "s3://bkt/apps/team/_ygg_staging/volumes/tid-1"
 
 
-class TestTableAccessPrecheck:
-    """``Table.external_location`` / ``can_read`` / ``can_write`` — the cheap,
-    cached, external-location-governed read/write precheck (direct cloud
-    access, bypassing the warehouse)."""
+class TestTableStagingInvalidation:
+    """Invalidation (what ``delete`` runs) drops the table's storage-derived
+    caches — the staging-volume handle and the cached infos."""
 
-    def _infos(self, loc="s3://bkt/apps/team/tbl"):
-        from types import SimpleNamespace
-        return SimpleNamespace(storage_location=loc, table_id="tid-1")
-
-    def test_read_and_write_when_a_writable_location_covers(self) -> None:
+    def test_invalidate_clears_staging_and_infos(self) -> None:
         tbl = _table("cat", "sch", "tbl")
-        el = MagicMock(read_only=False)
-        tbl.service.client.external_locations.find_url.return_value = el
-        with patch.object(Table, "read_infos", return_value=self._infos()):
-            assert tbl.external_location() is el
-            assert tbl.can_read() is True
-            assert tbl.can_write() is True
-        tbl.service.client.external_locations.find_url.assert_called_with(
-            "s3://bkt/apps/team/tbl", refresh=False)
-
-    def test_read_only_location_blocks_write(self) -> None:
-        tbl = _table("cat", "sch", "tbl")
-        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=True)
-        with patch.object(Table, "read_infos", return_value=self._infos()):
-            assert tbl.can_read() is True
-            assert tbl.can_write() is False
-
-    def test_no_covering_location_means_no_direct_access(self) -> None:
-        tbl = _table("cat", "sch", "tbl")
-        tbl.service.client.external_locations.find_url.return_value = None
-        with patch.object(Table, "read_infos", return_value=self._infos("s3://bkt/__unitystorage/x")):
-            assert tbl.external_location() is None
-            assert tbl.can_read() is False
-            assert tbl.can_write() is False
-
-    def test_no_storage_location_is_safe_and_skips_lookup(self) -> None:
-        tbl = _table("cat", "sch", "tbl")
-        with patch.object(Table, "read_infos", return_value=None):
-            assert tbl.external_location() is None
-            assert tbl.can_read() is False
-        tbl.service.client.external_locations.find_url.assert_not_called()
-
-    def test_external_location_is_memoised(self) -> None:
-        tbl = _table("cat", "sch", "tbl")
-        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
-        with patch.object(Table, "read_infos", return_value=self._infos()):
-            tbl.external_location()
-            tbl.external_location()
-            tbl.can_read()
-            tbl.can_write()
-        tbl.service.client.external_locations.find_url.assert_called_once()
-
-    def test_refresh_re_resolves(self) -> None:
-        tbl = _table("cat", "sch", "tbl")
-        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
-        with patch.object(Table, "read_infos", return_value=self._infos()):
-            tbl.external_location()
-            tbl.external_location(refresh=True)
-        assert tbl.service.client.external_locations.find_url.call_count == 2
-
-    def test_info_refresh_drops_the_memo(self) -> None:
-        from types import SimpleNamespace
-        tbl = _table("cat", "sch", "tbl")
-        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
-        with patch.object(Table, "read_infos", return_value=self._infos()):
-            tbl.external_location()
-        # A fresh info store drops the memo → next lookup re-resolves.
-        tbl._store_infos(SimpleNamespace(
-            storage_location="s3://bkt/x", table_id="tid-1", columns=[],
-        ))
-        with patch.object(Table, "read_infos", return_value=self._infos("s3://bkt/x")):
-            tbl.external_location()
-        assert tbl.service.client.external_locations.find_url.call_count == 2
-
-    def test_invalidate_clears_external_location_and_staging_memo(self) -> None:
-        from yggdrasil.databricks.table.table import _UNRESOLVED
-        tbl = _table("cat", "sch", "tbl")
-        tbl.service.client.external_locations.find_url.return_value = MagicMock(read_only=False)
-        with patch.object(Table, "read_infos", return_value=self._infos()):
-            tbl.external_location()
         tbl._staging_volume = MagicMock()
-        # Invalidation (what delete runs) drops the storage-derived caches.
         tbl.invalidate_singleton()
-        assert tbl._external_location is _UNRESOLVED
         assert tbl._staging_volume is None
         assert tbl._infos is None
 

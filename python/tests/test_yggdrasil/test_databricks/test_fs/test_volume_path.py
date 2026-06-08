@@ -2391,10 +2391,11 @@ class TestVolumeExternalAccessFlags:
         assert v.external_access(write=False) is True        # read still cached ok
 
 
-class TestVolumeCreateExternalLocationGate:
-    """``Volume.create`` validates an *inferred* EXTERNAL location against the
-    Unity Catalog external locations and falls back to MANAGED (with a warning)
-    when nothing accessible covers it."""
+class TestVolumeCreateExternalInference:
+    """``Volume.create`` infers EXTERNAL from a ``storage_location`` and sends
+    it straight through — no external-location precheck / downgrade. If Unity
+    Catalog rejects the location, the create fails loudly (deferred, not
+    pre-validated)."""
 
     def _vol(self):
         from yggdrasil.databricks.volume.volume import Volume
@@ -2410,37 +2411,22 @@ class TestVolumeCreateExternalLocationGate:
             patch.object(Volume, "_stat_uncached"),
         )
 
-    def test_inferred_external_falls_back_to_managed_when_uncovered(self) -> None:
+    def test_inferred_external_sent_through_without_lookup(self) -> None:
         from databricks.sdk.service.catalog import VolumeType
         from yggdrasil.databricks.volume.volume import Volume
 
         vol, svc = self._vol()
-        svc.client.external_locations.find_url.return_value = None
-        uc = svc.client.workspace_client.return_value.volumes
-        ri, ps, su = self._patches(Volume)
-        with ri, ps, su, patch("yggdrasil.databricks.volume.volume.logger") as log:
-            vol.create(storage_location="s3://bkt/x/staging")
-        svc.client.external_locations.find_url.assert_called_once_with("s3://bkt/x/staging")
-        kw = uc.create.call_args.kwargs
-        assert kw["volume_type"] == VolumeType.MANAGED
-        assert "storage_location" not in kw          # downgraded — no location sent
-        log.warning.assert_called_once()
-
-    def test_inferred_external_kept_when_a_location_covers_it(self) -> None:
-        from databricks.sdk.service.catalog import VolumeType
-        from yggdrasil.databricks.volume.volume import Volume
-
-        vol, svc = self._vol()
-        svc.client.external_locations.find_url.return_value = MagicMock()  # covered
         uc = svc.client.workspace_client.return_value.volumes
         ri, ps, su = self._patches(Volume)
         with ri, ps, su:
             vol.create(storage_location="s3://bkt/x/staging")
+        # No external-location precheck — the create fires as-is.
+        svc.client.external_locations.find_url.assert_not_called()
         kw = uc.create.call_args.kwargs
         assert kw["volume_type"] == VolumeType.EXTERNAL
         assert kw["storage_location"] == "s3://bkt/x/staging"
 
-    def test_explicit_external_skips_the_gate(self) -> None:
+    def test_explicit_external_honored(self) -> None:
         from yggdrasil.databricks.volume.volume import Volume
 
         vol, svc = self._vol()
@@ -2448,106 +2434,8 @@ class TestVolumeCreateExternalLocationGate:
         ri, ps, su = self._patches(Volume)
         with ri, ps, su:
             vol.create(storage_location="s3://bkt/x", volume_type="EXTERNAL")
-        # Pinned EXTERNAL → no external-location lookup; honored as-is.
         svc.client.external_locations.find_url.assert_not_called()
         assert uc.create.call_args.kwargs["storage_location"] == "s3://bkt/x"
-
-
-class TestVolumeAccessPrecheck:
-    """``Volume.external_location`` / ``can_read`` / ``can_write`` — the cheap,
-    cached, external-location-governed read/write precheck."""
-
-    def _vol(self, *, loc="s3://bkt/x"):
-        from yggdrasil.databricks.volume.volume import Volume
-        svc = MagicMock()
-        vol = Volume(service=svc, catalog_name="c", schema_name="s", volume_name="v")
-        vol._infos = _volume_info(storage_location=loc) if loc else None
-        vol._infos_fetched_at = time.time()
-        return vol, svc
-
-    def test_read_and_write_when_a_writable_location_covers(self) -> None:
-        vol, svc = self._vol()
-        el = MagicMock(read_only=False)
-        svc.client.external_locations.find_url.return_value = el
-        assert vol.external_location() is el
-        assert vol.can_read() is True
-        assert vol.can_write() is True
-        svc.client.external_locations.find_url.assert_called_with("s3://bkt/x", refresh=False)
-
-    def test_read_only_location_blocks_write(self) -> None:
-        vol, svc = self._vol()
-        svc.client.external_locations.find_url.return_value = MagicMock(read_only=True)
-        assert vol.can_read() is True
-        assert vol.can_write() is False
-
-    def test_no_covering_location_means_no_direct_access(self) -> None:
-        vol, svc = self._vol()
-        svc.client.external_locations.find_url.return_value = None
-        assert vol.external_location() is None
-        assert vol.can_read() is False
-        assert vol.can_write() is False
-
-    def test_no_storage_location_is_safe_and_skips_lookup(self) -> None:
-        from yggdrasil.databricks.volume.volume import Volume
-        vol, svc = self._vol(loc=None)
-        with patch.object(Volume, "read_info", return_value=None):
-            assert vol.external_location() is None
-            assert vol.can_read() is False
-        svc.client.external_locations.find_url.assert_not_called()
-
-    def test_external_location_is_memoised(self) -> None:
-        vol, svc = self._vol()
-        svc.client.external_locations.find_url.return_value = MagicMock(read_only=False)
-        vol.external_location()
-        vol.external_location()
-        vol.can_read()
-        vol.can_write()
-        # Resolved once, reused — no re-walking the location list.
-        svc.client.external_locations.find_url.assert_called_once()
-
-    def test_refresh_re_resolves(self) -> None:
-        vol, svc = self._vol()
-        svc.client.external_locations.find_url.return_value = MagicMock(read_only=False)
-        vol.external_location()
-        vol.external_location(refresh=True)
-        assert svc.client.external_locations.find_url.call_count == 2
-
-    def test_info_refresh_drops_the_memo(self) -> None:
-        vol, svc = self._vol()
-        svc.client.external_locations.find_url.return_value = MagicMock(read_only=False)
-        vol.external_location()
-        vol._store_infos(_volume_info(storage_location="s3://bkt/x"))
-        vol.external_location()
-        assert svc.client.external_locations.find_url.call_count == 2
-
-
-class TestVolumePathAccessPrecheckDelegation:
-    """``VolumePath`` surfaces the volume's external-location precheck."""
-
-    def _vp(self):
-        return VolumePath("/Volumes/cat/sch/vol/sub/f.bin", service=MagicMock(spec=Volumes))
-
-    def test_delegates_to_volume(self) -> None:
-        p = self._vp()
-        vol = MagicMock()
-        sentinel = object()
-        vol.external_location.return_value = sentinel
-        vol.can_read.return_value = True
-        vol.can_write.return_value = False
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock, return_value=vol):
-            assert p.external_location(refresh=True) is sentinel
-            assert p.can_read() is True
-            assert p.can_write() is False
-        vol.external_location.assert_called_once_with(refresh=True)
-
-    def test_too_shallow_path_is_safe(self) -> None:
-        # ``/Volumes`` doesn't address a volume — no delegation, safe defaults.
-        p = VolumePath("/Volumes", service=MagicMock(spec=Volumes))
-        with patch.object(VolumePath, "volume", new_callable=PropertyMock) as vol:
-            assert p.external_location() is None
-            assert p.can_read() is False
-            assert p.can_write() is False
-        vol.assert_not_called()
 
 
 class TestLooksLikePermissionDenied:

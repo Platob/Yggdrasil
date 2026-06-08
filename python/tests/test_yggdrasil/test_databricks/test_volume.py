@@ -437,14 +437,11 @@ class TestVolumeDeleteClearsCaches:
     def test_delete_resets_info_storage_and_external_caches(self, workspace, client):
         from unittest.mock import MagicMock
 
-        from yggdrasil.databricks.volume.volume import _UNRESOLVED
-
         v = Volumes(client=client).volume(
             catalog_name="cat", schema_name="sch", volume_name="vol",
         )
         # Seed every cache the way live use would.
         v._store_infos(_info())
-        v._external_location = MagicMock()
         v._external_readable = True
         v._external_writable = True
         v._storage_paths = {True: MagicMock(), False: MagicMock()}
@@ -453,7 +450,6 @@ class TestVolumeDeleteClearsCaches:
 
         assert v._infos is None
         assert v._infos_fetched_at is None
-        assert v._external_location is _UNRESOLVED
         assert v._external_readable is None
         assert v._external_writable is None
         assert v._storage_paths == {}

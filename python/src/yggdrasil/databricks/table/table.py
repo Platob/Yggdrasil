@@ -85,7 +85,6 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.schema.schema import UCSchema
     from yggdrasil.aws.client import AWSClient
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
-    from yggdrasil.databricks.external.location.resource import ExternalLocation
     from yggdrasil.data.statement import StatementBatch
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
@@ -151,10 +150,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-#: Sentinel for "external location not yet resolved" — distinct from a resolved
-#: ``None`` (no accessible location covers this table).
-_UNRESOLVED: Any = object()
 
 _INVALID_COL_CHARS = set(" ,;{}()\n\t=")
 
@@ -805,9 +800,6 @@ class Table(DatabricksPath):
         self._infos_fetched_at = infos_fetched_at
         self._columns = columns
         self._staging_volume: Volume | None = None
-        # Memoised covering external location (reused by ``external_location`` /
-        # ``can_read`` / ``can_write``); ``_UNRESOLVED`` until first looked up.
-        self._external_location: Any = _UNRESOLVED
         self._initialized = True
 
     # ------------------------------------
@@ -1469,9 +1461,8 @@ class Table(DatabricksPath):
         object.__setattr__(self, "_infos_fetched_at", None)
         object.__setattr__(self, "_columns", None)
         # Storage-derived caches go stale on a delete / rebind: drop the
-        # memoised external location and the per-table staging-volume handle so
-        # the next access re-derives against fresh info.
-        object.__setattr__(self, "_external_location", _UNRESOLVED)
+        # per-table staging-volume handle so the next access re-derives
+        # against fresh info.
         object.__setattr__(self, "_staging_volume", None)
         self._invalidate_entity_tag_cache()
         super().invalidate_singleton(remove_global=remove_global)
@@ -1514,9 +1505,6 @@ class Table(DatabricksPath):
         """Populate the ``infos`` + ``columns`` caches."""
         self._infos_fetched_at = time.time()
         self._infos = infos
-        # Storage location may have shifted — drop the memoised external
-        # location so the next precheck resolves against the fresh URL.
-        self._external_location = _UNRESOLVED
         self._columns = [
             Column.from_api(table=self, infos=col_info)
             for col_info in (infos.columns or [])
@@ -3791,46 +3779,6 @@ class Table(DatabricksPath):
             return None
 
         return infos.storage_location
-
-    def external_location(self, *, refresh: bool = False) -> ExternalLocation | None:
-        """The Unity Catalog **external location** governing this table's
-        backing storage — the most specific one whose URL the table's
-        ``storage_location`` sits under (longest-prefix match over the cached
-        external-location list, :meth:`ExternalLocations.find_url`) — or
-        ``None`` when the table has no resolvable storage or no accessible
-        location covers it (e.g. a MANAGED table on governed
-        ``__unitystorage``). Never raises.
-
-        **Memoised on the table**: resolved once and reused (a resolved ``None``
-        is cached too) so repeated precheck calls don't re-walk the location
-        list. ``refresh=True`` re-resolves; the memo is dropped on any info
-        refresh (:meth:`_store_infos`)."""
-        if not refresh and self._external_location is not _UNRESOLVED:
-            return self._external_location
-        loc = self.storage_location
-        result: ExternalLocation | None = None
-        if loc:
-            try:
-                result = self.client.external_locations.find_url(loc, refresh=refresh)
-            except Exception as exc:  # noqa: BLE001 — listing is best-effort
-                logger.debug("external-location lookup failed for %r: %s", self, exc)
-                result = None
-        self._external_location = result
-        return result
-
-    def can_read(self, *, refresh: bool = False) -> bool:
-        """Global precheck — can this table's storage be **read** directly at
-        the cloud layer (bypassing the warehouse)? ``True`` when an accessible
-        external location covers it. Cheap and cached (no per-object probe) —
-        gate :meth:`delta` / :meth:`storage_path` bulk work on it."""
-        return self.external_location(refresh=refresh) is not None
-
-    def can_write(self, *, refresh: bool = False) -> bool:
-        """Global precheck — can this table's storage be **written** directly at
-        the cloud layer? ``True`` when a covering external location exists and
-        is not read-only."""
-        el = self.external_location(refresh=refresh)
-        return el is not None and not el.read_only
 
     def storage_path(self, *, write: "bool | None" = None) -> "Path | None":
         """Return the table's backing storage as an addressable :class:`Path`.
