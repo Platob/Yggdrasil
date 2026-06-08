@@ -612,7 +612,16 @@ class WarehousePreparedStatement(PreparedStatement):
         """
         if self.external_volume_paths:
             for alias, path in self.external_volume_paths.items():
-                if getattr(path, "temporary", False):
+                # Path-level fire-once guard.  The same VolumePath can be
+                # reachable from several registries — a shallow-copied
+                # statement (``WarehouseStatementBatch._coerce``) shares the
+                # dict, and a synchronously-completed submit clears via both
+                # ``SQLWarehouse.send`` and ``StatementResult._start`` — so
+                # nulling ``external_volume_paths`` on one object isn't
+                # enough to stop a second unlink (and its log).  Flip a flag
+                # on the path itself, before firing, so the unlink runs once.
+                if getattr(path, "temporary", False) and not getattr(path, "_cleanup_unlinked", False):
+                    path._cleanup_unlinked = True
                     try:
                         Job.make(path.unlink, missing_ok=True).fire_and_forget()
                     except Exception:
@@ -1358,7 +1367,11 @@ class WarehouseStatementBatch(StatementBatch):
             return self
 
         for alias, path in list(self.external_volume_paths.items()):
-            if getattr(path, "temporary", False):
+            # Same path-level fire-once guard as the per-statement sweep
+            # above: ``super().clear_temporary_resources()`` may already
+            # have unlinked a path that's also mirrored batch-wide.
+            if getattr(path, "temporary", False) and not getattr(path, "_cleanup_unlinked", False):
+                path._cleanup_unlinked = True
                 try:
                     Job.make(path.unlink, missing_ok=True).fire_and_forget()
                 except Exception:
