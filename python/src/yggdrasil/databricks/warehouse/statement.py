@@ -74,6 +74,7 @@ from yggdrasil.aws.fs.path import S3Path
 from ..sql.types import parse_databricks_field
 
 if TYPE_CHECKING:
+    from yggdrasil.arrow.tabular import ArrowTabular
     from yggdrasil.databricks.client import DatabricksClient
     from yggdrasil.databricks.warehouse.warehouse import SQLWarehouse
 
@@ -1038,37 +1039,35 @@ class WarehouseStatementResult(StatementResult):
     # Arrow conversions
     # ------------------------------------------------------------------
 
-    def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
-        options = options.check_target(self.collect_schema)
+    def _chunk_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
+        """Fetch every result chunk's Arrow stream concurrently and yield the
+        **raw, uncast** record batches in chunk order.
 
+        The manifest carries every chunk index and the result totals up front,
+        so we never walk the ``next_chunk`` linked list (one serial SDK round-
+        trip per page). Each chunk's presigned-URL resolution, download, and IPC
+        decode happens in a worker thread, so N chunks transfer concurrently;
+        the pool is owned by the warehouse executor for cross-chunk connection
+        reuse. Casting is left to the caller — the streaming
+        :meth:`_read_arrow_batches` casts per flush group, while the whole-result
+        :meth:`_read_arrow_table` casts the lot once.
+        """
         max_workers = 8
         max_in_flight = max_workers * 2
 
-        # Pool is owned by the warehouse executor — its lifetime matches
-        # the warehouse handle, so we don't leak TCP connections in a
-        # long-running process that creates and discards warehouses, and
-        # we still get connection reuse across every chunk fetched
-        # against this warehouse.
+        # Pool is owned by the warehouse executor — its lifetime matches the
+        # warehouse handle, so we don't leak TCP connections in a long-running
+        # process that creates and discards warehouses, and we still get
+        # connection reuse across every chunk fetched against this warehouse.
         http = self.executor.external_link_pool(max_workers)
-        options = options.with_target(self._collect_schema(options))
-        byte_size = options.byte_size or _DEFAULT_BYTE_SIZE
-        memory_pool = options.arrow_memory_pool
-        pending: List[pa.RecordBatch] = []
-        pending_bytes = 0
-        yielded_any = False
 
-        # Manifest carries every chunk's index + the result totals up
-        # front, so we never walk the ``next_chunk`` linked list (one
-        # serial SDK round-trip per page) to discover what to fetch.
         manifest = self.manifest
         total_chunks = (manifest.total_chunk_count if manifest is not None else 0) or 0
-        total_rows = (manifest.total_row_count if manifest is not None else 0) or 0
-        total_bytes = (manifest.total_byte_count if manifest is not None else 0) or 0
 
-        # Presigned URLs the initial result already carried (usually chunk
-        # 0). Key by chunk index — falling back to ``ResultData.chunk_index
-        # + position`` when a link omits its own index — so a pre-resolved
-        # URL is reused instead of re-fetched by ``get_statement_result_chunk_n``.
+        # Presigned URLs the initial result already carried (usually chunk 0).
+        # Key by chunk index — falling back to ``ResultData.chunk_index +
+        # position`` when a link omits its own index — so a pre-resolved URL is
+        # reused instead of re-fetched by ``get_statement_result_chunk_n``.
         result_data = self.result
         start_index = (result_data.chunk_index if result_data is not None else 0) or 0
         preresolved: dict[int, str] = {}
@@ -1083,9 +1082,9 @@ class WarehouseStatementResult(StatementResult):
 
         def fetch_chunk(chunk_index: int) -> "List[pa.RecordBatch]":
             # Resolve this chunk's presigned URL — in the worker thread, so
-            # resolution for many chunks overlaps — unless the initial
-            # result already carried it. Each ``get_statement_result_chunk_n``
-            # is independent per index, so this no longer serializes on the
+            # resolution for many chunks overlaps — unless the initial result
+            # already carried it. Each ``get_statement_result_chunk_n`` is
+            # independent per index, so this no longer serializes on the
             # linked list.
             url = preresolved.get(chunk_index)
             if url is None:
@@ -1102,9 +1101,9 @@ class WarehouseStatementResult(StatementResult):
 
             # Download + decode the whole chunk *here*, in the worker, so N
             # chunks transfer concurrently. ``preload_content=False`` streams
-            # the body through Arrow's IPC reader; ``read_all`` materializes
-            # the chunk into Arrow-owned buffers (independent of the HTTP
-            # response, which we then drain + release).
+            # the body through Arrow's IPC reader; ``read_all`` materializes the
+            # chunk into Arrow-owned buffers (independent of the HTTP response,
+            # which we then drain + release).
             resp = http.fetch(
                 "GET", url,
                 preload_content=False,
@@ -1124,36 +1123,52 @@ class WarehouseStatementResult(StatementResult):
                     pass
                 resp.release_conn()
 
-        def jobs() -> Iterable[Job]:
-            # Manifest chunk count is authoritative; fall back to whatever
-            # the initial result carried for API shapes that omit it.
-            indices = range(total_chunks) if total_chunks else sorted(preresolved)
-            for chunk_index in indices:
-                yield Job.make(fetch_chunk, chunk_index)
+        # Manifest chunk count is authoritative; fall back to whatever the
+        # initial result carried for API shapes that omit it.
+        indices = range(total_chunks) if total_chunks else sorted(preresolved)
+        jobs = (Job.make(fetch_chunk, chunk_index) for chunk_index in indices)
+        with JobPoolExecutor.from_(max_workers) as ex:
+            for result in ex.as_completed(
+                jobs,
+                ordered=True,
+                max_in_flight=max_in_flight,
+                cancel_on_exit=True,
+                shutdown_on_exit=True,
+                shutdown_wait=False,
+            ):
+                yield from result.result
 
-        def raw_batches() -> Iterator[pa.RecordBatch]:
-            with JobPoolExecutor.from_(max_workers) as ex:
-                for result in ex.as_completed(
-                    jobs(),
-                    ordered=True,
-                    max_in_flight=max_in_flight,
-                    cancel_on_exit=True,
-                    shutdown_on_exit=True,
-                    shutdown_wait=False,
-                ):
-                    yield from result.result
+    def _log_stream_totals(self) -> None:
+        if not logger.isEnabledFor(logging.INFO):
+            return
+        manifest = self.manifest
+        logger.info(
+            "Statement %r streamed %d chunks / %d rows / %s",
+            self,
+            (manifest.total_chunk_count if manifest is not None else 0) or 0,
+            (manifest.total_row_count if manifest is not None else 0) or 0,
+            ByteUnit.pretty((manifest.total_byte_count if manifest is not None else 0) or 0),
+        )
+
+    def _read_arrow_batches(self, options: CastOptions) -> Iterator[pa.RecordBatch]:
+        options = options.check_target(self.collect_schema)
+        options = options.with_target(self._collect_schema(options))
+        byte_size = options.byte_size or _DEFAULT_BYTE_SIZE
+        memory_pool = options.arrow_memory_pool
+        pending: List[pa.RecordBatch] = []
+        pending_bytes = 0
+        yielded_any = False
 
         def flush() -> Iterator[pa.RecordBatch]:
             nonlocal pending, pending_bytes, yielded_any
             if not pending:
                 return
-
-            # Always go through `concat_batches`, even for a singleton.
-            # The singleton-skip shortcut handed out a batch that could
-            # alias the HTTP response buffer that backed the IPC read;
-            # once `fetch_batches` returns and the response is GC'd,
-            # those buffers vanish.  `concat_batches` materializes a
-            # fresh batch owned by `memory_pool`, breaking the alias.
+            # Always go through ``concat_batches``, even for a singleton. The
+            # singleton-skip shortcut handed out a batch that could alias the
+            # HTTP response buffer that backed the IPC read; once the fetch
+            # returns and the response is GC'd, those buffers vanish.
+            # ``concat_batches`` materializes a fresh batch owned by
+            # ``memory_pool``, breaking the alias.
             combined = pa.concat_batches(pending, memory_pool=memory_pool)
             casted = options.cast_arrow_table(combined)
             pending = []
@@ -1161,22 +1176,51 @@ class WarehouseStatementResult(StatementResult):
             yielded_any = True
             yield casted
 
-        for batch in raw_batches():
+        for batch in self._chunk_batches(options):
             pending.append(batch)
             pending_bytes += batch.nbytes
             if pending_bytes >= byte_size:
                 yield from flush()
-
         yield from flush()
 
         if not yielded_any:
             yield from _empty_arrow_batches(options.target.to_arrow_schema())
-        elif logger.isEnabledFor(logging.INFO):
-            # Only pay the human-size formatting when INFO is actually on.
-            logger.info(
-                "Statement %r streamed %d chunks / %d rows / %s",
-                self, total_chunks, total_rows, ByteUnit.pretty(total_bytes),
-            )
+        else:
+            self._log_stream_totals()
+
+    def _read_arrow_table(self, options: CastOptions) -> pa.Table:
+        """Optimized whole-result read: fetch **every** chunk in parallel,
+        concatenate the raw batches into a single Arrow table, and run the
+        target cast **once** over the lot.
+
+        The generic base method streams through :meth:`_read_arrow_batches`,
+        which casts each ``byte_size`` flush group, and then re-casts the
+        assembled table — two passes. Here the parallel fetch feeds one
+        ``Table.from_batches`` + one :meth:`CastOptions.cast_arrow_table`, so a
+        large result is materialized and typed in a single columnar pass with no
+        per-batch cast overhead.
+        """
+        options = options.check_target(self.collect_schema)
+        options = options.with_target(self._collect_schema(options))
+
+        raw = list(self._chunk_batches(options))
+        if raw:
+            table = options.cast_arrow_table(pa.Table.from_batches(raw))
+        else:
+            table = options.target.to_arrow_schema().empty_table()
+        table = options.apply_post_read_table(table)
+        if options.row_limit is not None and table.num_rows > options.row_limit:
+            table = table.slice(0, options.row_limit)
+        self._log_stream_totals()
+        return table
+
+    def _read_arrow_tabular(self, options: CastOptions) -> ArrowTabular:
+        # Back the in-memory tabular with the cast-once table above (single
+        # parallel fetch + single cast) rather than the per-batch streaming
+        # path the base method wraps.
+        from yggdrasil.arrow.tabular import ArrowTabular
+
+        return ArrowTabular(self._read_arrow_table(options))
 
     def _write_arrow_batches(self, batches: Iterable[pa.RecordBatch], options: CastOptions) -> None:
         raise NotImplementedError("Cannot write to Databricks SQL")
