@@ -395,15 +395,31 @@ def cast_arrow_tabular(
         return data
     src_children = src.children
     tgt_children = tgt.children
-    if len(src_children) == len(tgt_children) and all(
-        s.equals(
-            t,
-            check_names=True,
-            check_dtypes=True,
-            check_nullable=True,
-            check_metadata=False,
+    if (
+        len(src_children) == len(tgt_children)
+        and all(
+            s.equals(
+                t,
+                check_names=True,
+                check_dtypes=True,
+                check_nullable=True,
+                check_metadata=False,
+            )
+            for s, t in zip(src_children, tgt_children)
         )
-        for s, t in zip(src_children, tgt_children)
+        # ygg folds UTC aliases onto one canonical zone (``UTC`` → ``Etc/UTC``),
+        # so a column whose *live* Arrow label is ``UTC`` reads as type-equal to
+        # an ``Etc/UTC`` target above. Taking the zero-copy bypass there leaves a
+        # label polars/Arrow can't find a supertype for at concat time ("failed
+        # to determine supertype of datetime[μs, Etc/UTC] and datetime[μs, UTC]").
+        # Fall through to the per-field path — which relabels — when any aware
+        # timestamp column's Arrow tz differs from the target's canonical zone.
+        and not any(
+            pa.types.is_timestamp(f.type)
+            and f.type.tz
+            and f.type.tz != getattr(t.dtype, "tz_iana", None)
+            for f, t in zip(data.schema, tgt_children)
+        )
     ):
         return data
 

@@ -569,6 +569,25 @@ class TemporalType(PrimitiveType, ABC):
 
     def _cast_arrow_array(self, array: "pa.Array", options: "CastOptions") -> "pa.Array":
         if not options.need_cast(array, self):
+            # The type system folds UTC aliases onto a single canonical IANA
+            # zone (``UTC`` → ``Etc/UTC``), so an array literally tagged
+            # ``UTC`` reads as type-equal to an ``Etc/UTC`` schema and
+            # ``need_cast`` skips the cast — leaving a label that can't be
+            # Arrow/polars-concatenated with a canonical column ("failed to
+            # determine supertype of datetime[μs, Etc/UTC] and datetime[μs,
+            # UTC]"). Relabel equivalent zones here: same instant, so a
+            # metadata-only ``pc.cast`` keeps every array leaving the schema
+            # canonical.
+            target_tz = getattr(self, "tz_iana", None)
+            if (
+                target_tz
+                and pa.types.is_timestamp(array.type)
+                and array.type.tz
+                and array.type.tz != target_tz
+            ):
+                return pc.cast(
+                    array, pa.timestamp(array.type.unit, tz=target_tz), safe=False
+                )
             return array
         casted = arrow_cast(array, self.to_arrow(), safe=options.safe)
         return options.fill_arrow_nulls(casted)
@@ -636,6 +655,21 @@ class TemporalType(PrimitiveType, ABC):
 
     def _cast_polars_series(self, series: "polars.Series", options: "CastOptions"):
         if not options.need_cast(series, self):
+            # Canonicalize an equivalent-but-differently-spelled tz label
+            # (``UTC`` → ``Etc/UTC``) that ``need_cast`` can't see because
+            # the type system already folds the two together — otherwise the
+            # series can't be ``pl.concat``'d with a canonical column. Same
+            # instant, so ``convert_time_zone`` is a metadata-only relabel.
+            pl = polars_module()
+            target_tz = getattr(self, "tz_iana", None)
+            dtype = series.dtype
+            if (
+                target_tz
+                and isinstance(dtype, pl.Datetime)
+                and dtype.time_zone
+                and dtype.time_zone != target_tz
+            ):
+                return series.dt.convert_time_zone(target_tz)
             return series
         if self._needs_arrow_bridge():
             return self._polars_from_arrow(series, options)

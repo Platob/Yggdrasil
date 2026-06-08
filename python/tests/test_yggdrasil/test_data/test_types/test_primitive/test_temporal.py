@@ -437,6 +437,114 @@ class TestPolarsSeries:
         assert out.name == "my_ts"
 
 
+class TestTimezoneLabelCanonicalisation:
+    """``UTC`` and ``Etc/UTC`` are the same zone but different polars/Arrow
+    labels — and polars refuses to find a supertype between them
+    ("failed to determine supertype of datetime[μs, Etc/UTC] and
+    datetime[μs, UTC]"). The type system folds both onto ``Etc/UTC``, so a
+    no-op schema validation must still relabel the engine column to the
+    canonical zone, otherwise a later concat against canonical data raises.
+    """
+
+    def test_polars_relabels_utc_alias_when_cast_is_a_noop(self) -> None:
+        # Column literally tagged ``UTC`` validated against an ``Etc/UTC``
+        # schema: the types are equal so ``need_cast`` is False, yet the
+        # label must come out canonical.
+        s = pl.Series(
+            "t",
+            [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)],
+            dtype=pl.Datetime("us", "UTC"),
+        )
+        out = _cast_polars(s, TimestampType(unit="us", tz="Etc/UTC"))
+
+        assert out.dtype.time_zone == "Etc/UTC"
+        # Instant is untouched — pure metadata relabel.
+        assert out.to_list()[0] == dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+
+    def test_polars_relabelled_series_concats_with_canonical(self) -> None:
+        utc = pl.Series(
+            "t",
+            [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)],
+            dtype=pl.Datetime("us", "UTC"),
+        )
+        relabelled = _cast_polars(utc, TimestampType(unit="us", tz="Etc/UTC"))
+        canonical = pl.Series(
+            "t",
+            [dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc)],
+            dtype=pl.Datetime("us", "Etc/UTC"),
+        )
+        # Would raise SchemaError without the relabel.
+        merged = pl.concat([relabelled.to_frame(), canonical.to_frame()])
+        assert merged.height == 2
+
+    def test_arrow_relabels_utc_alias_when_cast_is_a_noop(self) -> None:
+        arr = pa.array(
+            [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)],
+            type=pa.timestamp("us", tz="UTC"),
+        )
+        out = _cast_arrow(arr, TimestampType(unit="us", tz="Etc/UTC"))
+
+        assert out.type.tz == "Etc/UTC"
+        assert out.to_pylist()[0] == dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+
+    def test_naive_target_is_left_untouched(self) -> None:
+        s = pl.Series("t", [dt.datetime(2024, 1, 1)], dtype=pl.Datetime("us"))
+        out = _cast_polars(s, TimestampType(unit="us", tz=None))
+
+        assert out.dtype.time_zone is None
+
+    def test_genuine_zone_is_not_rewritten(self) -> None:
+        # A real non-UTC zone that already matches the schema must pass
+        # through verbatim — the relabel only fires on alias divergence.
+        s = pl.Series(
+            "t",
+            [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)],
+            dtype=pl.Datetime("us", "Europe/Paris"),
+        )
+        out = _cast_polars(s, TimestampType(unit="us", tz="Europe/Paris"))
+
+        assert out.dtype.time_zone == "Europe/Paris"
+
+    def test_arrow_tabular_bypass_relabels_utc_alias(self) -> None:
+        # The whole-table fast bypass treats ``UTC`` as type-equal to the
+        # canonical ``Etc/UTC`` schema; it must still hand back a canonical
+        # label so the table can be concatenated with canonical data.
+        from yggdrasil.data.schema import Schema
+
+        tbl = pa.table(
+            {
+                "t": pa.array(
+                    [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+                "v": pa.array([1.0]),
+            }
+        )
+        out = Schema.from_arrow_schema(tbl.schema).to_field().cast_arrow_tabular(tbl)
+
+        assert out.schema.field("t").type.tz == "Etc/UTC"
+        assert out.column("t").to_pylist()[0] == dt.datetime(
+            2024, 1, 1, tzinfo=dt.timezone.utc
+        )
+
+    def test_arrow_tabular_canonical_table_is_zero_copy_bypassed(self) -> None:
+        # An already-canonical table keeps the identity fast-path — the
+        # tz guard only fires on alias divergence, not on every timestamp.
+        from yggdrasil.data.schema import Schema
+
+        tbl = pa.table(
+            {
+                "t": pa.array(
+                    [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)],
+                    type=pa.timestamp("us", tz="Etc/UTC"),
+                )
+            }
+        )
+        out = Schema.from_arrow_schema(tbl.schema).to_field().cast_arrow_tabular(tbl)
+
+        assert out is tbl
+
+
 class TestPolarsExpr:
 
     def test_expr_path_to_timestamp(self) -> None:
