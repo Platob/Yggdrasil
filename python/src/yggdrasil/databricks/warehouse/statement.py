@@ -1200,17 +1200,52 @@ class WarehouseStatementResult(StatementResult):
         large result is materialized and typed in a single columnar pass with no
         per-batch cast overhead.
         """
-        options = options.check_target(self.collect_schema)
-        options = options.with_target(self._collect_schema(options))
+        # ``typed`` forces the manifest schema so the raw wire batches cast to
+        # the right yggdrasil types; ``options`` stays the caller's, carrying
+        # any column projection / row_limit / resample / dedup — the same split
+        # the generic base keeps (it casts to manifest types inside
+        # ``_read_arrow_batches``, then applies the caller's options in its own
+        # scope). Collapsing the two would clobber the caller's projection.
+        typed = options.check_target(self.collect_schema)
+        typed = typed.with_target(self._collect_schema(typed))
 
-        raw = list(self._chunk_batches(options))
+        # Row-limit pushdown. A ``row_limit`` only constrains the final row
+        # count, so we can stop pulling chunks once we have enough — *unless* a
+        # post-read pass reshapes rows (resample collapses buckets, dedup drops
+        # duplicates), in which case the raw count isn't the output count and we
+        # must read everything before trimming. Closing the chunk generator
+        # trips JobPoolExecutor's ``cancel_on_exit``, so the remaining parallel
+        # fetches are cancelled rather than downloaded.
+        row_limit = options.row_limit
+        stop_early = (
+            row_limit is not None
+            and options.resample_on_read() is None
+            and not options.dedup_columns_on_read()
+        )
+
+        raw: List[pa.RecordBatch] = []
+        rows = 0
+        chunks = self._chunk_batches(typed)
+        try:
+            for batch in chunks:
+                raw.append(batch)
+                rows += batch.num_rows
+                if stop_early and rows >= row_limit:
+                    break
+        finally:
+            chunks.close()
+
         if raw:
-            table = options.cast_arrow_table(pa.Table.from_batches(raw))
+            table = typed.cast_arrow_table(pa.Table.from_batches(raw))
         else:
-            table = options.target.to_arrow_schema().empty_table()
+            table = typed.target.to_arrow_schema().empty_table()
+
+        # Caller pipeline: projection-cast + resample/dedup/projection, then the
+        # final row_limit trim (last, so resample/dedup see every row first).
+        table = options.cast_arrow_table(table)
         table = options.apply_post_read_table(table)
-        if options.row_limit is not None and table.num_rows > options.row_limit:
-            table = table.slice(0, options.row_limit)
+        if row_limit is not None and table.num_rows > row_limit:
+            table = table.slice(0, row_limit)
         self._log_stream_totals()
         return table
 
