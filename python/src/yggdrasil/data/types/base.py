@@ -678,6 +678,8 @@ class DataType(BaseChildrenFields, ABC):
             if depth <= 0:
                 return "struct"
             kids = self.children
+            if not kids:
+                return "struct"
             shown = ", ".join(f"{f.name}:{f.dtype.short(depth - 1)}" for f in kids[:4])
             return _short_elide(f"struct<{shown}{', …' if len(kids) > 4 else ''}>")
         if tid == DataTypeId.ARRAY:
@@ -691,6 +693,10 @@ class DataType(BaseChildrenFields, ABC):
                 return "map"
             return _short_elide(f"map<{self.key_field.dtype.short(depth - 1)},"
                                 f"{self.value_field.dtype.short(depth - 1)}>")
+        # Dictionary-encoded categorical (incl. enums) → dict<value-type>.
+        if tid.is_dictionary_like:
+            value = getattr(self, "value_type", None)
+            return f"dict<{value.short(max(0, depth - 1))}>" if value is not None else "dict"
         # Scalars — derive from the type-id predicates + the physical width hint.
         bits = self.byte_size * 8 if getattr(self, "byte_size", None) else None
         if tid.is_integer:
@@ -700,7 +706,8 @@ class DataType(BaseChildrenFields, ABC):
         if tid == DataTypeId.STRING:
             return "str"
         if tid.is_decimal:
-            return "dec"
+            prec, scale = getattr(self, "precision", None), getattr(self, "scale", None)
+            return f"dec({prec},{scale})" if prec is not None else "dec"
         if tid.is_boolean:
             return "bool"
         if tid.is_temporal:

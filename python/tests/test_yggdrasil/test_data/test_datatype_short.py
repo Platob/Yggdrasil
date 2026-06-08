@@ -40,6 +40,16 @@ class TestDataTypeShort(unittest.TestCase):
         # depth=2 → list<list<list>> (innermost goes flat).
         self.assertEqual(DataType.from_arrow_type(deep).short(depth=2), "list<list<list>>")
 
+    def test_decimal_carries_precision_scale(self):
+        self.assertEqual(self._short(pa.decimal128(10, 2)), "dec(10,2)")
+
+    def test_dictionary_categorical_shows_value_type(self):
+        self.assertEqual(self._short(pa.dictionary(pa.int8(), pa.string())), "dict<str>")
+        self.assertEqual(self._short(pa.dictionary(pa.int32(), pa.int64())), "dict<i64>")
+
+    def test_empty_struct_is_bare(self):
+        self.assertEqual(self._short(pa.struct([])), "struct")
+
     def test_field_short_is_name_colon_dtype(self):
         f = Field(name="age", dtype=DataType.from_arrow_type(pa.int64()))
         self.assertEqual(f.short(), "age:i64")
