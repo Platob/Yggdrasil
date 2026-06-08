@@ -64,6 +64,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import unicodedata
 from abc import abstractmethod
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Iterator, TypeVar
@@ -85,6 +86,39 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+#: Whitespace that would break column alignment, mapped to a single space.
+_WS_TRANS = {ord(c): " " for c in "\n\t\r\v\f"}
+
+
+def _char_width(ch: str) -> int:
+    """A character's *display* width — 0 for combining marks, 2 for East-Asian
+    wide / fullwidth glyphs (CJK, emoji), else 1. So a table aligns on what the
+    terminal actually shows, not the code-point count."""
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _disp_width(text: str) -> int:
+    return sum(_char_width(c) for c in text)
+
+
+def _clip_width(text: str, cap: int) -> str:
+    """Clip *text* to a *display-width* budget (not code points), ending in ``…``
+    — so one long value (or a wide-glyph value) can't balloon the display."""
+    if _disp_width(text) <= cap:
+        return text
+    out: list[str] = []
+    width = 0
+    for ch in text:
+        cw = _char_width(ch)
+        if width + cw > cap - 1:
+            break
+        out.append(ch)
+        width += cw
+    return "".join(out) + "…"
 
 
 def _compact_nested(value: Any) -> str:
@@ -2557,32 +2591,36 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
             if len(rows) >= n:
                 break
 
-        def clip(text: str, cap: int) -> str:
-            return text if len(text) <= cap else text[: cap - 1] + "…"
-
         def cell(value: Any) -> str:
             if value is None:
                 text = "·"                                # nulls read clearly
             elif isinstance(value, (dict, list, tuple)):     # nested → compact
                 text = _compact_nested(value)
             else:
-                text = str(value).replace("\n", " ")
-            return clip(text, max_width)                  # long values never balloon
+                text = str(value).translate(_WS_TRANS)    # no tabs/newlines to skew columns
+            return _clip_width(text, max_width)           # long values never balloon
 
-        # Two-row header (names, then type tags) + alignment all derive from the
-        # project Field / DataType — recursive short type repr + a numeric test.
+        # Two-row header (names, then type tags + the field's main schema markers)
+        # — all from the project Field / DataType: recursive short type repr, the
+        # markers (PK / partition / required), and a numeric test for alignment.
+        def type_tag(f: _Field) -> str:
+            marks = f.markers()
+            return f"{f.dtype.short()} {marks}" if marks else f.dtype.short()
+
         head_cap = max(max_width, 44)
-        names = [clip(f.name, head_cap) for f in fields]
-        types = [clip(f.dtype.short(), head_cap) for f in fields]
+        names = [_clip_width(f.name, head_cap) for f in fields]
+        types = [_clip_width(type_tag(f), head_cap) for f in fields]
         right = [f.dtype.type_id.is_numeric or f.dtype.type_id.is_boolean for f in fields]
         body = [[cell(v) for v in row] for row in rows]
-        widths = [max([len(names[i]), len(types[i])] + [len(r[i]) for r in body])
+        widths = [max([_disp_width(names[i]), _disp_width(types[i])]
+                      + [_disp_width(r[i]) for r in body])
                   for i in range(len(columns))]
 
         def pad(text: str, i: int) -> str:
-            return text.rjust(widths[i]) if right[i] else text.ljust(widths[i])
+            gap = " " * max(0, widths[i] - _disp_width(text))   # pad by display width
+            return (gap + text) if right[i] else (text + gap)
 
-        def line(cells: "list[str]") -> str:
+        def line(cells: list[str]) -> str:
             return " │ ".join(pad(c, i) for i, c in enumerate(cells))
 
         lines = [line(names), line(types), "─┼─".join("─" * w for w in widths)]

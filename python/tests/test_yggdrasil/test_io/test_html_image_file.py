@@ -211,3 +211,60 @@ class TestTabularDisplay(unittest.TestCase):
         p.write_text("n\n" + "\n".join(str(i) for i in range(100)) + "\n")
         out = IO.from_(str(p)).display(5)
         self.assertIn("first 5 rows", out)
+
+    def test_schema_markers_in_type_row(self):
+        try:
+            import pyarrow as pa
+        except Exception:
+            self.skipTest("pyarrow not installed")
+        import tempfile
+        from pathlib import Path
+
+        from yggdrasil.data import DataType, Field, Schema
+        from yggdrasil.io.holder import IO
+
+        # A primary-key, non-nullable id and a partition column — their main
+        # schema markers ride along on the type-tags row (PK / * / partition).
+        f_id = Field(name="id", dtype=DataType.from_arrow_type(pa.int64()),
+                     nullable=False, tags={"primary_key": True})
+        f_dt = Field(name="dt", dtype=DataType.from_arrow_type(pa.int32()),
+                     tags={"partition_by": True})
+        f_city = Field(name="city", dtype=DataType.from_arrow_type(pa.string()))
+        schema = Schema.from_fields([f_id, f_dt, f_city])
+        tbl = pa.table({"id": [1, 2], "dt": [10, 20], "city": ["Paris", "Tokyo"]},
+                       schema=schema.to_arrow_schema())
+        p = Path(tempfile.mkdtemp()) / "marks.arrow"
+        IO.from_(str(p)).write_arrow_table(tbl)
+        types_row = IO.from_(str(p)).display().splitlines()[1]
+        self.assertIn("i64 PK *", types_row)        # key + required marker
+        self.assertIn("partition", types_row)        # layout marker
+        # …and an unmarked column carries only its bare type tag.
+        self.assertIn("str", types_row)
+
+    def test_wide_glyphs_align_by_display_width(self):
+        try:
+            import pyarrow as pa
+        except Exception:
+            self.skipTest("pyarrow not installed")
+        import tempfile
+        from pathlib import Path
+
+        from yggdrasil.io.holder import IO
+
+        # CJK glyphs occupy two terminal columns each: "東京" (2 code points,
+        # 4 display columns) must align with "Paris" (5), not on len().
+        tbl = pa.table({"city": ["Paris", "東京"], "n": [1, 2]})
+        p = Path(tempfile.mkdtemp()) / "cjk.arrow"
+        IO.from_(str(p)).write_arrow_table(tbl)
+        lines = IO.from_(str(p)).display().splitlines()
+        # Every rendered row shares one display width (the alignment invariant),
+        # even though the byte/char lengths differ because of the wide glyphs.
+        import unicodedata
+
+        def dwidth(s: str) -> int:
+            return sum(0 if unicodedata.combining(c)
+                       else 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                       for c in s)
+
+        rule = lines[2]
+        self.assertEqual({dwidth(line) for line in lines[:5]}, {dwidth(rule)})
