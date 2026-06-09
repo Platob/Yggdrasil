@@ -132,9 +132,14 @@ class AnalysisService:
 
         def _fit(x_arr: list, y_arr: list, model: str):
             import numpy as np
-            X = np.array(x_arr).reshape(-1, 1)
+            X_raw = np.array(x_arr, dtype=float).reshape(-1, 1)
             y = np.array(y_arr)
-            feats = np.hstack([X, X ** 2, np.sin(2 * math.pi * X / max(req.period, 1))])
+            # Normalise the trend features (linear + quadratic) to [0,1] so
+            # Ridge gets a well-conditioned matrix.  The sin seasonality term
+            # uses the original x scale so period has the right meaning.
+            x_min, x_range = X_raw.min(), X_raw.max() - X_raw.min()
+            X = (X_raw - x_min) / (x_range if x_range else 1.0)
+            feats = np.hstack([X, X ** 2, np.sin(2 * math.pi * X_raw / max(req.period, 1))])
             if model == "xgboost":
                 try:
                     from xgboost import XGBRegressor
@@ -171,16 +176,20 @@ class AnalysisService:
             import numpy as np
             m, _, mu = _fit(xs, ys, req.model)
             model_used = mu
-            last_x = max(xs)
-            step = (last_x - min(xs)) / max(len(xs) - 1, 1) if len(xs) > 1 else 1
-            fut_x = np.array([last_x + step * (i + 1) for i in range(req.horizon)]).reshape(-1, 1)
+            xs_arr = np.array(xs, dtype=float)
+            x_min, x_range = xs_arr.min(), xs_arr.max() - xs_arr.min()
+            _norm = lambda x: (x - x_min) / (x_range if x_range else 1.0)  # noqa: E731
+            last_x = xs_arr.max()
+            step = x_range / max(len(xs) - 1, 1) if len(xs) > 1 else 1.0
+            fut_x_raw = np.array([last_x + step * (i + 1) for i in range(req.horizon)])
+            fut_x = _norm(fut_x_raw).reshape(-1, 1)
             fut_feats = np.hstack([fut_x, fut_x ** 2,
-                                   np.sin(2 * math.pi * fut_x / max(req.period, 1))])
+                                   np.sin(2 * math.pi * fut_x_raw.reshape(-1, 1) / max(req.period, 1))])
             preds = m.predict(fut_feats).tolist()
+            train_x = _norm(xs_arr).reshape(-1, 1)
             train_feats = np.hstack([
-                np.array(xs).reshape(-1, 1),
-                np.array(xs).reshape(-1, 1) ** 2,
-                np.sin(2 * math.pi * np.array(xs).reshape(-1, 1) / max(req.period, 1)),
+                train_x, train_x ** 2,
+                np.sin(2 * math.pi * xs_arr.reshape(-1, 1) / max(req.period, 1)),
             ])
             res_sq = (np.array(ys) - m.predict(train_feats)) ** 2
             rmse = float(np.sqrt(res_sq.mean()))
