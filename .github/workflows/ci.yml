@@ -4,9 +4,13 @@
 # Validation gate for every push / PR to main — the publish workflows
 # assume the tree is healthy; this is what makes that true.
 #
-# - python-tests: full pytest suite minus the `spark` marker (JVM boot
-#   is benchmarked separately) — integration-marked tests self-skip
-#   when DATABRICKS_HOST is absent.
+# - python-tests: full pytest suite minus the `spark` marker —
+#   integration-marked tests self-skip when DATABRICKS_HOST is absent.
+#   pyspark is deliberately NOT installed: a leaked SparkSession from
+#   any test poisons PyEnv._SPARK_SESSION for the rest of the process
+#   and silently reroutes every Tabular read through the Spark engine
+#   (see Tabular._read_table), failing ~20 unrelated cache tests.
+#   Until session hygiene is fixed, spark coverage stays local-only.
 # - python-lint: ruff with the rule set in python/pyproject.toml.
 #   (mypy is configured but not gated yet — see [tool.mypy] there.)
 # - js: tsc --noEmit + vitest for the packages/yggdrasil port.
@@ -53,7 +57,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Install package + test extras
-        run: uv pip install -e ".[dev,pickle,api,excel]" pyspark
+        run: uv pip install -e ".[dev,pickle,api,excel,html,image]"
 
       - name: Run pytest
         run: python -m pytest tests -q -m "not spark"

@@ -15,12 +15,34 @@ try:
 except Exception:  # pragma: no cover
     _HAVE_STACK = False
 
+try:
+    # The full pandas.read_html parser chain — lxml for tables,
+    # html5lib + bs4 for the table-less text degradation.
+    import bs4  # noqa: F401
+    import html5lib  # noqa: F401
+    import lxml  # noqa: F401
+
+    _HAVE_HTML = True
+except Exception:  # pragma: no cover
+    _HAVE_HTML = False
+
+try:
+    import PIL  # noqa: F401
+
+    _HAVE_PIL = True
+except Exception:  # pragma: no cover
+    _HAVE_PIL = False
+
+_need_html = unittest.skipUnless(_HAVE_HTML, "requires the [html] extra (lxml/html5lib/bs4)")
+_need_pil = unittest.skipUnless(_HAVE_PIL, "requires the [image] extra (pillow)")
+
 
 @unittest.skipUnless(_HAVE_STACK, "requires the polars/pyarrow stack")
 class TestHtmlImageLeaves(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="ygg-leaf-"))
 
+    @_need_html
     def test_html_table_parses_to_frame(self):
         (self.dir / "t.html").write_text(
             "<html><body><table><tr><th>a</th><th>b</th></tr>"
@@ -32,12 +54,14 @@ class TestHtmlImageLeaves(unittest.TestCase):
         self.assertEqual(list(df.columns), ["a", "b"])
         self.assertEqual(df["b"].sum(), 6)
 
+    @_need_html
     def test_html_without_table_degrades_to_text(self):
         (self.dir / "p.html").write_text("<html><body><h1>Hi</h1><p>No tables.</p></body></html>")
         rows = IO.from_(str(self.dir / "p.html")).to_polars().to_dicts()
         self.assertEqual(list(rows[0].keys()), ["text"])
         self.assertIn("No tables", rows[0]["text"])
 
+    @_need_html
     def test_html_roundtrip_write_read(self):
         import polars as pl
 
@@ -48,6 +72,7 @@ class TestHtmlImageLeaves(unittest.TestCase):
         self.assertEqual(back.shape, (2, 2))
         self.assertEqual(set(back.columns), {"x", "y"})
 
+    @_need_pil
     def test_png_metadata_projection(self):
         from PIL import Image
 
@@ -58,6 +83,7 @@ class TestHtmlImageLeaves(unittest.TestCase):
         self.assertEqual(row["mode"], "RGB")
         self.assertGreater(row["bytes"], 0)
 
+    @_need_pil
     def test_jpeg_uses_same_leaf_via_alias(self):
         from PIL import Image
 

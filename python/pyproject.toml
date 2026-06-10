@@ -110,6 +110,20 @@ excel = [
   "openpyxl",
 ]
 
+# HTML Tabular leaf — pandas.read_html with its full parser fallback
+# chain (lxml first, then html5lib/bs4 for table-less degradation).
+html = [
+  "pandas>=2.1",
+  "lxml",
+  "html5lib",
+  "beautifulsoup4",
+]
+
+# Image metadata leaf (PNG/JPEG → metadata rows).
+image = [
+  "pillow",
+]
+
 [project.urls]
 Homepage = "https://github.com/Platob/Yggdrasil"
 Repository = "https://github.com/Platob/Yggdrasil"
