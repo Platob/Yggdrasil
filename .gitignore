@@ -18,6 +18,7 @@ lib/
 lib64/
 !src/lib/
 !nextjs/src/lib/
+!app/lib/
 parts/
 sdist/
 var/
