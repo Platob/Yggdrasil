@@ -442,6 +442,81 @@ class TestCacheUpsert:
         rows_after = _folder(local_cache_dir).read_arrow_table().num_rows
         assert rows_after >= 1
 
+    def test_upsert_mode_refetches(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        from yggdrasil.enums import Mode
+        cache = CacheConfig(tabular=_folder(local_cache_dir), mode=Mode.UPSERT)
+        cfg = SendConfig(local_cache=cache)
+
+        resp1 = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg,
+        )
+        n1 = resp1.json()["n"]
+
+        # UPSERT is a refresh disposition: the cached entry is evicted to a
+        # miss, the wire is hit again, and the fresh row replaces it.
+        resp2 = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=cfg,
+        )
+        assert resp2.json()["n"] > n1
+        assert _Handler.call_count == 2
+
+        # The refreshed row is what an APPEND-mode read now serves.
+        read_cfg = SendConfig(
+            local_cache=CacheConfig(tabular=_folder(local_cache_dir)),
+        )
+        resp3 = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"), config=read_cfg,
+        )
+        assert resp3.json()["n"] == resp2.json()["n"]
+        assert _Handler.call_count == 2
+
+    def test_upsert_mode_cache_only_serves_hit(self, base_url, local_cache_dir):
+        session = HTTPSession(base_url=base_url)
+        from yggdrasil.enums import Mode
+        cache = CacheConfig(tabular=_folder(local_cache_dir), mode=Mode.UPSERT)
+
+        session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=SendConfig(local_cache=cache),
+        )
+        n_after_warm = _Handler.call_count
+
+        # cache_only has no network leg to refresh from — the cached row is
+        # served even under a refresh-mode cache.
+        resp = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=SendConfig(local_cache=cache, cache_only=True),
+        )
+        assert resp.status_code == 200
+        assert _Handler.call_count == n_after_warm
+
+    def test_upsert_mode_with_received_window_serves_hit(self, base_url, local_cache_dir):
+        import datetime as dt
+        session = HTTPSession(base_url=base_url)
+        from yggdrasil.enums import Mode
+
+        warm = CacheConfig(tabular=_folder(local_cache_dir), mode=Mode.UPSERT)
+        resp1 = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=SendConfig(local_cache=warm),
+        )
+        n1 = resp1.json()["n"]
+
+        # An explicit received window decides freshness — the in-window hit
+        # is served and UPSERT only shapes the writeback.
+        windowed = CacheConfig(
+            tabular=_folder(local_cache_dir),
+            mode=Mode.UPSERT,
+            received_from=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1),
+        )
+        resp2 = session.send(
+            HTTPRequest.prepare(method="GET", url=f"{base_url}/json"),
+            config=SendConfig(local_cache=windowed),
+        )
+        assert resp2.json()["n"] == n1
+        assert _Handler.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Cache key correctness

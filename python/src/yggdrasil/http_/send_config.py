@@ -162,7 +162,14 @@ class SendConfig:
                 LOGGER.warning("Cache probe failed for %r", holder, exc_info=True)
                 return set()
 
-        if self.local_cache is not None:
+        # A refresh-mode cache (``CacheConfig.refetch`` — UPSERT / MERGE /
+        # OVERWRITE / TRUNCATE without a received window) never serves hits:
+        # its entries fall through to misses so the wire response replaces
+        # them on writeback. ``cache_only`` overrides — there is no network
+        # leg to refresh from, so whatever is cached is served.
+        if self.local_cache is not None and (
+            self.cache_only or not self.local_cache.refetch
+        ):
             local_hashes = _probe(self.local_cache) & request_hash_set
             if local_hashes:
                 matched = [r for r in misses if r.match_value(MATCH_KEY) in local_hashes]
@@ -173,7 +180,9 @@ class SendConfig:
                         ", ".join(f"{r.method} {r.url}" for r in matched),
                     )
 
-        if self.remote_cache is not None and misses:
+        if self.remote_cache is not None and misses and (
+            self.cache_only or not self.remote_cache.refetch
+        ):
             remaining = {r.match_value(MATCH_KEY) for r in misses}
             remote_hashes = _probe(self.remote_cache) & remaining
             if remote_hashes:

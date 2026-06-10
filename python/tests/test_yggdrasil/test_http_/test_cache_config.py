@@ -201,6 +201,24 @@ class TestConstants:
         assert isinstance(MATCH_COLUMN, str)
 
 
+class TestRefetch:
+    """Refresh-mode caches bypass the read so the wire response replaces them."""
+
+    def test_append_serves_hits(self):
+        assert CacheConfig(mode=Mode.APPEND).refetch is False
+
+    def test_refresh_modes_refetch(self):
+        for mode in (Mode.UPSERT, Mode.MERGE, Mode.OVERWRITE, Mode.TRUNCATE):
+            assert CacheConfig(mode=mode).refetch is True
+
+    def test_received_window_overrides_refetch(self):
+        c = CacheConfig(
+            mode=Mode.UPSERT,
+            received_from=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        assert c.refetch is False
+
+
 # ---------------------------------------------------------------------------
 # DEFAULT_CACHE_CONFIG singleton
 # ---------------------------------------------------------------------------
