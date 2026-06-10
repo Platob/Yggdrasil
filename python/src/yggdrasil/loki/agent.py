@@ -139,6 +139,19 @@ DATA_SIGNALS: tuple[str, ...] = (
     "records", "metrics", "statistics", "prices", "price of", "rate", "rates",
     "exchange", "stock", "ticker", "quotes", "ohlc", "candles", "fx ",
 )
+#: FX / currency phrasing → the ``fxrate`` skill (spot or windowed rates).
+FXRATE_SIGNALS: tuple[str, ...] = (
+    "fx rate", "fx rates", "exchange rate", "exchange rates", "currency pair",
+    "eur/usd", "usd/jpy", "gbp/usd", "usd/chf", "forex", " fx ", "convert ",
+    "how much is", "spot rate",
+)
+
+#: Candlestick / market-data phrasing → the ``ohlc`` skill.
+OHLC_SIGNALS: tuple[str, ...] = (
+    "ohlc", "candlestick", "candlestick chart", "candles", "price history",
+    "market data", "open high low close", "candle chart",
+)
+
 #: Signals that a request is a *time series* (history over a period).
 TIMESERIES_SIGNALS: tuple[str, ...] = (
     "time series", "timeseries", "over the last", "over the past", "since ",
@@ -842,6 +855,28 @@ class Loki:
         ):
             return made("files", "scaffold",
                         why="scaffold a ready-to-push project from scratch")
+        # FX rates → the fxrate skill. Pull any "EUR/USD"-style pairs out of the
+        # text so the skill fetches exactly what was asked.
+        if not re.search(r"https?://", text) and any(s in low for s in FXRATE_SIGNALS):
+            pairs = re.findall(r"\b([A-Za-z]{3})\s*/\s*([A-Za-z]{3})\b", text)
+            p = made("data", "skill", why="FX/currency request → fxrate skill")
+            p.skill = "fxrate"
+            p.skill_kwargs = {"pairs": [f"{a.upper()}/{b.upper()}" for a, b in pairs]} if pairs else {}
+            return p
+
+        # Candlestick / OHLC market data → the ohlc skill (needs a file/URL source).
+        if any(s in low for s in OHLC_SIGNALS):
+            src = re.search(r"https?://\S+", text)
+            file_m = re.search(
+                r"(?:[\w./~-]*/)?[\w.-]+\.(?:csv|tsv|parquet|pq|arrow|feather|xlsx|xls)\b",
+                text, re.I,
+            )
+            p = made("data", "skill", why="candlestick/OHLC market data → ohlc skill")
+            p.skill = "ohlc"
+            chosen = (src.group(0).rstrip(").,") if src else None) or (file_m.group(0) if file_m else None)
+            p.skill_kwargs = {"source": chosen} if chosen else {}
+            return p
+
         # Power-market data → the entsoe skill, with series/zone inferred. Gate on
         # a data word (or an explicit ENTSO-E mention) so "what is electricity"
         # stays a plain question.

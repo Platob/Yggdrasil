@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import sys
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from yggdrasil import version
 from yggdrasil.exceptions.api import (
@@ -43,7 +44,13 @@ from yggdrasil.node.transport import (
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
-    app = FastAPI(title="ygg-node")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        _app.state.audit.close()  # flush the pending audit tail to disk
+
+    app = FastAPI(title="ygg-node", lifespan=lifespan)
     register_api_exception_handlers(app)
     started = time.monotonic()
 
@@ -190,9 +197,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v2/tabular/inspect")
     async def tabular_inspect(path: str) -> dict:
         return (await app.state.tabular.inspect(path)).model_dump()
-
-    @app.on_event("shutdown")
-    def _flush() -> None:
-        app.state.audit.close()
 
     return app

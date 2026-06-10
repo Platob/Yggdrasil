@@ -86,7 +86,10 @@ def _group_pairs_by_source(pairs: Iterable[tuple[Currency, Currency]]) -> dict[s
 class FxRate:
     def __new__(cls, *, backends: Sequence[Backend] | None = None, base_url: str | None = None) -> "FxRate":
         chain = tuple(backends) if backends else DEFAULT_BACKENDS
-        key = (tuple(b.name for b in chain), base_url)
+        # Identity keys on the concrete backend objects, not just their names —
+        # two stubs both named "stub" with different quote lists are different
+        # sessions, while the shared DEFAULT_BACKENDS instances dedupe to one.
+        key = (tuple(id(b) for b in chain), base_url)
         cached = _INSTANCES.get(key)
         if cached is not None:
             return cached

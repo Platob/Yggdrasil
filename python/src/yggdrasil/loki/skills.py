@@ -33,8 +33,9 @@ from .skill import LokiSkill, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentSkill", "DelegateSkill", "EntsoeSkill", "PythonProjectSkill",
-           "ScaffoldSkill", "SetupSkill", "WebSkill", "TabularSkill", "TransformSkill"]
+__all__ = ["AgentSkill", "DelegateSkill", "EntsoeSkill", "FxRateSkill", "OhlcSkill",
+           "PythonProjectSkill", "ScaffoldSkill", "SetupSkill", "WebSkill",
+           "TabularSkill", "TransformSkill"]
 
 
 @register
@@ -643,3 +644,119 @@ class PythonProjectSkill(LokiSkill):
                 stderr=proc.stderr,
             )
         return result
+
+
+@register
+class FxRateSkill(LokiSkill):
+    """Fetch FX rates (spot or a window) for currency pairs into a frame.
+
+    The trading FX path: hand it ``pairs`` ("EUR/USD", ("USD","JPY"), …) and
+    it fetches through :class:`~yggdrasil.fxrate.FxRate` — coercing inputs,
+    grouping pairs by source, walking the backend chain (Frankfurter → ER-API)
+    with fallback, and assembling a long polars frame. With ``start``/``end``
+    it pulls the daily window; otherwise the latest spot. ``geo=True`` enriches
+    each currency with its country/lat/lon. Runs anywhere (no backend).
+    """
+
+    name = "fxrate"
+    description = "Fetch FX spot or windowed rates for currency pairs as a polars frame."
+    preprompt = (
+        "You are an FX desk analyst. Reason only from the fetched rates; a "
+        "value is units of the target currency per 1 unit of the source. Be "
+        "precise about pair direction, the date window, and the rate source."
+    )
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        pairs: Optional[list] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        geo: bool = False,
+        **_: Any,
+    ) -> dict[str, Any]:
+        from yggdrasil.fxrate import FxRate
+
+        if not pairs:
+            pairs = ["EUR/USD"]
+        fx = FxRate()
+        if start and end:
+            df = fx.fetch(pairs=pairs, start=start, end=end, geo=geo)
+            mode = "window"
+        else:
+            df = fx.latest(pairs=pairs, geo=geo)
+            mode = "latest"
+        return {
+            "mode": mode,
+            "pairs": pairs,
+            "rows": df.height,
+            "columns": list(df.columns),
+            "preview": str(df.head(20)),
+            "frame": df,
+        }
+
+
+@register
+class OhlcSkill(LokiSkill):
+    """Resample a price series into OHLC candlestick bars from a file or URL.
+
+    The market-data path: point it at a tabular ``source`` (URL auto-fetched +
+    cached through the io handlers, or a local/columnar file) and a price
+    ``column``; it runs :meth:`AnalysisService.ohlc` to bucket the rows into
+    ``buckets`` open/high/low/close bars (the lazy-scan resample — only the
+    price column is read). Returns bars ready for a candlestick chart. Runs
+    anywhere (no backend).
+    """
+
+    name = "ohlc"
+    description = "Resample a price column from a file/URL into OHLC candlestick bars."
+    preprompt = (
+        "You are a market technician reading OHLC bars. Reason only from the "
+        "returned bars; each bar is open/high/low/close over one bucket of the "
+        "series. Note trends, gaps, and the high/low range."
+    )
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        source: Optional[str] = None,
+        url: Optional[str] = None,
+        column: str = "close",
+        buckets: int = 100,
+        time_col: Optional[str] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        import asyncio
+
+        from yggdrasil.io.holder import IO
+        from yggdrasil.node.api.schemas.analysis import OhlcRequest
+        from yggdrasil.node.api.services.analysis import AnalysisService
+        from yggdrasil.node.api.services.fs import FsService
+        from yggdrasil.node.config import Settings
+
+        src = source or url
+        if not src:
+            raise ValueError("provide source= (a file path or URL) to resample into OHLC")
+
+        # Cache the source as parquet under a node home, then resample it through
+        # the analysis engine's lazy-scan ohlc (reads only the price column).
+        cdir = pathlib.Path.home() / ".loki" / "cache"
+        cdir.mkdir(parents=True, exist_ok=True)
+        key = _auto_key(src)
+        cached = cdir / f"{key}.parquet"
+        IO.from_(str(cached)).write_polars_frame(IO.from_(str(src)).to_polars())
+
+        settings = Settings(node_id="loki", node_home=cdir, front_home=cdir)
+        svc = AnalysisService(settings, fs=FsService(settings))
+        res = asyncio.run(svc.ohlc(OhlcRequest(
+            path=cached.name, column=column, buckets=buckets, time_col=time_col,
+        )))
+        return {
+            "source": src,
+            "column": column,
+            "bars": res.bars,
+            "cached_to": str(cached),
+            "data": [b.model_dump() for b in res.data],
+        }
