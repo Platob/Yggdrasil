@@ -369,6 +369,23 @@ class CacheConfig:
             return False
         return self.tabular is not None
 
+    @property
+    def refetch(self) -> bool:
+        """True when cached entries must be refetched instead of served.
+
+        UPSERT / MERGE / OVERWRITE / TRUNCATE are refresh dispositions:
+        the caller wants the cached row *replaced* by a fresh wire
+        response, so serving a hit would skip the refresh entirely. An
+        explicit ``received_from`` / ``received_to`` window overrides
+        this — the window decides freshness (in-window hits are still
+        served) and the mode only shapes how the writeback lands.
+        """
+        if self.received_from is not None or self.received_to is not None:
+            return False
+        return self.mode in (
+            Mode.OVERWRITE, Mode.UPSERT, Mode.MERGE, Mode.TRUNCATE,
+        )
+
 
     @property
     def defined_received_from(self) -> dt.datetime:
