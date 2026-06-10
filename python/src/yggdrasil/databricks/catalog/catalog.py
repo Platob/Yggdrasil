@@ -33,7 +33,6 @@ from typing import Any, ClassVar, Iterable, Iterator, Mapping, Optional, TYPE_CH
 from databricks.sdk.errors import DatabricksError, NotFound
 from databricks.sdk.service.catalog import CatalogInfo, SecurableType
 from yggdrasil.concurrent.threading import Job
-from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.enums import MediaTypes, MimeType, MimeTypes, Scheme
 from yggdrasil.dataclasses import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg

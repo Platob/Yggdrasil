@@ -51,6 +51,7 @@ from yggdrasil.disposable import Disposable
 from yggdrasil.io.tabular import Tabular, O
 
 if TYPE_CHECKING:
+    from pyspark.sql import DataFrame as SparkDataFrame
     from yggdrasil.data.executor import StatementExecutor
 
 logger = logging.getLogger(__name__)

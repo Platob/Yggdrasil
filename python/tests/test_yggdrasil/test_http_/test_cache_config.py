@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import datetime as dt
 
-import pytest
 
 from yggdrasil.enums import Mode
 from yggdrasil.http_.cache_config import (

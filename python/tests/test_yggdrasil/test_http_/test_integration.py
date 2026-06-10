@@ -486,7 +486,6 @@ class TestCacheKeyCorrectness:
         assert resp2.json()["n"] == n1
 
     def test_different_query_params_different_cache_key(self, base_url, local_cache_dir):
-        session = HTTPSession(base_url=base_url)
         req_a = HTTPRequest.prepare(method="GET", url=f"{base_url}/json?page=1")
         req_b = HTTPRequest.prepare(method="GET", url=f"{base_url}/json?page=2")
         assert req_a.public_hash != req_b.public_hash

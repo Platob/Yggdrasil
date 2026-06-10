@@ -22,7 +22,6 @@ import pyarrow.json as paj
 # orjson failures too — including the ``msg`` / ``lineno`` / ``colno``
 # attributes we use for row-pointing error messages downstream.
 
-from yggdrasil.data.types.base import DataType
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.lazy_imports import polars_module, spark_sql_module
 

@@ -15,8 +15,6 @@ from unittest.mock import MagicMock
 import pyarrow as pa
 import pytest
 
-from yggdrasil.aws.fs.path import S3Path
-from yggdrasil.aws.fs.service import S3Service
 from yggdrasil.databricks.fs import DBFSPath, VolumePath
 from yggdrasil.databricks.fs.service import DBFSService
 from yggdrasil.databricks.volume.volumes import Volumes

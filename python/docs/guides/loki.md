@@ -24,7 +24,7 @@ raises) and reports the backends it can lean on:
 | Backend | Detected from |
 |---|---|
 | `databricks` | the Databricks runtime, `DATABRICKS_*` env vars, `~/.databrickscfg`, or a session remembered by `ygg databricks configure` |
-| `node` | a configured yggdrasil node home (`~/.node` / `YGG_NODE_HOME`) |
+| `aws` | signals that boto3 can resolve credentials (`AWS_*` env vars, `~/.aws` config / credentials) |
 | `local` | always available |
 
 ```python

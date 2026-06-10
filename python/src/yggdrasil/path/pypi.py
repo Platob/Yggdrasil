@@ -441,8 +441,8 @@ class PyPIPath:
                 raise RuntimeError(
                     f"Failed to build wheel for {local_root!r}: no wheel "
                     f"backend available. Tried: " + "; ".join(errors) + ". "
-                    f"Install one with `pip install build` or seed pip via "
-                    f"`python -m ensurepip --upgrade`."
+                    "Install one with `pip install build` or seed pip via "
+                    "`python -m ensurepip --upgrade`."
                 ) from exc
             cmd = [
                 sys.executable, "-m", "pip", "wheel",

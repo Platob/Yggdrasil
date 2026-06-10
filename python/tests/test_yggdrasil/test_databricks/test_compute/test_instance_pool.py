@@ -7,7 +7,6 @@ boundary while exercising the real :class:`InstancePools` /
 from __future__ import annotations
 
 from dataclasses import replace
-from unittest.mock import MagicMock
 
 from databricks.sdk.errors import ResourceDoesNotExist
 from databricks.sdk.service.compute import (

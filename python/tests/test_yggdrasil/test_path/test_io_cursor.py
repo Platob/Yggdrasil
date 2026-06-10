@@ -6,7 +6,6 @@ import pytest
 
 from yggdrasil.path.local_path import LocalPath
 from yggdrasil.enums import Mode
-from yggdrasil.data.options import CastOptions
 
 
 class TestCursorLifecycle:

@@ -31,7 +31,6 @@ from .service import (
     _is_numeric,
     _resolve_cluster_id,
     _resolve_job_obj,
-    _resolve_run_obj,
     _set_cached_name,
 )
 

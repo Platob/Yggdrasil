@@ -6,7 +6,6 @@ secondary path is the 5-minute TTL refresh and the cascade
 """
 from __future__ import annotations
 
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 

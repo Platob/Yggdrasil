@@ -295,7 +295,6 @@ class Jobs(DatabricksService):
             Returned when the job is not found.  ``...`` (the default)
             raises :class:`ResourceDoesNotExist`.
         """
-        from .job import Job
 
         job_id, name = _resolve_job_obj(obj, job_id=job_id, name=name)
 
@@ -623,7 +622,6 @@ class JobRuns(DatabricksService):
         resolved_job_id, resolved_name = _resolve_job_obj(obj, job_id=job_id, name=name)
 
         if resolved_name and not resolved_job_id:
-            from .job import Job
             found = Jobs(client=self.client).get(name=resolved_name, default=None)
             if found is not None:
                 resolved_job_id = found.job_id

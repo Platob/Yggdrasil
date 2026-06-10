@@ -174,8 +174,9 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame
     from yggdrasil.execution.expr import Predicate, PredicateLike
     from yggdrasil.dataclasses.waiting import WaitingConfigArg
-    from yggdrasil.io.holder import Holder
+    from yggdrasil.plan.lazy import LazyTabular
     from yggdrasil.spark.tabular import SparkDataset
+    from yggdrasil.url import URL
 
 
 __all__ = ["Tabular", "is_tabular_source"]
@@ -1038,7 +1039,7 @@ class Tabular(Singleton, URLBased, Disposable, Generic[O]):
         missing_ok: bool = False,
         delete_staging: bool = True,
         **kwargs: Any,
-    ) -> "Table":
+    ) -> "Tabular":
         """Delete rows matching *predicate*; return this tabular.
 
         *predicate* is a :class:`Predicate` from

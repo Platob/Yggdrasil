@@ -64,7 +64,6 @@ from yggdrasil.execution.expr import (
     Predicate,
 )
 from yggdrasil.execution.expr.backends.sql import Dialect, to_sql as expr_to_sql
-from yggdrasil.io.holder import IO
 from yggdrasil.io.io_stats import IOKind, IOStats
 from yggdrasil.io.tabular import Tabular, O
 from yggdrasil.path import Path
@@ -87,6 +86,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks.aws import AWSDatabricksTableCredentials
     from yggdrasil.databricks.external.location.resource import ExternalLocation
     from yggdrasil.data.statement import StatementBatch
+    from yggdrasil.io.delta import DeltaFolder
 
 _READ_ONLY_MODES = frozenset({Mode.AUTO})
 

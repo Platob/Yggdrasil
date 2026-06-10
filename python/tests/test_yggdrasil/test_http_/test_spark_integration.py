@@ -142,7 +142,7 @@ class TestSparkResponseArrow:
 
     def test_response_to_spark_dataframe(self, base_url, spark):
         session = HTTPSession(base_url=base_url)
-        resp = session.get(f"/arrow_test")
+        resp = session.get("/arrow_test")
         arrow_table = resp.read_arrow_table()
         df = spark.createDataFrame(arrow_table.to_pandas())
         assert df.count() >= 1
@@ -653,7 +653,6 @@ class TestSparkHolderTypes:
             r.send_config = SendConfig(local_cache=cache)
         list(session.send_many(reqs, spark_session=spark))
 
-        import pyarrow as pa
         batches = list(_folder(local_cache_dir).read_arrow_batches())
         total = sum(b.num_rows for b in batches)
         assert total >= 1

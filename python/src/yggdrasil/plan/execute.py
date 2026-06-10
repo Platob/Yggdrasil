@@ -109,7 +109,7 @@ def _is_in_memory(t: "Tabular") -> bool:
 
 def _exec_select(node: SelectNode, tables: dict[str, "Tabular"]) -> "Tabular":
     from yggdrasil.arrow.tabular import ArrowTabular
-    from yggdrasil.execution.expr.nodes import Alias, Column, FunctionCall, Literal, Star
+    from yggdrasil.execution.expr.nodes import Alias, Column, FunctionCall, Literal
 
     # CTEs
     if node.ctes:
@@ -256,8 +256,8 @@ def _exec_select(node: SelectNode, tables: dict[str, "Tabular"]) -> "Tabular":
 
 def _exec_join(jc: JoinClause, tables: dict[str, "Tabular"]) -> "Tabular":
     from yggdrasil.arrow.tabular import ArrowTabular
-    from yggdrasil.execution.expr.nodes import Column, Comparison, Logical
-    from yggdrasil.execution.expr.operators import CompareOp, LogicalOp
+    from yggdrasil.execution.expr.nodes import Column, Comparison
+    from yggdrasil.execution.expr.operators import CompareOp
 
     left_table = _resolve_from(jc.left, tables).read_arrow_table()
     right_table = _resolve_from(jc.right, tables).read_arrow_table()
@@ -313,7 +313,7 @@ def _exec_join(jc: JoinClause, tables: dict[str, "Tabular"]) -> "Tabular":
 
 def _exec_group_by(result: "Tabular", node: SelectNode) -> "tuple[Tabular, dict | None]":
     from yggdrasil.arrow.tabular import ArrowTabular
-    from yggdrasil.execution.expr.nodes import Alias, Column, FunctionCall, Star
+    from yggdrasil.execution.expr.nodes import Alias, Column, FunctionCall
     import pyarrow.compute as pc
 
     table = result.read_arrow_table()
@@ -363,8 +363,6 @@ def _rewrite_having(having: Any, result: "Tabular", agg_alias_map: dict) -> Any:
         col_names = set(result.collect_schema().names)
     except Exception:
         col_names = set(result.read_arrow_table().column_names)
-
-    pa_map = {"count": "count", "sum": "sum", "avg": "mean", "min": "min", "max": "max", "mean": "mean"}
 
     def _rw(expr: Any) -> Any:
         if isinstance(expr, FunctionCall):

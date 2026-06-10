@@ -7,7 +7,7 @@ classic-cluster ``<stem>.requirements.txt``. Built by the
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 from yggdrasil.version import VersionInfo
 

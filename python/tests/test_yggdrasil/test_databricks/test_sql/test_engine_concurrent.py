@@ -6,10 +6,10 @@ Skipped unless ``DATABRICKS_HOST`` (and credentials) are set — see
 from __future__ import annotations
 
 import concurrent.futures as cf
+from typing import ClassVar
 
 import pyarrow as pa
 
-from yggdrasil.databricks.table.table import Table
 from yggdrasil.enums import Mode
 
 from ._sql_integration import SQLIntegrationCase

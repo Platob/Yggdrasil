@@ -104,7 +104,6 @@ from .exceptions import (
     ReadTimeoutError,
     SSLError,
 )
-from .response import HTTPResponse
 from .retry import Retry
 from .timeout import _resolve_timeout
 
@@ -1495,7 +1494,7 @@ class HTTPSession(Session):
                     _retry_stale=False,
                 )
             raise ReadTimeoutError(self, url.to_string(), str(exc)) from exc
-        except (OSError, http.client.HTTPException) as exc:
+        except (OSError, http.client.HTTPException):
             try:
                 conn.close()
             except Exception:

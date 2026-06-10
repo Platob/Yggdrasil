@@ -91,10 +91,8 @@ class TestPyEnvPip:
         env = PyEnv.current()
         # Run in a temp directory to avoid project-specific issues
         import tempfile
-        import os
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            cwd_backup = env.cwd
             try:
                 # Create a new PyEnv with temp working directory
                 env_tmp = PyEnv(python_path=env.python_path, cwd=Path(tmpdir))

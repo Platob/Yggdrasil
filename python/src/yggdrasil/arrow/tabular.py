@@ -92,7 +92,6 @@ from yggdrasil.io import IOStats
 from yggdrasil.io.tabular import O
 from yggdrasil.io.tabular.base import Tabular
 from yggdrasil.enums import MimeType, Mode
-from yggdrasil.pickle.serde import ObjectSerde
 
 logger = logging.getLogger(__name__)
 

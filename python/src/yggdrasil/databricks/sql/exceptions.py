@@ -1,6 +1,6 @@
 """Custom exceptions for Databricks SQL helpers."""
 from dataclasses import dataclass
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from databricks.sdk.service.sql import ServiceErrorCode, StatementState
 
@@ -24,7 +24,7 @@ class SQLError(DatabricksError):
     url: str | None = None
 
     def __str__(self) -> str:
-        return f"[%s][%s][%s]: %s" % (
+        return "[%s][%s][%s]: %s" % (
             self.url,
             self.state.name,
             self.error_code.value,

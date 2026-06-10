@@ -11,7 +11,6 @@ from yggdrasil.io.tabular import Tabular
 from yggdrasil.plan import (
     ExecutionPlan,
     InsertPlan,
-    LazyTabular,
     MergePlan,
     OperationResult,
     SelectPlan,

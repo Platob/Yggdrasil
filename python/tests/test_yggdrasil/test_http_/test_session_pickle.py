@@ -14,8 +14,6 @@ import warnings
 import pytest
 
 from yggdrasil.http_.session import HTTPSession
-from yggdrasil.http_.headers import HTTPHeaders
-from yggdrasil.dataclasses.waiting import WaitingConfig
 
 
 @pytest.fixture(autouse=True)

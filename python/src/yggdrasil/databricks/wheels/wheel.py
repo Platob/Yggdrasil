@@ -9,9 +9,8 @@ workspace filesystem. Built by the
 from __future__ import annotations
 
 from pathlib import Path as _LocalPath
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
-from yggdrasil.version import VersionInfo
 
 from ..resource import DatabricksResource
 

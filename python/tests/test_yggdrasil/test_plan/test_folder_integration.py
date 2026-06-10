@@ -13,12 +13,9 @@ import tempfile
 import pyarrow as pa
 import pytest
 
-from yggdrasil.arrow.tabular import ArrowTabular
 from yggdrasil.path.folder import Folder
 from yggdrasil.path.local_path import LocalPath
 from yggdrasil.plan import (
-    LazyTabular,
-    SelectPlan,
     parse_sql,
 )
 

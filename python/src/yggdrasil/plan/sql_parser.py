@@ -17,19 +17,16 @@ from typing import TYPE_CHECKING, Any
 from yggdrasil.enums import JoinType
 from yggdrasil.enums.dialect import Dialect
 from yggdrasil.execution.expr.backends.sql import (
-    _CAST_DTYPE_ALIASES,
     _CAST_TEMPORAL_PARSERS,
     _Token,
     _coerce_number,
     _resolve_dialect,
-    _tokenize,
 )
 from yggdrasil.execution.expr.nodes import (
     Alias,
     Arithmetic,
     Between,
     CaseWhen,
-    Cast,
     Column,
     Comparison,
     Expression,
@@ -40,7 +37,6 @@ from yggdrasil.execution.expr.nodes import (
     Literal,
     Logical,
     Not,
-    Predicate,
     SortOrder,
     Star,
     Subscript,
@@ -49,7 +45,7 @@ from yggdrasil.execution.expr.nodes import (
 )
 from yggdrasil.execution.expr.operators import ArithmeticOp, CompareOp, LogicalOp
 
-from .nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
+from .nodes import InsertNode, MergeNode, PlanNode, SelectNode
 from .ops import CTE, JoinClause, LateralViewItem, SetOp, SubqueryRef, TableRef
 
 if TYPE_CHECKING:
@@ -1037,7 +1033,7 @@ class SQLQueryParser:
             order_by = self._parse_order_by_list()
 
         if self._is_kw("ROWS", "RANGE"):
-            frame_type = self._eat().upper
+            self._eat()
             if self._accept_kw("BETWEEN"):
                 frame_start = self._parse_frame_bound()
                 self._expect_kw("AND")
@@ -1188,8 +1184,8 @@ class SQLQueryParser:
             unit = self._normalize_interval_unit(unit)
         else:
             raise self._error(
-                f"expected interval unit (DAY, HOUR, MINUTE, SECOND, "
-                f"MONTH, YEAR, WEEK) after INTERVAL literal"
+                "expected interval unit (DAY, HOUR, MINUTE, SECOND, "
+                "MONTH, YEAR, WEEK) after INTERVAL literal"
             )
         return FunctionCall(name="INTERVAL",
             args=(Literal(value=value_text), Literal(value=unit)))
@@ -1218,8 +1214,8 @@ class SQLQueryParser:
             field = self._eat().upper
         else:
             raise self._error(
-                f"expected EXTRACT field (YEAR, MONTH, DAY, HOUR, MINUTE, "
-                f"SECOND, DOW, DOY, EPOCH, QUARTER, WEEK)"
+                "expected EXTRACT field (YEAR, MONTH, DAY, HOUR, MINUTE, "
+                "SECOND, DOW, DOY, EPOCH, QUARTER, WEEK)"
             )
         self._expect_kw("FROM")
         source = self._parse_expr()
@@ -1251,7 +1247,7 @@ def parse_sql(
         cls = _get_parser_class(resolved)
     try:
         return cls(sql, resolved).parse()
-    except (ValueError, NotImplementedError) as exc:
+    except (ValueError, NotImplementedError):
         if default is not ...:
             return default
         raise

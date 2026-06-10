@@ -113,7 +113,7 @@ class TestUnpickleAndCast:
         assert got.column("b").to_pylist() == [2, 5]
 
     def test_read_polars_frame_from_pickled_table(self) -> None:
-        pl = pytest.importorskip("polars")
+        pytest.importorskip("polars")
         table = pa.table({"v": [1, 2, 3]})
         pf = _pf()
         pf.write_arrow_table(table)

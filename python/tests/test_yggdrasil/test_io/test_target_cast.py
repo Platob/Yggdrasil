@@ -7,12 +7,10 @@ across ArrowIPC, Parquet, and Folder backends.
 from __future__ import annotations
 
 import pyarrow as pa
-import pytest
 
 from yggdrasil.data import field, schema
-from yggdrasil.enums.media_type import MediaTypes
 from yggdrasil.path.memory import Memory
-from yggdrasil.path.folder import Folder, FolderOptions
+from yggdrasil.path.folder import Folder
 from yggdrasil.io.arrow_ipc_file import ArrowIPCFile
 from yggdrasil.io.parquet_file import ParquetFile
 

@@ -517,7 +517,7 @@ def _databricks_current_url(*, kind: DatabricksLinkKind = "auto") -> URL | None:
 
 def _ctx_tags() -> Mapping[str, str]:
     try:
-        ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # type: ignore[name-defined]
+        ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # type: ignore[name-defined]  # noqa: F821 — notebook-injected global (builtins.dbutils)
         payload = json.loads(ctx.toJson())
         tags = payload.get("tags") or {}
         return {str(k): str(v) for k, v in tags.items()}

@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import pytest
 
-from yggdrasil.plan import SelectNode, parse_sql, ScanNode, InsertNode, MergeNode
+from yggdrasil.plan import SelectNode, parse_sql, InsertNode, MergeNode
 from yggdrasil.plan.nodes import PlanNode
 from yggdrasil.plan.ops import (
-    CTE, JoinClause, LateralViewItem, SetOp, SubqueryRef, TableRef,
+    JoinClause, SubqueryRef, TableRef,
 )
 from yggdrasil.execution.expr.nodes import (
     Alias,
@@ -22,17 +22,14 @@ from yggdrasil.execution.expr.nodes import (
     Cast,
     Column,
     Comparison,
-    Expression,
     FunctionCall,
     InList,
     IsNull,
     Like,
     Literal,
     Logical,
-    Not,
     SortOrder,
     Star,
-    Subscript,
     WindowFunction,
     WindowSpec,
 )

@@ -10,7 +10,7 @@ import pyarrow.compute as pc
 
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.data.types.nested import NestedType
-from yggdrasil.lazy_imports import pandas_module, polars_module, spark_sql_module
+from yggdrasil.lazy_imports import polars_module, spark_sql_module
 from yggdrasil.environ.importlib import cached_from_import
 from yggdrasil.enums import Mode
 from yggdrasil.lazy_imports import field_class, struct_type_class
@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     import pyspark.sql.types as pst
     from yggdrasil.data.options import CastOptions
     from yggdrasil.data.data_field import Field
+    from yggdrasil.data.types.base import DataType
     from .struct import StructType
 
 __all__ = [
@@ -986,9 +987,6 @@ def cast_polars_list_expr_to_map(
 
     source_key_field = source_item_dtype.field_at(0)
     source_value_field = source_item_dtype.field_at(1)
-
-    target_key_name = target_type.key_field.name
-    target_value_name = target_type.value_field.name
 
     entry_expr = pl.struct([
         target_type.key_field.cast_polars_expr(

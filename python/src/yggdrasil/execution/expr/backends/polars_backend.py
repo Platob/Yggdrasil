@@ -263,14 +263,61 @@ def _lift_polars_node(node: Any) -> Expression:
 
 
 def _lift_polars_literal(payload: Any) -> Expression:
-    if isinstance(payload, dict):
-        # ``{"<dtype>": <value>}`` — pick the value, drop the dtype.
-        if len(payload) == 1:
-            value = next(iter(payload.values()))
-            if isinstance(value, dict) and "value" in value:
-                value = value["value"]
-            return Literal(value=value)
+    if isinstance(payload, dict) and len(payload) == 1:
+        kind, value = next(iter(payload.items()))
+        # polars ≥ 1.x wraps every literal in a ``Dyn`` (untyped
+        # Python scalar: ``{"Dyn": {"Int": 100}}``) or ``Scalar``
+        # (typed: ``{"Scalar": {"String": "buy"}}``) envelope.
+        if kind == "Dyn" and isinstance(value, dict) and len(value) == 1:
+            return Literal(value=next(iter(value.values())))
+        if kind == "Scalar" and isinstance(value, dict) and len(value) == 1:
+            scalar_kind, scalar_value = next(iter(value.items()))
+            return Literal(value=_decode_polars_scalar(scalar_kind, scalar_value))
+        # Legacy (pre-1.x) shape: ``{"<dtype>": <value>}`` — pick the
+        # value, drop the dtype.
+        if isinstance(value, dict) and "value" in value:
+            value = value["value"]
+        return Literal(value=value)
     return Literal(value=payload)
+
+
+def _decode_polars_scalar(kind: str, value: Any) -> Any:
+    """Decode one ``{"Scalar": {kind: value}}`` payload to a Python value.
+
+    String / Boolean / Int* / UInt* / Float* arrive as plain JSON
+    values and pass through. Temporal kinds arrive as epoch offsets;
+    ``List`` (the ``is_in`` value-set) arrives as Arrow IPC stream
+    bytes. Unknown kinds pass through raw — over-lifting a value we
+    don't understand is worse than handing the caller the payload.
+    """
+    import datetime as dt
+
+    if kind == "Null":
+        return None
+    if kind == "Date":
+        return dt.date(1970, 1, 1) + dt.timedelta(days=value)
+    if kind == "Datetime":
+        offset, unit, tz = value
+        scale_us = {
+            "Nanoseconds": 1 / 1000,
+            "Microseconds": 1,
+            "Milliseconds": 1000,
+        }.get(unit)
+        if scale_us is None:
+            return value
+        stamp = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc) + dt.timedelta(
+            microseconds=offset * scale_us,
+        )
+        if tz is None:
+            return stamp.replace(tzinfo=None)
+        import zoneinfo
+
+        return stamp.astimezone(zoneinfo.ZoneInfo(tz))
+    if kind == "List":
+        import pyarrow as pa
+
+        return pa.ipc.open_stream(bytes(value)).read_all().column(0).to_pylist()
+    return value
 
 
 _POLARS_BIN_OPS: dict[str, CompareOp] = {
@@ -310,7 +357,23 @@ def _lift_polars_binary(payload: dict[str, Any]) -> Expression:
 
 def _lift_polars_function(payload: dict[str, Any]) -> Expression:
     function = payload.get("function") or {}
-    name = function.get("function") if isinstance(function, dict) else function
+    # polars ≥ 1.x wraps the name in a category envelope —
+    # ``{"Boolean": "IsNull"}`` for option-free functions,
+    # ``{"Boolean": {"IsIn": {"nulls_equal": false}}}`` for ones with
+    # options. Older builds used a flat ``{"function": "IsNull"}``.
+    name: Any = function
+    options: dict[str, Any] = {}
+    if isinstance(function, dict):
+        if "function" in function:
+            name = function["function"]
+        elif len(function) == 1:
+            inner = next(iter(function.values()))
+            if isinstance(inner, dict) and len(inner) == 1:
+                name = next(iter(inner.keys()))
+                if isinstance(inner[name], dict):
+                    options = inner[name]
+            else:
+                name = inner
     args = [_lift_polars_node(a) for a in payload.get("input", [])]
     if name == "IsNull":
         return IsNull(args[0], negated=False)
@@ -342,6 +405,14 @@ def _lift_polars_function(payload: dict[str, Any]) -> Expression:
             negated=False,
             includes_null=has_null,
         )
+    if name == "IsBetween" and len(args) == 3:
+        if options.get("closed", "Both") != "Both":
+            raise NotImplementedError(
+                "from_polars: IsBetween with closed="
+                f"{options.get('closed')!r} has no AST equivalent — "
+                "Between is inclusive on both bounds."
+            )
+        return Between(args[0], args[1], args[2])
 
     raise NotImplementedError(
         f"from_polars: function {name!r} not implemented yet."

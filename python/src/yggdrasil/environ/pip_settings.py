@@ -10,7 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional, Tuple, Iterable, MutableMapping
+from typing import Any, Dict, List, Tuple, Iterable, MutableMapping
 
 __all__ = [
     "PipIndexSettings",

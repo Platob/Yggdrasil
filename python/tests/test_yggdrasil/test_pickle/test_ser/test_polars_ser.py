@@ -15,7 +15,6 @@ from yggdrasil.pickle.ser.polars import (
     PolarsSeriesSerialized,
 )
 from yggdrasil.pickle.ser.serialized import Serialized
-from yggdrasil.pickle.ser.tags import Tags
 
 
 def _roundtrip(serialized: Serialized[object]) -> Serialized[object]:

@@ -54,7 +54,6 @@ from databricks.sdk.service.catalog import TableOperation, TableType
 
 from yggdrasil.data import Field
 from yggdrasil.enums import MediaTypes, Mode
-from yggdrasil.databricks.fs.volume_path import VolumePath
 from yggdrasil.databricks.table.table import Table
 from yggdrasil.databricks.volume import Volume
 

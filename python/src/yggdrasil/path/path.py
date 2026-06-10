@@ -36,7 +36,10 @@ import sys
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Iterator, List, Tuple, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, List, Tuple, Optional
+
+if TYPE_CHECKING:
+    from yggdrasil.io.holder import Holder
 
 from yggdrasil.enums import Mode
 from yggdrasil.dataclasses import WaitingConfigArg, WaitingConfig

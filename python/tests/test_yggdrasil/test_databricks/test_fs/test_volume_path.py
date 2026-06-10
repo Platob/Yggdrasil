@@ -830,7 +830,6 @@ class TestWriteAll:
         p1 = VolumePath("/Volumes/c/s/v/a.bin", service=service)
         p1.write_bytes(b"via-write-bytes")
         wb_upload_count = workspace.files.upload.call_count
-        wb_meta_count = workspace.files.get_metadata.call_count
 
         workspace.files.upload.reset_mock()
         workspace.files.get_metadata.reset_mock()
@@ -959,7 +958,6 @@ class TestListing:
         from yggdrasil.databricks.path import DatabricksPath
 
         DatabricksPath._INSTANCES.clear()
-        cache_size_before = len(list(DatabricksPath._INSTANCES.keys()))
 
         workspace.files.list_directory_contents.return_value = [
             SimpleNamespace(

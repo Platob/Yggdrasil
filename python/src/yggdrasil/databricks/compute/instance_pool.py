@@ -54,7 +54,7 @@ from yggdrasil.data.cast.registry import identity
 from yggdrasil.enums import NodeType
 from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.dataclasses.singleton import Singleton
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.environ import PyEnv
 from yggdrasil.url import URL
 from yggdrasil.pyutils.equality import dicts_equal

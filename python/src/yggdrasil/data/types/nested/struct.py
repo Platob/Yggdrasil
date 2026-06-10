@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     import pyspark.sql.types as pst
     from yggdrasil.data.options import CastOptions
     from yggdrasil.data.data_field import Field
+    from yggdrasil.data.types.base import DataType
 
 
 __all__ = [

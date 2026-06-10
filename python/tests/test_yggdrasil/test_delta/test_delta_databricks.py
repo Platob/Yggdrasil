@@ -22,12 +22,15 @@ import json
 import os
 import secrets
 import unittest
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import pyarrow as pa
 import pytest
 
 from yggdrasil.delta.io import DeltaOptions
+
+if TYPE_CHECKING:
+    from yggdrasil.io.delta import DeltaFolder
 
 
 def _has_databricks() -> bool:

@@ -13,9 +13,8 @@ from __future__ import annotations
 
 import datetime as dt
 
-import pytest
 
-from yggdrasil.enums import MediaType, MimeTypes
+from yggdrasil.enums import MimeTypes
 from yggdrasil.http_.response import (
     HTTPResponse,
     _media_from_mime_strings,

@@ -13,20 +13,17 @@ from typing import Any, TYPE_CHECKING, Iterator, Optional
 
 import pyarrow as pa
 from yggdrasil.arrow.cast import rechunk_arrow_batches
-from yggdrasil.data import Mode
 from yggdrasil.environ import PyEnv
 from yggdrasil.http_.request import HTTPRequest
 from yggdrasil.http_.response import HTTPResponse
 from yggdrasil.http_.schemas import REQUEST_SCHEMA, RESPONSE_SCHEMA
 from yggdrasil.http_.cache_config import CacheConfig, MATCH_COLUMN, MATCH_KEY
 from yggdrasil.http_.send_config import SendConfig
-from yggdrasil.io.tabular import ArrowTabular
 from yggdrasil.arrow.tabular import ArrowTabular
 from yggdrasil.io.tabular.base import Tabular
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame, SparkSession
-    from yggdrasil.spark.frame import Dataset as SparkDataset
 
 LOGGER = logging.getLogger(__name__)
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import pickle
-import unittest
 import zlib
 
 import pytest
@@ -18,10 +17,7 @@ import pytest
 pyspark = pytest.importorskip("pyspark")
 
 import pyarrow as pa  # noqa: E402
-import pyarrow.parquet as pq  # noqa: E402
-from pyspark.sql import SparkSession  # noqa: E402
 
-from yggdrasil.enums import Mode  # noqa: E402
 from yggdrasil.execution.expr import col  # noqa: E402
 from yggdrasil.path.folder import Folder, FolderOptions  # noqa: E402
 from yggdrasil.path.local_path import LocalPath  # noqa: E402

@@ -38,7 +38,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Mapping, Sequence
 from urllib.parse import (
     parse_qsl,
     quote,
@@ -48,6 +48,9 @@ from urllib.parse import (
     urlsplit,
     urlunsplit,
 )
+
+if TYPE_CHECKING:
+    from yggdrasil.enums import MediaType
 
 import pyarrow as pa
 from yggdrasil.lazy_imports import (

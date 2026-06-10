@@ -7,7 +7,6 @@ import polars as pl
 import pyarrow as pa
 
 from yggdrasil.data.options import CastOptions
-from yggdrasil.enums import Mode
 from yggdrasil.execution.expr import col
 from yggdrasil.path.folder import Folder, FolderOptions
 from yggdrasil.path.local_path import LocalPath

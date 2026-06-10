@@ -29,7 +29,6 @@ side.
 """
 from __future__ import annotations
 
-import pytest
 
 import pyarrow as pa
 

@@ -39,8 +39,6 @@ import pyarrow as pa
 
 from yggdrasil.arrow.ops import (
     _normalize_fill_strategy,
-    dedup_arrow_table,
-    fill_arrow_table,
     resample_arrow_table,
 )
 

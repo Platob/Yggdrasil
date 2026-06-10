@@ -40,7 +40,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path as _LocalPath
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Sequence, Tuple
 
 from yggdrasil.pickle import json as ygg_json
 

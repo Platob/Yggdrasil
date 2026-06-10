@@ -9,13 +9,11 @@ import shutil
 import tempfile
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
 from yggdrasil.arrow.tabular import ArrowTabular
 from yggdrasil.plan import parse_sql, BUILTIN_REGISTRY
-from yggdrasil.plan.func_registry import FunctionRegistry
 
 
 @pytest.fixture

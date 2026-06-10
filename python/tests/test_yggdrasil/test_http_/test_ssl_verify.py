@@ -10,11 +10,8 @@ Covers:
 """
 from __future__ import annotations
 
-import os
-import pathlib
 import socket
 import ssl
-import tempfile
 import warnings
 
 import pytest

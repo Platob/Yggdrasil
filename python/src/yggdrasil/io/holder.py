@@ -71,7 +71,12 @@ from yggdrasil.url import URL, URLBased
 from .io_stats import IOStats, IOKind
 
 if TYPE_CHECKING:
-    pass
+    from yggdrasil.io.base import (
+        _ArrowInputStreamContext,
+        _ArrowOutputStreamContext,
+        _FormatBufferContext,
+        _FormatInputContext,
+    )
 
 __all__ = ["IO", "Holder", "BytesLike", "T", "O"]
 

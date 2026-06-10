@@ -14,7 +14,6 @@ import base64
 import http.server
 import json
 import os
-import ssl
 import threading
 from unittest import mock
 

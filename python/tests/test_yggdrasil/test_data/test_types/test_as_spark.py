@@ -22,7 +22,6 @@ from __future__ import annotations
 import unittest
 
 from yggdrasil.data.data_field import Field
-from yggdrasil.enums.timezone import Timezone
 from yggdrasil.data.schema import Schema
 from yggdrasil.data.types.nested import ArrayType, MapType, StructType
 from yggdrasil.data.types.primitive import (

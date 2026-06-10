@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     from .ai import DatabricksAI
     from .genie import Genie
     from .tags.service import EntityTags
+    from yggdrasil.enums import Mode
+    from yggdrasil.http_ import HTTPSession
 
 __all__ = ["DatabricksClient", "DatabricksService", "DatabricksResource"]
 
@@ -1220,16 +1222,27 @@ class DatabricksClient(Singleton, URLBased):
         buff = IO(local_cache, copy=False)
         workspace_id = self.get_workspace_id()
 
+        existing_data = None
         if local_cache.exists() and local_cache.stat().st_size > 0:
-            # TODO: fix
-            existing_data = buff.as_media(MimeTypes.PARQUET).read_polars_frame()
-            filtered = existing_data.filter(pl.col("workspace_id") == workspace_id)
-
-            for record in filtered.to_dicts():
-                self.set_account_id(record.get("account_id"))
-                return self.account_id
-        else:
-            existing_data = None
+            # A corrupt / partially-written / old-schema cache file must
+            # never brick account-id resolution — treat it as absent and
+            # let the fresh fetch below rewrite it.
+            try:
+                existing_data = buff.as_media(MimeTypes.PARQUET).read_polars_frame()
+            except Exception:
+                existing_data = None
+            if existing_data is not None:
+                if {"account_id", "workspace_id", "workspace_url"} != set(
+                    existing_data.columns
+                ):
+                    existing_data = None
+                else:
+                    filtered = existing_data.filter(
+                        pl.col("workspace_id") == workspace_id
+                    )
+                    for record in filtered.to_dicts():
+                        self.set_account_id(record.get("account_id"))
+                        return self.account_id
 
         new_data = self.sql.execute(
             "select distinct account_id, cast(workspace_id as bigint) as workspace_id, workspace_url"

@@ -13,9 +13,8 @@ needing a real Spark cluster.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
-import pytest
 
 from yggdrasil.databricks.table.table import _spark_filter_existing_keys
 

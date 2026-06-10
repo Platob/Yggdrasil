@@ -8,8 +8,6 @@ import pytest
 from yggdrasil.arrow.tabular import ArrowTabular
 from yggdrasil.plan import (
     ExecutionPlan,
-    LazyTabular,
-    PlanNode,
     SelectNode,
     SelectPlan,
     parse_sql,
@@ -726,7 +724,7 @@ class TestExpressionSQLRoundTrip:
 
 class TestWalkNewNodes:
     def test_walk_function_call(self):
-        from yggdrasil.execution.expr import walk, free_columns
+        from yggdrasil.execution.expr import free_columns
         from yggdrasil.execution.expr.nodes import FunctionCall, Column
         fc = FunctionCall("UPPER", (Column(name="name"),))
         cols = free_columns(fc)
@@ -734,7 +732,7 @@ class TestWalkNewNodes:
 
     def test_walk_subscript(self):
         from yggdrasil.execution.expr import free_columns
-        from yggdrasil.execution.expr.nodes import Subscript, Column, Literal
+        from yggdrasil.execution.expr.nodes import Subscript, Column
         s = Subscript(Column(name="arr"), Column(name="idx"))
         cols = free_columns(s)
         assert "arr" in cols

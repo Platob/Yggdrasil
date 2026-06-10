@@ -36,7 +36,10 @@ the service.
 
 from __future__ import annotations
 
-from typing import Any, Callable, ClassVar, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Tuple
+
+if TYPE_CHECKING:
+    from .client import DatabricksClient
 
 from yggdrasil.dataclasses import ExpiringDict
 from yggdrasil.enums import Scheme
@@ -618,9 +621,6 @@ class DatabricksPath(RemotePath, DatabricksResource):
             from .fs.dbfs_path import DBFSPath
             from .fs.volume_path import VolumePath
             from .fs.workspace_path import WorkspacePath
-            from .table.table import Table
-            from .catalog.catalog import UCCatalog
-            from .schema.schema import UCSchema
 
             if target in (DBFSPath, VolumePath, WorkspacePath):
                 if normalized is not None:

@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     import pyspark.sql as ps  # noqa: F401
     import pyspark.sql.types as pst  # noqa: F401
     from ..cast.options import CastOptions  # noqa: F401
+    from ..base import DataType  # noqa: F401
 
 __all__ = [
     # type classes

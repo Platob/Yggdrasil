@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Iterator, Optional
 
 from yggdrasil.aws.fs.s3_http import S3HttpClient, S3NotFound
 from yggdrasil.aws.fs.sigv4 import SigV4Signer

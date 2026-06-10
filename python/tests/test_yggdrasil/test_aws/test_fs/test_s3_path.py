@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from yggdrasil.io.io_stats import IOKind
-from yggdrasil.aws.fs.path import S3Bucket, S3Path
+from yggdrasil.aws.fs.path import S3Bucket
 
 from tests.test_yggdrasil.test_aws._fake_s3 import FakeS3, wire_s3_path, reset_s3_singletons
 

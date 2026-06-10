@@ -141,7 +141,6 @@ class TestConcurrencyLive(_DeltaSQLBase):
         from yggdrasil.data.schema import Schema, field
         from yggdrasil.enums import Mode
         from yggdrasil.io.delta import ConcurrentDeltaCommitError, DeltaOptions
-        import yggdrasil.io.delta.delta_folder as df
 
         definition = Schema([field("id", "int64")])
         tbl = self._external_delta_table("conc_ow", definition)

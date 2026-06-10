@@ -74,7 +74,7 @@ def parse_exception_from_traceback(tb_text: str) -> ParsedException:
         if "install pymongo again" in msg:
             return ParsedException(
                 ModuleNotFoundError,
-                f"No module named 'pymongo' (hint: try installing pymongo again)",
+                "No module named 'pymongo' (hint: try installing pymongo again)",
                 "ModuleNotFoundError"
             )
         return ParsedException(RuntimeError, f"{name}: {msg}", name)

@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 import unittest
 import uuid
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import pyarrow as pa
 import pytest

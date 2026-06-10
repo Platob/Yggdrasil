@@ -40,7 +40,7 @@ from yggdrasil.io.delta.protocol import (
 )
 from yggdrasil.io.delta.schema_codec import (
     arrow_schema_to_spark_json, spark_json_to_arrow_schema,
-    schema_to_spark_json, spark_json_to_schema,
+    spark_json_to_schema,
 )
 from yggdrasil.io.delta.snapshot import Snapshot
 

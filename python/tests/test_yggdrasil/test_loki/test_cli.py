@@ -302,7 +302,7 @@ class TestModelChooser(unittest.TestCase):
         self.assertNotIn("model", state)
 
     def test_no_engine_warns(self):
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
         import io
         from contextlib import redirect_stdout
         from yggdrasil.cli import style

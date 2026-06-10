@@ -84,6 +84,8 @@ if TYPE_CHECKING:
     from botocore.client import BaseClient  # type: ignore[import-untyped]
 
     from .fs.service import S3Service
+    from yggdrasil.aws.account import AWSAccount
+    from yggdrasil.aws.batch import AWSBatch
     from yggdrasil.databricks.client import DatabricksClient
 
 

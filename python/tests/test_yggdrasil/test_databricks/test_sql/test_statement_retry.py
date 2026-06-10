@@ -7,12 +7,9 @@ batch coercer (prevents stale/missing alias substitution on re-submit).
 """
 from __future__ import annotations
 
-import copy
-import logging
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from databricks.sdk.service.sql import (
     Disposition,

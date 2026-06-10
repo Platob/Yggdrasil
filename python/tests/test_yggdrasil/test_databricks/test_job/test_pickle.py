@@ -13,7 +13,6 @@ import pytest
 from databricks.sdk.service.jobs import (
     Job as SDKJob,
     JobSettings,
-    Run as SDKRun,
     RunLifeCycleState,
     RunResultState,
     RunState,

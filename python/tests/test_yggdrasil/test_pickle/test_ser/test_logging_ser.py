@@ -22,7 +22,6 @@ import logging.handlers as _lh
 import sys
 from io import StringIO
 
-import pytest
 
 from yggdrasil.pickle.ser import dumps, loads
 from yggdrasil.pickle.ser.logging import (

@@ -23,10 +23,9 @@ from __future__ import annotations
 
 import dataclasses
 from types import MappingProxyType
-from typing import Any, Callable, ClassVar, Mapping, Optional, TYPE_CHECKING, Union
+from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
-    from .client import AWSClient
     from yggdrasil.databricks.client import DatabricksClient
 
 

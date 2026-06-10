@@ -88,6 +88,7 @@ from yggdrasil.lazy_imports import field_class, schema_class
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
+    from yggdrasil.arrow.tabular import ArrowTabular
     from yggdrasil.data.data_field import Field
     from yggdrasil.data.schema import Schema
     from yggdrasil.execution.expr import Predicate

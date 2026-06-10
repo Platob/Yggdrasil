@@ -22,7 +22,6 @@ import warnings
 import pytest
 
 from yggdrasil.http_.session import HTTPSession
-from yggdrasil.url import URL
 
 
 # ---------------------------------------------------------------------------

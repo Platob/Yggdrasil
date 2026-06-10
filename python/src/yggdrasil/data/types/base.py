@@ -1447,8 +1447,6 @@ class DataType(BaseChildrenFields, ABC):
             if target_class is not None:
                 return target_class.from_dict(value)
 
-            from .primitive import PrimitiveType
-            from .nested import NestedType
 
             target_class = DATA_TYPE_CLASSES.get(type_id)
             if target_class is not None:
@@ -2812,11 +2810,12 @@ class DataType(BaseChildrenFields, ABC):
     ):
         spark = spark_sql_module()
 
-        # TODO: Spark should handle nested types
-        if self.type_id.is_nested:
+        if value is None:
+            value = self.default_spark_scalar(nullable=nullable)
+        # Spark's lit() accepts lists (array literals) but not dicts —
+        # map / struct defaults render as NULL cast to the target type.
+        if value is None or isinstance(value, dict):
             return spark.functions.lit(None).cast(self.to_spark())
-
-        value = self.default_spark_scalar(nullable=nullable) if value is None else value
         return spark.functions.lit(value).cast(self.to_spark())
 
 

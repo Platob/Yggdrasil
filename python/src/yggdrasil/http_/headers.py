@@ -12,10 +12,13 @@ import platform
 import re
 import socket
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Iterator, Mapping, MutableMapping, Optional, Union, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator, Mapping, MutableMapping, Optional, Union, Literal
 
 from yggdrasil.enums import MediaType, MimeTypes, Codec
 from yggdrasil.io.holder import IO
+
+if TYPE_CHECKING:
+    from yggdrasil.io.holder import Holder
 from yggdrasil.version import __version_info__, __version__
 
 __all__ = [

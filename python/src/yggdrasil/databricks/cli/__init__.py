@@ -19,7 +19,10 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from typing import Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence
+
+if TYPE_CHECKING:
+    from yggdrasil.databricks.client import DatabricksClient
 
 from .services import (
     ClustersCommand,

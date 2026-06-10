@@ -64,7 +64,6 @@ path runs unchanged.
 from __future__ import annotations
 
 import datetime as dt
-import io
 import json
 import logging
 import os

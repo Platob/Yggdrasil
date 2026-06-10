@@ -85,7 +85,6 @@ class TestSettingsDiff:
         assert job.settings_match(desired) is False
 
     def test_match_false_when_no_current_settings(self):
-        job = _job(None) if False else None
         j = object.__new__(Job)
         j.__dict__["_initialized"] = True
         j.service = MagicMock()

@@ -12,6 +12,10 @@ Plus the dtype probes (``handles_polars_type`` / ``from_polars_type``
 from __future__ import annotations
 
 import pytest
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 from yggdrasil.data.data_field import Field
 from yggdrasil.data.options import CastOptions

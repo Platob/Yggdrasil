@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import io
 import tempfile
-import time
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Optional, Union
 
 from yggdrasil.enums.codec import Codec
@@ -512,24 +511,6 @@ class MemoryStream(Holder):
     @property
     def size(self) -> int:
         return self._window_start + len(self._buf)
-
-    @property
-    def size_known(self) -> bool:
-        """``False`` while the source can still grow :attr:`size`.
-
-        The base :class:`Holder` reports ``True`` for in-memory holders
-        because their size is a settled slot. A streaming holder is
-        different: :attr:`size` reflects only the bytes pulled so far, so
-        before the first read it is ``0`` even though the body is
-        non-empty. Format leaves (parquet / arrow / csv / ndjson) guard
-        their read with ``if self.size_known and self.size == 0: return``
-        as an empty-buffer short-circuit — with the base ``True`` that
-        fired on an un-pulled stream and silently returned zero rows.
-        Reporting the size as *unknown* until EOF makes the short-circuit
-        defer to the actual read (which drives the pull), so a
-        ``stream=True`` response body parses correctly.
-        """
-        return self._eof
 
     @property
     def size_known(self) -> bool:

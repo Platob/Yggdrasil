@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
 
 from yggdrasil.databricks.loki.router import route
 from yggdrasil.loki import Loki

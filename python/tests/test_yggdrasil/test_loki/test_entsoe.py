@@ -131,7 +131,7 @@ class TestToFrame(unittest.TestCase):
 
     def test_empty_document_yields_empty_typed_frame(self):
         try:
-            import polars as pl
+            pass
         except Exception:
             self.skipTest("polars not installed")
         df = entsoe.to_frame("<Acknowledgement_MarketDocument/>", zone="DE_LU")

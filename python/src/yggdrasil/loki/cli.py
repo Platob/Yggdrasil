@@ -359,7 +359,6 @@ def _enable_intel_gpu(style: Any) -> None:
 def _repl(loki: Any, style: Any) -> int:
     """A modern interactive session: route → reason/act, live token KPIs, budget."""
     from yggdrasil.loki.memory import LokiMemory
-    from yggdrasil.loki.session import LokiSession
     from yggdrasil.loki.usage import METER
 
     METER.set_limit(METER.DEFAULT_COST_LIMIT)

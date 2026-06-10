@@ -104,7 +104,6 @@ def test_empty_requests(tmp_path):
 
 
 def test_write_empty_batch_is_noop(tmp_path):
-    import pyarrow as pa
     cache = _cache(tmp_path)
     empty = Response.values_to_arrow_batch([_resp(_req())]).slice(0, 0)
     cache.write_arrow(empty)

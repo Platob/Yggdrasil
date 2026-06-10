@@ -9,7 +9,6 @@ two callers with materially different config (host, token, profile,
 from __future__ import annotations
 
 import pickle
-from unittest.mock import patch
 
 import pytest
 

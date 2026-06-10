@@ -14,7 +14,7 @@ from yggdrasil.data.cast import any_to_datetime
 from yggdrasil.enums import GZIP, Codec, MimeType
 from yggdrasil.enums import MediaType, MimeTypes
 from yggdrasil.dataclasses.dataclass import get_from_dict
-from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
+from yggdrasil.environ.userinfo import UserInfo
 from yggdrasil.http_.authorization.base import Authorization
 from yggdrasil.io.base import IO
 from yggdrasil.http_.headers import HTTPHeaders
@@ -23,10 +23,12 @@ from yggdrasil.path.memory import Memory
 from yggdrasil.url import URL
 
 if TYPE_CHECKING:
+    from types import EllipsisType
+
     from yggdrasil.http_.response import HTTPResponse
     from yggdrasil.http_.cache_config import CacheConfig
     from yggdrasil.http_.send_config import SendConfig
-    from yggdrasil.http_.session import HTTPSession
+    from yggdrasil.http_.session import HTTPSession, Session
 
 
 __all__ = [

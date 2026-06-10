@@ -16,9 +16,7 @@ import pyarrow as pa
 
 import yggdrasil.pickle.json as json_module
 from yggdrasil.data.cast import any_to_datetime
-from yggdrasil.data.data_field import field as schema_field
 from yggdrasil.data.options import CastOptions
-from yggdrasil.data.schema import schema
 from yggdrasil.dataclasses.dataclass import get_from_dict
 from yggdrasil.io.base import IO
 from yggdrasil.path.memory_stream import MemoryStream
@@ -26,8 +24,7 @@ from yggdrasil.enums import Codec, MediaType, MimeTypes
 from yggdrasil.http_.headers import HTTPHeaders
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory
-from yggdrasil.io.tabular.base import Tabular
-from yggdrasil.environ.userinfo import USERINFO_STRUCT, UserInfo
+from yggdrasil.environ.userinfo import UserInfo
 from yggdrasil.http_.request import (
     HTTPRequest,
     REQUEST_SCHEMA,
@@ -43,7 +40,7 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame as SparkDataFrame, Row as SparkRow
     from starlette.responses import Response as StarletteResponse
 
-    from yggdrasil.http_.session import HTTPSession
+    from yggdrasil.http_.session import HTTPSession, Session
     from yggdrasil.http_.path import HTTPPath
 
 
@@ -1521,7 +1518,7 @@ class HTTPResponse(IO):  # IO inherits Tabular
         # would break HEAD-based stat / size probes).
         method = (getattr(request, "method", "") or "").upper()
         self._bodyless: bool = method == "HEAD" or int(status_code) in (204, 304)
-        media = _ensure_media_headers(
+        _ensure_media_headers(
             self.headers, self.buffer, sync_content_length=not self._bodyless,
         )
         self._session: "HTTPSession | None" = None
@@ -1830,6 +1827,11 @@ class HTTPResponse(IO):  # IO inherits Tabular
 
 
 
+
+
+#: Public alias — the standalone ``Response`` class was merged into
+#: :class:`HTTPResponse`; re-exported as ``Response`` by ``yggdrasil.io.response``.
+Response = HTTPResponse
 
 
 from yggdrasil.arrow import cast as _arrow_cast  # noqa: E402

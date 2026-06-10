@@ -344,7 +344,7 @@ class IAMUsers(IAM):
                 )
                 logger.debug("Resolved current IAM user %r", result)
                 return result
-            except DatabricksError as e:
+            except DatabricksError:
                 if self.client.auth_type == "external-browser":
                     self.reset_local_cache()
                     raise

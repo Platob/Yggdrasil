@@ -48,8 +48,7 @@ each backend's emitter, not subclassing N abstract operator classes.
 
 from __future__ import annotations
 
-import dataclasses
-from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Iterator, Union
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, Mapping, Union
 
 from .operators import ArithmeticOp, CompareOp, LogicalOp
 

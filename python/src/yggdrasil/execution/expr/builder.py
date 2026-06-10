@@ -77,7 +77,6 @@ def col(
     exclusive — the field's dtype wins if both are supplied.
     """
     from yggdrasil.data.data_field import Field as _Field
-    from yggdrasil.data.types.primitive import ObjectType
 
     if isinstance(name, _Field):
         bound: _Field | None = name

@@ -13,11 +13,11 @@ import dataclasses
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from yggdrasil.enums import Dialect, JoinType
-    from yggdrasil.execution.expr import Expression, Predicate
+    from yggdrasil.enums import Dialect
+    from yggdrasil.execution.expr import Predicate
     from yggdrasil.io.tabular import Tabular
 
-from .ops import CTE, FromItem, JoinClause, LateralViewItem, SetOp, SubqueryRef, TableRef
+from .ops import CTE, FromItem, LateralViewItem, SetOp, TableRef
 
 
 # ---------------------------------------------------------------------------

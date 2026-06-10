@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from yggdrasil.data.types.base import DataType
 
 if TYPE_CHECKING:
-    from yggdrasil.data import Field
+    pass
 
 
 __all__ = [

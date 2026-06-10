@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
+
+if TYPE_CHECKING:
+    from .url import URL
 
 __all__ = ["URLBased", "_URL_BASED_REGISTRY"]
 

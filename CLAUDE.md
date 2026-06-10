@@ -115,4 +115,3 @@ docs/                   mkdocs (Material) — guides + auto-generated API refere
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DATABRICKS_HOST` / `DATABRICKS_TOKEN` | — | Databricks auth (or use `ygg databricks configure`) |
-| `YGG_NODE_SAGA_DIALECT` | postgres | Default SQL dialect (where applicable) |

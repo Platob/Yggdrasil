@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any
 
 from yggdrasil.data.types.id import DataTypeId
 from yggdrasil.lazy_imports import polars_module
-from yggdrasil.lazy_imports import polars_module
 
 if TYPE_CHECKING:
     import polars
@@ -61,7 +60,6 @@ def cast_polars_struct_expr(
         raise TypeError(f"Cannot cast {options.source} to {options.target}")
 
     source_field: "Field" = options.source
-    source_type: "StructType" = source_field.dtype
     target_type: "StructType" = options.target.dtype
 
     fields: list[Any] = []

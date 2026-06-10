@@ -540,7 +540,7 @@ class ArrayType(NestedType):
         series: "pd.Series",
         options: "CastOptions",
     ) -> "pd.Series":
-        pd = pandas_module()
+        pandas_module()
         options = options.check_source(series).check_target(self)
 
         source_type_id = options.source.dtype.type_id

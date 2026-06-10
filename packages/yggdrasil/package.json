@@ -1,7 +1,7 @@
 {
   "name": "@platob/yggdrasil",
   "version": "0.3.17",
-  "description": "Yggdrasil for JS/TS — the cross-compatible twin of the Python yggdrasil package, optimized for JS. Mirrors the Python module surface (enums, url, path, data typing, io) so backend (Python) and frontend (JS) speak one contract for high-performance communication, leveraging Apache Arrow and polars (and later Spark).",
+  "description": "Yggdrasil for JS/TS \u2014 the cross-compatible twin of the Python yggdrasil package, optimized for JS. Mirrors the Python module surface (enums, url, path, data typing, io) so backend (Python) and frontend (JS) speak one contract for high-performance communication, leveraging Apache Arrow and polars (and later Spark).",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -12,20 +12,34 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "sideEffects": false,
   "scripts": {
     "build": "tsup index.ts --format esm --dts --clean --out-dir dist --external apache-arrow",
     "test": "vitest run",
+    "typecheck": "tsc --noEmit",
     "bench": "vitest bench --run",
     "prepublishOnly": "npm run test && npm run build"
   },
-  "keywords": ["yggdrasil", "mime", "media-type", "url", "path", "http", "arrow"],
+  "keywords": [
+    "yggdrasil",
+    "mime",
+    "media-type",
+    "url",
+    "path",
+    "http",
+    "arrow"
+  ],
   "peerDependencies": {
     "apache-arrow": ">=17"
   },
   "peerDependenciesMeta": {
-    "apache-arrow": { "optional": true }
+    "apache-arrow": {
+      "optional": true
+    }
   },
   "license": "MIT",
   "repository": {

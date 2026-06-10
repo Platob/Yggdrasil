@@ -24,7 +24,6 @@ from yggdrasil.version import VersionInfo
 
 from ..service import DatabricksService
 from ..wheels.service import (
-    SUPPORTED_PYTHONS,
     WORKSPACE_ENV_DIR,
     WORKSPACE_PYPI_DIR,
     _norm,
@@ -41,7 +40,7 @@ from ..wheels.service import (
 from .environment import Environment
 
 if TYPE_CHECKING:
-    from ..client import DatabricksClient
+    pass
 
 logger = logging.getLogger(__name__)
 

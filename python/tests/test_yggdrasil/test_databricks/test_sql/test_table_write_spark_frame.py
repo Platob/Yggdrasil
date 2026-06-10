@@ -8,9 +8,8 @@ potentially pick a stale / wrong session or fail entirely.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 
 class TestWriteSparkFrameForwardsSession:

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from yggdrasil.databricks import DatabricksClient
 
     from .engine import TokenEngine
+    from .planning import AgentPlan
     from .tools import Toolbox
 
 __all__ = ["Loki", "ROUTES", "ActStep", "ActResult"]

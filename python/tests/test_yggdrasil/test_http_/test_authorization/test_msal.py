@@ -11,7 +11,6 @@ The tests focus on the wrapper's contract, not MSAL's.
 """
 from __future__ import annotations
 
-import os
 import pickle
 import threading
 import time

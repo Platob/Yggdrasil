@@ -1,21 +1,24 @@
 from __future__ import annotations
 
-import atexit
 import datetime as dt
 import logging
 import os
 import pathlib
 import threading
 import time
-from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Mapping, MutableMapping, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Literal, Mapping, MutableMapping, Optional
 
 from yggdrasil.data.cast import any_to_timedelta
-from yggdrasil.execution.expr import Predicate
-from yggdrasil.data.cast.datetime import truncate_datetime
+from yggdrasil.data.cast.datetime import any_to_datetime, truncate_datetime
 from yggdrasil.enums import Mode
 
 if TYPE_CHECKING:
+    from yggdrasil.http_.request import PreparedRequest
+    from yggdrasil.http_.session import Session
+    from yggdrasil.io.holder import Holder
+    from yggdrasil.io.response import Response
     from yggdrasil.io.tabular.base import Tabular
+    from yggdrasil.path import Path
 
 LOGGER = logging.getLogger(__name__)
 

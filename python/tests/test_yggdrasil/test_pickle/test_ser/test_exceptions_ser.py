@@ -5,8 +5,6 @@ Unit tests for yggdrasil.pickle.ser.exceptions
 
 from __future__ import annotations
 
-import sys
-from typing import cast
 
 import pytest
 
@@ -17,10 +15,8 @@ from yggdrasil.pickle.ser.exceptions import (
     _dump_exception_payload,
     _load_exception_payload,
     _extract_traceback_frames,
-    _EXC_FORMAT_V2,
     _MAX_CHAIN_DEPTH,
 )
-from yggdrasil.pickle.ser.complexs import ComplexSerialized
 
 
 # ---------------------------------------------------------------------------

@@ -27,7 +27,6 @@ from xml.etree import ElementTree as ET
 
 from yggdrasil.aws.fs.sigv4 import (
     EMPTY_PAYLOAD_SHA256,
-    UNSIGNED_PAYLOAD,
     SigV4Signer,
     sha256_hex,
 )

@@ -15,35 +15,23 @@ import datetime as dt
 import time
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pytest
 
 from yggdrasil.arrow.tabular import ArrowTabular
 from yggdrasil.execution.expr import col
 from yggdrasil.execution.expr.nodes import (
     Alias,
-    Column,
     Comparison,
     FunctionCall,
-    Literal,
     Logical,
-    SortOrder,
-    Star,
-    WindowFunction,
-    WindowSpec,
 )
-from yggdrasil.execution.expr.operators import CompareOp
 from yggdrasil.plan import (
     ExecutionPlan,
-    GroupByOp,
-    LazyTabular,
-    OrderByOp,
     SelectNode,
     SelectPlan,
     parse_sql,
 )
-from yggdrasil.plan.nodes import PlanNode
-from yggdrasil.plan.ops import CTE, JoinClause, TableRef
+from yggdrasil.plan.ops import JoinClause
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +979,6 @@ class TestLambdaParser:
 
     def test_lambda_free_columns_excludes_params(self):
         from yggdrasil.execution.expr import free_columns
-        from yggdrasil.execution.expr.nodes import Lambda
         node = parse_sql(
             "SELECT TRANSFORM(my_arr, x -> x + my_offset) FROM t",
             dialect="databricks",

@@ -24,7 +24,7 @@ from .answer import GenieAnswer
 from .space import _DEFAULT_TIMEOUT, GenieSpace
 
 if TYPE_CHECKING:
-    from ..client import DatabricksClient
+    pass
 
 __all__ = ["Genie"]
 

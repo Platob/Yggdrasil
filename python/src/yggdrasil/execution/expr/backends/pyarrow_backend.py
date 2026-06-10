@@ -206,13 +206,15 @@ def _emit_arithmetic(expr: Arithmetic, pc):  # type: ignore[no-untyped-def]
 def from_pyarrow(arrow_expr) -> Expression:  # type: ignore[no-untyped-def]
     """Walk a :class:`pyarrow.compute.Expression` back into our AST.
 
-    Limited by what the public pyarrow API exposes — the
-    expression-tree structure isn't stable across versions, so
-    this lifter handles the common shapes (column refs, literals,
-    boolean combinators, comparisons, ``is_null``, ``isin``) and
-    raises :class:`NotImplementedError` for anything else. Callers
-    that need a richer round-trip should keep the original
-    :class:`Expression` and emit fresh.
+    Limited by what the pyarrow API exposes — and on the pyarrow
+    versions this project supports (``>=20``) that is effectively
+    nothing: the private per-node accessors older builds leaked
+    (``_call_function_name`` / ``_args`` / ``_field_ref``) are gone,
+    and the only public serialization (``to_substrait``) requires
+    the input schema the lifter doesn't have. Expect
+    :class:`NotImplementedError` for any compound expression; keep
+    the original yggdrasil :class:`Expression` and emit fresh
+    instead of round-tripping through pyarrow.
     """
     return _lift(arrow_expr)
 

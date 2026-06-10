@@ -1,7 +1,6 @@
 """AWS Console deep-links: builders + explore_url on client / account / S3."""
 from __future__ import annotations
 
-import pytest
 
 from yggdrasil.aws import AWSClient, AWSAccount, AccountService
 from yggdrasil.aws.console import account_console_url, s3_bucket_url, s3_object_url, partition_for_region

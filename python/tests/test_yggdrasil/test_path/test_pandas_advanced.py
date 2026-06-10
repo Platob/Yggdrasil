@@ -6,7 +6,6 @@ import pathlib
 import pandas as pd
 import pyarrow as pa
 
-from yggdrasil.enums import Mode
 from yggdrasil.path.local_path import LocalPath
 
 

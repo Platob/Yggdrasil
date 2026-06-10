@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import os
 import secrets
-import time
 import unittest
 
 import pyarrow as pa

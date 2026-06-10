@@ -11,13 +11,11 @@ All SDK boundaries are autospec'd mocks — no network is touched.
 """
 from __future__ import annotations
 
-import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from databricks.sdk.client_types import ClientType
 from databricks.sdk.errors import DatabricksError, PermissionDenied
 from databricks.sdk.service.iam import (
-    ComplexValue,
     Group as GroupV1,
     User as UserV1,
 )

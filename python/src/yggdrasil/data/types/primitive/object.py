@@ -12,7 +12,9 @@ from ..id import DataTypeId
 from yggdrasil.lazy_imports import polars_module, spark_sql_module
 
 if TYPE_CHECKING:
+    import pandas as pd
     import polars
+    import pyspark.sql as ps
     import pyspark.sql.types as pst
     from ...cast.options import CastOptions
     from ...data_field import Field

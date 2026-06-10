@@ -1,1 +1,1 @@
-from dill import * # type: ignore[import]
+from dill import * # type: ignore[import] # noqa: F403

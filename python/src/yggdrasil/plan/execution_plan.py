@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import pyarrow as pa
 
-from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
+from yggdrasil.dataclasses.waiting import WaitingConfigArg
 from yggdrasil.data.options import CastOptions
 from yggdrasil.enums import JoinType, Mode
 from yggdrasil.io.tabular.base import (

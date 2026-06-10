@@ -16,7 +16,7 @@ override since the cluster id participates in the session builder.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from yggdrasil.spark.executor import SparkStatementExecutor
 

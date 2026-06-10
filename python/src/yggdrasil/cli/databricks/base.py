@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 import textwrap
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, Sequence

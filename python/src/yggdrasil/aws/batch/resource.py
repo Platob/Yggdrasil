@@ -20,7 +20,7 @@ var); the S3 layer uses it to skip an egress proxy that doesn't apply in-VPC.
 from __future__ import annotations
 
 import os
-from typing import Any, Mapping, Optional
+from typing import Mapping, Optional
 
 from yggdrasil.aws.batch.service import BatchService
 from yggdrasil.aws.client import AWSResource, AWSService

@@ -17,7 +17,6 @@ from yggdrasil.execution.expr.backends.sql import (
 )
 from yggdrasil.execution.expr.nodes import (
     Alias,
-    Column,
     Expression,
     FunctionCall,
     Literal,
@@ -28,7 +27,7 @@ from yggdrasil.execution.expr.nodes import (
 )
 
 from .nodes import InsertNode, MergeNode, PlanNode, ScanNode, SelectNode
-from .ops import CTE, JoinClause, LateralViewItem, SetOp, SubqueryRef, TableRef, ValuesRef
+from .ops import JoinClause, SubqueryRef, TableRef, ValuesRef
 
 if TYPE_CHECKING:
     pass

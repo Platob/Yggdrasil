@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     import polars as pl
 
-    from yggdrasil.http_ import HTTPResponse
+    from yggdrasil.http_ import HTTPResponse, HTTPSession
 
 __all__ = [
     "session",

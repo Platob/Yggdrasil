@@ -1201,7 +1201,7 @@ def _polars_lazyframe_prep(
     so it executes as part of streaming collection, fused with
     projection pushdown and any upstream scan filters.
     """
-    pl = polars_module()
+    polars_module()
     projection = _resolve_projection(options)
 
     # Bind source from the lazy plan schema — cheap, no materialization.

@@ -35,7 +35,7 @@ from ..service import DatabricksService
 from .wheel import Wheel
 
 if TYPE_CHECKING:
-    from ..client import DatabricksClient
+    pass
 
 logger = logging.getLogger(__name__)
 

@@ -22,6 +22,10 @@ tests skip cleanly when those engines are not installed.
 from __future__ import annotations
 
 import unittest
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 from yggdrasil.arrow.cast import (
     any_to_arrow_batch_iterator,

@@ -107,7 +107,6 @@ class TestSparkConnectDispatchSurrogate(unittest.TestCase):
 
             @property
             def schema(self):
-                from pyspark.sql.types import StructType
                 # Use a real Spark schema so downstream code works.
                 from yggdrasil.data.schema import Schema
                 return Schema.from_arrow(self._table.schema).to_spark_schema()

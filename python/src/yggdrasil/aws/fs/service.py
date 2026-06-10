@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
-from yggdrasil.aws.client import AWSClient, AWSService
+from yggdrasil.aws.client import AWSService
 
 if TYPE_CHECKING:
     from botocore.client import BaseClient  # type: ignore[import-untyped]

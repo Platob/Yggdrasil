@@ -33,7 +33,6 @@ from typing import Any, ClassVar, Generic, Iterable, Mapping, Optional, TypeVar
 from yggdrasil.dataclasses.singleton import Singleton
 from yggdrasil.dataclasses.waiting import WaitingConfig, WaitingConfigArg
 from yggdrasil.disposable import Disposable
-from yggdrasil.dataclasses.singleton import Singleton
 from .statement import (
     PreparedStatement,
     StatementBatch,

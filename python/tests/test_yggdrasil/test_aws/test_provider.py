@@ -14,7 +14,6 @@ Generic contract:
 from __future__ import annotations
 
 import pickle
-from typing import Optional
 
 import pytest
 

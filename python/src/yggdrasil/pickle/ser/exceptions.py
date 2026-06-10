@@ -29,7 +29,6 @@ from yggdrasil.pickle.ser.libs import (
     _deserialize_nested,
     _dump_object_state,
     _require_tuple,
-    _require_tuple_len,
     _restore_object_state,
     _serialize_nested,
 )

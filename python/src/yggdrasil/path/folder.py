@@ -108,6 +108,7 @@ _bootstrap_primitive_format_leaves()
 
 if TYPE_CHECKING:
     from yggdrasil.execution.expr import Predicate
+    from yggdrasil.io.io_stats import IOStats
     from yggdrasil.path import Path
 
 
@@ -1017,7 +1018,8 @@ class Folder(Path):
         bc_options = spark.sparkContext.broadcast(options)
 
         def _read_holders(batches: "Iterator[pa.RecordBatch]") -> "Iterator[pa.RecordBatch]":
-            import pickle as _pkl, zlib as _zlib
+            import pickle as _pkl
+            import zlib as _zlib
             opts = bc_options.value
             for batch in batches:
                 for blob in batch.column("_pkl").to_pylist():

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 
 import pyarrow as pa
-import pytest
 
 from yggdrasil.io.holder import Holder
 from yggdrasil.path.memory import Memory

@@ -15,7 +15,6 @@ pulling the cluster-command code in.
 
 from __future__ import annotations
 
-import io
 import os
 import zipfile
 from pathlib import Path as _LocalPath

@@ -352,7 +352,6 @@ class TestSQLEngineIntegration(SQLIntegrationCase):
 
         from yggdrasil.enums import Mode
         from yggdrasil.enums.media_type import MediaTypes
-        from yggdrasil.databricks.table.table import Table
 
         data = pa.table(
             {
@@ -404,7 +403,6 @@ class TestSQLEngineIntegration(SQLIntegrationCase):
         warehouse can read the file back."""
         from yggdrasil.enums import Mode
         from yggdrasil.enums.media_type import MediaTypes
-        from yggdrasil.databricks.table.table import Table
 
         data = pa.table(
             {

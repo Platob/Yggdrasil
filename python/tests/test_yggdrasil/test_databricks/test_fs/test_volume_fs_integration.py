@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import secrets
 import unittest
-from typing import ClassVar
 
 from databricks.sdk.errors import DatabricksError
 from databricks.sdk.errors.platform import PermissionDenied

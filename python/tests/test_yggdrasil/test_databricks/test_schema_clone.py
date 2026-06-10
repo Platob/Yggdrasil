@@ -8,7 +8,6 @@ failure is recorded without aborting the batch.
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from yggdrasil.databricks.schema.schema import UCSchema

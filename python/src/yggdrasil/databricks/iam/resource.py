@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from typing import Any, Mapping, Optional, TypeAlias, Union
 
 from databricks.sdk.client_types import ClientType

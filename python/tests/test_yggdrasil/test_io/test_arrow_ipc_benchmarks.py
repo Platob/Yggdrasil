@@ -20,10 +20,8 @@ from __future__ import annotations
 
 import os
 import random
-import string
 import time
 import unittest
-from typing import Any
 
 import pyarrow as pa
 import pyarrow.ipc as ipc

@@ -15,7 +15,7 @@ from databricks.sdk.service.jobs import (
     RunState,
 )
 
-from yggdrasil.databricks.job.dag import JobDag, JobDagNode
+from yggdrasil.databricks.job.dag import JobDag
 from yggdrasil.databricks.job.run import JobTask
 from yggdrasil.enums.state import State
 

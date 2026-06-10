@@ -575,7 +575,6 @@ class TestReserveCopyOnWrite:
         # End-to-end: a zero-copy Arrow read followed by an append to the
         # same holder (the path that surfaced the BufferError).
         import pyarrow as pa
-        import pyarrow.parquet as pq
 
         from yggdrasil.io.parquet_file import ParquetFile
 

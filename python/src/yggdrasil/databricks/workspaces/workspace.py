@@ -1,7 +1,7 @@
 """Workspace configuration and Databricks SDK helpers."""
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import field
 
 from yggdrasil.url import URL
 

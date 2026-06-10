@@ -47,7 +47,6 @@ from yggdrasil.databricks.cluster import (
 )
 from yggdrasil.databricks.volume.volume import Volume
 from yggdrasil.url import URLBased
-from yggdrasil.spark.statement import SparkPreparedStatement
 
 from .. import DatabricksIntegrationCase
 
@@ -265,13 +264,3 @@ class TestClusterStatementExecutorIntegration(_ClusterIntegrationBase):
         ctx_a = first.command.context.context_id
         ctx_b = second.command.context.context_id
         self.assertEqual(ctx_a, ctx_b)
-
-
-        self.assertFalse(result.failed)
-
-        # Spark Connect streams rows back directly — no staging path.
-        table = result.read_arrow_table()
-        self.assertEqual(table.num_rows, 5)
-        self.assertEqual(
-            sorted(table.column_names), ["id", "ten_id"],
-        )
