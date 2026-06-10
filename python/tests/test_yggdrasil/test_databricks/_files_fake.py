@@ -222,6 +222,11 @@ def wire_files_session(client, *, host: str = "https://test.databricks.com",
     """
     client.base_url = URL.from_(host)
     client.files_authorization.return_value = "Bearer test-token"
+    # Fresh dict per call — _fs_request mutates it (Accept / Range / …).
+    client.files_headers.side_effect = lambda: {
+        "Authorization": "Bearer test-token",
+        "User-Agent": "yggdrasil-tests/0.0.0",
+    }
     client.files_session.return_value = FakeFilesSession(
         client.workspace_client.return_value.files,
         honor_range=honor_range,

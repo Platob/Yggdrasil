@@ -323,12 +323,22 @@ class VolumePath(DatabricksPath):
         if params:
             for key, value in params.items():
                 url = url.add_param(key=key, value=value)
-        headers = {"Authorization": self.client.files_authorization()}
+        headers = self.client.files_headers()
+        # Mirror the SDK's per-call headers: directory listings accept
+        # JSON, file downloads accept the raw stream, raw-body uploads
+        # declare the octet-stream payload.
+        if method == "GET":
+            headers["Accept"] = (
+                "application/json" if kind == "directories"
+                else "application/octet-stream"
+            )
         if range_header is not None:
             headers["Range"] = range_header
         if json_body is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(json_body).encode()
+        elif body is not None:
+            headers["Content-Type"] = "application/octet-stream"
         return self.client.files_session().fetch(
             method,
             url,
@@ -417,13 +427,13 @@ class VolumePath(DatabricksPath):
     def _fs_coordination_post(self, endpoint: str, body: dict) -> dict:
         """``POST /api/2.0/fs/<endpoint>`` with auth + JSON body → parsed JSON."""
         url = self.client.base_url.with_path(f"/api/2.0/fs/{endpoint}")
+        headers = self.client.files_headers()
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
         resp = self.client.files_session().fetch(
             "POST",
             url,
-            headers={
-                "Authorization": self.client.files_authorization(),
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             body=json.dumps(body).encode(),
             preload_content=True,
         )

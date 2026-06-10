@@ -418,6 +418,16 @@ class DatabricksClient(Singleton, URLBased):
             resolved["host"] = "https://accounts.cloud.databricks.com"
 
         resolved["host"] = _normalize_host(resolved["host"])
+
+        # Azure workspace hosts carry the workspace id in the hostname
+        # (``adb-<workspace-id>.<n>.azuredatabricks.net``) — grab it for
+        # free so ``X-Databricks-Workspace-Id`` attribution works without
+        # a round-trip. AWS/GCP hosts don't encode it; those resolve
+        # lazily via :meth:`get_workspace_id`.
+        if not resolved["workspace_id"] and resolved["host"]:
+            m = re.match(r"https://adb-(\d+)\.", resolved["host"])
+            if m:
+                resolved["workspace_id"] = m.group(1)
         return resolved
 
     @classmethod
@@ -536,6 +546,9 @@ class DatabricksClient(Singleton, URLBased):
         # ``__getstate__`` and consumed on ``__setstate__``. Off-cluster
         # only — DBR runtime ignores it.
         self._session_token: Optional[dict[str, Any]] = None
+        # One-shot guard for the lazy workspace-id probe in
+        # :meth:`files_headers`.
+        self._workspace_id_probed = False
 
         self._initialized = True
 
@@ -1198,6 +1211,36 @@ class DatabricksClient(Singleton, URLBased):
                 f"{self.host!r}; check credentials / profile."
             )
         return header
+
+    def files_headers(self) -> dict[str, str]:
+        """Base header set for Files-API requests, matching the SDK transport.
+
+        The SDK's ``ApiClient`` stamps ``User-Agent`` (product + SDK
+        version + platform + auth type) on every call and
+        ``X-Databricks-Workspace-Id`` when the config carries a workspace
+        id — Databricks' edge uses both to attribute and rate-limit
+        traffic, so requests without them are classified as anonymous and
+        throttled (429) far more aggressively. Mirror them here since
+        Files traffic bypasses the SDK transport (:meth:`files_session`).
+        """
+        cfg = self.workspace_config
+        headers = {
+            "Authorization": self.files_authorization(),
+            "User-Agent": cfg.user_agent,
+        }
+        workspace_id = self.workspace_id or cfg.workspace_id
+        if not workspace_id and not self._workspace_id_probed:
+            # One best-effort round-trip (cached on ``workspace_id``);
+            # never retried so an offline / restricted token doesn't tax
+            # every files request — the header just stays off.
+            self._workspace_id_probed = True
+            try:
+                workspace_id = self.get_workspace_id()
+            except Exception:
+                workspace_id = None
+        if workspace_id:
+            headers["X-Databricks-Workspace-Id"] = str(workspace_id)
+        return headers
 
     # -------------------------------------------------------------------------
     # Serverless image — wheels + environments live on dbc.wheels / dbc.environments
