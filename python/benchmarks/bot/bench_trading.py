@@ -107,6 +107,19 @@ def main() -> None:
         # Correlation matrix (2 assets)
         _timeit("correlation (2 assets)", lambda: run(svc.correlation(["ohlcv.parquet", "ohlcv.parquet"])))
 
+        # Scan (latest signal per file)
+        _timeit("scan (1 file, cached)", lambda: run(svc.scan(["ohlcv.parquet"])))
+
+        # Cache demonstration: clear cache, time cold vs. warm
+        svc._cache.clear()
+        t0 = time.perf_counter()
+        run(svc.indicators("ohlcv.parquet", "close", "ts"))
+        cold_ms = (time.perf_counter() - t0) * 1000
+        t0 = time.perf_counter()
+        run(svc.indicators("ohlcv.parquet", "close", "ts"))
+        warm_ms = (time.perf_counter() - t0) * 1000
+        print(f"  {'cache: cold vs. warm indicators':<55} {cold_ms:>7.1f} ms → {warm_ms:.2f} ms")
+
         print(f"\n  indicators result: "
               f"{len(ind[0]['price'])} rows, "
               f"ema_9 non-null={sum(1 for v in ind[0]['ema_9'] if v is not None)}, "
@@ -140,9 +153,16 @@ def main() -> None:
                     ("POST /api/v2/trading/signals", "post",
                      "/api/v2/trading/signals",
                      {"path": "ohlcv.parquet", "column": "close"}),
-                    ("POST /api/v2/trading/backtest", "post",
+                    ("POST /api/v2/trading/backtest (ema_cross)", "post",
                      "/api/v2/trading/backtest",
                      {"path": "ohlcv.parquet", "column": "close", "strategy": "ema_cross"}),
+                    ("POST /api/v2/trading/backtest (stop_loss=5%)", "post",
+                     "/api/v2/trading/backtest",
+                     {"path": "ohlcv.parquet", "column": "close", "strategy": "ema_cross",
+                      "stop_loss_pct": 0.05, "take_profit_pct": 0.10, "position_sizing": "half"}),
+                    ("POST /api/v2/trading/scan (1 file)", "post",
+                     "/api/v2/trading/scan",
+                     {"paths": ["ohlcv.parquet"], "column": "close"}),
                 ]:
                     samples = []
                     for _ in range(n):

@@ -316,20 +316,24 @@ class TradingService:
         trades: list[dict] = []
         trade_returns: list[float] = []
         entry_price: float | None = None
+        # Pre-compute absolute price thresholds at entry so the inner loop
+        # does a comparison instead of a division on every in-position bar.
+        stop_floor: float | None = None
+        tp_ceiling: float | None = None
 
         for i in range(n):
             price = float(prices[i])
 
             # Risk exits run before the strategy signal: a stop/TP fires the moment
-            # price crosses the threshold relative to the entry, regardless of trend.
+            # price crosses the pre-computed threshold, with no per-bar division.
             if shares > 0.0 and entry_price:
-                ret = price / entry_price - 1.0
                 forced = None
-                if stop_loss_pct and ret < -stop_loss_pct:
+                if stop_floor is not None and price < stop_floor:
                     forced = "stop_loss"
-                elif take_profit_pct and ret > take_profit_pct:
+                elif tp_ceiling is not None and price > tp_ceiling:
                     forced = "take_profit"
                 if forced:
+                    ret = price / entry_price - 1.0
                     cash += shares * price
                     trade_returns.append(ret)
                     trades.append({"ts": ts[i], "action": forced, "price": price,
@@ -337,6 +341,8 @@ class TradingService:
                                    "win": price > entry_price, "return_pct": round(ret, 6)})
                     shares = 0.0
                     entry_price = None
+                    stop_floor = None
+                    tp_ceiling = None
                     equity_curve.append(cash)
                     continue
 
@@ -347,6 +353,8 @@ class TradingService:
                 cash -= spent
                 shares = bought
                 entry_price = price
+                stop_floor = price * (1.0 - stop_loss_pct) if stop_loss_pct else None
+                tp_ceiling = price * (1.0 + take_profit_pct) if take_profit_pct else None
                 trades.append({"ts": ts[i], "action": "buy", "price": price,
                                "shares": shares, "cash": cash, "value": cash + shares * price})
             elif want == -1 and shares > 0.0:
@@ -358,6 +366,8 @@ class TradingService:
                                "win": price > entry_price, "return_pct": round(ret, 6)})
                 shares = 0.0
                 entry_price = None
+                stop_floor = None
+                tp_ceiling = None
             equity_curve.append(cash + shares * price)
 
         final_value = equity_curve[-1]
@@ -403,7 +413,7 @@ class TradingService:
             "avg_loss_pct": round(avg_loss_pct, 6),
             "max_consecutive_losses": max_consec_losses,
             "equity_curve": _ds_list(equity_curve, max_points),
-            "trades": trades,
+            "trades": trades[:500],
             "benchmark_return": round(benchmark_return, 6),
             "benchmark_equity": _ds_list(benchmark_equity, max_points),
         }
