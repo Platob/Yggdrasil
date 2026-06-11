@@ -11,9 +11,11 @@ from __future__ import annotations
 import sys
 import time
 
-from fastapi import FastAPI, Query, Request, Response
-from fastapi.middleware.gzip import GZipMiddleware
+import gzip as _gzip
+
+from fastapi import FastAPI, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .. import remote as remote_mod
 from ..config import Settings
@@ -22,6 +24,13 @@ from ..services.function import FunctionService
 from ..services.messenger import MessengerService
 from ..services.monitor import MonitorService
 from .schemas.analysis import ForecastRequest
+from .schemas.trading import (
+    BacktestRequest,
+    CorrelationRequest,
+    IndicatorsRequest,
+    PortfolioRequest,
+    SignalsRequest,
+)
 from .schemas.saga import (
     CatalogCreate,
     ForecastRegisterRequest,
@@ -30,16 +39,49 @@ from .schemas.saga import (
     TableCreate,
 )
 from .services.analysis import AnalysisService
+from .services.trading import STRATEGIES, TradingService
 from .services.audit import AuditLog
 from .services.fs import FsService
 from .services.saga import SagaService
 from .services.tabular import TabularService
 
 
+_GZIP_TYPES = frozenset({"application/json", "text/html", "text/plain", "text/csv"})
+_GZIP_MIN = 1024
+
+
+class _SelectiveGZipMiddleware(BaseHTTPMiddleware):
+    """Compress only JSON/text responses; pass Arrow IPC and pickle through raw.
+
+    Arrow binary data compresses poorly at gzip level 9 (~134ms for 280KB) and
+    the Arrow IPC format is already column-store efficient — gzipping it wastes
+    CPU without meaningful size savings.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        accept = request.headers.get("accept-encoding", "")
+        if "gzip" not in accept:
+            return response
+        ct = response.headers.get("content-type", "").split(";")[0].strip()
+        if ct not in _GZIP_TYPES:
+            return response
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        if len(body) < _GZIP_MIN:
+            return Response(content=body, status_code=response.status_code,
+                            headers=dict(response.headers), media_type=ct)
+        compressed = _gzip.compress(body, compresslevel=6)
+        headers = dict(response.headers)
+        headers["content-encoding"] = "gzip"
+        headers["content-length"] = str(len(compressed))
+        return Response(content=compressed, status_code=response.status_code,
+                        headers=headers, media_type=ct)
+
+
 def create_api(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     app = FastAPI(title="yggdrasil node", version="2.0")
-    app.add_middleware(GZipMiddleware, minimum_size=512)
+    app.add_middleware(_SelectiveGZipMiddleware)
 
     st = app.state
     st.settings = settings
@@ -52,6 +94,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     st.fs = FsService(settings)
     st.tabular = TabularService(settings, st.fs)
     st.analysis = AnalysisService(settings, st.fs)
+    st.trading = TradingService(settings, st.fs)
     st.saga = SagaService(settings)
     st.peers = {}
 
@@ -102,11 +145,17 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     def pyfunc():
         return {"functions": sorted(remote_mod._REGISTRY)}
 
+    _pyenv_cache: dict = {}
+
     @app.get("/api/v2/pyenv")
     def pyenv():
-        import importlib.metadata as md
-        pkgs = sorted(f"{d.metadata['Name']}=={d.version}" for d in md.distributions())
-        return {"python": sys.version, "packages": pkgs}
+        if not _pyenv_cache:
+            import importlib.metadata as md
+            _pyenv_cache["python"] = sys.version
+            _pyenv_cache["packages"] = sorted(
+                f"{d.metadata['Name']}=={d.version}" for d in md.distributions()
+            )
+        return _pyenv_cache
 
     # -- remote call (pickle transport) ------------------------------------
 
@@ -186,6 +235,76 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v2/analysis/forecast")
     async def analysis_forecast(payload: dict):
         return (await st.analysis.forecast(ForecastRequest(**payload))).model_dump()
+
+    # -- trading -----------------------------------------------------------
+
+    @app.post("/api/v2/trading/indicators")
+    async def trading_indicators(req: IndicatorsRequest):
+        return await st.trading.indicators(req.path, req.column, req.ts_column)
+
+    @app.post("/api/v2/trading/signals")
+    async def trading_signals(req: SignalsRequest):
+        return await st.trading.signals(req.path, req.column, req.ts_column)
+
+    @app.post("/api/v2/trading/backtest")
+    async def trading_backtest(req: BacktestRequest):
+        return await st.trading.backtest(
+            req.path, req.column, req.strategy, req.initial_cash, req.ts_column)
+
+    @app.post("/api/v2/trading/correlation")
+    async def trading_correlation(req: CorrelationRequest):
+        return await st.trading.correlation(req.paths, req.column)
+
+    @app.post("/api/v2/trading/portfolio")
+    async def trading_portfolio(req: PortfolioRequest):
+        return await st.trading.portfolio(req.paths, req.weights, req.column)
+
+    @app.get("/api/v2/trading/strategies")
+    def trading_strategies():
+        return {"strategies": STRATEGIES}
+
+    @app.websocket("/ws/v2/trading/stream")
+    async def trading_stream(websocket: WebSocket):
+        """Stream real-time indicator updates as new data arrives.
+
+        Client sends: {"path": "prices.parquet", "column": "close", "interval_ms": 1000}
+        Server sends: {"ts": ..., "price": ..., "ema9": ..., "ema21": ..., "rsi14": ..., "signal": ...}
+
+        In simulation mode (no live feed): replays the last N rows at interval_ms,
+        starting from row 0.
+        """
+        await websocket.accept()
+        import asyncio
+        try:
+            config = await websocket.receive_json()
+            path = config.get("path", "")
+            column = config.get("column", "close")
+            interval_ms = max(100, config.get("interval_ms", 1000))
+
+            result = await st.trading.indicators(path, column, config.get("ts_column"))
+            prices = result["price"]
+            ema9 = result["ema_9"]
+            ema21 = result["ema_21"]
+            rsi = result["rsi_14"]
+            ts = result["ts"]
+
+            for i in range(len(prices)):
+                await websocket.send_json({
+                    "ts": ts[i],
+                    "price": prices[i],
+                    "ema9": ema9[i],
+                    "ema21": ema21[i],
+                    "rsi14": rsi[i],
+                    "signal": 1 if (ema9[i] and ema21[i] and ema9[i] > ema21[i]) else -1,
+                })
+                await asyncio.sleep(interval_ms / 1000.0)
+        except Exception:
+            pass
+        finally:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     # -- fs ----------------------------------------------------------------
 
