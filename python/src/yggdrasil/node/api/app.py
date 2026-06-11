@@ -29,6 +29,7 @@ from .schemas.trading import (
     CorrelationRequest,
     IndicatorsRequest,
     PortfolioRequest,
+    ScanRequest,
     SignalsRequest,
 )
 from .schemas.saga import (
@@ -249,7 +250,12 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v2/trading/backtest")
     async def trading_backtest(req: BacktestRequest):
         return await st.trading.backtest(
-            req.path, req.column, req.strategy, req.initial_cash, req.ts_column, req.max_points)
+            req.path, req.column, req.strategy, req.initial_cash, req.ts_column, req.max_points,
+            req.stop_loss_pct, req.take_profit_pct, req.position_sizing)
+
+    @app.post("/api/v2/trading/scan")
+    async def trading_scan(req: ScanRequest):
+        return {"results": await st.trading.scan(req.paths, req.column, req.ts_column)}
 
     @app.post("/api/v2/trading/correlation")
     async def trading_correlation(req: CorrelationRequest):

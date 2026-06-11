@@ -13,6 +13,7 @@ usual risk metrics.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import polars as pl
@@ -63,6 +64,10 @@ class TradingService:
         self.settings = settings
         self.fs = fs
         self._root = Path(settings.node_home)
+        # File-mtime keyed LRU: indicator computation is the dominant cost and the
+        # underlying parquet rarely changes between calls, so we key on mtime and
+        # invalidate the entry the moment the file is rewritten.
+        self._cache: dict[tuple[str, str, str | None], tuple[float, dict]] = {}
 
     def _lf(self, relative: str) -> pl.LazyFrame:
         return _scan(self.fs._resolve(relative))
@@ -71,6 +76,15 @@ class TradingService:
         return self._lf(relative).collect_schema().names()
 
     async def _indicators_full(self, path: str, column: str, ts_column: str | None = None) -> dict:
+        try:
+            mtime = os.stat(self.fs._resolve(path)).st_mtime
+        except OSError:
+            mtime = 0.0
+        key = (path, column, ts_column)
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+
         have = self._columns(path)
         if column not in have:
             raise ValueError(
@@ -154,8 +168,13 @@ class TradingService:
             df = df.with_columns(pl.lit(None).cast(pl.Float64).alias("vwap"))
 
         ts_list = df.get_column(ts_column).to_list() if ts_column else list(range(n))
-        return {"price": df.get_column(column).to_list(), "ts": ts_list,
-                **{c: df.get_column(c).to_list() for c in [*indicator_cols, "atr_14", "vwap"]}}
+        result = {"price": df.get_column(column).to_list(), "ts": ts_list,
+                  **{c: df.get_column(c).to_list() for c in [*indicator_cols, "atr_14", "vwap"]}}
+
+        if len(self._cache) >= 32:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[key] = (mtime, result)
+        return result
 
     async def indicators(self, path: str, column: str, ts_column: str | None = None,
                          max_points: int | None = None) -> dict:
@@ -240,12 +259,21 @@ class TradingService:
 
     async def backtest(self, path: str, column: str, strategy: str = "ema_cross",
                        initial_cash: float = 10_000.0, ts_column: str | None = None,
-                       max_points: int | None = None) -> dict:
+                       max_points: int | None = None, stop_loss_pct: float | None = None,
+                       take_profit_pct: float | None = None,
+                       position_sizing: str = "full") -> dict:
         valid = {"ema_cross", "rsi_mean_reversion", "macd", "buy_and_hold"}
         if strategy not in valid:
             raise ValueError(
                 f"Unknown strategy {strategy!r}. Pick one of: {', '.join(sorted(valid))}."
             )
+        sizing = {"full": 1.0, "half": 0.5, "quarter": 0.25}
+        if position_sizing not in sizing:
+            raise ValueError(
+                f"Unknown position_sizing {position_sizing!r}. "
+                f"Pick one of: {', '.join(sizing)}."
+            )
+        size_frac = sizing[position_sizing]
 
         ind = await self._indicators_full(path, column, ts_column)
         prices = ind["price"]
@@ -281,27 +309,53 @@ class TradingService:
             ]
 
         # Position state is sequential — this loop is the documented exception
-        # to the no-Python-loop rule. One share at a time, no costs, no partials.
+        # to the no-Python-loop rule. One position at a time, no costs, no partials.
         cash = float(initial_cash)
         shares = 0.0
         equity_curve: list[float] = []
         trades: list[dict] = []
+        trade_returns: list[float] = []
         entry_price: float | None = None
 
         for i in range(n):
             price = float(prices[i])
+
+            # Risk exits run before the strategy signal: a stop/TP fires the moment
+            # price crosses the threshold relative to the entry, regardless of trend.
+            if shares > 0.0 and entry_price:
+                ret = price / entry_price - 1.0
+                forced = None
+                if stop_loss_pct and ret < -stop_loss_pct:
+                    forced = "stop_loss"
+                elif take_profit_pct and ret > take_profit_pct:
+                    forced = "take_profit"
+                if forced:
+                    cash += shares * price
+                    trade_returns.append(ret)
+                    trades.append({"ts": ts[i], "action": forced, "price": price,
+                                   "shares": shares, "cash": cash, "value": cash,
+                                   "win": price > entry_price, "return_pct": round(ret, 6)})
+                    shares = 0.0
+                    entry_price = None
+                    equity_curve.append(cash)
+                    continue
+
             want = want_long[i]
             if want == 1 and shares == 0.0:
-                shares = cash / price
-                cash = 0.0
+                bought = (cash * size_frac) / price
+                spent = bought * price
+                cash -= spent
+                shares = bought
                 entry_price = price
                 trades.append({"ts": ts[i], "action": "buy", "price": price,
-                               "shares": shares, "cash": cash, "value": shares * price})
+                               "shares": shares, "cash": cash, "value": cash + shares * price})
             elif want == -1 and shares > 0.0:
-                cash = shares * price
+                ret = price / entry_price - 1.0
+                cash += shares * price
+                trade_returns.append(ret)
                 trades.append({"ts": ts[i], "action": "sell", "price": price,
                                "shares": shares, "cash": cash, "value": cash,
-                               "win": price > entry_price})
+                               "win": price > entry_price, "return_pct": round(ret, 6)})
                 shares = 0.0
                 entry_price = None
             equity_curve.append(cash + shares * price)
@@ -311,10 +365,27 @@ class TradingService:
         benchmark_return = benchmark_equity[-1] / initial_cash - 1.0
 
         metrics = _equity_metrics(equity_curve, initial_cash)
-        sells = [t for t in trades if t["action"] == "sell"]
+        sells = [t for t in trades if t["action"] in ("sell", "stop_loss", "take_profit")]
         wins = sum(1 for t in sells if t.get("win"))
         win_rate = wins / len(sells) if sells else 0.0
         n_trades = sum(1 for t in trades if t["action"] == "buy")
+
+        win_rets = [r for r in trade_returns if r > 0]
+        loss_rets = [r for r in trade_returns if r <= 0]
+        gross_win = sum(win_rets)
+        gross_loss = abs(sum(loss_rets))
+        profit_factor = gross_win / gross_loss if gross_loss > 0 else (
+            float("inf") if gross_win > 0 else 0.0)
+        avg_win_pct = sum(win_rets) / len(win_rets) if win_rets else 0.0
+        avg_loss_pct = sum(loss_rets) / len(loss_rets) if loss_rets else 0.0
+        max_consec_losses = 0
+        streak = 0
+        for r in trade_returns:
+            if r <= 0:
+                streak += 1
+                max_consec_losses = max(max_consec_losses, streak)
+            else:
+                streak = 0
 
         return {
             "strategy": strategy,
@@ -327,11 +398,49 @@ class TradingService:
             "sortino": metrics["sortino"],
             "n_trades": n_trades,
             "win_rate": round(win_rate, 4),
+            "profit_factor": round(profit_factor, 4) if math.isfinite(profit_factor) else None,
+            "avg_win_pct": round(avg_win_pct, 6),
+            "avg_loss_pct": round(avg_loss_pct, 6),
+            "max_consecutive_losses": max_consec_losses,
             "equity_curve": _ds_list(equity_curve, max_points),
             "trades": trades,
             "benchmark_return": round(benchmark_return, 6),
             "benchmark_equity": _ds_list(benchmark_equity, max_points),
         }
+
+    async def scan(self, paths: list[str], column: str = "close",
+                   ts_column: str | None = None) -> list[dict]:
+        """Compute the latest composite signal for each file (one row per path)."""
+        results = []
+        for p in paths:
+            try:
+                ind = await self._indicators_full(p, column, ts_column)
+                n = len(ind["price"])
+                if n == 0:
+                    continue
+                last = n - 1
+                ema9 = ind["ema_9"][last]
+                ema21 = ind["ema_21"][last]
+                rsi = ind["rsi_14"][last]
+                macd_hist = ind["macd_hist"][last]
+                signal = (
+                    (1 if ema9 and ema21 and ema9 > ema21 else -1)
+                    + (1 if rsi and rsi < 40 else -1 if rsi and rsi > 60 else 0)
+                    + (1 if macd_hist and macd_hist > 0 else -1 if macd_hist else 0)
+                ) / 3.0
+                results.append({
+                    "path": p,
+                    "price": ind["price"][last],
+                    "ema9": ema9,
+                    "ema21": ema21,
+                    "rsi": rsi,
+                    "macd_hist": macd_hist,
+                    "signal": round(signal, 4),
+                    "ts": ind["ts"][last],
+                })
+            except Exception as e:
+                results.append({"path": p, "error": str(e)})
+        return results
 
     async def correlation(self, paths: list[str], column: str = "close") -> dict:
         if len(paths) < 2:

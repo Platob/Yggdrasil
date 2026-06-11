@@ -29,6 +29,15 @@ class BacktestRequest(BaseModel):
     initial_cash: float = 10_000.0
     ts_column: str | None = None
     max_points: int | None = 2000
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+    position_sizing: Literal["full", "half", "quarter"] = "full"
+
+
+class ScanRequest(BaseModel):
+    paths: list[str]
+    column: str = "close"
+    ts_column: str | None = None
 
 
 class CorrelationRequest(BaseModel):
