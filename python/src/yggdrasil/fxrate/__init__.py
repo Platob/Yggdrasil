@@ -17,6 +17,7 @@ normalised on the way in. A backend that can't answer raises
 from __future__ import annotations
 
 from .backends import Backend
+from .frankfurter import FrankfurterBackend
 from .session import BackendError, FxQuote, FxRate
 
-__all__ = ["FxRate", "FxQuote", "BackendError", "Backend"]
+__all__ = ["FxRate", "FxQuote", "BackendError", "Backend", "FrankfurterBackend"]

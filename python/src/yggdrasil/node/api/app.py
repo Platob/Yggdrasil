@@ -43,6 +43,7 @@ from .services.analysis import AnalysisService
 from .services.trading import STRATEGIES, TradingService
 from .services.audit import AuditLog
 from .services.fs import FsService
+from .services.fxrate import FxRateService
 from .services.saga import SagaService
 from .services.tabular import TabularService
 
@@ -96,6 +97,7 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     st.tabular = TabularService(settings, st.fs)
     st.analysis = AnalysisService(settings, st.fs)
     st.trading = TradingService(settings, st.fs)
+    st.fxrate = FxRateService()
     st.saga = SagaService(settings)
     st.peers = {}
 
@@ -268,6 +270,17 @@ def create_api(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v2/trading/strategies")
     def trading_strategies():
         return {"strategies": STRATEGIES}
+
+    # -- fx rates ----------------------------------------------------------
+
+    @app.get("/api/v2/fx/latest")
+    def fx_latest(source: str | None = None, target: str | None = None):
+        pairs = [(source, target)] if source and target else None
+        return {"quotes": st.fxrate.latest(pairs)}
+
+    @app.get("/api/v2/fx/timeseries")
+    def fx_timeseries(source: str, target: str, start: str, end: str):
+        return {"quotes": st.fxrate.timeseries(source, target, start, end)}
 
     @app.websocket("/ws/v2/trading/stream")
     async def trading_stream(websocket: WebSocket):

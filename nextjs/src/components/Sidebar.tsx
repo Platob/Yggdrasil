@@ -7,6 +7,7 @@ const NAV = [
   { href: "/trading", label: "Trading", icon: "📈" },
   { href: "/scan", label: "Signal Scan", icon: "⚡" },
   { href: "/portfolio", label: "Portfolio", icon: "◎" },
+  { href: "/fx", label: "FX Rates", icon: "💱" },
   { href: "/analysis", label: "Analysis", icon: "🔬" },
   { href: "/files", label: "Files", icon: "📁" },
   { href: "/saga", label: "Saga SQL", icon: "⚙" },
