@@ -1,6 +1,6 @@
 import type {
   BacktestResult, FinanceResult, FsListResult, IndicatorsResult,
-  Message, NodeStats, SagaCatalog, SqlResult,
+  Message, NodeStats, SagaCatalog, ScanEntry, SqlResult,
 } from "./types";
 
 const BASE = "";  // uses Next.js rewrite proxy
@@ -25,18 +25,38 @@ export const api = {
   ping: () => get<{ status: string }>("/api/ping"),
   stats: () => get<NodeStats>("/api/v2/stats"),
   health: () => get<{ status: string }>("/api/v2/health"),
+  backend: () => get<{ name: string; status: string }[]>("/api/v2/backend"),
 
   // Files
   ls: (path = "", offset = 0, limit = 100) =>
     get<FsListResult>(`/api/v2/fs/ls?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}`),
 
   // Trading
-  indicators: (path: string, column: string) =>
-    post<IndicatorsResult>("/api/v2/trading/indicators", { path, column }),
+  indicators: (path: string, column: string, max_points = 2000) =>
+    post<IndicatorsResult>("/api/v2/trading/indicators", { path, column, max_points }),
+
   signals: (path: string, column: string) =>
     post<unknown>("/api/v2/trading/signals", { path, column }),
-  backtest: (path: string, column: string, strategy = "ema_cross", initial_cash = 10000) =>
-    post<BacktestResult>("/api/v2/trading/backtest", { path, column, strategy, initial_cash }),
+
+  backtest: (
+    path: string,
+    column: string,
+    strategy = "ema_cross",
+    initial_cash = 10000,
+    stop_loss_pct?: number,
+    take_profit_pct?: number,
+    position_sizing = "full",
+  ) =>
+    post<BacktestResult>("/api/v2/trading/backtest", {
+      path, column, strategy, initial_cash,
+      stop_loss_pct: stop_loss_pct ?? null,
+      take_profit_pct: take_profit_pct ?? null,
+      position_sizing,
+    }),
+
+  scan: (paths: string[], column = "close") =>
+    post<{ results: ScanEntry[] }>("/api/v2/trading/scan", { paths, column }),
+
   strategies: () =>
     get<{ strategies: { id: string; name: string; description: string }[] }>("/api/v2/trading/strategies"),
 

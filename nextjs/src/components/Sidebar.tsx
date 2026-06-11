@@ -5,9 +5,10 @@ import { usePathname } from "next/navigation";
 const NAV = [
   { href: "/", label: "Dashboard", icon: "⊞" },
   { href: "/trading", label: "Trading", icon: "📈" },
+  { href: "/scan", label: "Signal Scan", icon: "⚡" },
   { href: "/analysis", label: "Analysis", icon: "🔬" },
   { href: "/files", label: "Files", icon: "📁" },
-  { href: "/saga", label: "Saga SQL", icon: "⚡" },
+  { href: "/saga", label: "Saga SQL", icon: "⚙" },
 ];
 
 export function Sidebar() {
