@@ -11,6 +11,7 @@ computes the standard return/risk metric set with polars window expressions.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import polars as pl
@@ -88,6 +89,8 @@ class AnalysisService:
         self.settings = settings
         self.fs = fs
         self._root = Path(settings.node_home)
+        # Mtime-keyed cache: (path, column, ts_column) -> (mtime, result)
+        self._finance_cache: dict[tuple, tuple[float, dict]] = {}
 
     def _lf(self, relative: str) -> pl.LazyFrame:
         return _scan(self.fs._resolve(relative))
@@ -202,6 +205,15 @@ class AnalysisService:
         return ForecastResult(model_used=model_used, series=series)
 
     async def finance(self, path: str, column: str, ts_column: str | None = None) -> dict:
+        try:
+            mtime = os.stat(self.fs._resolve(path)).st_mtime
+        except OSError:
+            mtime = 0.0
+        key = (path, column, ts_column)
+        cached = self._finance_cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+
         cols = [column] + ([ts_column] if ts_column else [])
         df = self._lf(path).select(list(dict.fromkeys(cols)))
         if ts_column:
@@ -234,7 +246,7 @@ class AnalysisService:
         max_dd = float(drawdown.min() or 0.0)
         calmar = (cagr / abs(max_dd)) if max_dd < 0 else 0.0
 
-        return {
+        result = {
             "total_return": round(total_return, 6),
             "cagr": round(cagr, 6),
             "ann_return": round(ann_return, 6),
@@ -246,6 +258,10 @@ class AnalysisService:
             "ema": ema.to_list(),
             "drawdown": drawdown.to_list(),
         }
+        if len(self._finance_cache) >= 32:
+            self._finance_cache.pop(next(iter(self._finance_cache)))
+        self._finance_cache[key] = (mtime, result)
+        return result
 
 
 # ---------------------------------------------------------------------------
