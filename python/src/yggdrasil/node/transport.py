@@ -108,27 +108,64 @@ def read_arrow_stream(data: bytes) -> pa.Table:
     return ipc.open_stream(pa.py_buffer(data)).read_all()
 
 
+class _PyChunkSink:
+    """Minimal write-only sink the pyarrow IPC writer accepts.
+
+    ``BufferOutputStream.getvalue()`` closes the stream, so it can't be polled
+    mid-encode. This sink instead buffers each ``write`` and lets the caller
+    drain the accumulated chunks between batches — peak memory is one chunk.
+    The writer only needs ``write``/``tell``/``flush``/``closed`` off it.
+    """
+
+    def __init__(self) -> None:
+        self.chunks: list[bytes] = []
+        self._pos = 0
+        self.closed = False
+
+    def write(self, data) -> int:
+        b = bytes(data)
+        self.chunks.append(b)
+        self._pos += len(b)
+        return len(b)
+
+    def tell(self) -> int:
+        return self._pos
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+    def drain(self) -> bytes:
+        if not self.chunks:
+            return b""
+        out = b"".join(self.chunks)
+        self.chunks.clear()
+        return out
+
+
 def iter_arrow_ipc_stream(batches: Iterator[pa.RecordBatch], schema: pa.Schema) -> Iterator[bytes]:
     """Stream an Arrow IPC encoding of ``batches`` chunk by chunk.
 
-    Peak memory stays near one batch: each ``write_batch`` flushes into the
-    sink, we drain the sink, then move on. This is the heavy/remote result path
-    where materialising the whole encoded result would blow up RAM.
+    Peak memory stays near one batch: each ``write_batch`` buffers into the
+    sink, we drain it, then move on. This is the heavy/remote result path where
+    materialising the whole encoded result would blow up RAM.
     """
-    sink = pa.BufferOutputStream()
+    sink = _PyChunkSink()
     writer = ipc.new_stream(sink, schema)
-    pos = 0
-    # Drain the schema header (and each subsequent batch) by slicing only the
-    # newly-written tail off the sink, so we never re-yield bytes already sent.
+    # The schema header is written eagerly; drain it before the first batch so
+    # the consumer gets a well-formed stream prefix immediately.
+    header = sink.drain()
+    if header:
+        yield header
     for batch in batches:
         writer.write_batch(batch)
-        buf = sink.getvalue()
-        chunk = buf.slice(pos).to_pybytes()
+        chunk = sink.drain()
         if chunk:
             yield chunk
-        pos = len(buf)
     writer.close()
-    tail = sink.getvalue().slice(pos).to_pybytes()
+    tail = sink.drain()
     if tail:
         yield tail
 
