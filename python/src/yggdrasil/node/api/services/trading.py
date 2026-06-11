@@ -38,6 +38,26 @@ def _scan(path: Path) -> pl.LazyFrame:
     )
 
 
+def _ds_list(lst: list, max_points: int | None) -> list:
+    if not max_points or len(lst) <= max_points:
+        return lst
+    step = len(lst) / max_points
+    return [lst[int(i * step)] for i in range(max_points)]
+
+
+def _downsample_dict(d: dict, max_points: int) -> dict:
+    """Evenly subsample all list values in d to at most max_points entries."""
+    n = max(len(v) for v in d.values() if isinstance(v, list))
+    if n <= max_points:
+        return d
+    step = n / max_points
+    idx = [int(i * step) for i in range(max_points)]
+    return {
+        k: [v[i] for i in idx] if isinstance(v, list) else v
+        for k, v in d.items()
+    }
+
+
 class TradingService:
     def __init__(self, settings, fs: FsService) -> None:
         self.settings = settings
@@ -50,7 +70,7 @@ class TradingService:
     def _columns(self, relative: str) -> list[str]:
         return self._lf(relative).collect_schema().names()
 
-    async def indicators(self, path: str, column: str, ts_column: str | None = None) -> dict:
+    async def _indicators_full(self, path: str, column: str, ts_column: str | None = None) -> dict:
         have = self._columns(path)
         if column not in have:
             raise ValueError(
@@ -123,29 +143,32 @@ class TradingService:
         df = lf.with_columns(exprs).collect()
         n = df.height
 
-        out = {
-            "price": df.get_column(column).to_list(),
-            "ema_9": df.get_column("ema_9").to_list(),
-            "ema_21": df.get_column("ema_21").to_list(),
-            "ema_50": df.get_column("ema_50").to_list(),
-            "ema_200": df.get_column("ema_200").to_list(),
-            "sma_20": df.get_column("sma_20").to_list(),
-            "sma_50": df.get_column("sma_50").to_list(),
-            "rsi_14": df.get_column("rsi_14").to_list(),
-            "macd_line": df.get_column("macd_line").to_list(),
-            "macd_signal": df.get_column("macd_signal").to_list(),
-            "macd_hist": df.get_column("macd_hist").to_list(),
-            "bb_upper": df.get_column("bb_upper").to_list(),
-            "bb_middle": df.get_column("bb_middle").to_list(),
-            "bb_lower": df.get_column("bb_lower").to_list(),
-            "atr_14": df.get_column("atr_14").to_list() if "atr_14" in df.columns else [None] * n,
-            "vwap": df.get_column("vwap").to_list() if "vwap" in df.columns else [None] * n,
-            "ts": df.get_column(ts_column).to_list() if ts_column else list(range(n)),
-        }
-        return out
+        indicator_cols = [
+            "ema_9", "ema_21", "ema_50", "ema_200", "sma_20", "sma_50",
+            "rsi_14", "macd_line", "macd_signal", "macd_hist",
+            "bb_upper", "bb_middle", "bb_lower",
+        ]
+        if "atr_14" not in df.columns:
+            df = df.with_columns(pl.lit(None).cast(pl.Float64).alias("atr_14"))
+        if "vwap" not in df.columns:
+            df = df.with_columns(pl.lit(None).cast(pl.Float64).alias("vwap"))
 
-    async def signals(self, path: str, column: str, ts_column: str | None = None) -> dict:
-        ind = await self.indicators(path, column, ts_column)
+        ts_list = df.get_column(ts_column).to_list() if ts_column else list(range(n))
+        return {"price": df.get_column(column).to_list(), "ts": ts_list,
+                **{c: df.get_column(c).to_list() for c in [*indicator_cols, "atr_14", "vwap"]}}
+
+    async def indicators(self, path: str, column: str, ts_column: str | None = None,
+                         max_points: int | None = None) -> dict:
+        """Full TA suite. max_points downsamples output for chart display without
+        affecting indicator accuracy (computed on all rows first)."""
+        raw = await self._indicators_full(path, column, ts_column)
+        if max_points and len(raw["price"]) > max_points:
+            return _downsample_dict(raw, max_points)
+        return raw
+
+    async def signals(self, path: str, column: str, ts_column: str | None = None,
+                      max_points: int | None = None) -> dict:
+        ind = await self._indicators_full(path, column, ts_column)
         # Re-derive the crossover signals as a DataFrame so we stay vectorized:
         # a crossover is a sign change in (a - b), i.e. sign flips between rows.
         df = pl.DataFrame({
@@ -206,23 +229,25 @@ class TradingService:
             .alias("signal")
         )
 
-        return {
+        out = {
             "signal": df.get_column("signal").to_list(),
             "ema_cross": df.get_column("ema_cross").to_list(),
             "rsi_signal": df.get_column("rsi_signal").to_list(),
             "macd_cross": df.get_column("macd_cross").to_list(),
             "ts": ind["ts"],
         }
+        return _downsample_dict(out, max_points) if max_points else out
 
     async def backtest(self, path: str, column: str, strategy: str = "ema_cross",
-                       initial_cash: float = 10_000.0, ts_column: str | None = None) -> dict:
+                       initial_cash: float = 10_000.0, ts_column: str | None = None,
+                       max_points: int | None = None) -> dict:
         valid = {"ema_cross", "rsi_mean_reversion", "macd", "buy_and_hold"}
         if strategy not in valid:
             raise ValueError(
                 f"Unknown strategy {strategy!r}. Pick one of: {', '.join(sorted(valid))}."
             )
 
-        ind = await self.indicators(path, column, ts_column)
+        ind = await self._indicators_full(path, column, ts_column)
         prices = ind["price"]
         n = len(prices)
         if n < 2:
@@ -233,6 +258,28 @@ class TradingService:
         macd_line, macd_signal = ind["macd_line"], ind["macd_signal"]
         ts = ind["ts"]
 
+        # Pre-compute per-bar long signal as a flat list[int]: +1=enter, -1=exit, 0=hold.
+        # Avoids per-iteration function call overhead in the sequential equity loop.
+        if strategy == "buy_and_hold":
+            want_long = [1 if i == 0 else 0 for i in range(n)]
+        elif strategy == "ema_cross":
+            want_long = [
+                0 if (ema9[i] is None or ema21[i] is None)
+                else (1 if ema9[i] > ema21[i] else -1)
+                for i in range(n)
+            ]
+        elif strategy == "rsi_mean_reversion":
+            want_long = [
+                0 if rsi[i] is None else (1 if rsi[i] < 30 else (-1 if rsi[i] > 70 else 0))
+                for i in range(n)
+            ]
+        else:  # macd
+            want_long = [
+                0 if (macd_line[i] is None or macd_signal[i] is None)
+                else (1 if macd_line[i] > macd_signal[i] else -1)
+                for i in range(n)
+            ]
+
         # Position state is sequential — this loop is the documented exception
         # to the no-Python-loop rule. One share at a time, no costs, no partials.
         cash = float(initial_cash)
@@ -241,46 +288,20 @@ class TradingService:
         trades: list[dict] = []
         entry_price: float | None = None
 
-        def _want_long(i: int) -> bool | None:
-            """True=enter long, False=exit, None=hold."""
-            if strategy == "buy_and_hold":
-                return True if i == 0 else None
-            if strategy == "ema_cross":
-                a, b = ema9[i], ema21[i]
-                if a is None or b is None:
-                    return None
-                return a > b
-            if strategy == "rsi_mean_reversion":
-                r = rsi[i]
-                if r is None:
-                    return None
-                if r < 30:
-                    return True
-                if r > 70:
-                    return False
-                return None
-            # macd
-            m, s = macd_line[i], macd_signal[i]
-            if m is None or s is None:
-                return None
-            return m > s
-
         for i in range(n):
             price = float(prices[i])
-            want = _want_long(i)
-            if want is True and shares == 0.0:
+            want = want_long[i]
+            if want == 1 and shares == 0.0:
                 shares = cash / price
                 cash = 0.0
                 entry_price = price
                 trades.append({"ts": ts[i], "action": "buy", "price": price,
                                "shares": shares, "cash": cash, "value": shares * price})
-            elif want is False and shares > 0.0:
+            elif want == -1 and shares > 0.0:
                 cash = shares * price
                 trades.append({"ts": ts[i], "action": "sell", "price": price,
-                               "shares": shares, "cash": cash, "value": cash})
-                # Win = sold above entry.
-                if entry_price is not None:
-                    trades[-1]["win"] = price > entry_price
+                               "shares": shares, "cash": cash, "value": cash,
+                               "win": price > entry_price})
                 shares = 0.0
                 entry_price = None
             equity_curve.append(cash + shares * price)
@@ -306,10 +327,10 @@ class TradingService:
             "sortino": metrics["sortino"],
             "n_trades": n_trades,
             "win_rate": round(win_rate, 4),
-            "equity_curve": equity_curve,
+            "equity_curve": _ds_list(equity_curve, max_points),
             "trades": trades,
             "benchmark_return": round(benchmark_return, 6),
-            "benchmark_equity": benchmark_equity,
+            "benchmark_equity": _ds_list(benchmark_equity, max_points),
         }
 
     async def correlation(self, paths: list[str], column: str = "close") -> dict:

@@ -70,7 +70,7 @@ class _SelectiveGZipMiddleware(BaseHTTPMiddleware):
         if len(body) < _GZIP_MIN:
             return Response(content=body, status_code=response.status_code,
                             headers=dict(response.headers), media_type=ct)
-        compressed = _gzip.compress(body, compresslevel=6)
+        compressed = _gzip.compress(body, compresslevel=1)
         headers = dict(response.headers)
         headers["content-encoding"] = "gzip"
         headers["content-length"] = str(len(compressed))
@@ -240,16 +240,16 @@ def create_api(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/v2/trading/indicators")
     async def trading_indicators(req: IndicatorsRequest):
-        return await st.trading.indicators(req.path, req.column, req.ts_column)
+        return await st.trading.indicators(req.path, req.column, req.ts_column, req.max_points)
 
     @app.post("/api/v2/trading/signals")
     async def trading_signals(req: SignalsRequest):
-        return await st.trading.signals(req.path, req.column, req.ts_column)
+        return await st.trading.signals(req.path, req.column, req.ts_column, req.max_points)
 
     @app.post("/api/v2/trading/backtest")
     async def trading_backtest(req: BacktestRequest):
         return await st.trading.backtest(
-            req.path, req.column, req.strategy, req.initial_cash, req.ts_column)
+            req.path, req.column, req.strategy, req.initial_cash, req.ts_column, req.max_points)
 
     @app.post("/api/v2/trading/correlation")
     async def trading_correlation(req: CorrelationRequest):

@@ -12,12 +12,14 @@ class IndicatorsRequest(BaseModel):
     path: str
     column: str
     ts_column: str | None = None
+    max_points: int | None = 2000
 
 
 class SignalsRequest(BaseModel):
     path: str
     column: str
     ts_column: str | None = None
+    max_points: int | None = 2000
 
 
 class BacktestRequest(BaseModel):
@@ -26,6 +28,7 @@ class BacktestRequest(BaseModel):
     strategy: Strategy = "ema_cross"
     initial_cash: float = 10_000.0
     ts_column: str | None = None
+    max_points: int | None = 2000
 
 
 class CorrelationRequest(BaseModel):
