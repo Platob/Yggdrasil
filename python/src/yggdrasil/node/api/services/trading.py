@@ -457,10 +457,16 @@ class TradingService:
             raise ValueError(f"Need >=2 assets to correlate, got {len(paths)}.")
         # Align by row index (assets may differ in length): truncate to the
         # shortest, build a returns DataFrame, let polars compute corr/std.
+        # Deduplicate stems: append _2, _3 … when the same file name appears
+        # multiple times so duplicate paths produce distinct column names.
+        seen: dict[str, int] = {}
         series: dict[str, pl.Series] = {}
         for p in paths:
+            stem = Path(p).stem
+            seen[stem] = seen.get(stem, 0) + 1
+            key = stem if seen[stem] == 1 else f"{stem}_{seen[stem]}"
             df = self._lf(p).select(pl.col(column)).collect()
-            series[Path(p).stem] = df.get_column(column)
+            series[key] = df.get_column(column)
         m = min(s.len() for s in series.values())
         rets = pl.DataFrame({name: s.head(m) for name, s in series.items()}).select(
             pl.all().pct_change()
