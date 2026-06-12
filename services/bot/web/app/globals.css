@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0a0f1a;
+  --foreground: #e2e8f0;
+  --card: #0f172a;
+  --card-border: rgba(148, 163, 184, 0.08);
+  --accent: #6366f1;
+  --muted: #334155;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+
+/* Ticker animation */
+@keyframes ticker-scroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.ticker-scroll {
+  animation: ticker-scroll 40s linear infinite;
+  will-change: transform;
+}
+.ticker-scroll:hover { animation-play-state: paused; }
+
+/* Card glow on hover */
+.card-hover:hover {
+  border-color: rgba(99, 102, 241, 0.3) !important;
+  box-shadow: 0 0 20px rgba(99, 102, 241, 0.08);
+}
+
+/* Number flash */
+@keyframes flash-green { 0%, 100% { color: inherit; } 50% { color: #34d399; } }
+@keyframes flash-red   { 0%, 100% { color: inherit; } 50% { color: #f87171; } }
+.flash-green { animation: flash-green 0.5s ease; }
+.flash-red   { animation: flash-red 0.5s ease; }
