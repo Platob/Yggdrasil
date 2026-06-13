@@ -95,10 +95,11 @@ pickle = [
 ]
 
 api = [
-  "fastapi",
-  "uvicorn",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
   "pydantic>=2.10",
   "httpx",
+  "psutil>=5.9",
 ]
 
 mongoengine = [
