@@ -9,16 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import math
-import os
 import platform
 import random
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 
 from .config import Settings
 from .remote import call_remote, get_registry
