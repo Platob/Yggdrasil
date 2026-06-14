@@ -101,6 +101,15 @@ api = [
   "httpx",
 ]
 
+node = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic>=2.10",
+  "httpx",
+  "psutil",
+  "scikit-learn",
+]
+
 mongoengine = [
   "mongoengine>=0.29",
 ]
