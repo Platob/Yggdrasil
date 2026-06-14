@@ -78,14 +78,36 @@ export interface MonitorSnapshot {
   disk_percent: number;
 }
 
+export interface CryptoPrice {
+  id: string;
+  price: number | null;
+  change_24h: number | null;
+  vs: string;
+}
+
+export interface CryptoResponse {
+  prices: CryptoPrice[];
+  error?: string;
+}
+
+export interface MarketSummary {
+  fx: FxRate[];
+  crypto: { id: string; price: number | null; change_24h: number | null; vs?: string }[];
+  node: { cpu_percent: number; mem_percent: number };
+}
+
 export const api = {
   ping: () => apiFetch<HealthResponse>("/api/ping"),
   health: () => apiFetch<HealthResponse>("/api/v2/health"),
   stats: () => apiFetch<StatsResponse>("/api/v2/stats"),
   backend: () => apiFetch<BackendInfo>("/api/v2/backend"),
 
-  fx: (pairs = "EUR/USD,EUR/GBP,EUR/JPY,USD/JPY,GBP/USD") =>
-    apiFetch<FxResponse>(`/api/v2/market/fx?pairs=${encodeURIComponent(pairs)}`),
+  fx: (pairs = "EUR/USD,EUR/GBP,EUR/JPY,USD/JPY,GBP/USD", start?: string, end?: string) => {
+    const q = new URLSearchParams({ pairs });
+    if (start) q.set("start", start);
+    if (end) q.set("end", end);
+    return apiFetch<FxResponse>(`/api/v2/market/fx?${q}`);
+  },
 
   energy: (zone = "DE_LU", series = "day_ahead_prices", start?: string, end?: string) => {
     const q = new URLSearchParams({ zone, series });
@@ -93,6 +115,11 @@ export const api = {
     if (end) q.set("end", end);
     return apiFetch<EnergyResponse>(`/api/v2/market/energy?${q}`);
   },
+
+  crypto: (coins = "bitcoin,ethereum,solana,cardano") =>
+    apiFetch<CryptoResponse>(`/api/v2/market/crypto?coins=${encodeURIComponent(coins)}`),
+
+  marketSummary: () => apiFetch<MarketSummary>("/api/v2/market/summary"),
 
   chat: (req: ChatRequest) =>
     apiFetch<ChatResponse>("/api/v2/loki/chat", {
