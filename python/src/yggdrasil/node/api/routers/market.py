@@ -13,8 +13,8 @@ _DEFAULT_CRYPTO = "bitcoin,ethereum,solana,cardano"
 async def get_fx(
     request: Request,
     pairs: str = Query(_DEFAULT_FX),
-    start: str | None = Query(None),
-    end: str | None = Query(None),
+    start: str | None = Query(None, description="ISO date for historical range start"),
+    end: str | None = Query(None, description="ISO date for historical range end"),
     sampling: str = Query("1d"),
 ):
     pair_list = [p.strip() for p in pairs.split(",") if "/" in p]
