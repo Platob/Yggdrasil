@@ -7,6 +7,8 @@ These run anywhere Loki runs (no cloud session required):
   source into a frame through the io handlers, cache it, reshape it.
 - :class:`EntsoeSkill` — the energy-data path: pull ENTSO-E power-market series
   (prices / load / generation) for a bidding zone into a cached frame.
+- :class:`FxRateSkill` — the FX path: pull multi-pair exchange-rate time series
+  (Frankfurter → Fawaz fallback) into a cached, optionally geo-enriched frame.
 - :class:`ScaffoldSkill` — create a ready-to-push project from scratch (README,
   .gitignore, per-language ``src``/``tests``, manifest, git-init).
 - :class:`DelegateSkill` — fan independent tasks out to parallel process agents.
@@ -33,8 +35,9 @@ from .skill import LokiSkill, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentSkill", "DelegateSkill", "EntsoeSkill", "PythonProjectSkill",
-           "ScaffoldSkill", "SetupSkill", "WebSkill", "TabularSkill", "TransformSkill"]
+__all__ = ["AgentSkill", "DelegateSkill", "EntsoeSkill", "FxRateSkill",
+           "PythonProjectSkill", "ScaffoldSkill", "SetupSkill", "WebSkill",
+           "TabularSkill", "TransformSkill"]
 
 
 @register
@@ -505,6 +508,103 @@ class EntsoeSkill(LokiSkill):
                 f"then group by date  (or polars: df.group_by_dynamic('timestamp', every='1d'))",
                 f"store as Parquet/Arrow/CSV/Delta:  loki.run('entsoe', series={series!r}, "
                 f"zone={zone!r}, store='out.parquet')",
+            ],
+        }
+
+
+@register
+class FxRateSkill(LokiSkill):
+    """Pull FX exchange-rate time series for currency pairs into a cached frame.
+
+    The FX path, mirroring :class:`EntsoeSkill` for the currency markets: fetch
+    spot or historical rates for one or more ``(source, target)`` pairs through
+    :class:`~yggdrasil.fxrate.FxRate` — which tries Frankfurter (ECB data) then
+    falls back to the Fawaz CDN on any outage — **cache the long frame as
+    Parquet** through the io handlers, and return the preview plus
+    reuse/transform/store next steps. Same data loop as :class:`TabularSkill`,
+    sourced from the FX markets.
+
+    Runs anywhere (no cloud session, no API key — both upstreams are free).
+    Pairs accept ISO codes, ``$``/``€`` aliases, or :class:`Currency` instances;
+    dates accept ``"YYYY-MM-DD"`` / epoch / datetime. Set ``geo=True`` to
+    left-join country/region metadata onto each currency. With no ``start``/``end``
+    it returns the latest spot for each pair.
+    """
+
+    name = "fx_rate"
+    description = "Fetch FX rate time series for currency pairs (multi-backend) as a cached frame."
+    preprompt = (
+        "You are an FX-markets analyst. Reason only from the fetched frame; "
+        "each row is a (source, target) rate over a daily window — value is "
+        "units of target per 1 unit of source — and timestamps are UTC. Be "
+        "precise with the pair direction, the quote, and the time window."
+    )
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        pairs: Optional[list] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        sampling: str = "1d",
+        geo: bool = False,
+        store: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        from yggdrasil.fxrate import FxRate
+        from yggdrasil.io.holder import IO
+
+        # Pairs arrive as ["EUR/USD", "EUR-GBP"] (NL/CLI) or [["EUR","USD"], …]
+        # (programmatic). Normalise both to (source, target) tuples; FxRate's
+        # own coercion then handles ISO/alias/Currency forms per element.
+        pairs = pairs or [("EUR", "USD")]
+        norm: list[tuple[str, str]] = []
+        for p in pairs:
+            if isinstance(p, str):
+                parts = re.split(r"[\/\-_, ]+", p.strip())
+                if len(parts) != 2:
+                    raise ValueError(f"cannot read pair {p!r}; use 'EUR/USD' or ['EUR','USD']")
+                norm.append((parts[0], parts[1]))
+            else:
+                norm.append((p[0], p[1]))
+
+        fx = FxRate()
+        if start and end:
+            df = fx.fetch(pairs=norm, start=start, end=end, sampling=sampling, geo=geo)
+            mode = "timeseries"
+        else:
+            df = fx.latest(pairs=norm)
+            mode = "latest"
+
+        cdir = pathlib.Path(cache_dir) if cache_dir else (pathlib.Path.home() / ".loki" / "cache")
+        cdir.mkdir(parents=True, exist_ok=True)
+        slug = "-".join(f"{s}{t}".lower() for s, t in norm)[:48] or "fx"
+        key = f"fxrate-{mode}-{slug}"
+        cached_to = cdir / f"{key}.parquet"
+        IO.from_(str(cached_to)).write_polars_frame(df)
+
+        stored = None
+        if store:
+            IO.from_(store).write_polars_frame(df)
+            stored = store
+
+        return {
+            "available": True,
+            "mode": mode,
+            "pairs": norm,
+            "rows": df.height,
+            "columns": list(df.columns),
+            "preview": IO.from_(str(cached_to)).display(),
+            "cached_to": str(cached_to),
+            "stored": stored,
+            "next_steps": [
+                f"reuse:  loki.run('tabular', cache={str(cached_to)!r})",
+                f"daily mean / resample:  loki.run('transform', cache={str(cached_to)!r}) "
+                f"(or polars: df.group_by(['source','target']).agg(pl.col('value').mean()))",
+                f"store as Parquet/Arrow/CSV/Delta:  loki.run('fx_rate', pairs={norm!r}, "
+                f"start={start!r}, end={end!r}, store='out.parquet')",
             ],
         }
 
