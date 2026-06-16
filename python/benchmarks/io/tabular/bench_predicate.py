@@ -668,6 +668,54 @@ def _dispatch_scenarios(
     return out
 
 
+def _view_scenarios(rows_n: int, repeat: int, engines: set[str]) -> list[dict]:
+    """Filter Arrow tables whose columns use the *view* layouts.
+
+    pyarrow ships no ``equal`` / ``is_in`` / ``array_filter`` /
+    ``array_take`` kernel for ``string_view`` / ``binary_view``, so the
+    predicate path flattens view columns to their concrete form first
+    (``arrow.cast.flatten_view_columns``) before the kernel runs — it
+    used to raise ``ArrowNotImplementedError`` instead. These rows
+    measure that flatten + filter against the same data in flat
+    ``string`` / ``binary`` so the flatten overhead is visible, and pin
+    that the view path actually runs.
+
+    The third row is the sharp case: a predicate on a **non-view**
+    column while a ``string_view`` column merely rides along. The
+    row-selection kernels (``array_filter`` / ``array_take``) have no
+    view overload, so this filter broke even though the predicate never
+    touched the view column — the flatten is what unblocks it.
+    """
+    if "arrow" not in engines:
+        return []
+    sides = ["buy" if i % 2 == 0 else "sell" for i in range(rows_n)]
+    flat = pa.table({"id": list(range(rows_n)), "side": sides})
+    view = pa.table({
+        "id": list(range(rows_n)),
+        "side": pa.array(sides, type=pa.string_view()),
+    })
+    on_side = col("side") == "buy"
+    on_id = col("id") >= (rows_n // 2)
+
+    out: list[dict] = []
+    out.append(_time_one(
+        f"view: filter flat string col=='buy' rows={rows_n}",
+        lambda: on_side.filter_arrow_table(flat),
+        repeat=repeat, inner=20,
+    ))
+    out.append(_time_one(
+        f"view: filter string_view col=='buy' rows={rows_n}",
+        lambda: on_side.filter_arrow_table(view),
+        repeat=repeat, inner=20,
+    ))
+    out.append(_time_one(
+        f"view: filter id>=N/2 with string_view col riding along rows={rows_n}",
+        lambda: on_id.filter_arrow_table(view),
+        repeat=repeat, inner=20,
+    ))
+    return out
+
+
 def scenarios(
     rows_n: int,
     values_n: int,
@@ -682,6 +730,7 @@ def scenarios(
         *(_arrow_eval_scenarios(rows_n, values_n, repeat) if "arrow" in engines else []),
         *_cast_scenarios(rows_n, values_n, repeat, engines),
         *_temporal_scenarios(rows_n, repeat, engines),
+        *_view_scenarios(rows_n, repeat, engines),
         *_dispatch_scenarios(rows_n, values_n, repeat, engines),
     ]
 

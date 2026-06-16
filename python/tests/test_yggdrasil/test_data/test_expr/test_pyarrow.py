@@ -253,3 +253,74 @@ class TestPredicateFilterPicksBestEngine:
         kept = list(col("x").is_in([2, 4]).filter_arrow_batches(batches))
         merged = pa.Table.from_batches(kept)
         assert merged.column("x").to_pylist() == [2, 4]
+
+
+class TestArrowViewTypes:
+    """Predicate filtering over Arrow *view* columns (``string_view`` /
+    ``binary_view`` / ``list_view``).
+
+    pyarrow ships no ``equal`` / ``is_in`` / ``array_filter`` / ``array_take``
+    kernel for the view layouts, so a naive ``table.filter(...)`` raises
+    ``ArrowNotImplementedError`` on any table carrying one — even when the
+    predicate only touches a non-view column. The filter path flattens view
+    columns to their concrete form first; these tests pin that.
+    """
+
+    def _view_table(self):
+        return pa.table({
+            "x": pa.array(["a", "b", "c"], type=pa.string_view()),
+            "v": [1, 2, 3],
+            "b": pa.array([b"p", b"q", b"r"], type=pa.binary_view()),
+            "l": pa.array([[1], [2], [3]], type=pa.list_view(pa.int64())),
+        })
+
+    def test_equality_on_string_view_column(self):
+        out = (col("x") == "b").filter_arrow_table(self._view_table())
+        assert out.column("v").to_pylist() == [2]
+
+    def test_predicate_on_non_view_column_with_view_columns_present(self):
+        # The array_filter/array_take kernels have no view overload, so this
+        # used to raise even though the predicate never touches a view column.
+        out = (col("v") > 1).filter_arrow_table(self._view_table())
+        assert out.column("v").to_pylist() == [2, 3]
+
+    def test_is_in_on_string_view_column(self):
+        out = col("x").is_in(["b", "c"]).filter_arrow_table(self._view_table())
+        assert out.column("v").to_pylist() == [2, 3]
+
+    def test_equality_on_binary_view_column(self):
+        out = (col("b") == b"q").filter_arrow_table(self._view_table())
+        assert out.column("v").to_pylist() == [2]
+
+    def test_view_columns_flattened_to_concrete_in_output(self):
+        out = (col("v") >= 1).filter_arrow_table(self._view_table())
+        assert out.schema.field("x").type == pa.large_string()
+        assert out.schema.field("b").type == pa.large_binary()
+        assert pa.types.is_list(out.schema.field("l").type)
+        # values survive the flatten untouched
+        assert out.column("x").to_pylist() == ["a", "b", "c"]
+        assert out.column("l").to_pylist() == [[1], [2], [3]]
+
+    def test_record_batch_path(self):
+        batch = self._view_table().to_batches()[0]
+        kept = (col("x") == "a").filter_arrow_batch(batch)
+        assert kept.num_rows == 1
+        assert kept.column("x").to_pylist() == ["a"]
+
+    def test_streaming_filter_over_view_batches(self):
+        batches = self._view_table().to_batches()
+        kept = list((col("v") >= 2).filter_arrow_batches(batches))
+        merged = pa.Table.from_batches(kept)
+        assert merged.column("v").to_pylist() == [2, 3]
+
+    def test_out_of_order_list_view_filters_correctly(self):
+        # Rows point into the shared values buffer out of order — pc.cast
+        # mis-packs this, so the flatten uses the dedicated gather helper.
+        lv = pa.ListViewArray.from_arrays(
+            pa.array([4, 0, 2], type=pa.int32()),
+            pa.array([1, 2, 2], type=pa.int32()),
+            pa.array([10, 20, 30, 40, 50, 60]),
+        )
+        t = pa.table({"k": [1, 2, 3], "lv": lv})
+        out = (col("k") == 2).filter_arrow_table(t)
+        assert out.column("lv").to_pylist() == [[10, 20]]

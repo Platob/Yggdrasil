@@ -652,11 +652,18 @@ class Predicate(Expression):
         fully-dropped batches are skipped so consumers see only
         "non-empty rows that match".
         """
+        from yggdrasil.arrow.cast import flatten_view_columns
+
         clauses = _to_inlist_clauses(self)
         effective_arrow: "Any" = None
         for batch in batches:
             if batch.num_rows == 0:
                 continue
+            # Flatten Arrow view columns (no-op when none) so the filter /
+            # is_in kernels — which lack view overloads — apply. The
+            # compiled expression is built once off the first flattened
+            # batch; flattening is deterministic per schema.
+            batch = flatten_view_columns(batch)
             if clauses is not None:
                 kept = _apply_inlist(batch, clauses)
             else:
@@ -690,6 +697,14 @@ class Predicate(Expression):
           against the target's actual schema) and then the standard
           ``target.filter(pa.Expression)`` path.
         """
+        from yggdrasil.arrow.cast import flatten_view_columns
+
+        # pyarrow has no filter / take / equal / is_in kernel for the
+        # Arrow view types — flatten string_view / binary_view / list_view
+        # columns to their concrete form first (identity no-op when the
+        # target carries none) so both the predicate kernels and the
+        # row-selection apply. See :func:`flatten_view_columns`.
+        target = flatten_view_columns(target)
         clauses = _to_inlist_clauses(self)
         if clauses is not None:
             return _apply_inlist(target, clauses)

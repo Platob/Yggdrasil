@@ -18,8 +18,15 @@ predicate, in one native pass.
 
 A non-local (remote) holder falls back to the generic per-leaf
 :class:`Folder` read, which still prunes partitions on the path and pushes the
-projection into each :class:`ParquetFile`. Writes / child iteration / the schema
-sidecar are inherited from :class:`Folder` (children default to parquet).
+projection into each :class:`ParquetFile`. Writes / child iteration are
+inherited from :class:`Folder` (children default to parquet).
+
+**Schema detection** is specialized too: :meth:`ParquetFolder._collect_schema`
+reads the shape from the **first part file's footer** (unified with the Hive
+partition columns on the path) rather than the inherited ``.ygg/schema.arrow``
+sidecar — the parquet footer is the authoritative, never-stale record of what's
+on disk and is present even for directories materialised by external writers
+that drop no sidecar.
 
 Mirrors :class:`~yggdrasil.io.delta.delta_folder.DeltaFolder` (a parquet
 directory + a transaction log) minus the ``_delta_log`` — same pruning/pushdown
@@ -74,6 +81,78 @@ class ParquetFolder(Folder):
             return None
         full = getattr(path, "full_path", None)
         return full() if callable(full) else None
+
+    # ------------------------------------------------------------------
+    # Schema — from the first part file's footer, not the .ygg sidecar
+    # ------------------------------------------------------------------
+    def _collect_schema(self, options: FolderOptions) -> Any:
+        """Schema from the first parquet part file's footer, not the sidecar.
+
+        A parquet directory carries its schema natively in every part
+        file's footer, so the first part is the authoritative shape — it
+        stays correct for directories materialised by external writers
+        (Spark, ``pyarrow.dataset.write_dataset``, a bare
+        ``pq.write_table`` loop) that never drop a ``.ygg/schema.arrow``
+        sidecar, and it never goes stale the way a hand-maintained
+        sidecar can. ``pyarrow.dataset`` infers the dataset schema from
+        the **first** file alone (no full-tree scan) and folds in the
+        Hive partition columns discovered on the directory path, so one
+        footer read yields the complete folder shape.
+
+        Resolution order (most specific wins):
+
+        1. Ancestor ``_schema_cache`` walk (as :class:`Folder`) — a
+           partition child minted mid-read reuses the root's already
+           resolved schema instead of re-opening a footer.
+        2. The first local part file's footer, unified with the Hive
+           partition columns on the path (the part files don't carry
+           them); those columns are tagged ``partition_by`` so the
+           inherited write / prune machinery still recognises them.
+        3. Falls back to :meth:`Folder._collect_schema` (sidecar /
+           first-batch) for a remote holder or a directory with no
+           readable parquet part file yet.
+        """
+        parent = self.tabular_parent
+        while parent is not None:
+            cached = getattr(parent, "_schema_cache", ...)
+            if cached is not ...:
+                return cached
+            parent = getattr(parent, "tabular_parent", None)
+
+        path = self._local_dir_str()
+        if path is not None:
+            arrow_schema = None
+            physical: list[str] = []
+            try:
+                dataset = pyarrow_dataset_module().dataset(
+                    path, format="parquet", partitioning="hive",
+                )
+                arrow_schema = dataset.schema
+                # Hive partition columns live on the path, not in the
+                # footer — diff the unified dataset schema against the
+                # first fragment's physical schema to recover them.
+                physical = next(dataset.get_fragments()).physical_schema.names
+            except Exception:
+                # No parquet files / not materialised yet — defer to the
+                # sidecar / first-batch fallback below.
+                arrow_schema = None
+            if arrow_schema is not None:
+                from yggdrasil.data.schema import Schema
+                schema = Schema.from_arrow(arrow_schema)
+                partition_names = [n for n in arrow_schema.names if n not in physical]
+                if partition_names:
+                    schema = Schema(
+                        [
+                            c.with_partition_by(True, inplace=False)
+                            if c.name in partition_names else c
+                            for c in schema.children
+                        ],
+                        name=schema.name,
+                        metadata=schema.metadata,
+                    )
+                return schema
+
+        return super()._collect_schema(options)
 
     # ------------------------------------------------------------------
     # Read — native dataset scan with pushdown, else generic per-leaf
