@@ -234,3 +234,7 @@ tsconfig.tsbuildinfo
 
 # Throwaway local live-smoke scripts (never committed).
 smoke_*.py
+
+# YGG node runtime data (generated at runtime, not source)
+python/logs/
+.ygg_node/
