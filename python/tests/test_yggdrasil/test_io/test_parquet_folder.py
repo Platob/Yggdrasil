@@ -91,6 +91,51 @@ class TestParquetFolderPolars:
         assert sorted(got.column("id").to_pylist()) == [3, 4]
 
 
+class TestParquetFolderSchemaDetection:
+    def test_schema_from_first_file_footer_without_sidecar(self, tmp_path):
+        # Materialise part files by hand — no ``.ygg/schema.arrow`` sidecar,
+        # exactly like a directory written by Spark / pq.write_table.
+        pq.write_table(pa.table({"id": [1], "v": [2]}), str(tmp_path / "p.parquet"))
+        assert not (tmp_path / ".ygg").exists()
+        schema = ParquetFolder(path=str(tmp_path)).collect_schema()
+        assert schema.names == ["id", "v"]
+
+    def test_schema_prefers_footer_over_stale_sidecar(self, tmp_path):
+        # Write through the folder (drops a sidecar), then replace the part
+        # file's actual shape on disk. The footer must win over the sidecar.
+        f = ParquetFolder(path=str(tmp_path))
+        f.write_arrow_table(
+            pa.table({"id": [1], "v": [2]}),
+            options=ParquetFolderOptions(mode=Mode.OVERWRITE),
+        )
+        assert (tmp_path / ".ygg").exists()  # sidecar was persisted
+        for name in os.listdir(tmp_path):
+            if name.endswith(".parquet"):
+                os.remove(tmp_path / name)
+        pq.write_table(
+            pa.table({"id": [1], "w": ["x"]}), str(tmp_path / "fresh.parquet"),
+        )
+        # Drop the singleton + its warm in-memory schema cache so the read
+        # resolves cold, as a fresh process would.
+        ParquetFolder._INSTANCES.clear()
+        schema = ParquetFolder(path=str(tmp_path), yggmeta=True).collect_schema()
+        assert schema.names == ["id", "w"]  # footer, not the stale sidecar
+
+    def test_hive_partition_column_is_in_schema_and_tagged(self, tmp_path):
+        for r in ("us", "eu"):
+            d = tmp_path / f"region={r}"
+            d.mkdir()
+            pq.write_table(pa.table({"id": [1], "v": [2]}), str(d / "p.parquet"))
+        schema = ParquetFolder(path=str(tmp_path)).collect_schema()
+        assert "region" in schema.names
+        assert schema["region"].partition_by is True
+        assert schema["id"].partition_by is False
+
+    def test_empty_directory_schema_is_empty(self, tmp_path):
+        schema = ParquetFolder(path=str(tmp_path)).collect_schema()
+        assert list(schema.names) == []
+
+
 class TestParquetFolderArrowDataset:
     def test_read_arrow_dataset_is_hive_partitioned(self, tmp_path):
         for r in ("us", "eu"):
