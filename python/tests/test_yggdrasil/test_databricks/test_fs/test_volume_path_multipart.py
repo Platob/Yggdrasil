@@ -157,6 +157,12 @@ class _Client:
     def files_authorization(self):
         return "Bearer test"
 
+    def files_headers(self):
+        return {
+            "Authorization": "Bearer test",
+            "User-Agent": "yggdrasil-tests/0.0.0",
+        }
+
 
 class _Service:
     def __init__(self, client):
