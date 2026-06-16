@@ -81,6 +81,7 @@ __all__ = [
     "cast_arrow_record_batch_reader",
     "conform_arrow_batch",
     "default_arrow_scalar",
+    "flatten_view_columns",
     "rechunk_arrow_batches",
     "rechunk_arrow_table",
 ]
@@ -342,6 +343,64 @@ def _is_view_type(arr_type: Any) -> bool:
     except TypeError:
         # Unhashable type — return without caching.
         pass
+    return result
+
+
+def flatten_view_columns(data: Any) -> Any:
+    """Materialise every top-level Arrow *view* column to its concrete form.
+
+    *data* is a :class:`pa.Table` or :class:`pa.RecordBatch`. pyarrow
+    ships **no** ``array_filter`` / ``array_take`` kernel for the view
+    layouts (``string_view`` / ``binary_view`` / ``list_view`` /
+    ``large_list_view``), and the ``equal`` / ``is_in`` comparison
+    kernels a predicate compiles to have no view overloads either — so
+    ``Table.filter`` / ``Table.take`` raise ``ArrowNotImplementedError``
+    on *any* table that carries one, even when the predicate only
+    touches non-view columns. Flattening up front lets the row-selection
+    and comparison kernels apply; the flattened columns carry
+    byte-identical logical values.
+
+    Concrete targets follow the existing ``_VIEW_TO_CONCRETE`` convention
+    (``string_view`` → ``large_string``, ``binary_view`` →
+    ``large_binary``); list views rebuild through
+    :func:`_list_view_to_list` because ``pc.cast(list_view → list)``
+    mis-packs out-of-order / overlapping offsets. Identity return (no
+    copy) when *data* carries no view-typed column — the steady-state
+    path pays only the cached :func:`_is_view_type` probe per field.
+    """
+    schema = data.schema
+    view_indices = [i for i, f in enumerate(schema) if _is_view_type(f.type)]
+    if not view_indices:
+        return data
+
+    import pyarrow.types as pat
+
+    result = data
+    for i in view_indices:
+        f = schema.field(i)
+        col = data.column(i)
+        t = f.type
+        if pat.is_string_view(t):
+            flat = col.cast(pa.large_string())
+        elif pat.is_binary_view(t):
+            flat = col.cast(pa.large_binary())
+        else:
+            # list_view / large_list_view — rebuild via the gather helper
+            # (one Array at a time; combine a Table's chunked column first).
+            from yggdrasil.data.types.nested.array import _list_view_to_list
+            if isinstance(col, pa.ChunkedArray):
+                large = pat.is_large_list_view(t)
+                target_type = (
+                    pa.large_list(t.value_field) if large else pa.list_(t.value_field)
+                )
+                flat = pa.chunked_array(
+                    [_list_view_to_list(c) for c in col.chunks], type=target_type,
+                )
+            else:
+                flat = _list_view_to_list(col)
+        result = result.set_column(
+            i, pa.field(f.name, flat.type, f.nullable), flat,
+        )
     return result
 
 
