@@ -1374,15 +1374,28 @@ class HTTPSession(Session):
                 retries = next_retries
                 if response.status == 429:
                     # Rate limited: retry on a fresh connection (new source
-                    # port / TLS session) with a rotated browser identity, so a
-                    # per-connection or fingerprint-keyed limiter sees a clean,
-                    # internally-consistent client rather than the just-throttled
-                    # pooled socket. Only the who-am-I headers rotate —
-                    # content negotiation (Accept/Accept-Encoding) is preserved.
+                    # port / TLS session) so a per-connection limiter sees a
+                    # clean socket rather than the just-throttled pooled one.
                     self._evict_host(current_request.url)
-                    rotated_headers = HTTPHeaders(current_request.headers)
-                    rotated_headers.update(random_browser_profile().identity)
-                    current_request = current_request.copy(headers=rotated_headers)
+                    # Browser-identity rotation is a *scraping* tactic: against a
+                    # public, fingerprint-keyed limiter a fresh User-Agent /
+                    # Sec-Fetch identity reads as a new client. But an
+                    # **authenticated** request is attributed by its bearer token
+                    # (or a signed URL), not its User-Agent — and APIs like the
+                    # Databricks Files endpoint deliberately key the
+                    # *authenticated* rate limit on a stable, attributable
+                    # User-Agent (see ``DatabricksClient.files_headers``): a
+                    # request missing it is treated as anonymous and throttled
+                    # *harder*. Swapping in a random browser UA there gets the
+                    # retry reclassified as an anonymous browser, turning one 429
+                    # into a storm. So only rotate when the request carries no
+                    # ``Authorization`` — i.e. the unauthenticated scraping case
+                    # the rotation was built for. Content negotiation
+                    # (Accept/Accept-Encoding) is preserved either way.
+                    if not current_request.headers.get("Authorization"):
+                        rotated_headers = HTTPHeaders(current_request.headers)
+                        rotated_headers.update(random_browser_profile().identity)
+                        current_request = current_request.copy(headers=rotated_headers)
                 continue
 
             return response

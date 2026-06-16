@@ -208,3 +208,90 @@ def test_persistent_connection_drops_warn_after_fourth_retry(server):
     warnings = [r for r in records if r.levelno == logging.WARNING]
     assert len(debugs) == 3       # the first three retries stay quiet
     assert len(warnings) == 2     # the 4th and 5th retries warn
+
+
+# -- 429 identity rotation: only for unauthenticated traffic -------------
+#
+# Browser-identity rotation on a 429 is a scraping tactic. Against an
+# *authenticated* API (a request carrying ``Authorization``) it is actively
+# harmful: services like the Databricks Files API key the authenticated rate
+# limit on a stable, attributable User-Agent, so swapping in a random browser
+# UA mid-retry gets the request reclassified as anonymous and throttled harder
+# — turning one 429 into a storm. The session must leave an authenticated
+# request's User-Agent untouched and only rotate the unauthenticated case.
+
+
+class _UACapturingHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    throttle_first = 0          # answer the first N requests with 429 before 200
+    requests = 0
+    user_agents: list[str] = []
+
+    def do_GET(self):
+        type(self).requests += 1
+        type(self).user_agents.append(self.headers.get("User-Agent", ""))
+        if type(self).requests <= type(self).throttle_first:
+            body = b"slow down"
+            self.send_response(429)
+            self.send_header("Retry-After", "0")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+@pytest.fixture(scope="module")
+def ua_server():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _UACapturingHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{port}"
+    srv.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def _reset_ua_handler():
+    _UACapturingHandler.throttle_first = 0
+    _UACapturingHandler.requests = 0
+    _UACapturingHandler.user_agents = []
+    yield
+
+
+def test_429_keeps_user_agent_for_authenticated_requests(ua_server):
+    # An authenticated request (Authorization header set) must keep its
+    # User-Agent verbatim across every 429 retry — the edge attributes the
+    # authenticated rate limit to it.
+    _UACapturingHandler.throttle_first = 3
+    session = HTTPSession(base_url=ua_server)
+    stable_ua = "yggdrasil-sdk/1.2.3 (databricks-files)"
+    r = session.get(
+        "/x",
+        headers={"Authorization": "Bearer tok", "User-Agent": stable_ua},
+    )
+    assert r.status_code == 200
+    assert _UACapturingHandler.requests == 4         # 3 × 429 + 1 × 200
+    # Every attempt — initial and all three retries — carried the same UA.
+    assert _UACapturingHandler.user_agents == [stable_ua] * 4
+
+
+def test_429_rotates_user_agent_for_unauthenticated_requests(ua_server):
+    # No Authorization → the scraping rotation still applies: at least one
+    # retry presents a different (browser-shaped) User-Agent.
+    _UACapturingHandler.throttle_first = 3
+    session = HTTPSession(base_url=ua_server)
+    stable_ua = "yggdrasil-sdk/1.2.3"
+    r = session.get("/x", headers={"User-Agent": stable_ua})
+    assert r.status_code == 200
+    assert _UACapturingHandler.requests == 4
+    seen = _UACapturingHandler.user_agents
+    assert seen[0] == stable_ua                       # initial attempt unchanged
+    assert any(ua != stable_ua for ua in seen[1:])    # retries rotated identity
