@@ -49,6 +49,36 @@ def to_polars(expr: Expression):
     return _emit(expr, pl)
 
 
+def _match_literal_tz(pl_dt, value, pl):  # type: ignore[no-untyped-def]
+    """Re-stamp a ``pl.Datetime`` literal's tz from the *value*'s own zone key.
+
+    polars treats ``"UTC"`` and ``"Etc/UTC"`` as **distinct** zones for
+    comparison and raises ``SchemaError`` when a literal's zone string
+    differs from the column's — even though both name the same instant.
+    yggdrasil's :class:`~yggdrasil.enums.timezone.Timezone` canonicalises
+    every UTC-family spelling to ``"Etc/UTC"``, so a literal that the tz
+    pushdown aligned to a column polars spells ``"UTC"`` would emit
+    ``"Etc/UTC"`` and blow up the filter.
+
+    The aligned datetime *value* carries the column's actual zone via its
+    ``tzinfo.key`` (the pushdown builds it with ``ZoneInfo(column_tz)``), so
+    prefer that key over the canonicalised dtype tz. No-op when the value
+    has no explicit zone key (fixed-offset / naive) or the strings already
+    agree, so non-UTC zones (``"Europe/Paris"`` …) and the steady state are
+    untouched. Arrow is unaffected — it treats the two spellings as equal.
+    """
+    import datetime as _dt
+
+    if not isinstance(pl_dt, pl.Datetime) or pl_dt.time_zone is None:
+        return pl_dt
+    if not isinstance(value, _dt.datetime) or value.tzinfo is None:
+        return pl_dt
+    key = getattr(value.tzinfo, "key", None)
+    if key and key != pl_dt.time_zone:
+        return pl.Datetime(time_unit=pl_dt.time_unit, time_zone=key)
+    return pl_dt
+
+
 def _emit(expr: Expression, pl):  # type: ignore[no-untyped-def]
     if isinstance(expr, Column):
         return pl.col(expr.name)
@@ -60,7 +90,7 @@ def _emit(expr: Expression, pl):  # type: ignore[no-untyped-def]
             except Exception:
                 pl_dt = None
             if pl_dt is not None:
-                return pl.lit(expr.value, dtype=pl_dt)
+                return pl.lit(expr.value, dtype=_match_literal_tz(pl_dt, expr.value, pl))
         return pl.lit(expr.value)
 
     if isinstance(expr, Comparison):
