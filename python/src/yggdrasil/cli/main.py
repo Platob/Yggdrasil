@@ -34,6 +34,10 @@ def _build_parser() -> argparse.ArgumentParser:
     loki = sub.add_parser("loki", help="Loki — the global yggdrasil agent.", add_help=False)
     loki.set_defaults(handler=_loki)
 
+    # -- node --------------------------------------------------------------
+    node = sub.add_parser("node", help="YGG node server (FastAPI backend + trading).", add_help=False)
+    node.set_defaults(handler=_node)
+
     return parser
 
 
@@ -47,6 +51,12 @@ def _loki(args: argparse.Namespace) -> int:
     from yggdrasil.loki.cli import main as loki_main
     remaining = sys.argv[2:] if len(sys.argv) > 2 else []
     return loki_main(remaining)
+
+
+def _node(args: argparse.Namespace) -> int:
+    from yggdrasil.node.cli import main as node_main
+    remaining = sys.argv[2:] if len(sys.argv) > 2 else []
+    return node_main(remaining)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -40,6 +40,7 @@ from .api import (
 from .base import YGGException
 from .cast import CastError
 from .loki import LokiError, TokenBudgetExceeded
+from .node import NodeBadRequestError, NodeError, NodeNotFoundError
 from .http import (
     AuthRequiredError,
     BadGatewayError,
@@ -104,6 +105,10 @@ __all__ = [
     "CastError",
     "LokiError",
     "TokenBudgetExceeded",
+    # Node
+    "NodeError",
+    "NodeNotFoundError",
+    "NodeBadRequestError",
     # HTTP — base
     "HTTPError",
     # HTTP — request-bound
