@@ -205,6 +205,20 @@ def _text(elem: "ET.Element | None", name: str) -> "str | None":
     return child.text.strip() if (child is not None and child.text) else None
 
 
+# Cached tag-stripping: ENTSO-E documents reuse the same ~10 tag names across
+# thousands of elements, so memoizing the namespace-strip pays off immediately.
+_local_cache: dict[str, str] = {}
+
+
+def _lc(tag: str) -> str:
+    """Fast cached variant of _local — for the hot parse loop only."""
+    v = _local_cache.get(tag)
+    if v is None:
+        v = tag.rsplit("}", 1)[-1]
+        _local_cache[tag] = v
+    return v
+
+
 def parse_timeseries_xml(xml: str) -> list[dict[str, Any]]:
     """Parse an ENTSO-E publication document into tidy rows.
 
@@ -217,33 +231,74 @@ def parse_timeseries_xml(xml: str) -> list[dict[str, Any]]:
     API's "no matching data" reply) yields an empty list rather than raising.
     """
     root = ET.fromstring(xml.encode() if isinstance(xml, str) else xml)
-    if _local(root.tag).startswith("Acknowledgement"):
+    if _lc(root.tag).startswith("Acknowledgement"):
         return []                                   # API "no data" envelope
 
     rows: list[dict[str, Any]] = []
-    for ts in _findall(root, "TimeSeries"):
-        currency = _text(ts, "currency_Unit.name")
-        unit = (_text(ts, "price_Measure_Unit.name")
-                or _text(ts, "quantity_Measure_Unit.name") or "MAW")
-        for period in _findall(ts, "Period"):
-            interval = _find(period, "timeInterval")
-            start_txt = _text(interval, "start")
+    for child0 in root:
+        if _lc(child0.tag) != "TimeSeries":
+            continue
+        # Single pass over TimeSeries children — collect currency, unit, and
+        # Period elements without re-iterating for each metadata field.
+        currency: str | None = None
+        unit: str | None = None
+        periods: list[ET.Element] = []
+        for child1 in child0:
+            lname = _lc(child1.tag)
+            if lname == "currency_Unit.name":
+                currency = child1.text.strip() if child1.text else None
+            elif lname == "price_Measure_Unit.name":
+                unit = child1.text.strip() if child1.text else None
+            elif lname == "quantity_Measure_Unit.name" and unit is None:
+                unit = child1.text.strip() if child1.text else "MAW"
+            elif lname == "Period":
+                periods.append(child1)
+        if unit is None:
+            unit = "MAW"
+
+        for period in periods:
+            # Single pass over Period children — collect timeInterval, resolution,
+            # and Point elements.
+            start_txt: str | None = None
+            resolution: str | None = None
+            points: list[ET.Element] = []
+            for child2 in period:
+                lname = _lc(child2.tag)
+                if lname == "timeInterval":
+                    for child3 in child2:
+                        if _lc(child3.tag) == "start":
+                            start_txt = child3.text.strip() if child3.text else None
+                            break
+                elif lname == "resolution":
+                    resolution = child2.text.strip() if child2.text else "PT60M"
+                elif lname == "Point":
+                    points.append(child2)
             if not start_txt:
                 continue
-            start = dt.datetime.fromisoformat(start_txt.replace("Z", "+00:00"))
-            step = _RESOLUTION_MIN.get(_text(period, "resolution") or "PT60M", 60)
-            for point in _findall(period, "Point"):
-                pos = _text(point, "position")
-                val = _text(point, "price.amount") or _text(point, "quantity")
+            period_start = dt.datetime.fromisoformat(start_txt.replace("Z", "+00:00"))
+            step = _RESOLUTION_MIN.get(resolution or "PT60M", 60)
+            # Pre-compute the timedelta for one step — avoids constructing it
+            # for every point in the inner loop.
+            step_delta = dt.timedelta(minutes=step)
+
+            for point in points:
+                pos: str | None = None
+                val: str | None = None
+                for child3 in point:
+                    lname = _lc(child3.tag)
+                    if lname == "position":
+                        pos = child3.text
+                    elif lname in ("price.amount", "quantity"):
+                        val = child3.text
                 if pos is None or val is None:
                     continue
                 position = int(pos)
                 rows.append({
-                    "timestamp": start + dt.timedelta(minutes=step * (position - 1)),
+                    "timestamp": period_start + step_delta * (position - 1),
                     "value": float(val),
                     "unit": unit,
                     "currency": currency,
-                    "resolution": _text(period, "resolution"),
+                    "resolution": resolution,
                     "position": position,
                 })
     return rows
@@ -259,14 +314,16 @@ def to_frame(xml: str, *, zone: Optional[str] = None, series: Optional[str] = No
     import polars as pl
 
     rows = parse_timeseries_xml(xml)
-    frame = pl.DataFrame(rows, schema_overrides={"value": pl.Float64}) if rows else pl.DataFrame(
-        schema={"timestamp": pl.Datetime, "value": pl.Float64, "unit": pl.Utf8,
-                "currency": pl.Utf8, "resolution": pl.Utf8, "position": pl.Int64})
+    if not rows:
+        return pl.DataFrame(
+            schema={"timestamp": pl.Datetime, "value": pl.Float64, "unit": pl.Utf8,
+                    "currency": pl.Utf8, "resolution": pl.Utf8, "position": pl.Int64})
+    frame = pl.DataFrame(rows, schema_overrides={"value": pl.Float64})
     if zone is not None:
         frame = frame.with_columns(pl.lit(zone).alias("zone"))
     if series is not None:
         frame = frame.with_columns(pl.lit(series).alias("series"))
-    return frame.sort("timestamp") if frame.height else frame
+    return frame.sort("timestamp")
 
 
 def fetch_frame(

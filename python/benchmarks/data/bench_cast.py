@@ -132,16 +132,17 @@ def _arrow_scenarios(rows: int, repeat: int) -> list[dict]:
     mismatch_table = _arrow_table(rows, mismatch=True)
 
     # Match path — every column already matches; the cast site
-    # short-circuits via the engine-type bypass.
+    # short-circuits via the engine-type bypass. Use cast_arrow_table which
+    # is the correct entry for pa.Table (cast_arrow_tabular expects ArrowTabular).
     out.append(_time_one(
-        f"arrow: cast_arrow_tabular MATCH rows={rows}",
-        lambda: opts.cast_arrow_tabular(match_table),
+        f"arrow: cast_arrow_table MATCH rows={rows}",
+        lambda: opts.cast_arrow_table(match_table),
         repeat=repeat, inner=200,
     ))
     # Mismatch path — int32 → int64 cast kernel fires on the id col.
     out.append(_time_one(
-        f"arrow: cast_arrow_tabular CAST rows={rows}",
-        lambda: opts.cast_arrow_tabular(mismatch_table),
+        f"arrow: cast_arrow_table CAST rows={rows}",
+        lambda: opts.cast_arrow_table(mismatch_table),
         repeat=repeat, inner=200,
     ))
     # opts.cast(table) — the public DataIO entry point. Hits the
