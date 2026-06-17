@@ -33,8 +33,9 @@ from .skill import LokiSkill, register
 if TYPE_CHECKING:
     from .agent import Loki
 
-__all__ = ["AgentSkill", "DelegateSkill", "EntsoeSkill", "PythonProjectSkill",
-           "ScaffoldSkill", "SetupSkill", "WebSkill", "TabularSkill", "TransformSkill"]
+__all__ = ["AgentSkill", "DelegateSkill", "EntsoeSkill", "FxRateSkill",
+           "PythonProjectSkill", "ScaffoldSkill", "SetupSkill", "WebSkill",
+           "TabularSkill", "TransformSkill"]
 
 
 @register
@@ -505,6 +506,86 @@ class EntsoeSkill(LokiSkill):
                 f"then group by date  (or polars: df.group_by_dynamic('timestamp', every='1d'))",
                 f"store as Parquet/Arrow/CSV/Delta:  loki.run('entsoe', series={series!r}, "
                 f"zone={zone!r}, store='out.parquet')",
+            ],
+        }
+
+
+@register
+class FxRateSkill(LokiSkill):
+    """Fetch FX exchange rates for currency pairs as a cached frame.
+
+    The trading-data path: pull daily exchange rates for one or more currency
+    pairs from free public APIs (Frankfurter/ECB rates), parse into a tidy
+    polars frame (source/target/timestamp/value), **cache it as Parquet**, and
+    return the preview plus concrete next steps — reuse the cache, transform,
+    store, or load into Databricks.
+
+    Runs anywhere (no cloud session). Default: EUR/USD, EUR/GBP, EUR/JPY
+    for the last 30 days. Specify ``pairs`` as ``[("EUR", "USD"), ...]``.
+    """
+
+    name = "fxrate"
+    description = "Fetch FX exchange rates for currency pairs as a cached frame."
+    preprompt = (
+        "You are a markets analyst. Quote exchange rate levels and changes precisely "
+        "(absolute and %), note the period and direction. Do not give financial advice."
+    )
+
+    def run(
+        self,
+        agent: Loki,
+        *,
+        pairs: Optional[list] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        days: int = 30,
+        store: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        import datetime as dt
+
+        from yggdrasil.fxrate import FxRate
+        from yggdrasil.io.holder import IO
+
+        # defaults: EUR → USD, GBP, JPY — classic G10 cross
+        if not pairs:
+            pairs = [("EUR", "USD"), ("EUR", "GBP"), ("EUR", "JPY")]
+
+        now = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_v = start or (now - dt.timedelta(days=days)).date().isoformat()
+        end_v = end or now.date().isoformat()
+
+        try:
+            fx = FxRate()
+            df = fx.fetch(pairs, start_v, end_v)
+        except Exception as exc:
+            return {"available": False, "pairs": pairs, "error": str(exc)}
+
+        cdir = pathlib.Path(cache_dir) if cache_dir else (pathlib.Path.home() / ".loki" / "cache")
+        cdir.mkdir(parents=True, exist_ok=True)
+        pair_slug = "-".join(f"{s}{t}" for s, t in pairs[:3]).lower()
+        key = f"fxrate-{pair_slug}"
+        cached_to = cdir / f"{key}.parquet"
+        IO.from_(str(cached_to)).write_polars_frame(df)
+
+        stored = None
+        if store:
+            IO.from_(store).write_polars_frame(df)
+            stored = store
+
+        return {
+            "available": True,
+            "pairs": pairs,
+            "rows": df.height,
+            "columns": list(df.columns),
+            "preview": IO.from_(str(cached_to)).display(),
+            "cached_to": str(cached_to),
+            "stored": stored,
+            "next_steps": [
+                f"reuse:  loki.run('tabular', cache={str(cached_to)!r})",
+                f"transform (cast, tz, select):  loki.run('transform', cache={str(cached_to)!r})",
+                f"store as Parquet:  loki.run('fxrate', pairs={pairs!r}, store='out.parquet')",
             ],
         }
 

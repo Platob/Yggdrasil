@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from .engine import TokenEngine
     from .tools import Toolbox
 
-__all__ = ["Loki", "ROUTES", "ActStep", "ActResult"]
+__all__ = ["Loki", "ROUTES", "ActStep", "ActResult", "TRADING_SIGNALS"]
 
 
 @dataclass(slots=True)
@@ -123,6 +123,14 @@ ENERGY_SIGNALS: tuple[str, ...] = (
     "entso", "electricity price", "power price", "power prices", "electricity",
     "day-ahead", "day ahead", "spot price", "power market", "energy market",
     "grid load", "power generation", "power demand", "megawatt", "mwh", "bidding zone",
+)
+
+#: FX/trading phrasing → the ``fxrate`` skill.
+TRADING_SIGNALS: tuple[str, ...] = (
+    "exchange rate", "fx rate", "fxrate", "currency pair", "currency rate",
+    "forex", "fx market", "spot rate", "forward rate", "cross rate",
+    "eur/usd", "gbp/usd", "usd/jpy", "eur/gbp", "usd/chf",
+    "eurusd", "gbpusd", "usdjpy",
 )
 
 #: Meta/advice phrasing that asks *how to build* something rather than to do it
@@ -854,6 +862,17 @@ class Loki:
             p = made("data", "skill", why="ENTSO-E power-market data → entsoe skill")
             p.skill = "entsoe"
             p.skill_kwargs = infer_query(text)
+            return p
+
+        # FX/trading data → the fxrate skill, with pairs extracted from text.
+        if not re.search(r"https?://", text) and any(s in low for s in TRADING_SIGNALS):
+            pair_matches = re.findall(r"\b([A-Z]{3})[/\-]([A-Z]{3})\b", text.upper())
+            kw: dict[str, Any] = {}
+            if pair_matches:
+                kw["pairs"] = [(a, b) for a, b in pair_matches[:6]]
+            p = made("data", "skill", why="FX/trading request → fxrate skill")
+            p.skill = "fxrate"
+            p.skill_kwargs = kw
             return p
 
         # With a live Databricks session, a precise NL request ("list catalogs",
