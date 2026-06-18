@@ -4,6 +4,7 @@ Subcommands::
 
     ygg databricks      YGGDBKS Databricks management CLI
     ygg loki            Loki — the global yggdrasil agent (status/run/token)
+    ygg bot             YGG Bot trading+AI server (serve/status)
 
 ``ygg`` is the single console-script entry point: deployed Databricks
 python-wheel tasks (Auto Loader via ``ygg databricks table autoload``, the Loki
@@ -34,6 +35,10 @@ def _build_parser() -> argparse.ArgumentParser:
     loki = sub.add_parser("loki", help="Loki — the global yggdrasil agent.", add_help=False)
     loki.set_defaults(handler=_loki)
 
+    # -- bot ---------------------------------------------------------------
+    bot = sub.add_parser("bot", help="YGG Bot trading+AI server.", add_help=False)
+    bot.set_defaults(handler=_bot)
+
     return parser
 
 
@@ -47,6 +52,12 @@ def _loki(args: argparse.Namespace) -> int:
     from yggdrasil.loki.cli import main as loki_main
     remaining = sys.argv[2:] if len(sys.argv) > 2 else []
     return loki_main(remaining)
+
+
+def _bot(args: argparse.Namespace) -> int:
+    from yggdrasil.bot.cli import main as bot_main
+    remaining = sys.argv[2:] if len(sys.argv) > 2 else []
+    return bot_main(remaining)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

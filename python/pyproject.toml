@@ -101,6 +101,15 @@ api = [
   "httpx",
 ]
 
+# Trading + AI bot server (FastAPI backend + CLI)
+bot = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "pydantic>=2.10",
+  "pydantic-settings>=2.0",
+  "httpx",
+]
+
 mongoengine = [
   "mongoengine>=0.29",
 ]
