@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ygg"
+description = "Schema-aware data interchange — Python bindings over the Rust ygg-core engine."
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: Apache Software License",
+]
+
+[project.urls]
+Homepage = "https://github.com/platob/yggdrasil"
+Repository = "https://github.com/platob/yggdrasil"
+
+[tool.maturin]
+# Pure-Rust extension; the compiled module is imported as `ygg`.
+module-name = "ygg"
+manifest-path = "Cargo.toml"
+strip = true

@@ -1,38 +1,41 @@
 # Yggdrasil
 
-Schema-aware data interchange, rebuilt from scratch in **pure Rust**.
+Schema-aware data interchange, built **Rust-first**. The engine lives in the
+Rust crate `ygg-core`; the Python and JS/TS packages are thin bindings that
+wrap the same core — not separate reimplementations.
 
-> This repository was reset to a clean Rust foundation. The previous
-> Python / JS-TS / Databricks implementation was removed. Build up from here.
+> Reset to a clean Rust foundation. Logic that matters lives in Rust once;
+> the other languages extend outward from it. See [CLAUDE.md](CLAUDE.md).
 
 ## Layout
 
-Each language implementation lives in its own top-level directory, kept
-cleanly separated:
-
 ```
-rust/      Rust crate (reference implementation, started here)
-python/    Python package (to be (re)added)
-js/        JS/TS package (to be (re)added)
+rust/                Cargo workspace
+  ygg-core/          the engine — single source of truth (Uri, Url, …)
+python/              PyO3/maturin bindings → package `ygg` (PyPI)
+js/                  napi-rs/wasm bindings → package `@platob/yggdrasil` (npm)
 ```
 
 ## Build
 
 ```bash
-cd rust
-cargo build
-cargo test
+# Rust core
+cd rust && cargo test
+
+# Python bindings (wraps the Rust core via maturin)
+cd python && pip install maturin && maturin develop
+python -c "from ygg import Url; print(Url.parse('https://example.com:443/p'))"
 ```
 
 ## Publishing
 
-Releases are driven by GitHub Actions, one workflow per language:
+One workflow per language, each named for its target:
 
-| Language | Directory | Crate/Package | Workflow | Trigger |
-|----------|-----------|---------------|----------|---------|
-| Rust (crates.io) | `rust/` | `ygg` | `publish-rust.yml` | tag `ygg-rust-v*` |
-| Python (PyPI) | `python/` | `ygg` | `publish-python.yml` | tag `v*` / `python/**` push |
-| JS/TS (npm) | `js/` | `@platob/yggdrasil` | `publish-js.yml` | tag `yggdrasil-js-v*` |
+| Language | Directory | Package | Workflow | Trigger |
+|----------|-----------|---------|----------|---------|
+| Rust → crates.io | `rust/ygg-core/` | `ygg-core` | `publish-rust.yml` | tag `ygg-rust-v*` |
+| Python → PyPI | `python/` | `ygg` | `publish-python.yml` | tag `ygg-python-v*` |
+| JS/TS → npm | `js/` | `@platob/yggdrasil` | `publish-js.yml` | tag `ygg-js-v*` |
 
 ## License
 

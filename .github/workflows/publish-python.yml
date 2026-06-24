@@ -1,312 +1,123 @@
-# ============================================================================
-# publish.yml
-#
-# Builds and publishes the `ygg` pure-Python package to PyPI.
-# Versioned from the single source of truth: python/pyproject.toml.
-#
-# Jobs
-# ----
-#   detect             → reads version, checks ygg on PyPI, decides
-#   build-python       → sdist + pure-Python wheel (uv / setuptools), plus
-#                        the serverless environment spec pairing the wheel +
-#                        the bundled dependency wheels (databricks-sdk, polars
-#                        + polars-runtime, orjson, xxhash — all by path) with
-#                        the py3.12 Databricks serverless env version
-#                        (scripts/build_serverless_env.py → environments/ygg/)
-#   publish-python     → uploads ygg dist to PyPI
-#   tag                → creates vX.Y.Z git tag + GitHub Release (dist +
-#                        serverless env spec + bundled wheels), commits the
-#                        spec to environments/ygg/
-#   cleanup-previous   → opt-in: removes previous tag/release on
-#                        ``!cleanup-prev-release`` commit marker
-#   skip               → summary when publish is intentionally skipped
-#
-# Commit conventions
-# ------------------
-# Include the literal token ``!cleanup-prev-release`` anywhere in any
-# commit message on the push to ask CI to delete the previous git tag
-# + GitHub Release after the new one publishes. PyPI yanking has to be
-# confirmed manually (no public API); the workflow summary links the
-# release management page.
-#
-# Cleanup also fires automatically when the new version is a patch bump
-# of the previous tag (same ``MAJOR.MINOR``) — e.g. 1.2.3 → 1.2.4 drops
-# 1.2.3, but 1.2.5 → 1.3.0 keeps the 1.2.x series. The marker stays as
-# the opt-in for cross-minor cleanup.
-#
-# PyPI setup required
-# -------------------
-# environment "pypi" with trusted publisher OR secret PYPI_API_TOKEN.
-# Set repo variable PYPI_TRUSTED_PUBLISHING = 'true' to opt into OIDC;
-# otherwise the token-based fallback is used automatically.
-# ============================================================================
-
 name: publish-python
+
+# Builds the `ygg` Python package — a maturin-built extension wrapping the
+# Rust ygg-core engine — and publishes it to PyPI.
+#
+# Triggers:
+#   - push a tag like ``ygg-python-v0.1.0`` (must match python/Cargo.toml version)
+#   - or run manually (workflow_dispatch) with an optional dry run (build only)
+#
+# PyPI auth: trusted publishing (OIDC) when repo variable
+# PYPI_TRUSTED_PUBLISHING == 'true', otherwise the PYPI_API_TOKEN secret.
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "python/src/**"
-      - "python/pyproject.toml"
-      - "python/README.md"
-      - "python/LICENSE"
-      - ".github/workflows/publish-python.yml"
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-
+      - "ygg-python-v*"
   workflow_dispatch:
     inputs:
-      force_publish:
-        description: "Publish even if version already exists on PyPI"
-        required: false
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-
-concurrency:
-  group: publish
-  cancel-in-progress: false
+      dry_run:
+        description: "Build wheels + sdist only (no publish)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: publish-python
+  cancel-in-progress: false
+
 jobs:
-
   # --------------------------------------------------------------------------
-  # detect — version gate
+  # build-wheels — compiled wheels across platforms via maturin
   # --------------------------------------------------------------------------
-  detect:
-    name: Detect version & decide
-    runs-on: ubuntu-latest
-
-    outputs:
-      version:           ${{ steps.meta.outputs.version }}
-      should_publish:    ${{ steps.decision.outputs.should_publish }}
-      cleanup_previous:  ${{ steps.cleanup.outputs.cleanup_previous }}
-      previous_tag:      ${{ steps.cleanup.outputs.previous_tag }}
+  build-wheels:
+    name: Wheels (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  manylinux: auto }
+          - { os: ubuntu-latest,  target: aarch64-unknown-linux-gnu, manylinux: auto }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      manylinux: "" }
+          - { os: macos-13,       target: x86_64-apple-darwin,       manylinux: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    manylinux: "" }
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Extract version from python/pyproject.toml
-        id: meta
-        run: |
-          VERSION=$(python3 - <<'PY'
-          import re, pathlib
-          text = pathlib.Path("python/pyproject.toml").read_text()
-          m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
-          print(m.group(1))
-          PY
-          )
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "📦 Version: $VERSION"
-
-      - name: Check ygg on PyPI
-        id: pypi
-        env:
-          VER: ${{ steps.meta.outputs.version }}
-        run: |
-          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-            "https://pypi.org/pypi/ygg/${VER}/json" || echo "000")
-          if [ "$STATUS" = "200" ]; then
-            echo "exists=true"  >> "$GITHUB_OUTPUT"
-            echo "⚠️  ygg v${VER} is already on PyPI."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "✅ ygg v${VER} is not on PyPI yet."
-          fi
-
-      - name: Decide
-        id: decision
-        env:
-          EXISTS: ${{ steps.pypi.outputs.exists }}
-          FORCE:  ${{ github.event.inputs.force_publish || 'false' }}
-          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        run: |
-          if [ "$EXISTS" = "false" ] || [ "$FORCE" = "true" ] || [ "$IS_TAG" = "true" ]; then
-            echo "should_publish=true"  >> "$GITHUB_OUTPUT"
-            echo "🚀 Will publish ygg v${{ steps.meta.outputs.version }}."
-          else
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            echo "⏭️  Skipping – version already on PyPI and force=false."
-          fi
-
-      # Cleanup fires when either (a) any commit on the push carries the
-      # literal token ``!cleanup-prev-release`` (opt-in, cross-minor), or
-      # (b) the previous tag shares the new version's MAJOR.MINOR — i.e.
-      # the new release is a patch bump and the previous patch in that
-      # series is superseded. Routine minor/major bumps stay
-      # non-destructive unless the marker is set.
-      - name: Detect cleanup trigger (marker or same-minor patch bump)
-        id: cleanup
-        env:
-          CURRENT: ${{ steps.meta.outputs.version }}
-        run: |
-          MARKER='!cleanup-prev-release'
-          # Look at every commit on this push, not just HEAD — a release
-          # often lands in a merge that doesn't itself carry the marker.
-          if git log --format='%B' ${{ github.event.before }}..${{ github.sha }} 2>/dev/null \
-               | grep -qF "$MARKER" \
-             || git log -1 --format='%B' ${{ github.sha }} | grep -qF "$MARKER"; then
-            MARKER_FOUND=true
-          else
-            MARKER_FOUND=false
-          fi
-
-          # Resolve previous tag: highest semver v* tag below the current
-          # version. Skip the new version's own tag if it's already pushed.
-          PREV=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
-                 | grep -vx "v$CURRENT" \
-                 | head -n1)
-
-          # Same-minor check: drop the previous tag if it shares MAJOR.MINOR
-          # with the new version (1.2.3 → 1.2.4 cleans 1.2.3; 1.2.5 → 1.3.0
-          # does not). Empty PREV (first release) leaves the flag false.
-          SAME_MINOR=false
-          if [ -n "$PREV" ]; then
-            CURRENT_MM=$(echo "$CURRENT"   | awk -F. '{print $1"."$2}')
-            PREV_MM=$(echo "${PREV#v}" | awk -F. '{print $1"."$2}')
-            if [ "$CURRENT_MM" = "$PREV_MM" ]; then
-              SAME_MINOR=true
-            fi
-          fi
-
-          if [ "$MARKER_FOUND" = "true" ] || [ "$SAME_MINOR" = "true" ]; then
-            CLEANUP=true
-          else
-            CLEANUP=false
-          fi
-
-          echo "cleanup_previous=$CLEANUP" >> "$GITHUB_OUTPUT"
-          echo "previous_tag=$PREV" >> "$GITHUB_OUTPUT"
-          if [ "$CLEANUP" = "true" ]; then
-            REASON="marker=$MARKER_FOUND same_minor=$SAME_MINOR"
-            echo "🧹 Cleanup will run ($REASON); previous_tag=${PREV:-<none>}"
-          else
-            echo "ℹ️  No cleanup trigger (no !cleanup-prev-release marker, previous tag ${PREV:-<none>} not same-minor); previous release will be kept."
-          fi
-
-  # --------------------------------------------------------------------------
-  # build-python — pure-Python sdist + wheel
-  # --------------------------------------------------------------------------
-  build-python:
-    name: Build ygg (pure Python)
-    runs-on: ubuntu-latest
-    needs: detect
-    if: needs.detect.outputs.should_publish == 'true'
-
-    defaults:
-      run:
-        working-directory: python
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          version: "latest"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Build sdist and wheel
-        run: uv build --no-sources
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --find-interpreter
 
-      - name: Verify dist contents
-        run: ls -lh dist/
-
-      # Fetch the bundled dependency wheels to ship BY PATH alongside the ygg
-      # wheel. The runner is Linux x86_64 / py3.12 — the serverless target — so
-      # a native download yields the correct manylinux cp312 builds (no cross
-      # flags). Kept OUT of dist/ so they are never uploaded to PyPI.
-      - name: Fetch bundled dependency wheels
-        run: |
-          mkdir -p serverless-wheels
-          # Pure-python / no-dep packages — their common transitive deps
-          # (e.g. requests for databricks-sdk) ship in the serverless base image.
-          python -m pip download databricks-sdk orjson xxhash \
-            --no-deps --only-binary=:all: -d serverless-wheels
-          # polars is a thin shim over a compiled runtime — pull the closure
-          # (polars + polars-runtime-XX) so it works with no index install.
-          python -m pip download polars \
-            --only-binary=:all: -d serverless-wheels
-          ls -lh serverless-wheels/
-
-      # Alongside the wheel, generate the serverless environment spec — it pairs
-      # this version's ygg wheel with the bundled dependency wheels (all by path,
-      # no index installs) and the py3.12 serverless environment version. Written
-      # to environments/ygg/. Stdlib only, so no install is required.
-      - name: Generate serverless environment spec
-        run: >-
-          python scripts/build_serverless_env.py
-          --version "${{ needs.detect.outputs.version }}"
-          --python 3.12
-          --wheel-dir serverless-wheels
-
-      - name: Verify serverless environment spec
-        working-directory: ${{ github.workspace }}
-        run: cat "environments/ygg/ygg-${{ needs.detect.outputs.version }}-py3.12-serverless.yml"
-
-      # Stage the env spec + the bundled wheels into one flat directory so the
-      # release assets (and the deploy bundle) are the spec next to its wheels.
-      - name: Stage serverless bundle
-        working-directory: ${{ github.workspace }}
-        run: |
-          mkdir -p serverless-bundle
-          cp "environments/ygg/ygg-${{ needs.detect.outputs.version }}-py3.12-serverless.yml" serverless-bundle/
-          cp python/serverless-wheels/*.whl serverless-bundle/
-          ls -lh serverless-bundle/
-
-      - name: Upload python dist artifacts
+      - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: python-dist-${{ needs.detect.outputs.version }}
-          path: python/dist/
-          retention-days: 7
-          if-no-files-found: error
-
-      - name: Upload serverless environment bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: serverless-env-${{ needs.detect.outputs.version }}
-          path: serverless-bundle/
-          retention-days: 7
+          name: wheels-${{ matrix.target }}
+          path: python/dist/*.whl
           if-no-files-found: error
 
   # --------------------------------------------------------------------------
-  # publish-python — upload ygg to PyPI
+  # build-sdist — source distribution
   # --------------------------------------------------------------------------
-  publish-python:
-    name: Publish ygg to PyPI
+  build-sdist:
+    name: sdist
     runs-on: ubuntu-latest
-    needs: [detect, build-python]
-    if: needs.detect.outputs.should_publish == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    permissions:
-      id-token: write
-      contents: read
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: python
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: python/dist/*.tar.gz
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # publish — upload all artifacts to PyPI
+  # --------------------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [build-wheels, build-sdist]
+    if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
 
     environment:
       name: pypi
-      url: https://pypi.org/project/ygg/${{ needs.detect.outputs.version }}/
+      url: https://pypi.org/project/ygg/
+
+    permissions:
+      id-token: write
 
     steps:
-      - name: Download python dist artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: python-dist-${{ needs.detect.outputs.version }}
-          path: dist/
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
 
       - name: Publish via trusted publishing (OIDC)
         if: vars.PYPI_TRUSTED_PUBLISHING == 'true'
@@ -314,209 +125,19 @@ jobs:
         with:
           packages-dir: dist/
           print-hash: true
-          verbose: true
-
-      - name: Install uv (for token-based fallback)
-        if: vars.PYPI_TRUSTED_PUBLISHING != 'true'
-        uses: astral-sh/setup-uv@v4
-        with:
-          version: "latest"
 
       - name: Publish via API token
         if: vars.PYPI_TRUSTED_PUBLISHING != 'true'
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: uv publish dist/*
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          print-hash: true
+          password: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Write success summary
         run: |
           {
-            echo "## ✅ Published \`ygg\` v${{ needs.detect.outputs.version }}"
+            echo "## ✅ Published \`ygg\` to PyPI"
             echo ""
-            echo "🔗 https://pypi.org/project/ygg/${{ needs.detect.outputs.version }}/"
+            echo "🔗 https://pypi.org/project/ygg/"
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # --------------------------------------------------------------------------
-  # tag — git tag + GitHub Release containing ygg dist files
-  # --------------------------------------------------------------------------
-  tag:
-    name: Tag & Release
-    runs-on: ubuntu-latest
-    needs: [detect, publish-python]
-    if: >-
-      needs.detect.outputs.should_publish == 'true'
-      && needs.publish-python.result == 'success'
-      && !startsWith(github.ref, 'refs/tags/v')
-
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Create git tag v${{ needs.detect.outputs.version }}
-        env:
-          VERSION: ${{ needs.detect.outputs.version }}
-        run: |
-          TAG="v${VERSION}"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "⏭️  Tag $TAG already exists — skipping."
-          else
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "$TAG" -m "Release ${TAG}"
-            git push origin "$TAG"
-            echo "🏷️  Created and pushed tag $TAG"
-          fi
-
-      - name: Download python dist artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: python-dist-${{ needs.detect.outputs.version }}
-          path: release/
-
-      - name: Download serverless environment bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: serverless-env-${{ needs.detect.outputs.version }}
-          path: release/
-
-      - name: List release assets
-        run: ls -lh release/
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION:  ${{ needs.detect.outputs.version }}
-        run: |
-          TAG="v${VERSION}"
-          gh release create "$TAG" release/* \
-            --title "Release ${TAG}" \
-            --generate-notes \
-            --verify-tag
-
-      # Commit the generated serverless env spec back into environments/ygg/
-      # so the repo carries a per-version catalog. Runs after the Release is
-      # cut so a push race never blocks publishing — a non-fast-forward push
-      # only warns. The publish trigger's path filter excludes environments/**,
-      # so this push does not re-run the workflow.
-      - name: Commit serverless environment spec to environments/ygg
-        env:
-          VERSION: ${{ needs.detect.outputs.version }}
-        run: |
-          SPEC="environments/ygg/ygg-${VERSION}-py3.12-serverless.yml"
-          mkdir -p "environments/ygg"
-          cp "release/ygg-${VERSION}-py3.12-serverless.yml" "$SPEC"
-          if git diff --quiet -- "$SPEC"; then
-            echo "ℹ️  $SPEC already up to date — nothing to commit."
-            exit 0
-          fi
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$SPEC"
-          git commit -m "chore(environments): add serverless env spec for ygg ${VERSION}"
-          if git push origin "HEAD:${GITHUB_REF_NAME}"; then
-            echo "📦 Committed $SPEC to ${GITHUB_REF_NAME}"
-          else
-            echo "::warning ::Could not push $SPEC to ${GITHUB_REF_NAME} (branch moved?); the spec is still attached to the Release."
-          fi
-
-      - name: Write release summary
-        env:
-          VERSION: ${{ needs.detect.outputs.version }}
-        run: |
-          {
-            echo "## 🏷️ Tagged & Released \`v${VERSION}\`"
-            echo ""
-            echo "🔗 https://github.com/${{ github.repository }}/releases/tag/v${VERSION}"
-            echo ""
-            echo "| Field | Value |"
-            echo "|---|---|"
-            echo "| Tag | \`v${VERSION}\` |"
-            echo "| PyPI (\`ygg\`) | https://pypi.org/project/ygg/${VERSION}/ |"
-            echo "| Commit | \`${{ github.sha }}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # --------------------------------------------------------------------------
-  # cleanup-previous — fires on !cleanup-prev-release marker or same-minor
-  # --------------------------------------------------------------------------
-  #
-  # Runs when the detect job decided either (a) any commit on the push
-  # carries the literal token ``!cleanup-prev-release``, or (b) the
-  # previous tag shares MAJOR.MINOR with the new version (patch bump).
-  # Deletes the prior ``vX.Y.Z`` git tag + GitHub Release and surfaces
-  # the PyPI yank URL for the prior version. Routine cross-minor releases
-  # stay non-destructive unless the marker is set. PyPI's public API
-  # does not expose a yank endpoint; the maintainer-side yank link is
-  # surfaced in the workflow summary as the source of truth.
-  cleanup-previous:
-    name: Cleanup previous release
-    runs-on: ubuntu-latest
-    needs: [detect, tag]
-    if: >-
-      needs.detect.outputs.cleanup_previous == 'true'
-      && needs.tag.result == 'success'
-      && needs.detect.outputs.previous_tag != ''
-
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Delete previous GitHub Release + tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PREV:     ${{ needs.detect.outputs.previous_tag }}
-        run: |
-          echo "🧹 Deleting GitHub Release + tag $PREV"
-          gh release delete "$PREV" --cleanup-tag --yes
-          echo "✅ Removed $PREV from GitHub"
-
-      - name: Yank previous PyPI version
-        env:
-          PREV: ${{ needs.detect.outputs.previous_tag }}
-        run: |
-          VERSION="${PREV#v}"
-          MANAGE_URL="https://pypi.org/manage/project/ygg/release/${VERSION}/"
-          # PyPI does not expose a public token-authenticated yank endpoint;
-          # surface the manage URL so the maintainer can yank in one click.
-          echo "::warning ::PyPI yank for ygg ${VERSION} must be confirmed manually at ${MANAGE_URL}"
-          {
-            echo "## 🧹 Cleaned up previous release \`${PREV}\`"
-            echo ""
-            echo "- GitHub tag + Release: deleted"
-            echo "- PyPI \`ygg ${VERSION}\`: **yank manually** at ${MANAGE_URL}"
-            echo ""
-            echo "_PyPI does not expose a public yank API; once the official"
-            echo "endpoint stabilises, wire it in here._"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # --------------------------------------------------------------------------
-  # skip-summary — posted when nothing needs to be published
-  # --------------------------------------------------------------------------
-  skip-summary:
-    name: Skip summary
-    runs-on: ubuntu-latest
-    needs: detect
-    if: needs.detect.outputs.should_publish == 'false'
-
-    steps:
-      - name: Write skip summary
-        env:
-          VERSION: ${{ needs.detect.outputs.version }}
-        run: |
-          {
-            echo "## ⏭️ Skipped — nothing to publish"
-            echo ""
-            echo "\`ygg\` v${VERSION} is already on PyPI."
-            echo ""
-            echo "Re-run with **force_publish = true** to override."
-          } >> "$GITHUB_STEP_SUMMARY"
-

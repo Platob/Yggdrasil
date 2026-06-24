@@ -16,9 +16,9 @@ re-derive behavior — they call into the compiled Rust core and present a
 language-idiomatic surface over it.
 
 ```
-rust/   ── the engine. All real logic: schema, casting, IO, plans, expr.
-python/ ── PyO3/maturin bindings → import ygg's Rust core from Python.
-js/     ── napi-rs (native) or wasm-bindgen (wasm) → same core from JS/TS.
+rust/ygg-core/ ── the engine. All real logic: identifiers, schema, IO, …
+python/        ── PyO3/maturin bindings → import ygg's Rust core from Python.
+js/            ── napi-rs (native) or wasm-bindgen (wasm) → same core from JS/TS.
 ```
 
 Rules, in order of importance:
@@ -44,13 +44,14 @@ Rules, in order of importance:
 
 ## Architecture & tooling
 
-- **Core** — `rust/`, crate `ygg`. Plain Rust library; no Python/JS knowledge
-  leaks into it. Keep the binding-facing API explicit and stable.
-- **Python** — `python/`, package `ygg`. Bindings via **PyO3**, built and
-  packaged with **maturin** (`pyproject.toml`, `[tool.maturin]`). The crate's
-  Python-facing entry points live behind a `#[cfg(feature = "python")]`
-  (or a dedicated `ygg-python` bridge crate) so the core builds without
-  Python.
+- **Core** — `rust/` is a Cargo workspace; the engine is the `ygg-core`
+  crate (`rust/ygg-core/`). Plain Rust library, no dependencies, no Python/JS
+  knowledge leaks into it. Keep the binding-facing API explicit and stable.
+- **Python** — `python/`, package `ygg`. A dedicated `ygg-python` crate
+  (`python/Cargo.toml`, `crate-type = ["cdylib"]`) builds a **PyO3** extension
+  module depending on `ygg-core` by path; **maturin** (`pyproject.toml`,
+  `[tool.maturin]`) packages it into wheels. There is **no pure-Python
+  implementation** — Python is a binding over the Rust core.
 - **JS/TS** — `js/`, package `@platob/yggdrasil`. Bindings via **napi-rs**
   for native Node addons, or **wasm-bindgen** for a portable WASM build —
   pick per target and keep the TS types generated from the Rust surface.
@@ -77,10 +78,16 @@ Rules, in order of importance:
 ## Layout
 
 ```
-rust/                 ygg crate — the core engine (single source of truth)
-  Cargo.toml
-  src/lib.rs
+rust/                 Cargo workspace
+  Cargo.toml          workspace manifest
+  ygg-core/           the core engine (single source of truth)
+    src/lib.rs        re-exports
+    src/uri.rs        Uri  — RFC 3986 component split
+    src/url.rs        Url  — located URI (scheme + host + port + …)
 python/               PyO3/maturin bindings → package `ygg` (PyPI)
+  Cargo.toml          ygg-python cdylib crate (depends on ../rust/ygg-core)
+  pyproject.toml      maturin build config
+  src/lib.rs          #[pymodule] exposing Uri, Url
 js/                   napi-rs/wasm bindings → package `@platob/yggdrasil` (npm)
 .github/workflows/    publish-rust.yml · publish-python.yml · publish-js.yml
 LICENSE               Apache-2.0
@@ -89,8 +96,9 @@ LICENSE               Apache-2.0
 ## Build
 
 ```bash
-cd rust && cargo build && cargo test     # the core
-# python/ and js/ build their bindings against the rust/ crate
+cd rust && cargo test                    # the core (ygg-core)
+cd python && maturin develop             # build + install the Python binding
+js/                                       # napi-rs/wasm build (to be added)
 ```
 
 ## Publishing
@@ -99,9 +107,10 @@ One workflow per language, named for its target:
 
 | Language | Dir | Package | Workflow | Trigger |
 |----------|-----|---------|----------|---------|
-| Rust → crates.io | `rust/` | `ygg` | `publish-rust.yml` | tag `ygg-rust-v*` |
-| Python → PyPI | `python/` | `ygg` | `publish-python.yml` | tag `v*` / `python/**` push |
-| JS/TS → npm | `js/` | `@platob/yggdrasil` | `publish-js.yml` | tag `yggdrasil-js-v*` |
+| Rust → crates.io | `rust/ygg-core/` | `ygg-core` | `publish-rust.yml` | tag `ygg-rust-v*` |
+| Python → PyPI | `python/` | `ygg` | `publish-python.yml` | tag `ygg-python-v*` |
+| JS/TS → npm | `js/` | `@platob/yggdrasil` | `publish-js.yml` | tag `ygg-js-v*` |
 
-Each release ships the **same core** — the Rust crate plus the bindings that
-wrap it. Keep the three versions in lockstep when the public API changes.
+Each release ships the **same core** — `ygg-core` plus the bindings that wrap
+it. Python ships as maturin-built wheels (compiled extension), **never** a
+pure-Python package. Keep versions in lockstep when the public API changes.

@@ -1,9 +1,9 @@
 name: publish-js
 
-# Publishes the JS/TS yggdrasil library (packages/yggdrasil) to npm.
+# Publishes the JS/TS yggdrasil library (js/) to npm.
 #
 # Triggers:
-#   - push a tag like ``yggdrasil-js-v0.1.0`` (the version must match package.json)
+#   - push a tag like ``ygg-js-v0.1.0`` (the version must match package.json)
 #   - or run manually from the Actions tab (workflow_dispatch)
 #
 # Requires an ``NPM_TOKEN`` repo secret: an npm "Automation" access token for an
@@ -12,7 +12,7 @@ name: publish-js
 on:
   push:
     tags:
-      - "yggdrasil-js-v*"
+      - "ygg-js-v*"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: publish-yggdrasil-npm
+  group: publish-js
   cancel-in-progress: false
 
 jobs:
