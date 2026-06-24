@@ -5,22 +5,34 @@ Schema-aware data interchange, rebuilt from scratch in **pure Rust**.
 > This repository was reset to a clean Rust foundation. The previous
 > Python / JS-TS / Databricks implementation was removed. Build up from here.
 
+## Layout
+
+Each language implementation lives in its own top-level directory, kept
+cleanly separated:
+
+```
+rust/      Rust crate (reference implementation, started here)
+python/    Python package (to be (re)added)
+js/        JS/TS package (to be (re)added)
+```
+
 ## Build
 
 ```bash
+cd rust
 cargo build
 cargo test
 ```
 
 ## Publishing
 
-Releases are driven by GitHub Actions:
+Releases are driven by GitHub Actions, one workflow per language:
 
-| Language | Workflow | Trigger |
-|----------|----------|---------|
-| Rust (crates.io) | `.github/workflows/publish-rust.yml` | tag `yggdrasil-rust-v*` |
-| Python (PyPI) | `.github/workflows/publish.yml` | tag `v*` / `python/**` push |
-| JS/TS (npm) | `.github/workflows/publish-yggdrasil-npm.yml` | tag `yggdrasil-js-v*` |
+| Language | Directory | Workflow | Trigger |
+|----------|-----------|----------|---------|
+| Rust (crates.io) | `rust/` | `.github/workflows/publish-rust.yml` | tag `yggdrasil-rust-v*` |
+| Python (PyPI) | `python/` | `.github/workflows/publish.yml` | tag `v*` / `python/**` push |
+| JS/TS (npm) | `js/` | `.github/workflows/publish-yggdrasil-npm.yml` | tag `yggdrasil-js-v*` |
 
 ## License
 

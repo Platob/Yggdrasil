@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: packages/yggdrasil
+        working-directory: js
 
     steps:
       - name: Checkout
