@@ -54,9 +54,10 @@ Rules, in order of importance:
   (`pyproject.toml`, `[tool.maturin]`) packages it into wheels named `ygg`.
   There is **no pure-Python implementation** — Python is a binding over the
   Rust core.
-- **JS/TS** — `js/`, package `@platob/yggdrasil`. Bindings via **napi-rs**
-  for native Node addons, or **wasm-bindgen** for a portable WASM build —
-  pick per target and keep the TS types generated from the Rust surface.
+- **JS/TS** — `js/`, package `@platob/ygg`. A `ygg-js` cdylib crate binds the
+  `ygg` engine via **wasm-bindgen** (`crate-type = ["cdylib", "rlib"]`),
+  packaged by **wasm-pack** into the npm package; the TS types are generated
+  from the Rust surface. (napi-rs remains an option for native Node addons.)
 
 ## Coding style
 
@@ -90,7 +91,9 @@ python/               PyO3/maturin bindings → package `ygg` (PyPI)
   Cargo.toml          ygg-python cdylib crate (depends on ../rust/ygg)
   pyproject.toml      maturin build config
   src/lib.rs          #[pymodule] exposing Uri, Url
-js/                   napi-rs/wasm bindings → package `@platob/yggdrasil` (npm)
+js/                   wasm-bindgen bindings → package `@platob/ygg` (npm)
+  Cargo.toml          ygg-js cdylib crate (wasm-bindgen, depends on ../rust/ygg)
+  src/lib.rs          #[wasm_bindgen] Uri, Url
 .github/workflows/    publish-rust.yml · publish-python.yml · publish-js.yml
 LICENSE               Apache-2.0
 ```
@@ -111,7 +114,7 @@ One workflow per language, named for its target:
 |----------|-----|---------|----------|---------|
 | Rust → crates.io | `rust/ygg/` | `ygg` | `publish-rust.yml` | tag `ygg-rust-v*` |
 | Python → PyPI | `python/` | `ygg` | `publish-python.yml` | tag `ygg-python-v*` |
-| JS/TS → npm | `js/` | `@platob/yggdrasil` | `publish-js.yml` | tag `ygg-js-v*` |
+| JS/TS → npm | `js/` | `@platob/ygg` | `publish-js.yml` | tag `ygg-js-v*` |
 
 Each release ships the **same core** — the `ygg` crate plus the bindings that
 wrap it. Python ships as maturin-built wheels (compiled extension), **never** a

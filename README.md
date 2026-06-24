@@ -13,7 +13,7 @@ the same core — not separate reimplementations.
 rust/                Cargo workspace
   ygg/               the engine — single source of truth (Uri, Url, …)
 python/              PyO3/maturin bindings → package `ygg` (PyPI)
-js/                  napi-rs/wasm bindings → package `@platob/yggdrasil` (npm)
+js/                  wasm-bindgen bindings → package `@platob/ygg` (npm)
 ```
 
 ## Build
@@ -35,7 +35,7 @@ One workflow per language, each named for its target:
 |----------|-----------|---------|----------|---------|
 | Rust → crates.io | `rust/ygg/` | `ygg` | `publish-rust.yml` | tag `ygg-rust-v*` |
 | Python → PyPI | `python/` | `ygg` | `publish-python.yml` | tag `ygg-python-v*` |
-| JS/TS → npm | `js/` | `@platob/yggdrasil` | `publish-js.yml` | tag `ygg-js-v*` |
+| JS/TS → npm | `js/` | `@platob/ygg` | `publish-js.yml` | tag `ygg-js-v*` |
 
 ## License
 

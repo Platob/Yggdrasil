@@ -1,0 +1,26 @@
+[package]
+name = "ygg-js"
+description = "WASM bindings (wasm-bindgen) over the Rust ygg engine."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+repository = "https://github.com/platob/yggdrasil"
+
+# Produces the `@platob/ygg` npm package via wasm-pack. Binding layer only —
+# all logic lives in the `ygg` engine crate (see ../rust/ygg). Aliased to
+# `ygg_engine` on the Rust side for symmetry with the Python binding.
+[lib]
+name = "ygg_js"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ygg_engine = { path = "../rust/ygg", package = "ygg" }
+
+[dependencies.wasm-bindgen]
+version = "0.2"
+
+# wasm-opt (binaryen) is an optional size optimization; disabled so the build
+# does not require fetching the binaryen release at pack time.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

@@ -1,13 +1,16 @@
 name: publish-js
 
-# Publishes the JS/TS yggdrasil library (js/) to npm.
+# Builds `@platob/ygg` — a wasm-bindgen package wrapping the Rust ygg engine —
+# and publishes it to npm.
 #
 # Triggers:
-#   - push a tag like ``ygg-js-v0.1.0`` (the version must match package.json)
-#   - or run manually from the Actions tab (workflow_dispatch)
+#   - push a tag like ``ygg-js-v0.1.0`` (the version must match js/Cargo.toml)
+#   - or run manually from the Actions tab (workflow_dispatch), dry run = pack only
 #
-# Requires an ``NPM_TOKEN`` repo secret: an npm "Automation" access token for an
-# account/org that owns the ``@platob`` scope (npmjs.com → Access Tokens).
+# Requires an ``NPM_TOKEN`` repo secret: an npm **Automation** token (or a
+# granular token with "Bypass two-factor authentication" enabled) that can
+# publish under the ``@platob`` scope. A plain publish token will be rejected
+# with 403 when the account enforces 2FA.
 
 on:
   push:
@@ -39,23 +42,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Rust toolchain (+ wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Install build deps
-        run: npm install --no-audit --no-fund
+      - name: Build wasm package
+        run: wasm-pack build --target nodejs --out-dir pkg --release
 
-      - name: Build (ESM + type declarations)
-        run: npm run build
+      - name: Finalize package (name, access, license, readme)
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("pkg/package.json"));
+            p.name = "@platob/ygg";
+            p.publishConfig = { access: "public" };
+            p.files = ["ygg_js_bg.wasm", "ygg_js.js", "ygg_js.d.ts", "ygg_js_bg.wasm.d.ts", "LICENSE", "README.md"];
+            fs.writeFileSync("pkg/package.json", JSON.stringify(p, null, 2) + "\n");
+          '
+          cp ../LICENSE pkg/LICENSE
+          cp README.md pkg/README.md
 
       - name: Pack (sanity — lists the published files)
         run: npm pack --dry-run
+        working-directory: js/pkg
 
       - name: Publish to npm
         if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
-        run: npm publish --access public
+        run: npm publish
+        working-directory: js/pkg
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

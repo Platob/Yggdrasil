@@ -8,6 +8,10 @@ target/
 # This crate is a library, so the lockfile is not tracked.
 Cargo.lock
 
+# wasm-pack / npm build output
+js/pkg/
+node_modules/
+
 # Editor / OS
 .DS_Store
 *.swp
