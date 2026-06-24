@@ -103,7 +103,7 @@ LICENSE               Apache-2.0
 ```bash
 cd rust && cargo test                    # the core (ygg)
 cd python && maturin develop             # build + install the Python binding
-js/                                       # napi-rs/wasm build (to be added)
+cd js && wasm-pack build --target nodejs --out-dir pkg --release   # JS binding
 ```
 
 ## Publishing
@@ -118,4 +118,20 @@ One workflow per language, named for its target:
 
 Each release ships the **same core** — the `ygg` crate plus the bindings that
 wrap it. Python ships as maturin-built wheels (compiled extension), **never** a
-pure-Python package. Keep versions in lockstep when the public API changes.
+pure-Python package.
+
+## Versioning (IMPORTANT — global rule)
+
+**All three packages share one uniform version.** Rust (`ygg`), Python (`ygg`),
+and JS (`@platob/ygg`) are released in lockstep at the *same* version number —
+never let them drift. The current version is **`0.9.0`**.
+
+The version lives in three manifests; bump **all** of them together:
+
+- `rust/Cargo.toml` → `[workspace.package] version` (the `ygg` engine inherits it)
+- `python/Cargo.toml` → `version` (maturin reads it; `pyproject.toml` is `dynamic`)
+- `js/Cargo.toml` → `version` (wasm-pack writes it into the npm `package.json`)
+
+When you change the version, change it in all three in the same commit, and tag
+each release from the matching value (`ygg-rust-v0.9.0`, `ygg-python-v0.9.0`,
+`ygg-js-v0.9.0`).
