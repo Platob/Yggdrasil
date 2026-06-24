@@ -1,18 +1,17 @@
 [package]
-name = "yggdrasil"
+name = "ygg"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
-description = "Yggdrasil — schema-aware data interchange, rebuilt in pure Rust."
+description = "ygg — schema-aware data interchange, rebuilt in pure Rust."
 license = "Apache-2.0"
-readme = "README.md"
 repository = "https://github.com/platob/yggdrasil"
 homepage = "https://github.com/platob/yggdrasil"
 keywords = ["data", "interchange", "schema", "arrow"]
 categories = ["data-structures"]
 
 [lib]
-name = "yggdrasil"
+name = "ygg"
 path = "src/lib.rs"
 
 [dependencies]

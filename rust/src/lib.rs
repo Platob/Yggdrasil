@@ -1,4 +1,4 @@
-//! Yggdrasil — schema-aware data interchange, rebuilt in pure Rust.
+//! ygg — schema-aware data interchange, rebuilt in pure Rust.
 //!
 //! This is a fresh start. The crate is intentionally empty beyond a
 //! version probe; build the project up from here.
