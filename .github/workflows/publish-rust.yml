@@ -1,4 +1,4 @@
-name: 🦀 Publish ygg (crates.io)
+name: publish-rust
 
 # Publishes the Rust ygg crate to crates.io.
 #

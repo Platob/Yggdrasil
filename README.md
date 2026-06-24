@@ -30,9 +30,9 @@ Releases are driven by GitHub Actions, one workflow per language:
 
 | Language | Directory | Crate/Package | Workflow | Trigger |
 |----------|-----------|---------------|----------|---------|
-| Rust (crates.io) | `rust/` | `ygg` | `.github/workflows/publish-rust.yml` | tag `ygg-rust-v*` |
-| Python (PyPI) | `python/` | `ygg` | `.github/workflows/publish.yml` | tag `v*` / `python/**` push |
-| JS/TS (npm) | `js/` | `@platob/yggdrasil` | `.github/workflows/publish-yggdrasil-npm.yml` | tag `yggdrasil-js-v*` |
+| Rust (crates.io) | `rust/` | `ygg` | `publish-rust.yml` | tag `ygg-rust-v*` |
+| Python (PyPI) | `python/` | `ygg` | `publish-python.yml` | tag `v*` / `python/**` push |
+| JS/TS (npm) | `js/` | `@platob/yggdrasil` | `publish-js.yml` | tag `yggdrasil-js-v*` |
 
 ## License
 

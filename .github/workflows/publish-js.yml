@@ -1,4 +1,4 @@
-name: 📦 Publish @platob/yggdrasil (npm)
+name: publish-js
 
 # Publishes the JS/TS yggdrasil library (packages/yggdrasil) to npm.
 #

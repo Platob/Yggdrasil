@@ -41,7 +41,7 @@
 # otherwise the token-based fallback is used automatically.
 # ============================================================================
 
-name: 🚀 Publish ygg
+name: publish-python
 
 on:
   push:
@@ -52,7 +52,7 @@ on:
       - "python/pyproject.toml"
       - "python/README.md"
       - "python/LICENSE"
-      - ".github/workflows/publish.yml"
+      - ".github/workflows/publish-python.yml"
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
