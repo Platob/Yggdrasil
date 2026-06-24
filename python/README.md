@@ -1,7 +1,7 @@
 # ygg (Python)
 
-Python bindings over the Rust [`ygg-core`](../rust/ygg-core) engine. All
-logic lives in Rust; this package only exposes a Pythonic surface.
+Python bindings over the Rust [`ygg`](../rust/ygg) engine. All logic lives
+in Rust; this package only exposes a Pythonic surface.
 
 ## Install (from source)
 

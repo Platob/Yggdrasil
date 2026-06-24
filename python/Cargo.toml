@@ -1,20 +1,23 @@
 [package]
 name = "ygg-python"
-description = "Python bindings (PyO3) over the Rust ygg-core engine."
+description = "Python bindings (PyO3) over the Rust ygg engine."
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
 license = "Apache-2.0"
 repository = "https://github.com/platob/yggdrasil"
 
-# Produces the `ygg` Python extension module. This crate is a binding layer
-# only — all logic lives in ygg-core (see ../rust/ygg-core).
+# Produces the `ygg` Python extension module (maturin renames the cdylib to
+# `ygg`). This crate is a binding layer only — all logic lives in the `ygg`
+# engine crate (see ../rust/ygg).
 [lib]
-name = "ygg"
+name = "ygg_python"
 crate-type = ["cdylib"]
 
 [dependencies]
-ygg-core = { path = "../rust/ygg-core" }
+# The engine. Aliased to `ygg_engine` on the Rust side so the name does not
+# clash with the `#[pymodule] fn ygg`; the published package is still `ygg`.
+ygg_engine = { path = "../rust/ygg", package = "ygg" }
 
 [dependencies.pyo3]
 version = "0.22"

@@ -1,11 +1,11 @@
 # Cargo workspace for the Rust side of ygg.
 #
-# The engine lives in `ygg-core` (the single source of truth). Language
+# The engine lives in the `ygg` crate (the single source of truth). Language
 # bindings (python/, js/) depend on it by path and only marshal types.
 
 [workspace]
 resolver = "2"
-members = ["ygg-core"]
+members = ["ygg"]
 
 [workspace.package]
 version = "0.1.0"

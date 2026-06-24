@@ -1,15 +1,15 @@
-//! PyO3 bindings for ygg — a thin layer over `ygg-core`.
+//! PyO3 bindings for ygg — a thin layer over the `ygg` engine crate.
 //!
 //! These classes only marshal types across the boundary and expose a
 //! Pythonic surface (`snake_case` accessors, `__str__`/`__repr__`). All
-//! parsing logic lives in `ygg-core`; parse errors are mapped to
+//! parsing logic lives in the engine; parse errors are mapped to
 //! `ValueError`.
 
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use ygg_core::{Uri as CoreUri, Url as CoreUrl};
+use ygg_engine::{Uri as CoreUri, Url as CoreUrl};
 
 /// A URI split into its RFC 3986 components.
 #[pyclass(name = "Uri", module = "ygg", frozen)]
@@ -147,7 +147,7 @@ impl Url {
 /// The `ygg` extension module.
 #[pymodule]
 fn ygg(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", ygg_core::VERSION)?;
+    m.add("__version__", ygg_engine::VERSION)?;
     m.add_class::<Uri>()?;
     m.add_class::<Url>()?;
     Ok(())

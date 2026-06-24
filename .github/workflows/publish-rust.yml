@@ -1,6 +1,6 @@
 name: publish-rust
 
-# Publishes the Rust ygg-core crate (the engine) to crates.io.
+# Publishes the Rust `ygg` crate (the engine) to crates.io.
 #
 # Triggers:
 #   - push a tag like ``ygg-rust-v0.1.0`` (must match the version in Cargo.toml)
@@ -57,10 +57,10 @@ jobs:
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#ygg-rust-v}"
           CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='ygg-core'))")
+            | python3 -c "import sys,json; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='ygg'))")
           echo "tag=$TAG_VERSION crate=$CRATE_VERSION"
           if [ "$TAG_VERSION" != "$CRATE_VERSION" ]; then
-            echo "::error ::Tag version ($TAG_VERSION) does not match ygg-core Cargo.toml ($CRATE_VERSION)"
+            echo "::error ::Tag version ($TAG_VERSION) does not match ygg Cargo.toml ($CRATE_VERSION)"
             exit 1
           fi
 
@@ -71,10 +71,10 @@ jobs:
         run: cargo test --verbose
 
       - name: Package (sanity — lists the published files)
-        run: cargo package -p ygg-core --list
+        run: cargo package -p ygg --list
 
-      - name: Publish ygg-core to crates.io
+      - name: Publish ygg to crates.io
         if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
-        run: cargo publish -p ygg-core
+        run: cargo publish -p ygg
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

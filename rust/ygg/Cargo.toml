@@ -1,6 +1,6 @@
 [package]
-name = "ygg-core"
-description = "ygg-core — the Rust engine behind ygg: schema-aware data interchange."
+name = "ygg"
+description = "ygg — schema-aware data interchange: the Rust engine (single source of truth)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ keywords = ["data", "interchange", "uri", "url"]
 categories = ["data-structures", "parser-implementations"]
 
 [lib]
-name = "ygg_core"
+name = "ygg"
 path = "src/lib.rs"
 
 [lints]

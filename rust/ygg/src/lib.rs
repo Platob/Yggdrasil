@@ -1,4 +1,4 @@
-//! ygg-core — the Rust engine behind ygg.
+//! ygg — the Rust engine (single source of truth).
 //!
 //! This crate holds the real logic; the Python (`python/`) and JS (`js/`)
 //! packages are thin bindings that wrap it. Keep the public surface here

@@ -1,7 +1,7 @@
 name: publish-python
 
 # Builds the `ygg` Python package — a maturin-built extension wrapping the
-# Rust ygg-core engine — and publishes it to PyPI.
+# Rust `ygg` engine — and publishes it to PyPI.
 #
 # Triggers:
 #   - push a tag like ``ygg-python-v0.1.0`` (must match python/Cargo.toml version)
